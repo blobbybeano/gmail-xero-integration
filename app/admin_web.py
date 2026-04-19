@@ -203,10 +203,22 @@ def _xero_scope_string(scopes: list[str]) -> str:
     return " ".join(parts)
 
 
+def _get_xero_creds(config: AppConfig) -> tuple[str, str]:
+    """Return (client_id, client_secret) from env vars or JSON settings store."""
+    client_id = config.xero_client_id or str(
+        get_json_setting(config.admin_db_file, "xero_client_id", "")
+    ).strip()
+    client_secret = config.xero_client_secret or str(
+        get_json_setting(config.admin_db_file, "xero_client_secret", "")
+    ).strip()
+    return client_id, client_secret
+
+
 def _xero_authorization_url(config: AppConfig, state: str) -> str:
+    client_id, _ = _get_xero_creds(config)
     params = {
         "response_type": "code",
-        "client_id": config.xero_client_id,
+        "client_id": client_id,
         "redirect_uri": config.xero_redirect_uri,
         "scope": _xero_scope_string(config.xero_scopes),
         "state": state,
@@ -215,8 +227,9 @@ def _xero_authorization_url(config: AppConfig, state: str) -> str:
 
 
 def _exchange_xero_code(config: AppConfig, code: str) -> dict:
+    client_id, client_secret = _get_xero_creds(config)
     basic = base64.b64encode(
-        f"{config.xero_client_id}:{config.xero_client_secret}".encode()
+        f"{client_id}:{client_secret}".encode()
     ).decode()
     headers = {"Authorization": f"Basic {basic}"}
     data = {
@@ -244,9 +257,10 @@ def _get_xero_tenant_id(access_token: str) -> str:
 def _xero_status_data(config: AppConfig) -> tuple[bool, str, str]:
     """Returns (connected, status_text, tenant_id)"""
     token = load_xero_token(config.xero_token_file)
-    has_credentials = bool(config.xero_client_id and config.xero_client_secret)
+    client_id, client_secret = _get_xero_creds(config)
+    has_credentials = bool(client_id and client_secret)
     if not has_credentials:
-        return False, "Missing XERO_CLIENT_ID / XERO_CLIENT_SECRET environment variables.", ""
+        return False, "Enter your Xero Client ID and Secret below, then click Save.", ""
     access = token.get("access_token")
     tenant = token.get("tenant_id")
     if access and tenant:
@@ -516,11 +530,27 @@ def create_app() -> Flask:
         session.clear()
         return redirect(url_for("login"))
 
+    @app.post("/save-xero-creds")
+    @require_login
+    def save_xero_creds():
+        client_id = (request.form.get("xero_client_id") or "").strip()
+        client_secret = (request.form.get("xero_client_secret") or "").strip()
+        if client_id:
+            set_json_setting(config.admin_db_file, "xero_client_id", client_id)
+        if client_secret:
+            set_json_setting(config.admin_db_file, "xero_client_secret", client_secret)
+        if client_id or client_secret:
+            session["save_notice"] = "success:Xero credentials saved. Now click Connect Xero."
+        else:
+            session["save_notice"] = "error:No credentials entered."
+        return redirect(url_for("index"))
+
     @app.get("/connect-xero")
     @require_login
     def connect_xero():
-        if not config.xero_client_id or not config.xero_client_secret:
-            session["save_notice"] = "error:Xero connect failed: missing XERO_CLIENT_ID/XERO_CLIENT_SECRET."
+        xero_client_id, xero_client_secret = _get_xero_creds(config)
+        if not xero_client_id or not xero_client_secret:
+            session["save_notice"] = "error:Xero connect failed: enter your Client ID and Secret in the Xero card first."
             return redirect(url_for("index"))
         state = secrets.token_urlsafe(24)
         session["xero_oauth_state"] = state
@@ -680,6 +710,8 @@ def create_app() -> Flask:
         submitter_aliases = get_submitter_aliases(config.admin_db_file)
         client_id = _oauth_client_id(config)
         creds_file_exists = Path(config.google_credentials_file).exists()
+        stored_xero_id, stored_xero_secret = _get_xero_creds(config)
+        xero_has_creds = bool(stored_xero_id and stored_xero_secret)
         pending_auth_url = (
             session.get("oauth_auth_url")
             or str(get_json_setting(config.admin_db_file, "oauth_auth_url", "")).strip()
@@ -803,7 +835,6 @@ def create_app() -> Flask:
             sheet_options += f'<option value="{escape(sheet_current_id)}" selected>Current saved ({escape(sheet_current_id)})</option>'
 
         # --- Xero credential hints ---
-        xero_has_creds = bool(config.xero_client_id and config.xero_client_secret)
         xero_redirect = escape(config.xero_redirect_uri)
         google_redirect = escape(config.google_oauth_redirect_uri)
 
@@ -940,10 +971,27 @@ def create_app() -> Flask:
                 <div class="text-xs text-gray-500 mb-3 space-y-1">
                   <p>{escape(xero_msg)}</p>
                   {"" if not xero_tenant else f'<p class="font-mono text-gray-400 truncate" title="{escape(xero_tenant)}">Tenant: {escape(xero_tenant[:32])}{"..." if len(xero_tenant) > 32 else ""}</p>'}
-                  <p>Redirect URI: <code class="bg-gray-100 px-1 py-0.5 rounded">{xero_redirect}</code></p>
+                  <p>Redirect URI: <code class="bg-gray-100 px-1 py-0.5 rounded text-xs">{xero_redirect}</code></p>
                 </div>
 
-                {"" if xero_has_creds else '<p class="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-3">Set <code>XERO_CLIENT_ID</code> and <code>XERO_CLIENT_SECRET</code> in your environment variables first.</p>'}
+                <form method="post" action="/save-xero-creds" class="space-y-2 mb-3">
+                  <div>
+                    <label class="block text-xs font-medium text-gray-600 mb-1">Client ID</label>
+                    <input name="xero_client_id" value="{escape(stored_xero_id)}"
+                      placeholder="Paste your Xero Client ID"
+                      class="w-full px-3 py-1.5 border border-gray-300 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono">
+                  </div>
+                  <div>
+                    <label class="block text-xs font-medium text-gray-600 mb-1">Client Secret</label>
+                    <input name="xero_client_secret" type="password"
+                      placeholder="{"••••••••  (saved)" if stored_xero_secret else "Paste your Xero Client Secret"}"
+                      class="w-full px-3 py-1.5 border border-gray-300 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono">
+                  </div>
+                  <button type="submit"
+                    class="px-3 py-1.5 text-xs font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors">
+                    Save Credentials
+                  </button>
+                </form>
 
                 <a href="/connect-xero"
                   class="inline-block px-3 py-1.5 text-xs font-medium text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors {"opacity-50 pointer-events-none" if not xero_has_creds else ""}">
