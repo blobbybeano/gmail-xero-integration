@@ -433,6 +433,12 @@ def _xero_account_mapping_card(
             '</div>'
         )
 
+    def _find_name(accounts, code):
+        for a in accounts:
+            if a.get("Code", "") == code:
+                return a.get("Name", code)
+        return None
+
     def _opts(accounts, saved):
         out = '<option value="">— select account —</option>'
         for a in sorted(accounts, key=lambda x: x.get("Name", "")):
@@ -442,8 +448,17 @@ def _xero_account_mapping_card(
             out += f'<option value="{code}"{sel}>{name} ({code})</option>'
         return out
 
+    def _saved_badge(accounts, code):
+        if not code:
+            return '<p class="text-xs text-gray-400 mt-1">No account saved yet.</p>'
+        name = _find_name(accounts, code)
+        label = escape(f"{name} ({code})") if name else escape(code)
+        return f'<p class="text-xs text-emerald-600 mt-1">&#10003; Currently saved: <span class="font-medium">{label}</span></p>'
+
     rev_opts = _opts(revenue_accounts, saved_invoice)
     bank_opts = _opts(bank_accounts, saved_payment)
+    rev_badge = _saved_badge(revenue_accounts, saved_invoice)
+    bank_badge = _saved_badge(bank_accounts, saved_payment)
 
     return f"""
     <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
@@ -456,6 +471,7 @@ def _xero_account_mapping_card(
             class="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300">
             {rev_opts}
           </select>
+          {rev_badge}
         </div>
         <div>
           <label class="block text-xs font-medium text-gray-700 mb-1">Payment bank account <span class="text-gray-400 font-normal">(where payments land)</span></label>
@@ -463,6 +479,7 @@ def _xero_account_mapping_card(
             class="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300">
             {bank_opts}
           </select>
+          {bank_badge}
         </div>
         <button type="submit"
           class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg transition-colors">
@@ -814,8 +831,8 @@ def create_app() -> Flask:
                         xero_bank_accounts.append(_a)
             except Exception:
                 pass
-        saved_invoice_account = str(get_json_setting(config.admin_db_file, "xero_invoice_account_code", ""))
-        saved_payment_account = str(get_json_setting(config.admin_db_file, "xero_payment_account_code", ""))
+        saved_invoice_account = str(get_json_setting(config.admin_db_file, "xero_invoice_account_code", "") or "")
+        saved_payment_account = str(get_json_setting(config.admin_db_file, "xero_payment_account_code", "") or "")
         pending_auth_url = (
             session.get("oauth_auth_url")
             or str(get_json_setting(config.admin_db_file, "oauth_auth_url", "")).strip()
