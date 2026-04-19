@@ -719,10 +719,11 @@ def create_app() -> Flask:
         creds_file_exists = Path(config.google_credentials_file).exists()
         stored_xero_id, stored_xero_secret = _get_xero_creds(config)
         xero_has_creds = bool(stored_xero_id and stored_xero_secret)
-        xero_pending_auth_url = (
-            session.get("xero_auth_url")
-            or str(get_json_setting(config.admin_db_file, "xero_auth_url", "")).strip()
-        ) if not xero_ok else ""
+        # Always clear stale Xero auth link on page load — user must click Connect to get a fresh one
+        session.pop("xero_auth_url", None)
+        set_json_setting(config.admin_db_file, "xero_auth_url", "")
+        set_json_setting(config.admin_db_file, "xero_oauth_pending_state", "")
+        xero_pending_auth_url = ""
         pending_auth_url = (
             session.get("oauth_auth_url")
             or str(get_json_setting(config.admin_db_file, "oauth_auth_url", "")).strip()
