@@ -202,3 +202,11 @@ def get_xero_webhook_verified(db_path: str) -> bool:
 
 def set_xero_webhook_verified(db_path: str, verified: bool) -> None:
     set_json_setting(db_path, "xero_webhook_verified", verified)
+
+
+def get_enabled(db_path: str) -> bool:
+    return bool(get_json_setting(db_path, "system_enabled", True))
+
+
+def set_enabled(db_path: str, enabled: bool) -> None:
+    set_json_setting(db_path, "system_enabled", enabled)

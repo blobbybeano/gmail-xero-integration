@@ -46,6 +46,8 @@ from .xero_client import load_xero_token, save_xero_token, token_is_expired, ref
 from .google_sheets import backfill_submitter_in_sheet, update_invoice_paid_in_sheet
 from .google_calendar import register_calendar_watch, stop_calendar_watch
 from .admin_store import (
+    get_enabled,
+    set_enabled,
     get_google_watches,
     set_google_watch,
     delete_google_watch,
@@ -803,47 +805,109 @@ def create_app() -> Flask:
         google_ok = bool(load_admin_credentials(config))
         xero_ok = bool(xero_tok and not token_is_expired(xero_tok))
         watch_count = len(watches)
+        enabled = get_enabled(config.admin_db_file)
 
-        try:
-            ls = get_last_sync(state)
-            if ls.tzinfo is None:
-                ls = ls.replace(tzinfo=dt.timezone.utc)
-            diff = (dt.datetime.now(dt.timezone.utc) - ls).total_seconds()
-            if state.get("last_sync") is None:
-                last_sync_str = "never"
-            elif diff < 60:
-                last_sync_str = "just now"
-            elif diff < 3600:
-                last_sync_str = f"{int(diff // 60)}m ago"
-            else:
-                last_sync_str = f"{int(diff // 3600)}h ago"
-        except Exception:
-            last_sync_str = "—"
-
-        recent_logs = _feed.recent(200)
+        recent_logs = _feed.recent(500)
         last_seq_val = recent_logs[-1]["seq"] if recent_logs else 0
 
+        # Scan feed for meaningful status signals
+        last_event_entry = None
+        last_contact_entry = None
+        last_invoice_entry = None
+        for entry in reversed(recent_logs):
+            msg = entry.get("msg", "")
+            level = entry.get("level", "")
+            if last_event_entry is None and level == "event" and "DONE event detected:" in msg:
+                last_event_entry = entry
+            if last_contact_entry is None and level == "event" and msg.startswith("New contact:"):
+                last_contact_entry = entry
+            if last_invoice_entry is None and level == "success" and "Invoice created" in msg:
+                last_invoice_entry = entry
+            if last_event_entry and last_contact_entry and last_invoice_entry:
+                break
+
+        def _ago(ts_f: float) -> str:
+            diff = time.time() - ts_f
+            if diff < 5:
+                return "just now"
+            if diff < 60:
+                return f"{int(diff)}s ago"
+            if diff < 3600:
+                return f"{int(diff // 60)}m ago"
+            if diff < 86400:
+                return f"{int(diff // 3600)}h ago"
+            return f"{int(diff // 86400)}d ago"
+
+        def _signal_card(label: str, value: str, sub: str, color: str) -> str:
+            return (
+                f'<div class="bg-neutral-900 border border-neutral-800 rounded-xl p-4 min-w-0">'
+                f'<p class="text-xs text-neutral-500 mb-1.5 uppercase tracking-wider">{label}</p>'
+                f'<p class="text-sm font-semibold {color} truncate" title="{escape(value)}">{escape(value)}</p>'
+                f'<p class="text-xs text-neutral-600 mt-0.5">{escape(sub)}</p>'
+                f'</div>'
+            )
+
+        # Webhook signal card
+        if watch_count:
+            wh_value = f"{watch_count} active webhook{'s' if watch_count != 1 else ''}"
+            wh_sub = "Google push notifications on"
+            wh_color = "text-indigo-300"
+        else:
+            wh_value = "Polling only"
+            wh_sub = "No webhooks registered"
+            wh_color = "text-neutral-400"
+        webhook_card = _signal_card("Webhooks", wh_value, wh_sub, wh_color)
+
+        # Last DONE event card
+        if last_event_entry:
+            ev_msg = last_event_entry["msg"].replace("DONE event detected: ", "").strip('"')
+            ev_sub = _ago(last_event_entry["ts"])
+            event_card = _signal_card("Last event formatted", ev_msg, ev_sub, "text-cyan-300")
+        else:
+            event_card = _signal_card("Last event formatted", "None yet", "Waiting for a DONE event…", "text-neutral-500")
+
+        # Last new contact card
+        if last_contact_entry:
+            ct_name = last_contact_entry["msg"].replace("New contact: ", "").strip()
+            ct_sub = _ago(last_contact_entry["ts"])
+            contact_card = _signal_card("Last new contact", ct_name, ct_sub, "text-emerald-300")
+        else:
+            contact_card = _signal_card("Last new contact", "None yet", "New submitters appear here", "text-neutral-500")
+
+        # Last invoice card
+        if last_invoice_entry:
+            inv_msg = last_invoice_entry["msg"].replace("Invoice created in Xero — ", "").strip()
+            inv_sub = _ago(last_invoice_entry["ts"])
+            invoice_card = _signal_card("Last invoice", inv_msg[:40], inv_sub, "text-blue-300")
+        else:
+            invoice_card = _signal_card("Last invoice", f"{total_invoices} total" if total_invoices else "None yet", "Session history", "text-neutral-400")
+
+        # Connection badges
         google_badge = (
-            '<span class="flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-900/60 text-emerald-300 border border-emerald-700/50">'
+            '<span class="flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-900/60 text-emerald-300 border border-emerald-700/50">'
             '<span class="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0"></span>Google</span>'
             if google_ok else
-            '<span class="flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-neutral-800 text-neutral-400 border border-neutral-700">'
+            '<span class="flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-neutral-800 text-neutral-400 border border-neutral-700">'
             '<span class="w-1.5 h-1.5 rounded-full bg-neutral-500 shrink-0"></span>Google</span>'
         )
         xero_badge = (
-            '<span class="flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-blue-900/60 text-blue-300 border border-blue-700/50">'
+            '<span class="flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-blue-900/60 text-blue-300 border border-blue-700/50">'
             '<span class="w-1.5 h-1.5 rounded-full bg-blue-400 shrink-0"></span>Xero</span>'
             if xero_ok else
-            '<span class="flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-neutral-800 text-neutral-400 border border-neutral-700">'
+            '<span class="flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-neutral-800 text-neutral-400 border border-neutral-700">'
             '<span class="w-1.5 h-1.5 rounded-full bg-neutral-500 shrink-0"></span>Xero</span>'
         )
-        watches_badge = (
-            f'<span class="flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-indigo-900/60 text-indigo-300 border border-indigo-700/50">'
-            f'<span class="w-1.5 h-1.5 rounded-full bg-indigo-400 shrink-0"></span>{watch_count} watch{"es" if watch_count != 1 else ""}</span>'
-            if watch_count else
-            '<span class="flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-neutral-800 text-neutral-400 border border-neutral-700">'
-            '<span class="w-1.5 h-1.5 rounded-full bg-neutral-500 shrink-0"></span>Polling</span>'
+
+        # On/Off toggle state
+        enabled_js = "true" if enabled else "false"
+        toggle_label = "Running" if enabled else "Paused"
+        toggle_cls = (
+            "flex items-center gap-2 px-4 py-1.5 rounded-full text-sm font-semibold border transition-all "
+            + ("bg-emerald-900/50 text-emerald-300 border-emerald-600/60 hover:bg-emerald-800/60"
+               if enabled else
+               "bg-neutral-800 text-neutral-400 border-neutral-600 hover:bg-neutral-700")
         )
+        dot_cls = "w-2 h-2 rounded-full " + ("bg-emerald-400 animate-pulse" if enabled else "bg-neutral-500")
 
         def _render_line(entry):
             ts = dt.datetime.fromtimestamp(entry["ts"], tz=dt.timezone.utc).strftime("%H:%M:%S")
@@ -914,7 +978,12 @@ def create_app() -> Flask:
     <div class="flex items-center gap-2">
       {google_badge}
       {xero_badge}
-      {watches_badge}
+      <div class="w-px h-5 bg-neutral-700 mx-1"></div>
+      <!-- On/Off Toggle -->
+      <button id="toggle-btn" onclick="toggleEnabled()" class="{toggle_cls}">
+        <span id="toggle-dot" class="{dot_cls}"></span>
+        <span id="toggle-label">{toggle_label}</span>
+      </button>
       <div class="w-px h-5 bg-neutral-700 mx-1"></div>
       <a href="/settings" class="px-3 py-1.5 text-xs font-medium text-neutral-300 hover:text-white bg-neutral-800 hover:bg-neutral-700 rounded-lg border border-neutral-700 transition-colors">
         Settings
@@ -925,27 +994,12 @@ def create_app() -> Flask:
     </div>
   </header>
 
-  <!-- Stats -->
+  <!-- Status signals -->
   <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 px-6 pt-5 pb-4">
-    <div class="bg-neutral-900 border border-neutral-800 rounded-xl p-4">
-      <p class="text-xs text-neutral-500 mb-1">Invoices created</p>
-      <p class="text-2xl font-bold text-white tabular-nums">{total_invoices}</p>
-    </div>
-    <div class="bg-neutral-900 border border-neutral-800 rounded-xl p-4">
-      <p class="text-xs text-neutral-500 mb-1">Last checked</p>
-      <p class="text-2xl font-bold text-white">{last_sync_str}</p>
-    </div>
-    <div class="bg-neutral-900 border border-neutral-800 rounded-xl p-4">
-      <p class="text-xs text-neutral-500 mb-1">Mode</p>
-      <p class="text-2xl font-bold {"text-indigo-400" if watch_count else "text-neutral-400"}">{"Webhooks" if watch_count else "Polling"}</p>
-    </div>
-    <div class="bg-neutral-900 border border-neutral-800 rounded-xl p-4 flex flex-col justify-between">
-      <p class="text-xs text-neutral-500 mb-2">Manual trigger</p>
-      <button id="poll-btn" onclick="pollNow()"
-        class="px-3 py-1.5 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg transition-colors">
-        Poll now
-      </button>
-    </div>
+    {webhook_card}
+    {event_card}
+    {contact_card}
+    {invoice_card}
   </div>
 
   <!-- Terminal -->
@@ -969,7 +1023,7 @@ def create_app() -> Flask:
     </div>
     <!-- Terminal body -->
     <div id="terminal"
-      class="h-[56vh] overflow-y-auto bg-neutral-950 p-4 font-mono text-sm"
+      class="h-[55vh] overflow-y-auto bg-neutral-950 p-4 font-mono text-sm"
       onscroll="onUserScroll()">
       {history_html}
     </div>
@@ -977,12 +1031,12 @@ def create_app() -> Flask:
 
   <!-- Legend -->
   <div class="flex flex-wrap gap-4 px-6 pb-6 text-xs font-mono">
-    <span class="text-cyan-400">◆ event detected</span>
+    <span class="text-cyan-400">◆ event / new contact</span>
     <span class="text-emerald-400">✓ created / logged</span>
     <span class="text-emerald-300">£ payment received</span>
     <span class="text-amber-400">⚠ needs attention</span>
     <span class="text-red-400">✗ error</span>
-    <span class="text-neutral-400">› info</span>
+    <span class="text-neutral-500">· system</span>
   </div>
 
 <script>
@@ -991,7 +1045,6 @@ const connDot = document.getElementById('conn-dot');
 const connLabel = document.getElementById('conn-label');
 const scrollBtn = document.getElementById('scroll-btn');
 let autoScroll = true;
-let userScrolling = false;
 
 function scrollToBottom() {{
   term.scrollTop = term.scrollHeight;
@@ -1066,14 +1119,30 @@ es.onerror = () => {{
   connLabel.className = 'text-xs text-red-400';
 }};
 
-function pollNow() {{
-  const btn = document.getElementById('poll-btn');
-  btn.textContent = 'Triggering…';
-  btn.disabled = true;
-  fetch('/poll-now', {{method:'POST'}}).then(() => {{
-    btn.textContent = 'Triggered!';
-    setTimeout(() => {{ btn.textContent = 'Poll now'; btn.disabled = false; }}, 2000);
-  }}).catch(() => {{ btn.textContent = 'Poll now'; btn.disabled = false; }});
+// On/Off toggle
+let _enabled = {enabled_js};
+const toggleBtn = document.getElementById('toggle-btn');
+const toggleDot = document.getElementById('toggle-dot');
+const toggleLbl = document.getElementById('toggle-label');
+
+function applyToggleState(on) {{
+  _enabled = on;
+  toggleLbl.textContent = on ? 'Running' : 'Paused';
+  if (on) {{
+    toggleBtn.className = 'flex items-center gap-2 px-4 py-1.5 rounded-full text-sm font-semibold border transition-all bg-emerald-900/50 text-emerald-300 border-emerald-600/60 hover:bg-emerald-800/60';
+    toggleDot.className = 'w-2 h-2 rounded-full bg-emerald-400 animate-pulse';
+  }} else {{
+    toggleBtn.className = 'flex items-center gap-2 px-4 py-1.5 rounded-full text-sm font-semibold border transition-all bg-neutral-800 text-neutral-400 border-neutral-600 hover:bg-neutral-700';
+    toggleDot.className = 'w-2 h-2 rounded-full bg-neutral-500';
+  }}
+}}
+
+function toggleEnabled() {{
+  toggleBtn.disabled = true;
+  fetch('/toggle-enabled', {{method: 'POST'}})
+    .then(r => r.json())
+    .then(d => {{ applyToggleState(d.enabled); toggleBtn.disabled = false; }})
+    .catch(() => {{ toggleBtn.disabled = false; }});
 }}
 </script>
 
@@ -1101,6 +1170,15 @@ function pollNow() {{
         _feed.push("Manual poll triggered", "system")
         trigger_poll()
         return "", 204
+
+    @app.post("/toggle-enabled")
+    @require_login
+    def toggle_enabled():
+        current = get_enabled(config.admin_db_file)
+        set_enabled(config.admin_db_file, not current)
+        new_state = not current
+        import flask as _flask
+        return _flask.jsonify({"enabled": new_state})
 
     @app.get("/settings")
     @require_login

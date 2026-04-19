@@ -6,7 +6,9 @@ import time
 from .admin_store import (
     add_seen_submitter,
     get_active_calendars,
+    get_enabled,
     get_google_watches,
+    get_seen_submitters,
     get_sheet_target,
     get_stats_fields,
     get_submitter_aliases,
@@ -258,6 +260,8 @@ def run() -> None:
             print(f"Sheets append failed for {event_key}: {exc}")
             return state
 
+    _was_enabled = True
+
     while True:
         xero_client = build_xero_client(config)
         now = dt.datetime.now(dt.timezone.utc)
@@ -288,6 +292,18 @@ def run() -> None:
                             print(f"[watch] Failed to renew watch for {cal_id}: {exc}", flush=True)
         except Exception:
             pass
+
+        # Global on/off toggle
+        _enabled = get_enabled(config.admin_db_file)
+        if not _enabled:
+            if _was_enabled:
+                _feed.push("System paused — no events will be processed", "system")
+            _was_enabled = False
+            wait_for_poll(backoff_seconds)
+            continue
+        if not _was_enabled:
+            _feed.push("System resumed — watching for events", "system")
+        _was_enabled = True
         time_min = now - dt.timedelta(days=365)
         time_max = now + dt.timedelta(days=365)
         active_calendars = get_active_calendars(
@@ -339,7 +355,12 @@ def run() -> None:
                 or ""
             ).strip()
             if submitter_email:
+                _existing_submitters = set(get_seen_submitters(config.admin_db_file))
+                _is_new_contact = submitter_email.lower() not in _existing_submitters
                 add_seen_submitter(config.admin_db_file, submitter_email)
+                if _is_new_contact:
+                    _display_preview = submitter_aliases.get(submitter_email.lower(), submitter_email)
+                    _feed.push(f"New contact: {_display_preview}", "event")
             submitter_display = submitter_aliases.get(
                 submitter_email.lower(), submitter_email
             )
