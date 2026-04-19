@@ -536,6 +536,11 @@ def create_app() -> Flask:
         client_id = (request.form.get("xero_client_id") or "").strip()
         client_secret = (request.form.get("xero_client_secret") or "").strip()
         if client_id:
+            # Auto-format to UUID with dashes if entered as 32 hex chars without dashes
+            import re as _re
+            hex_only = client_id.replace("-", "")
+            if _re.match(r'^[0-9A-Fa-f]{32}$', hex_only) and "-" not in client_id:
+                client_id = f"{hex_only[0:8]}-{hex_only[8:12]}-{hex_only[12:16]}-{hex_only[16:20]}-{hex_only[20:32]}".upper()
             set_json_setting(config.admin_db_file, "xero_client_id", client_id)
         if client_secret:
             set_json_setting(config.admin_db_file, "xero_client_secret", client_secret)
