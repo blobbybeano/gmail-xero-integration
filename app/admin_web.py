@@ -55,7 +55,8 @@ from .admin_store import (
     set_xero_webhook_verified,
 )
 from .trigger import trigger_poll
-from .state import load_state
+from .state import load_state, get_last_sync
+from .log_feed import feed as _feed
 
 
 XERO_AUTH_URL = "https://login.xero.com/identity/connect/authorize"
@@ -589,7 +590,7 @@ def create_app() -> Flask:
         password = request.form.get("password") or ""
         if username == config.admin_username and password == config.admin_password:
             session["logged_in"] = True
-            return redirect(url_for("index"))
+            return redirect(url_for("dashboard"))
         return _page(f"""
         <div class="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-50 to-blue-100 px-4">
           <div class="w-full max-w-md">
@@ -789,7 +790,319 @@ def create_app() -> Flask:
         set_json_setting(config.admin_db_file, "oauth_auth_url", "")
         return redirect(url_for("index"))
 
+    # ── Dashboard (main page) ──────────────────────────────────────────────────
+
     @app.get("/")
+    @require_login
+    def dashboard():
+        state = load_state(config.state_file)
+        inv_map = state.get("event_invoice_map", {})
+        total_invoices = len(inv_map)
+        watches = get_google_watches(config.admin_db_file)
+        xero_tok = load_xero_token(config.xero_token_file)
+        google_ok = bool(load_admin_credentials(config))
+        xero_ok = bool(xero_tok and not token_is_expired(xero_tok))
+        watch_count = len(watches)
+
+        try:
+            ls = get_last_sync(state)
+            if ls.tzinfo is None:
+                ls = ls.replace(tzinfo=dt.timezone.utc)
+            diff = (dt.datetime.now(dt.timezone.utc) - ls).total_seconds()
+            if state.get("last_sync") is None:
+                last_sync_str = "never"
+            elif diff < 60:
+                last_sync_str = "just now"
+            elif diff < 3600:
+                last_sync_str = f"{int(diff // 60)}m ago"
+            else:
+                last_sync_str = f"{int(diff // 3600)}h ago"
+        except Exception:
+            last_sync_str = "—"
+
+        recent_logs = _feed.recent(200)
+        last_seq_val = recent_logs[-1]["seq"] if recent_logs else 0
+
+        google_badge = (
+            '<span class="flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-900/60 text-emerald-300 border border-emerald-700/50">'
+            '<span class="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0"></span>Google</span>'
+            if google_ok else
+            '<span class="flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-neutral-800 text-neutral-400 border border-neutral-700">'
+            '<span class="w-1.5 h-1.5 rounded-full bg-neutral-500 shrink-0"></span>Google</span>'
+        )
+        xero_badge = (
+            '<span class="flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-blue-900/60 text-blue-300 border border-blue-700/50">'
+            '<span class="w-1.5 h-1.5 rounded-full bg-blue-400 shrink-0"></span>Xero</span>'
+            if xero_ok else
+            '<span class="flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-neutral-800 text-neutral-400 border border-neutral-700">'
+            '<span class="w-1.5 h-1.5 rounded-full bg-neutral-500 shrink-0"></span>Xero</span>'
+        )
+        watches_badge = (
+            f'<span class="flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-indigo-900/60 text-indigo-300 border border-indigo-700/50">'
+            f'<span class="w-1.5 h-1.5 rounded-full bg-indigo-400 shrink-0"></span>{watch_count} watch{"es" if watch_count != 1 else ""}</span>'
+            if watch_count else
+            '<span class="flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-neutral-800 text-neutral-400 border border-neutral-700">'
+            '<span class="w-1.5 h-1.5 rounded-full bg-neutral-500 shrink-0"></span>Polling</span>'
+        )
+
+        def _render_line(entry):
+            ts = dt.datetime.fromtimestamp(entry["ts"], tz=dt.timezone.utc).strftime("%H:%M:%S")
+            level = entry.get("level", "info")
+            msg = entry.get("msg", "")
+            from html import escape as _esc
+            color_map = {
+                "event":   "text-cyan-400",
+                "success": "text-emerald-400",
+                "warn":    "text-amber-400",
+                "error":   "text-red-400",
+                "paid":    "text-emerald-300",
+                "system":  "text-neutral-500",
+                "info":    "text-neutral-300",
+            }
+            prefix_map = {
+                "event":   "◆",
+                "success": "✓",
+                "warn":    "⚠",
+                "error":   "✗",
+                "paid":    "£",
+                "system":  "·",
+                "info":    "›",
+            }
+            col = color_map.get(level, "text-neutral-300")
+            pre = prefix_map.get(level, "›")
+            return (
+                f'<div class="term-line flex gap-3 leading-relaxed">'
+                f'<span class="text-neutral-600 shrink-0 select-none">{_esc(ts)}</span>'
+                f'<span class="{col} shrink-0 select-none">{pre}</span>'
+                f'<span class="{col}">{_esc(msg)}</span>'
+                f'</div>'
+            )
+
+        history_html = "\n".join(_render_line(e) for e in recent_logs) if recent_logs else (
+            '<div class="text-neutral-600 text-sm italic">No activity yet — waiting for events…</div>'
+        )
+
+        return (
+            f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Powwash Bridge</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body {{ background: #0a0a0f; }}
+    #terminal {{ scroll-behavior: smooth; }}
+    .term-line {{ padding: 1px 0; }}
+  </style>
+</head>
+<body class="min-h-screen text-neutral-100 font-sans">
+
+  <!-- Header -->
+  <header class="flex items-center justify-between px-6 py-3 border-b border-neutral-800 bg-neutral-900/80 backdrop-blur sticky top-0 z-10">
+    <div class="flex items-center gap-3">
+      <div class="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center shrink-0">
+        <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/>
+        </svg>
+      </div>
+      <div>
+        <h1 class="text-sm font-semibold text-white tracking-tight">Powwash Bridge</h1>
+        <p class="text-xs text-neutral-500">Calendar → Xero automation</p>
+      </div>
+    </div>
+    <div class="flex items-center gap-2">
+      {google_badge}
+      {xero_badge}
+      {watches_badge}
+      <div class="w-px h-5 bg-neutral-700 mx-1"></div>
+      <a href="/settings" class="px-3 py-1.5 text-xs font-medium text-neutral-300 hover:text-white bg-neutral-800 hover:bg-neutral-700 rounded-lg border border-neutral-700 transition-colors">
+        Settings
+      </a>
+      <a href="/logout" class="px-3 py-1.5 text-xs font-medium text-neutral-400 hover:text-neutral-300 transition-colors">
+        Sign out
+      </a>
+    </div>
+  </header>
+
+  <!-- Stats -->
+  <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 px-6 pt-5 pb-4">
+    <div class="bg-neutral-900 border border-neutral-800 rounded-xl p-4">
+      <p class="text-xs text-neutral-500 mb-1">Invoices created</p>
+      <p class="text-2xl font-bold text-white tabular-nums">{total_invoices}</p>
+    </div>
+    <div class="bg-neutral-900 border border-neutral-800 rounded-xl p-4">
+      <p class="text-xs text-neutral-500 mb-1">Last checked</p>
+      <p class="text-2xl font-bold text-white">{last_sync_str}</p>
+    </div>
+    <div class="bg-neutral-900 border border-neutral-800 rounded-xl p-4">
+      <p class="text-xs text-neutral-500 mb-1">Mode</p>
+      <p class="text-2xl font-bold {"text-indigo-400" if watch_count else "text-neutral-400"}">{"Webhooks" if watch_count else "Polling"}</p>
+    </div>
+    <div class="bg-neutral-900 border border-neutral-800 rounded-xl p-4 flex flex-col justify-between">
+      <p class="text-xs text-neutral-500 mb-2">Manual trigger</p>
+      <button id="poll-btn" onclick="pollNow()"
+        class="px-3 py-1.5 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg transition-colors">
+        Poll now
+      </button>
+    </div>
+  </div>
+
+  <!-- Terminal -->
+  <div class="mx-6 mb-6 rounded-xl overflow-hidden border border-neutral-800 shadow-2xl">
+    <!-- Terminal chrome -->
+    <div class="flex items-center justify-between px-4 py-2.5 bg-neutral-900 border-b border-neutral-800">
+      <div class="flex items-center gap-1.5">
+        <div class="w-3 h-3 rounded-full bg-red-500/80"></div>
+        <div class="w-3 h-3 rounded-full bg-amber-400/80"></div>
+        <div class="w-3 h-3 rounded-full bg-emerald-500/80"></div>
+      </div>
+      <span class="text-xs font-mono text-neutral-500">live feed</span>
+      <div class="flex items-center gap-2">
+        <span id="conn-dot" class="w-2 h-2 rounded-full bg-neutral-600"></span>
+        <span id="conn-label" class="text-xs text-neutral-600">connecting…</span>
+        <button id="scroll-btn" onclick="toggleScroll()"
+          class="text-xs text-neutral-500 hover:text-neutral-300 px-2 py-0.5 rounded border border-neutral-700 transition-colors">
+          ↓ Auto-scroll
+        </button>
+      </div>
+    </div>
+    <!-- Terminal body -->
+    <div id="terminal"
+      class="h-[56vh] overflow-y-auto bg-neutral-950 p-4 font-mono text-sm"
+      onscroll="onUserScroll()">
+      {history_html}
+    </div>
+  </div>
+
+  <!-- Legend -->
+  <div class="flex flex-wrap gap-4 px-6 pb-6 text-xs font-mono">
+    <span class="text-cyan-400">◆ event detected</span>
+    <span class="text-emerald-400">✓ created / logged</span>
+    <span class="text-emerald-300">£ payment received</span>
+    <span class="text-amber-400">⚠ needs attention</span>
+    <span class="text-red-400">✗ error</span>
+    <span class="text-neutral-400">› info</span>
+  </div>
+
+<script>
+const term = document.getElementById('terminal');
+const connDot = document.getElementById('conn-dot');
+const connLabel = document.getElementById('conn-label');
+const scrollBtn = document.getElementById('scroll-btn');
+let autoScroll = true;
+let userScrolling = false;
+
+function scrollToBottom() {{
+  term.scrollTop = term.scrollHeight;
+}}
+scrollToBottom();
+
+function toggleScroll() {{
+  autoScroll = !autoScroll;
+  scrollBtn.textContent = autoScroll ? '↓ Auto-scroll' : '⏸ Paused';
+  scrollBtn.classList.toggle('text-indigo-400', autoScroll);
+  scrollBtn.classList.toggle('text-neutral-500', !autoScroll);
+  if (autoScroll) scrollToBottom();
+}}
+
+function onUserScroll() {{
+  const atBottom = term.scrollTop + term.clientHeight >= term.scrollHeight - 40;
+  if (!atBottom && autoScroll) {{
+    autoScroll = false;
+    scrollBtn.textContent = '⏸ Paused';
+    scrollBtn.classList.remove('text-indigo-400');
+    scrollBtn.classList.add('text-neutral-500');
+  }}
+}}
+
+const levelColor = {{
+  event: 'text-cyan-400', success: 'text-emerald-400', warn: 'text-amber-400',
+  error: 'text-red-400', paid: 'text-emerald-300', system: 'text-neutral-500', info: 'text-neutral-300',
+}};
+const levelPrefix = {{
+  event: '◆', success: '✓', warn: '⚠', error: '✗', paid: '£', system: '·', info: '›',
+}};
+
+function escHtml(s) {{
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}}
+
+function appendLine(entry) {{
+  const ts = new Date(entry.ts * 1000).toLocaleTimeString('en-GB', {{hour:'2-digit',minute:'2-digit',second:'2-digit'}});
+  const lvl = entry.level || 'info';
+  const col = levelColor[lvl] || 'text-neutral-300';
+  const pre = levelPrefix[lvl] || '›';
+  const div = document.createElement('div');
+  div.className = 'term-line flex gap-3 leading-relaxed';
+  div.innerHTML = `<span class="text-neutral-600 shrink-0 select-none">${{ts}}</span>`
+    + `<span class="${{col}} shrink-0 select-none">${{pre}}</span>`
+    + `<span class="${{col}}">${{escHtml(entry.msg)}}</span>`;
+  term.appendChild(div);
+  if (autoScroll) scrollToBottom();
+}}
+
+let lastSeq = {last_seq_val};
+const es = new EventSource('/feed?since=' + lastSeq);
+
+es.onopen = () => {{
+  connDot.className = 'w-2 h-2 rounded-full bg-emerald-400';
+  connLabel.textContent = 'live';
+  connLabel.className = 'text-xs text-emerald-400';
+}};
+
+es.onmessage = (e) => {{
+  try {{
+    const data = JSON.parse(e.data);
+    if (data.type !== 'log' && !data.seq) return;
+    appendLine(data);
+    lastSeq = data.seq;
+  }} catch (err) {{}}
+}};
+
+es.onerror = () => {{
+  connDot.className = 'w-2 h-2 rounded-full bg-red-400';
+  connLabel.textContent = 'reconnecting…';
+  connLabel.className = 'text-xs text-red-400';
+}};
+
+function pollNow() {{
+  const btn = document.getElementById('poll-btn');
+  btn.textContent = 'Triggering…';
+  btn.disabled = true;
+  fetch('/poll-now', {{method:'POST'}}).then(() => {{
+    btn.textContent = 'Triggered!';
+    setTimeout(() => {{ btn.textContent = 'Poll now'; btn.disabled = false; }}, 2000);
+  }}).catch(() => {{ btn.textContent = 'Poll now'; btn.disabled = false; }});
+}}
+</script>
+
+</body>
+</html>"""
+        )
+
+    @app.get("/feed")
+    def feed_stream():
+        if not session.get("logged_in"):
+            return "", 401
+        last_seq = int(request.args.get("since", 0))
+        from flask import Response, stream_with_context
+        def generate():
+            yield from _feed.stream(last_seq)
+        return Response(
+            stream_with_context(generate()),
+            content_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.post("/poll-now")
+    @require_login
+    def poll_now():
+        _feed.push("Manual poll triggered", "system")
+        trigger_poll()
+        return "", 204
+
+    @app.get("/settings")
     @require_login
     def index():
         creds = load_admin_credentials(config)
@@ -1062,13 +1375,21 @@ def create_app() -> Flask:
               <h1 class="text-2xl font-bold text-gray-900">Powwash Integration</h1>
               <p class="text-gray-500 text-sm mt-0.5">Google Calendar → Xero invoice automation</p>
             </div>
-            <a href="/logout" class="text-sm text-gray-500 hover:text-gray-700 flex items-center gap-1.5">
-              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                  d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/>
-              </svg>
-              Sign out
-            </a>
+            <div class="flex items-center gap-3">
+              <a href="/" class="text-sm text-indigo-600 hover:text-indigo-700 flex items-center gap-1.5 font-medium">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/>
+                </svg>
+                Live Feed
+              </a>
+              <a href="/logout" class="text-sm text-gray-500 hover:text-gray-700 flex items-center gap-1.5">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                    d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/>
+                </svg>
+                Sign out
+              </a>
+            </div>
           </div>
 
           {notice_html}
@@ -1471,6 +1792,7 @@ def create_app() -> Flask:
         if token != "gcal-bridge":
             return "", 200
         if state_header == "exists":
+            _feed.push("Google Calendar change detected — scanning calendars now", "event")
             trigger_poll()
             print("[webhook] Google Calendar event changed — poll triggered", flush=True)
         return "", 200
@@ -1541,6 +1863,7 @@ def create_app() -> Flask:
                     if invoices and invoices[0].get("Status") == "PAID":
                         inv_number = invoices[0].get("InvoiceNumber", "")
                         print(f"[webhook] Invoice {inv_number} is PAID — updating sheet", flush=True)
+                        _feed.push(f"Invoice {inv_number} paid — marking sheet row as Paid", "paid")
                         if creds and spreadsheet_id and inv_number:
                             try:
                                 updated = update_invoice_paid_in_sheet(
@@ -1551,6 +1874,7 @@ def create_app() -> Flask:
                                 )
                                 if updated:
                                     print(f"[webhook] Sheet row updated for {inv_number}", flush=True)
+                                    _feed.push(f"Sheet updated: {inv_number} marked as Paid", "paid")
                             except Exception as exc:
                                 print(f"[webhook] Sheet update failed: {exc}", flush=True)
                 except Exception as exc:

@@ -69,6 +69,7 @@ from .state import (
     set_sheet_log_marker,
 )
 from .xero_client import XeroClient, build_xero_client
+from .log_feed import feed as _feed
 
 
 def run() -> None:
@@ -251,6 +252,7 @@ def run() -> None:
                 event_id_display=event_id_display,
             )
             print(f"Sheets row appended for {event_key}")
+            _feed.push(f"Sheet row logged: {event_key}", "success")
             return set_sheet_log_marker(state, event_key, marker)
         except Exception as exc:
             print(f"Sheets append failed for {event_key}: {exc}")
@@ -425,6 +427,7 @@ def run() -> None:
                     continue
                 if has_done and not invoice_lines:
                     print(f"Event {event_id}: no invoice lines found, skipping invoice")
+                    _feed.push(f"No job details in \"{event.get('summary', event_id)}\" — awaiting line items", "warn")
                 if is_processed(state, event_key):
                     # If we have a stored contact, update it only when the event changed.
                     existing_contact_id = get_contact_for_event(state, event_key)
@@ -515,11 +518,13 @@ def run() -> None:
                             )
                             if not invoice_id:
                                 print(f"Event {event_id}: creating draft invoice")
+                                _feed.push(f"Creating invoice in Xero for \"{event.get('summary', event_id)}\"…", "info")
                                 details = extract_event_details(event)
                                 result = xero_client.create_invoice_from_event(
                                     details, contact=contact_ref, line_items=invoice_lines
                                 )
                                 print(f"Invoice draft created for event {details.get('id')}: {_invoice_brief(result)}")
+                                _feed.push(f"Invoice created in Xero — {_invoice_brief(result)}", "success")
                                 if result.get("Invoices"):
                                     invoice_id = result["Invoices"][0].get("InvoiceID")
                                     if invoice_id:
@@ -743,6 +748,7 @@ def run() -> None:
                                 state, event_key, event_updated
                             )
                             print(f"Invoice sent for event {event_id}: {invoice_id}")
+                            _feed.push(f"Invoice authorised & emailed: {invoice_id[:8]}… for \"{event.get('summary', event_id)}\"", "success")
                             state = _append_sheet_stats_if_enabled(
                                 event=event,
                                 event_key=event_key,
@@ -766,6 +772,7 @@ def run() -> None:
                         continue
                 else:
                     details = extract_event_details(event)
+                    _feed.push(f"DONE event detected: \"{event.get('summary', event_id)}\"", "event")
                     customer = parse_customer_fields(event.get("description"))
                     address_debug = parse_event_address_debug(event.get("location"))
                     address = address_debug.get("address")
@@ -788,6 +795,8 @@ def run() -> None:
                             print(
                                 f"Validation errors for event {details.get('id')}: {errors}"
                             )
+                            missing = ", ".join(blocking_errors.keys())
+                            _feed.push(f"Missing fields in \"{event.get('summary', event_id)}\": {missing}", "warn")
                             continue
                     if not xero_client:
                         print("Xero client not configured. Skipping send.")
@@ -827,6 +836,9 @@ def run() -> None:
                                     details, contact=contact_ref, line_items=invoice_lines
                                 )
                                 print(f"Invoice draft created for event {details.get('id')}: {_invoice_brief(result)}")
+                                _brief = _invoice_brief(result)
+                                _cname = customer.get("name") or event.get("summary", "")
+                                _feed.push(f"Invoice created in Xero — {_brief} for {_cname}", "success")
                                 if result.get("Invoices"):
                                     invoice_id = result["Invoices"][0].get("InvoiceID")
                                     if invoice_id:
@@ -1042,6 +1054,7 @@ def run() -> None:
                                 state, event_key, event_updated
                             )
                             print(f"Invoice sent for event {event.get('id')}: {invoice_id}")
+                            _feed.push(f"Invoice authorised & emailed: {invoice_id[:8]}… for \"{event.get('summary', '')}\"", "success")
                             state = _append_sheet_stats_if_enabled(
                                 event=event,
                                 event_key=event_key,
