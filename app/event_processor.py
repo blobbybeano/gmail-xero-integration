@@ -591,19 +591,11 @@ def upsert_invoice_summary(
 
     cleaned = [line for line in lines if not is_summary_line(line)]
     current_payment = payment_choice(description).upper()
-    submitter_line = f"Submitted by: {submitter}" if submitter else _extract_existing_submitter(description)
-    submitted_at_line = (
-        f"Submitted at: {submitted_at}" if submitted_at else _extract_existing_submitted_at(description)
-    )
 
     summary_lines: list[str] = []
     summary_lines.append(STATUS_START)
     summary_lines.append(f"<b>Invoice total (ex VAT): £{subtotal:.2f}</b>")
     summary_lines.append(f"<b>Invoice total (inc VAT): £{total:.2f}</b>")
-    if submitter_line:
-        summary_lines.append(submitter_line)
-    if submitted_at_line:
-        summary_lines.append(submitted_at_line)
     summary_lines.append(f"PAYMENT TYPE (CARD/INVOICE) = {current_payment}")
     if sent:
         summary_lines.append("<b>Invoice sent ✅</b>")
@@ -633,12 +625,6 @@ def upsert_send_confirmation(
     cleaned = _status_base_lines(description)
     totals = _extract_existing_totals(description)
     payment = _extract_existing_payment_type(description)
-    submitter_line = (
-        f"Submitted by: {submitter}" if submitter else _extract_existing_submitter(description)
-    )
-    submitted_at_line = (
-        f"Submitted at: {submitted_at}" if submitted_at else _extract_existing_submitted_at(description)
-    )
 
     summary_lines: list[str] = []
     summary_lines.append(STATUS_START)
@@ -646,10 +632,6 @@ def upsert_send_confirmation(
         summary_lines.append(totals[0])
     if totals[1]:
         summary_lines.append(totals[1])
-    if submitter_line:
-        summary_lines.append(submitter_line)
-    if submitted_at_line:
-        summary_lines.append(submitted_at_line)
     if payment:
         summary_lines.append(payment)
     summary_lines.append("<b>Invoice sent ✅</b>")
@@ -679,22 +661,12 @@ def upsert_send_failure(
     cleaned = _status_base_lines(description)
     totals = _extract_existing_totals(description)
     payment = _extract_existing_payment_type(description)
-    submitter_line = (
-        f"Submitted by: {submitter}" if submitter else _extract_existing_submitter(description)
-    )
-    submitted_at_line = (
-        f"Submitted at: {submitted_at}" if submitted_at else _extract_existing_submitted_at(description)
-    )
     summary_lines: list[str] = []
     summary_lines.append(STATUS_START)
     if totals[0]:
         summary_lines.append(totals[0])
     if totals[1]:
         summary_lines.append(totals[1])
-    if submitter_line:
-        summary_lines.append(submitter_line)
-    if submitted_at_line:
-        summary_lines.append(submitted_at_line)
     if payment:
         summary_lines.append(payment)
     summary_lines.append("<b>Invoice send failed ❌</b>")
