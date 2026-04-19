@@ -553,9 +553,12 @@ def create_app() -> Flask:
             session["save_notice"] = "error:Xero connect failed: enter your Client ID and Secret in the Xero card first."
             return redirect(url_for("index"))
         state = secrets.token_urlsafe(24)
+        xero_auth_url = _xero_authorization_url(config, state)
         session["xero_oauth_state"] = state
+        session["xero_auth_url"] = xero_auth_url
         set_json_setting(config.admin_db_file, "xero_oauth_pending_state", state)
-        return redirect(_xero_authorization_url(config, state))
+        set_json_setting(config.admin_db_file, "xero_auth_url", xero_auth_url)
+        return redirect(url_for("index"))
 
     @app.get("/xero/callback")
     def xero_callback():
@@ -603,7 +606,9 @@ def create_app() -> Flask:
         save_xero_token(config.xero_token_file, token)
         session["logged_in"] = True
         session.pop("xero_oauth_state", None)
+        session.pop("xero_auth_url", None)
         set_json_setting(config.admin_db_file, "xero_oauth_pending_state", "")
+        set_json_setting(config.admin_db_file, "xero_auth_url", "")
         session["save_notice"] = "success:Xero connected successfully."
         return redirect(url_for("index"))
 
@@ -712,6 +717,10 @@ def create_app() -> Flask:
         creds_file_exists = Path(config.google_credentials_file).exists()
         stored_xero_id, stored_xero_secret = _get_xero_creds(config)
         xero_has_creds = bool(stored_xero_id and stored_xero_secret)
+        xero_pending_auth_url = (
+            session.get("xero_auth_url")
+            or str(get_json_setting(config.admin_db_file, "xero_auth_url", "")).strip()
+        ) if not xero_ok else ""
         pending_auth_url = (
             session.get("oauth_auth_url")
             or str(get_json_setting(config.admin_db_file, "oauth_auth_url", "")).strip()
@@ -855,6 +864,23 @@ def create_app() -> Flask:
         else:
             pending_auth_url_html = ""
 
+        # --- Pending Xero auth URL block ---
+        if xero_pending_auth_url:
+            _xesc = escape(xero_pending_auth_url)
+            _xjs = xero_pending_auth_url.replace("'", "\\'")
+            _xprev = escape(xero_pending_auth_url[:72]) + "..."
+            xero_pending_auth_url_html = (
+                f'<div class="mt-3 p-3 bg-blue-50 border border-blue-200 rounded-xl">'
+                f'<p class="text-xs font-semibold text-blue-800 mb-1">&#128279; Open this link in a new tab to authorise Xero:</p>'
+                f'<a href="{_xesc}" target="_blank" class="block text-xs text-blue-700 underline break-all hover:text-blue-900 mb-2">{_xprev}</a>'
+                f'<button type="button" onclick="navigator.clipboard.writeText(\'{_xjs}\');this.textContent=\'Copied!\';setTimeout(()=>this.textContent=\'Copy link\',2000)" '
+                f'class="px-2 py-1 text-xs font-medium bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors">Copy link</button>'
+                f'<p class="text-xs text-blue-600 mt-1.5">After approving in Xero, come back here — the status will update automatically.</p>'
+                f'</div>'
+            )
+        else:
+            xero_pending_auth_url_html = ""
+
         return _page(f"""
         <div class="max-w-4xl mx-auto px-4 py-8">
 
@@ -993,9 +1019,11 @@ def create_app() -> Flask:
                   </button>
                 </div>
 
+                {xero_pending_auth_url_html}
+
                 <a href="/connect-xero"
-                  class="inline-block px-3 py-1.5 text-xs font-medium text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors {"opacity-50 pointer-events-none" if not xero_has_creds else ""}">
-                  {"Reconnect Xero" if xero_ok else "Connect Xero"}
+                  class="inline-block mt-3 px-3 py-1.5 text-xs font-medium text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors {"opacity-50 pointer-events-none" if not xero_has_creds else ""}">
+                  {"Reconnect Xero" if xero_ok else ("New link" if xero_pending_auth_url else "Connect Xero")}
                 </a>
               </div>
             </div>
