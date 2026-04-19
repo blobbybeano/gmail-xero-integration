@@ -974,7 +974,7 @@ def create_app() -> Flask:
                   <p>Redirect URI: <code class="bg-gray-100 px-1 py-0.5 rounded text-xs">{xero_redirect}</code></p>
                 </div>
 
-                <form method="post" action="/save-xero-creds" class="space-y-2 mb-3">
+                <div class="space-y-2 mb-3">
                   <div>
                     <label class="block text-xs font-medium text-gray-600 mb-1">Client ID</label>
                     <input name="xero_client_id" value="{escape(stored_xero_id)}"
@@ -987,11 +987,11 @@ def create_app() -> Flask:
                       placeholder="{"••••••••  (saved)" if stored_xero_secret else "Paste your Xero Client Secret"}"
                       class="w-full px-3 py-1.5 border border-gray-300 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono">
                   </div>
-                  <button type="submit"
+                  <button type="submit" formaction="/save-xero-creds"
                     class="px-3 py-1.5 text-xs font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors">
                     Save Credentials
                   </button>
-                </form>
+                </div>
 
                 <a href="/connect-xero"
                   class="inline-block px-3 py-1.5 text-xs font-medium text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors {"opacity-50 pointer-events-none" if not xero_has_creds else ""}">
