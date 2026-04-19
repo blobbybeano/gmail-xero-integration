@@ -16,25 +16,30 @@ from .config import AppConfig
 
 
 def _load_credentials(config: AppConfig) -> Credentials:
-    token_path = Path(config.google_token_file)
-    creds = None
-    if token_path.exists():
-        creds = Credentials.from_authorized_user_file(
-            config.google_token_file, config.google_scopes
-        )
-
-    if not creds or not creds.valid:
+    # Prefer the admin token written by the web OAuth flow, fall back to legacy token
+    for token_file in [config.google_admin_token_file, config.google_token_file]:
+        token_path = Path(token_file)
+        if not token_path.exists():
+            continue
+        try:
+            creds = Credentials.from_authorized_user_file(
+                token_path.as_posix(),
+                getattr(config, "google_admin_scopes", None) or config.google_scopes,
+            )
+        except Exception:
+            continue
+        if creds and creds.valid:
+            return creds
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                config.google_credentials_file, config.google_scopes
-            )
-            creds = flow.run_local_server(port=0)
+            token_path.write_text(creds.to_json())
+            if creds.valid:
+                return creds
 
-        token_path.write_text(creds.to_json())
-
-    return creds
+    raise RuntimeError(
+        "No valid Google credentials found. "
+        "Please connect Google via the admin dashboard first."
+    )
 
 
 def build_calendar_service(config: AppConfig):

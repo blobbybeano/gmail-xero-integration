@@ -107,7 +107,7 @@ def load_config() -> AppConfig:
         xero_tenant_id=os.getenv("XERO_TENANT_ID", ""),
         keyword=os.getenv("KEYWORD", "DONE"),
         invoice_send_keyword=os.getenv("INVOICE_SEND_KEYWORD", "SEND"),
-        dry_run=os.getenv("DRY_RUN", "true").lower() == "true",
+        dry_run=os.getenv("DRY_RUN", "false").lower() == "true",
         state_file=os.getenv("STATE_FILE", "state.json"),
         poll_seconds=int(os.getenv("POLL_SECONDS", "20")),
         run_once=os.getenv("RUN_ONCE", "false").lower() == "true",

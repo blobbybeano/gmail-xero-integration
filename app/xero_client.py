@@ -8,6 +8,7 @@ from typing import Dict
 import requests
 
 from .config import AppConfig
+from .admin_store import get_json_setting
 
 TOKEN_URL = "https://identity.xero.com/connect/token"
 DEFAULT_SALES_ACCOUNT_CODE = "200"
@@ -344,8 +345,17 @@ def build_xero_client(config: AppConfig) -> XeroClient | None:
     """
     Build a Xero client from either env vars or xero_token.json (preferred).
     If a refresh token exists, automatically refresh access token and persist.
+    Credentials are read from env vars first, then from the admin JSON store.
     """
     token = load_xero_token(config.xero_token_file)
+
+    # Read credentials from env vars first, fall back to admin JSON store
+    client_id = config.xero_client_id or str(
+        get_json_setting(config.admin_db_file, "xero_client_id", "")
+    ).strip()
+    client_secret = config.xero_client_secret or str(
+        get_json_setting(config.admin_db_file, "xero_client_secret", "")
+    ).strip()
 
     access_token = config.xero_access_token or token.get("access_token", "")
     tenant_id = config.xero_tenant_id or token.get("tenant_id", "")
@@ -353,8 +363,8 @@ def build_xero_client(config: AppConfig) -> XeroClient | None:
     refresh_token = token.get("refresh_token")
     if refresh_token and (not access_token or token_is_expired(token)):
         refreshed = refresh_xero_token(
-            client_id=config.xero_client_id,
-            client_secret=config.xero_client_secret,
+            client_id=client_id,
+            client_secret=client_secret,
             refresh_token=refresh_token,
         )
         token = {**token, **refreshed}
@@ -371,8 +381,8 @@ def build_xero_client(config: AppConfig) -> XeroClient | None:
         access_token=access_token,
         tenant_id=tenant_id,
         dry_run=config.dry_run,
-        client_id=config.xero_client_id,
-        client_secret=config.xero_client_secret,
+        client_id=client_id,
+        client_secret=client_secret,
         refresh_token=refresh_token or "",
         token_file=config.xero_token_file,
     )
