@@ -19,6 +19,21 @@ def _split_csv(value: str | None) -> List[str]:
     return [item.strip() for item in normalized.split() if item.strip()]
 
 
+def _base_url() -> str:
+    """Auto-detect the base URL from the environment."""
+    # Explicit override always wins
+    explicit = os.getenv("APP_BASE_URL", "").strip().rstrip("/")
+    if explicit:
+        return explicit
+    # Replit provides this in both dev and deployed environments
+    replit_domain = os.getenv("REPLIT_DEV_DOMAIN", "").strip()
+    if replit_domain:
+        return f"https://{replit_domain}"
+    # Fall back to localhost for local development
+    port = os.getenv("WEB_PORT", "8080")
+    return f"http://localhost:{port}"
+
+
 @dataclass(frozen=True)
 class AppConfig:
     google_credentials_file: str
@@ -74,12 +89,12 @@ def load_config() -> AppConfig:
             )
         ),
         google_oauth_redirect_uri=os.getenv(
-            "GOOGLE_OAUTH_REDIRECT_URI", "http://localhost:8080/oauth/callback"
+            "GOOGLE_OAUTH_REDIRECT_URI", f"{_base_url()}/oauth/callback"
         ),
         xero_client_id=os.getenv("XERO_CLIENT_ID", ""),
         xero_client_secret=os.getenv("XERO_CLIENT_SECRET", ""),
         xero_redirect_uri=os.getenv(
-            "XERO_REDIRECT_URI", "http://localhost:8080/xero/callback"
+            "XERO_REDIRECT_URI", f"{_base_url()}/xero/callback"
         ),
         xero_token_file=os.getenv("XERO_TOKEN_FILE", "xero_token.json"),
         xero_scopes=_split_csv(
