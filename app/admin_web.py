@@ -42,7 +42,7 @@ from .google_admin import (
     save_admin_credentials,
 )
 from .config import AppConfig
-from .xero_client import load_xero_token, save_xero_token, token_is_expired
+from .xero_client import load_xero_token, save_xero_token, token_is_expired, refresh_xero_token
 
 
 XERO_AUTH_URL = "https://login.xero.com/identity/connect/authorize"
@@ -806,10 +806,15 @@ def create_app() -> Flask:
         xero_bank_accounts = []
         if xero_ok:
             try:
-                import json as _json
-                with open(config.xero_token_file, "r", encoding="utf-8") as _f:
-                    _tok = _json.load(_f)
-                _at = _tok["access_token"]
+                _tok = load_xero_token(config.xero_token_file)
+                # Refresh token if expired before fetching accounts
+                if token_is_expired(_tok) and _tok.get("refresh_token"):
+                    _cid, _csec = _get_xero_creds(config)
+                    if _cid and _csec:
+                        _refreshed = refresh_xero_token(_cid, _csec, _tok["refresh_token"])
+                        _tok = {**_tok, **_refreshed}
+                        save_xero_token(config.xero_token_file, _tok)
+                _at = _tok.get("access_token", "")
                 _cr = requests.get(
                     "https://api.xero.com/connections",
                     headers={"Authorization": f"Bearer {_at}", "Accept": "application/json"},
