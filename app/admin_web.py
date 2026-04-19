@@ -606,7 +606,16 @@ def create_app() -> Flask:
     @app.get("/connect-google")
     @require_login
     def connect_google():
-        auth_url, state = oauth_authorization_url(config)
+        if not Path(config.google_credentials_file).exists():
+            session["save_notice"] = (
+                "error:No credentials file found. Please upload your Google OAuth JSON file first using the Upload JSON button."
+            )
+            return redirect(url_for("index"))
+        try:
+            auth_url, state = oauth_authorization_url(config)
+        except Exception as exc:
+            session["save_notice"] = f"error:Could not start Google OAuth: {exc}"
+            return redirect(url_for("index"))
         session["oauth_state"] = state
         set_json_setting(config.admin_db_file, "oauth_pending_state", state)
         return redirect(auth_url)
@@ -657,6 +666,7 @@ def create_app() -> Flask:
         seen_submitters = get_seen_submitters(config.admin_db_file)
         submitter_aliases = get_submitter_aliases(config.admin_db_file)
         client_id = _oauth_client_id(config)
+        creds_file_exists = Path(config.google_credentials_file).exists()
 
         calendars = []
         spreadsheets = []
@@ -855,13 +865,19 @@ def create_app() -> Flask:
                       class="block w-full text-xs text-gray-500 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-medium file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100">
                     {"" if not (creds_meta or {}).get("uploaded_name") else f'<p class="text-xs text-gray-400 mt-1">Last upload: {escape((creds_meta or {{}}).get("uploaded_name", ""))}</p>'}
                   </div>
+
+                  <div class="mb-3">
+                    {"" if creds_file_exists else '<p class="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">No credentials file uploaded yet. Select your JSON file and click <strong>Upload JSON</strong> first.</p>'}
+                    {"" if not creds_file_exists else '<p class="text-xs text-green-700 bg-green-50 border border-green-200 rounded-lg px-3 py-2">&#10003; Credentials file uploaded. Click <strong>Connect Google</strong> to authorise.</p>'}
+                  </div>
+
                   <div class="flex gap-2 flex-wrap">
                     <button type="submit" formaction="/upload-google-credentials"
                       class="px-3 py-1.5 text-xs font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors">
                       Upload JSON
                     </button>
                     <a href="/connect-google"
-                      class="px-3 py-1.5 text-xs font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors">
+                      class="px-3 py-1.5 text-xs font-medium text-white {"bg-blue-600 hover:bg-blue-700" if creds_file_exists else "bg-gray-300 cursor-not-allowed"} rounded-lg transition-colors">
                       {"Reconnect Google" if google_ok else "Connect Google"}
                     </a>
                   </div>
