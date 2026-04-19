@@ -14,6 +14,7 @@ DEFAULT_STATS_FIELDS = [
     "slot_datetime",
     "payment_datetime",
     "payment_method",
+    "paid_status",
     "job_cost_ex_vat",
     "job_cost_inc_vat",
 ]

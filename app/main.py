@@ -183,10 +183,26 @@ def run() -> None:
                 print(f"Sheets: failed to read invoice {invoice_id}: {exc}")
                 return state
 
+        def _fmt_british(iso_str: str) -> str:
+            if not iso_str:
+                return ""
+            try:
+                if "T" in iso_str:
+                    obj = dt.datetime.fromisoformat(iso_str)
+                    return obj.strftime("%d/%m/%Y %H:%M")
+                else:
+                    obj = dt.date.fromisoformat(iso_str)
+                    return obj.strftime("%d/%m/%Y")
+            except Exception:
+                return iso_str
+
         start = (event.get("start", {}) or {}).get("dateTime") or (event.get("start", {}) or {}).get("date") or ""
         end = (event.get("end", {}) or {}).get("dateTime") or (event.get("end", {}) or {}).get("date") or ""
-        slot_text = f"{start} -> {end}".strip(" ->")
+        start_fmt = _fmt_british(start)
+        end_fmt = _fmt_british(end)
+        slot_text = f"{start_fmt} – {end_fmt}".strip(" –") if start_fmt != end_fmt else start_fmt
         customer_fields = parse_customer_fields(event.get("description"))
+        is_card = payment_method.lower() == "card"
         payload = {
             "submitter": submitter_display
             or (event.get("creator", {}) or {}).get("email")
@@ -196,16 +212,18 @@ def run() -> None:
             "invoice_number": invoice.get("InvoiceNumber") or "",
             "receipt_details": "",
             "slot_datetime": slot_text,
-            "payment_datetime": dt.datetime.now(dt.timezone.utc).isoformat()
-            if payment_method.lower() == "card"
+            "payment_datetime": _fmt_british(dt.datetime.now(dt.timezone.utc).isoformat())
+            if is_card
             else "N/A",
-            "payment_method": payment_method.upper()
-            if payment_method.lower() == "card"
-            else "N/A",
+            "payment_method": payment_method.upper() if is_card else "N/A",
+            "paid_status": "Paid" if is_card else "Outstanding",
             "job_cost_ex_vat": invoice.get("SubTotal") or "",
             "job_cost_inc_vat": invoice.get("Total") or "",
         }
-        event_id_display = event_key.split(":", 1)[-1] if ":" in event_key else event_key
+        event_id_raw = event.get("id") or ""
+        date_part = start.split("T", 1)[0].replace("-", "")
+        suffix = event_id_raw[-4:] if event_id_raw else "0000"
+        event_id_display = f"GC-{date_part}-{suffix}" if date_part else (event_id_raw or event_key)
         try:
             ensure_header(
                 admin_creds,

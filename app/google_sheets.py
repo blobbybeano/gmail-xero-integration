@@ -13,9 +13,10 @@ STAT_LABELS = {
     "customer": "Customer",
     "invoice_number": "Invoice Number",
     "receipt_details": "Receipt Details",
-    "slot_datetime": "Diary Slot Date/Time",
+    "slot_datetime": "Diary Slot",
     "payment_datetime": "Payment Date/Time",
     "payment_method": "Payment Method",
+    "paid_status": "Paid",
     "job_cost_ex_vat": "Job Cost Ex VAT",
     "job_cost_inc_vat": "Job Cost Inc VAT",
 }
