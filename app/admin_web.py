@@ -216,14 +216,16 @@ def _get_xero_creds(config: AppConfig) -> tuple[str, str]:
 
 def _xero_authorization_url(config: AppConfig, state: str) -> str:
     client_id, _ = _get_xero_creds(config)
-    params = {
+    # Build manually so spaces in scope are encoded as %20 (not +) — Xero requires %20
+    scope_str = _xero_scope_string(config.xero_scopes)
+    base_params = urllib.parse.urlencode({
         "response_type": "code",
         "client_id": client_id,
         "redirect_uri": config.xero_redirect_uri,
-        "scope": _xero_scope_string(config.xero_scopes),
         "state": state,
-    }
-    return f"{XERO_AUTH_URL}?{urllib.parse.urlencode(params)}"
+    })
+    scope_param = "scope=" + urllib.parse.quote(scope_str, safe="")
+    return f"{XERO_AUTH_URL}?{base_params}&{scope_param}"
 
 
 def _exchange_xero_code(config: AppConfig, code: str) -> dict:
