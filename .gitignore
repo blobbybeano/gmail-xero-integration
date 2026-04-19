@@ -1,0 +1,13 @@
+__pycache__/
+.venv/
+*.pyc
+.env
+*.env
+credentials.json
+google_admin_token.json
+google_token.json
+xero_token.json
+token.json
+state.json
+certs/
+admin.db

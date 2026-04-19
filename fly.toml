@@ -1,0 +1,28 @@
+app = "powwash-gcal-xero"
+primary_region = "lhr"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  WEB_HOST = "0.0.0.0"
+  WEB_PORT = "8080"
+  PYTHONUNBUFFERED = "1"
+  POLL_SECONDS = "20"
+
+[processes]
+  web = "gunicorn -b 0.0.0.0:8080 'app.admin_web:create_app()'"
+  worker = "python -m app.main"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["web"]
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1

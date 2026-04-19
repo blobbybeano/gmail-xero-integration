@@ -1,0 +1,872 @@
+from __future__ import annotations
+
+from typing import Dict
+
+
+def event_contains_keyword(event: Dict, keyword: str) -> bool:
+    """
+    Return True if keyword appears in the description *outside* [contact]/[invoice] blocks.
+    """
+    description = event.get("description") or ""
+    if not description:
+        return False
+    text = _normalize_description(description)
+    text = _strip_bracket_blocks(text)
+    return keyword.upper() in text.upper()
+
+
+def done_choice_is_yes(description: str | None, keyword: str = "DONE") -> bool:
+    """
+    DONE gate for processing.
+    Accepts both legacy and prompt styles:
+      DONE
+      DONE Y
+      DONE YES
+      DONE Y/N =Y
+      DONE Y/N = YES
+    """
+    if not description:
+        return False
+    import re
+
+    text = _normalize_description(description)
+    text = _strip_bracket_blocks(text)
+    key = keyword.strip().lower()
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        lower = line.lower()
+
+        if lower == key:
+            return True
+        if re.fullmatch(rf"{re.escape(key)}\s+(y|yes)", lower):
+            return True
+        if re.search(rf"\b{re.escape(key)}\b[^\n]*?(?:=|:)\s*(y|yes)\b", lower):
+            return True
+        if re.search(rf"\b{re.escape(key)}\b[^\n]*?\by/n\b[^\n]*?(y|yes)\b", lower):
+            return True
+    return False
+
+
+def send_choice_is_yes(description: str | None) -> bool:
+    if not description:
+        return False
+    import re
+
+    text = _normalize_description(description)
+    text = _strip_bracket_blocks(text).lower()
+    # Accept tolerant variants:
+    # SEND Y/N =Y
+    # SEND Y/N = Y
+    # SEND =Y
+    # SEND YES
+    return bool(re.search(r"\bsend\b[^\n]*?(?:=|:)?\s*(y|yes)\b", text, re.I))
+
+
+def payment_choice(description: str | None) -> str:
+    """
+    Parse payment type from notes outside [contact]/[invoice] blocks.
+    Returns: "card", "invoice", or "".
+    Accepts tolerant formats like:
+      PAYMENT TYPE = CARD
+      PAYMENT = INVOICE
+      CARD OR INVOICE = CARD
+    """
+    if not description:
+        return ""
+    import re
+
+    text = _normalize_description(description)
+    text = _strip_bracket_blocks(text).lower()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if "payment" in line or "card" in line or "invoice" in line:
+            m = re.search(
+                r"(payment(?:\s*type)?|card\s*or\s*invoice)\s*(?:\([^)]*\))?\s*(?:=|:)?\s*(card|invoice)\b",
+                line,
+                flags=re.I,
+            )
+            if m:
+                return m.group(2).lower()
+    return ""
+
+
+def extract_event_details(event: Dict) -> Dict:
+    start = event.get("start", {})
+    end = event.get("end", {})
+    return {
+        "id": event.get("id"),
+        "calendar_id": event.get("_calendar_id"),
+        "summary": event.get("summary"),
+        "description": event.get("description"),
+        "location": event.get("location"),
+        "start": start.get("dateTime") or start.get("date"),
+        "end": end.get("dateTime") or end.get("date"),
+        "attendees": [a.get("email") for a in event.get("attendees", [])],
+        "updated": event.get("updated"),
+        "htmlLink": event.get("htmlLink"),
+    }
+
+
+def ensure_notes_template(description: str | None) -> str:
+    template = (
+        "[contact]\n"
+        "Customer name:\n"
+        "Customer email address:\n"
+        "Customer contact number:\n"
+        "[/contact]\n"
+        "\n"
+        "[invoice]\n"
+        "\n"
+        "[/invoice]\n"
+        "\n"
+        "DONE Y/N =\n"
+    )
+
+    if not description:
+        return template
+
+    # Ensure core customer fields exist; if not, append full template.
+    if "Customer name:" not in description or "Customer email address:" not in description:
+        return f"{description.rstrip()}\n\n{template}"
+
+    # Ensure invoice block exists. If missing, insert before DONE if present.
+    if not _has_invoice_block(description):
+        invoice_block = "[invoice]\n\n[/invoice]\n"
+        done_repl = f"{invoice_block}DONE"
+        lines = description.splitlines()
+        for i, line in enumerate(lines):
+            if line.strip().upper() == "DONE":
+                lines[i] = done_repl
+                return "\n".join(lines)
+        return f"{description.rstrip()}\n\n{invoice_block}"
+
+    return description
+
+
+def normalize_user_sections(description: str | None) -> str:
+    """
+    Normalize user-entered [contact]/[invoice] blocks for neatness:
+    - Contact labels are canonical with a single space after ':'
+    - Invoice descriptions are title-normalized (first letter upper, rest lower)
+    - Invoice lines are normalized to `Description = value`
+    """
+    if not description:
+        return description or ""
+    import re
+
+    text = description
+
+    def _norm_contact(block: str) -> str:
+        lines = block.splitlines()
+        out: list[str] = []
+        for raw in lines:
+            line = raw.strip()
+            low = line.lower()
+            if low.startswith("customer name:"):
+                val = line.split(":", 1)[1].strip() if ":" in line else ""
+                out.append(f"Customer name: {val}")
+            elif low.startswith("customer email address:") or low.startswith("customer email:"):
+                val = line.split(":", 1)[1].strip() if ":" in line else ""
+                out.append(f"Customer email address: {val}")
+            elif low.startswith("customer contact number:"):
+                val = line.split(":", 1)[1].strip() if ":" in line else ""
+                out.append(f"Customer contact number: {val}")
+            else:
+                out.append(raw.rstrip())
+        return "\n".join(out)
+
+    def _norm_title(text_val: str) -> str:
+        s = " ".join(text_val.strip().split())
+        if not s:
+            return s
+        return s[:1].upper() + s[1:].lower()
+
+    def _norm_rhs(rhs: str) -> str:
+        v = " ".join(rhs.strip().split())
+        v = re.sub(r"\+?\s*vat\b", "+VAT", v, flags=re.I)
+        return v
+
+    def _norm_invoice(block: str) -> str:
+        out: list[str] = []
+        for raw in block.splitlines():
+            line = raw.strip()
+            if not line:
+                out.append("")
+                continue
+            m = re.match(r"^(.+?)\s*([=:\-])\s*(.+)$", line)
+            if m:
+                desc = _norm_title(m.group(1))
+                rhs = _norm_rhs(m.group(3))
+                out.append(f"{desc} = {rhs}")
+                continue
+            m2 = re.match(r"^(.+?)\s+(£?\s*\d+(?:\.\d+)?\s*(?:\+?\s*vat)?)\s*$", line, re.I)
+            if m2:
+                desc = _norm_title(m2.group(1))
+                rhs = _norm_rhs(m2.group(2))
+                out.append(f"{desc} = {rhs}")
+                continue
+            out.append(raw.rstrip())
+        return "\n".join(out)
+
+    text = re.sub(
+        r"(\[contact\])(.*?)(\[/contact\])",
+        lambda m: f"{m.group(1)}\n{_norm_contact(m.group(2).strip())}\n{m.group(3)}",
+        text,
+        flags=re.I | re.S,
+    )
+    text = re.sub(
+        r"(\[invoice\])(.*?)(\[/invoice\])",
+        lambda m: f"{m.group(1)}\n{_norm_invoice(m.group(2).strip())}\n{m.group(3)}",
+        text,
+        flags=re.I | re.S,
+    )
+    return text
+
+
+def parse_customer_fields(description: str | None) -> Dict:
+    """
+    Extract customer fields from the event description.
+    Expected format:
+      Customer name: ...
+      Customer email address: ...
+      Customer contact number: ...
+    """
+    result = {"name": "", "email": "", "phone": ""}
+    if not description:
+        return result
+
+    text = _normalize_description(description)
+
+    import re
+
+    # If a [contact] block exists, only parse inside it.
+    contact_match = re.search(r"\[contact\](.*?)\[/contact\]", text, re.I | re.S)
+    if contact_match:
+        text = contact_match.group(1)
+
+    name_val = ""
+    email_val = ""
+    phone_val = ""
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        lower = line.lower()
+        if lower.startswith("customer name:"):
+            name_val = line.split(":", 1)[1].strip()
+        elif lower.startswith("customer email address:"):
+            email_val = line.split(":", 1)[1].strip()
+        elif lower.startswith("customer email:"):
+            email_val = line.split(":", 1)[1].strip()
+        elif lower.startswith("customer contact number:"):
+            phone_val = line.split(":", 1)[1].strip()
+
+    if name_val:
+        result["name"] = _normalize_name(_strip_error_hint(name_val))
+    if email_val:
+        result["email"] = _normalize_email(_extract_email(_strip_error_hint(email_val)))
+    if phone_val:
+        result["phone"] = _normalize_phone(_strip_error_hint(phone_val))
+
+    return result
+
+
+def parse_event_address(location: str | None) -> Dict:
+    debug = parse_event_address_debug(location)
+    return debug.get("address", {})
+
+
+def parse_event_address_debug(location: str | None) -> Dict:
+    """
+    Parse the event location into a Xero Address payload.
+    Returns debug info plus the final address.
+    """
+    if not location:
+        return {"address": {}}
+
+    import re
+
+    raw = "\n".join([line.strip() for line in location.splitlines() if line.strip()])
+    if not raw:
+        return {"address": {}}
+
+    raw = raw.replace("\n", ",")
+    raw = re.sub(r"\s+", " ", raw).strip(" ,")
+
+    tokens = [t.strip() for t in raw.split(",") if t.strip()]
+
+    postcode_re = re.compile(r"\b[A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2}\b", re.I)
+    postcode_match = postcode_re.search(raw)
+    postcode = postcode_match.group(0).upper() if postcode_match else ""
+
+    if re.search(r"\bUK\b", raw, re.I):
+        country = "UK"
+    elif re.search(r"United Kingdom", raw, re.I):
+        country = "United Kingdom"
+    else:
+        country = ""
+
+    def strip_noise(value: str) -> str:
+        v = postcode_re.sub("", value)
+        v = re.sub(r"\bUK\b|United Kingdom", "", v, flags=re.I)
+        v = re.sub(r"\s+", " ", v).strip(" ,")
+        return v
+
+    tokens = [strip_noise(t) for t in tokens]
+    tokens = [t for t in tokens if t and t.lower() not in {"uk", "united kingdom"}]
+
+    deduped = []
+    seen = set()
+    for t in tokens:
+        key = t.lower()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(t)
+    deduped = [t for t in deduped if not any(t != o and t.lower() in o.lower() for o in deduped)]
+
+    street_token = ""
+    for t in deduped:
+        if re.match(r"^\d+\s+\w+", t):
+            street_token = t
+            break
+    if not street_token:
+        for t in deduped:
+            if re.search(r"\d+\s+\w+", t):
+                street_token = t
+                break
+
+    remaining = [t for t in deduped if t != street_token]
+    if street_token:
+        st_key = street_token.lower()
+        remaining = [t for t in remaining if st_key not in t.lower()]
+
+    city = ""
+    for t in reversed(remaining):
+        if not re.search(r"\d", t):
+            city = t
+            break
+
+    address_line2_parts = [t for t in remaining if t != city]
+    address_line2_parts = [p for p in address_line2_parts if p]
+    address_line2 = ", ".join(address_line2_parts) if address_line2_parts else ""
+
+    address_line1 = street_token or (remaining[0] if remaining else raw)
+
+    if address_line2 and address_line2.lower() == address_line1.lower():
+        address_line2 = ""
+
+    address = {
+        "AddressType": "POBOX",
+        "AddressLine1": address_line1,
+        **({"AddressLine2": address_line2} if address_line2 else {}),
+        **({"City": city} if city else {}),
+        **({"PostalCode": postcode} if postcode else {}),
+        **({"Country": country} if country else {}),
+    }
+
+    return {
+        "raw": raw,
+        "tokens": tokens,
+        "deduped": deduped,
+        "street_token": street_token,
+        "remaining": remaining,
+        "city": city,
+        "postcode": postcode,
+        "country": country,
+        "address": address,
+    }
+
+def _extract_email(value: str) -> str:
+    # Handle cases where Google inserts mailto links or HTML.
+    import re
+
+    match = re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", value, re.I)
+    if match:
+        return match.group(0)
+    return value.strip()
+
+
+def _normalize_email(value: str) -> str:
+    import re
+
+    value = value.strip()
+    value = re.sub(r"\s+", "", value)
+    value = value.replace("mailto:", "")
+    value = value.strip("()[]<>,.;'\"")
+    if "@" in value:
+        parts = value.split("@", 1)
+        if len(parts) == 2 and parts[0] and "." in parts[1]:
+            return value.lower()
+    match = re.search(r"[^\s@]+@[^\s@]+\.[^\s@]+", value, re.I)
+    if match:
+        return match.group(0).lower()
+    return ""
+
+
+def _normalize_description(description: str) -> str:
+    import html
+    import re
+
+    text = html.unescape(description)
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
+    text = re.sub(r"</p>|</div>", "\n", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", "", text)
+    return text
+
+
+def _strip_bracket_blocks(text: str) -> str:
+    import re
+
+    # Remove [contact]...[/contact] and [invoice]...[/invoice] blocks.
+    text = re.sub(r"\[contact\].*?\[/contact\]", "", text, flags=re.I | re.S)
+    text = re.sub(r"\[invoice\].*?\[/invoice\]", "", text, flags=re.I | re.S)
+    return text
+
+
+def _strip_error_hint(value: str) -> str:
+    import re
+
+    return re.sub(r"\s*\(error:.*\)$", "", value, flags=re.I).strip()
+
+
+def validate_customer_fields(fields: Dict) -> Dict[str, str]:
+    """
+    Return per-field validation errors. Empty dict means valid enough to send.
+    """
+    errors: Dict[str, str] = {}
+    name = (fields.get("name") or "").strip()
+    email = (fields.get("email") or "").strip()
+    phone = (fields.get("phone") or "").strip()
+
+    if not name:
+        errors["name"] = "Type a full name"
+
+    if email and not _is_valid_email(email):
+        errors["email"] = "Type a valid email"
+
+    # Phone is optional and never blocks or warns (per user request).
+
+    return errors
+
+
+def extract_invoice_lines(description: str | None) -> list[dict]:
+    """
+    Extract invoice lines from <invoice>...</invoice> or [invoice]...[/invoice] block.
+    Accepts formats like:
+      item = £135+VAT
+      item: 135
+      item - 7.50
+    Returns list of line items with Description, UnitAmount, Quantity, TaxType (optional).
+    """
+    if not description:
+        return []
+
+    import html
+    import re
+
+    text = html.unescape(description)
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
+    text = re.sub(r"</p>|</div>", "\n", text, flags=re.I)
+
+    block_match = re.search(r"\[invoice\](.*?)\[/invoice\]", text, re.I | re.S)
+    if not block_match:
+        block_match = re.search(r"<invoice>(.*?)</invoice>", text, re.I | re.S)
+    if not block_match:
+        return []
+
+    block = block_match.group(1)
+    block = re.sub(r"<[^>]+>", "", block).strip()
+    block = block.replace("\r", "\n")
+
+    lines: list[dict] = []
+    for raw_line in block.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        desc = ""
+        vat_flag = False
+        amount = None
+
+        # Preferred explicit separators: "item = 12+VAT", "item: 12"
+        for sep in ("=", ":", "-"):
+            if sep in line:
+                left, right = line.split(sep, 1)
+                desc = left.strip()
+                amt_str = right.strip()
+                vat_flag = "vat" in amt_str.lower()
+                amt_clean = re.sub(r"[£$,]", "", amt_str, flags=re.I)
+                amt_clean = re.sub(r"\+?\s*vat", "", amt_clean, flags=re.I)
+                amt_clean = amt_clean.strip()
+                try:
+                    amount = float(amt_clean)
+                except ValueError:
+                    amount = None
+                break
+
+        # Tolerant format: "item 12+VAT" or "item £12.50 + VAT"
+        if amount is None:
+            m = re.match(
+                r"^(.+?)\s+£?\s*(\d+(?:\.\d+)?)\s*(\+?\s*vat)?\s*$",
+                line,
+                flags=re.I,
+            )
+            if not m:
+                continue
+            desc = m.group(1).strip()
+            amount = float(m.group(2))
+            vat_flag = bool(m.group(3))
+
+        line_item = {
+            "Description": desc,
+            "Quantity": 1,
+            "UnitAmount": amount,
+        }
+        if vat_flag:
+            line_item["TaxType"] = "OUTPUT2"
+        lines.append(line_item)
+
+    return lines
+
+
+def _normalize_invoice_text(description: str) -> str:
+    import html
+    import re
+
+    text = html.unescape(description)
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
+    text = re.sub(r"</p>|</div>", "\n", text, flags=re.I)
+    # Normalize [invoice] markers to <invoice> for parsing.
+    text = re.sub(r"\[\s*invoice\s*\]", "<invoice>", text, flags=re.I)
+    text = re.sub(r"\[\s*/\s*invoice\s*\]", "</invoice>", text, flags=re.I)
+    return text
+
+
+def compute_invoice_totals(line_items: list[dict]) -> tuple[float, float]:
+    subtotal = 0.0
+    vat_total = 0.0
+    for item in line_items:
+        qty = item.get("Quantity", 1) or 1
+        amount = item.get("UnitAmount", 0) or 0
+        line_total = float(qty) * float(amount)
+        subtotal += line_total
+        if (item.get("TaxType") or "").upper() == "OUTPUT2":
+            vat_total += line_total * 0.2
+    subtotal = round(subtotal, 2)
+    total = round(subtotal + vat_total, 2)
+    return subtotal, total
+
+
+def upsert_invoice_summary(
+    description: str,
+    subtotal: float,
+    total: float,
+    *,
+    sent: bool,
+    invoice_url: str | None = None,
+    include_prompt: bool = True,
+    submitter: str | None = None,
+    submitted_at: str | None = None,
+) -> str:
+    import re
+
+    STATUS_START = "[app-status]"
+    STATUS_END = "[/app-status]"
+    lines = _status_base_lines(description)
+
+    def is_summary_line(line: str) -> bool:
+        plain = re.sub(r"<[^>]+>", "", line).strip().lower()
+        return (
+            "invoice total" in plain
+            or "send y/n" in plain
+            or "invoice sent" in plain
+            or "invoice link" in plain
+            or "submitted by:" in plain
+            or "submitted at:" in plain
+        )
+
+    cleaned = [line for line in lines if not is_summary_line(line)]
+    current_payment = payment_choice(description).upper()
+    submitter_line = f"Submitted by: {submitter}" if submitter else _extract_existing_submitter(description)
+    submitted_at_line = (
+        f"Submitted at: {submitted_at}" if submitted_at else _extract_existing_submitted_at(description)
+    )
+
+    summary_lines: list[str] = []
+    summary_lines.append(STATUS_START)
+    summary_lines.append(f"<b>Invoice total (ex VAT): £{subtotal:.2f}</b>")
+    summary_lines.append(f"<b>Invoice total (inc VAT): £{total:.2f}</b>")
+    if submitter_line:
+        summary_lines.append(submitter_line)
+    if submitted_at_line:
+        summary_lines.append(submitted_at_line)
+    summary_lines.append(f"PAYMENT TYPE (CARD/INVOICE) = {current_payment}")
+    if sent:
+        summary_lines.append("<b>Invoice sent ✅</b>")
+        if invoice_url:
+            summary_lines.append(f'Invoice link: <a href="{invoice_url}">{invoice_url}</a>')
+    elif include_prompt:
+        summary_lines.append("SEND Y/N =")
+    summary_lines.append(STATUS_END)
+
+    while cleaned and not cleaned[-1].strip():
+        cleaned.pop()
+    if cleaned:
+        summary_lines = ["", ""] + summary_lines
+    updated = cleaned + summary_lines
+    return "\n".join(updated)
+
+
+def upsert_send_confirmation(
+    description: str,
+    invoice_url: str | None = None,
+    *,
+    submitter: str | None = None,
+    submitted_at: str | None = None,
+) -> str:
+    STATUS_START = "[app-status]"
+    STATUS_END = "[/app-status]"
+    cleaned = _status_base_lines(description)
+    totals = _extract_existing_totals(description)
+    payment = _extract_existing_payment_type(description)
+    submitter_line = (
+        f"Submitted by: {submitter}" if submitter else _extract_existing_submitter(description)
+    )
+    submitted_at_line = (
+        f"Submitted at: {submitted_at}" if submitted_at else _extract_existing_submitted_at(description)
+    )
+
+    summary_lines: list[str] = []
+    summary_lines.append(STATUS_START)
+    if totals[0]:
+        summary_lines.append(totals[0])
+    if totals[1]:
+        summary_lines.append(totals[1])
+    if submitter_line:
+        summary_lines.append(submitter_line)
+    if submitted_at_line:
+        summary_lines.append(submitted_at_line)
+    if payment:
+        summary_lines.append(payment)
+    summary_lines.append("<b>Invoice sent ✅</b>")
+    if invoice_url:
+        summary_lines.append(f'Invoice link: <a href="{invoice_url}">{invoice_url}</a>')
+    summary_lines.append(STATUS_END)
+
+    # Keep all existing notes/details and append confirmation neatly at the end.
+    while cleaned and not cleaned[-1].strip():
+        cleaned.pop()
+    if cleaned:
+        summary_lines = ["", ""] + summary_lines
+    updated = cleaned + summary_lines
+    return "\n".join(updated)
+
+
+def upsert_send_failure(
+    description: str,
+    reason: str | None = None,
+    *,
+    invoice_url: str | None = None,
+    submitter: str | None = None,
+    submitted_at: str | None = None,
+) -> str:
+    STATUS_START = "[app-status]"
+    STATUS_END = "[/app-status]"
+    cleaned = _status_base_lines(description)
+    totals = _extract_existing_totals(description)
+    payment = _extract_existing_payment_type(description)
+    submitter_line = (
+        f"Submitted by: {submitter}" if submitter else _extract_existing_submitter(description)
+    )
+    submitted_at_line = (
+        f"Submitted at: {submitted_at}" if submitted_at else _extract_existing_submitted_at(description)
+    )
+    summary_lines: list[str] = []
+    summary_lines.append(STATUS_START)
+    if totals[0]:
+        summary_lines.append(totals[0])
+    if totals[1]:
+        summary_lines.append(totals[1])
+    if submitter_line:
+        summary_lines.append(submitter_line)
+    if submitted_at_line:
+        summary_lines.append(submitted_at_line)
+    if payment:
+        summary_lines.append(payment)
+    summary_lines.append("<b>Invoice send failed ❌</b>")
+    if reason:
+        summary_lines.append(f"Reason: {reason}")
+    if invoice_url:
+        summary_lines.append(f'Invoice link: <a href="{invoice_url}">{invoice_url}</a>')
+    else:
+        summary_lines.append("Invoice link: unavailable (retry in a moment).")
+    summary_lines.append(
+        "Check customer e-mail, Update if needed then retry below:"
+    )
+    summary_lines.append("SEND Y/N =")
+    summary_lines.append(STATUS_END)
+    while cleaned and not cleaned[-1].strip():
+        cleaned.pop()
+    if cleaned:
+        summary_lines = ["", ""] + summary_lines
+    return "\n".join(cleaned + summary_lines)
+
+
+def _status_base_lines(description: str) -> list[str]:
+    import re
+
+    if not description:
+        return []
+    text = description
+    # Remove current managed status block.
+    text = re.sub(
+        r"\[app-status\].*?\[/app-status\]\s*",
+        "",
+        text,
+        flags=re.I | re.S,
+    )
+    lines = text.splitlines()
+    # Remove legacy status-only lines if they existed outside block.
+    cleaned: list[str] = []
+    for line in lines:
+        plain = re.sub(r"<[^>]+>", "", line).strip().lower()
+        if (
+            "invoice total" in plain
+            or "send y/n" in plain
+            or "invoice sent" in plain
+            or "invoice link" in plain
+            or "payment type" in plain
+            or "card/invoice" in plain
+            or "submitted by:" in plain
+            or "submitted at:" in plain
+            or plain.startswith("reason:")
+            or "invoice send failed" in plain
+            or "check customer e-mail" in plain
+        ):
+            continue
+        cleaned.append(line)
+    return cleaned
+
+
+def _extract_existing_totals(description: str) -> tuple[str, str]:
+    import re
+
+    text = _normalize_description(description or "")
+    lines = [re.sub(r"<[^>]+>", "", l).strip() for l in text.splitlines()]
+    ex_line = ""
+    inc_line = ""
+    for line in lines:
+        low = line.lower()
+        if "invoice total (ex vat)" in low:
+            ex_line = line
+        elif "invoice total (inc vat)" in low:
+            inc_line = line
+    if ex_line and not ex_line.lower().startswith("<b>"):
+        ex_line = f"<b>{ex_line}</b>"
+    if inc_line and not inc_line.lower().startswith("<b>"):
+        inc_line = f"<b>{inc_line}</b>"
+    return ex_line, inc_line
+
+
+def _extract_existing_payment_type(description: str) -> str:
+    import re
+
+    text = _normalize_description(description or "")
+    for raw in text.splitlines():
+        line = re.sub(r"<[^>]+>", "", raw).strip()
+        if "payment type" in line.lower():
+            return line
+    return ""
+
+
+def _extract_existing_submitter(description: str) -> str:
+    import re
+
+    text = _normalize_description(description or "")
+    for raw in text.splitlines():
+        line = re.sub(r"<[^>]+>", "", raw).strip()
+        if line.lower().startswith("submitted by:"):
+            return line
+    return ""
+
+
+def _extract_existing_submitted_at(description: str) -> str:
+    import re
+
+    text = _normalize_description(description or "")
+    for raw in text.splitlines():
+        line = re.sub(r"<[^>]+>", "", raw).strip()
+        if line.lower().startswith("submitted at:"):
+            return line
+    return ""
+
+
+def _has_invoice_block(description: str) -> bool:
+    import html
+    import re
+
+    text = html.unescape(description or "")
+    return bool(
+        re.search(r"(<\s*invoice\s*>|\[\s*invoice\s*\])", text, re.I)
+    )
+
+
+def apply_validation_hints(description: str, errors: Dict[str, str]) -> str:
+    """
+    Add inline hints to the customer fields in the description.
+    """
+    if not errors:
+        return description
+
+    lines = description.splitlines()
+    updated = []
+    for line in lines:
+        line_stripped = line.strip()
+        lower = line_stripped.lower()
+
+        if lower.startswith("customer name:") and "name" in errors:
+            line = _append_hint(line, errors["name"])
+        elif lower.startswith("customer email address:") and "email" in errors:
+            line = _append_hint(line, errors["email"])
+        # No phone hinting per user request.
+
+        updated.append(line)
+
+    return "\n".join(updated)
+
+
+def _append_hint(line: str, hint: str) -> str:
+    if "ERROR:" in line:
+        return line
+    return f"{line}  (ERROR: {hint})"
+
+
+def _is_valid_email(value: str) -> bool:
+    return "@" in value and "." in value.split("@", 1)[1]
+
+
+def _is_valid_phone(value: str) -> bool:
+    import re
+
+    digits = re.sub(r"\\D", "", value)
+    return len(digits) >= 7
+
+
+def _normalize_phone(value: str) -> str:
+    import re
+
+    value = value.strip().strip("'\"")
+    digits = re.sub(r"\\D", "", value)
+    return digits
+
+
+def _normalize_name(value: str) -> str:
+    value = value.strip().strip("'\"")
+    value = " ".join(value.strip().split())
+    if not value:
+        return ""
+    return " ".join(part.capitalize() for part in value.split(" "))
