@@ -1004,6 +1004,17 @@ def create_app() -> Flask:
         if not watch_rows_html:
             watch_rows_html = '<p class="text-sm text-gray-400">No active calendars selected yet.</p>'
 
+        # Google Calendar watch badge
+        if watches and active_cals_for_wh and all(
+            int((watches.get(c) or {}).get("expiration_ms") or 0) > now_ms
+            for c in active_cals_for_wh if watches.get(c)
+        ) and all(watches.get(c) for c in active_cals_for_wh):
+            gcal_watch_badge = '<span class="text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full">&#10003; Registered</span>'
+        elif watches:
+            gcal_watch_badge = '<span class="text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full">Some watches expired</span>'
+        else:
+            gcal_watch_badge = '<span class="text-xs font-medium text-gray-500 bg-gray-100 px-2 py-0.5 rounded-full">Polling only</span>'
+
         # --- Xero credential hints ---
         xero_redirect = escape(config.xero_redirect_uri)
         google_redirect = escape(config.google_oauth_redirect_uri)
@@ -1266,7 +1277,7 @@ def create_app() -> Flask:
             <div class="border border-gray-100 rounded-xl p-4">
               <div class="flex items-center justify-between mb-3">
                 <h3 class="text-sm font-semibold text-gray-800">Google Calendar — Push Notifications</h3>
-                {('<span class="text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full">Watching</span>' if watches else '<span class="text-xs font-medium text-gray-500 bg-gray-100 px-2 py-0.5 rounded-full">Polling only</span>')}
+                {gcal_watch_badge}
               </div>
               <p class="text-xs text-gray-500 mb-3">Click <strong>Register</strong> to tell Google to call this app whenever a calendar event changes. Watches auto-renew every 7 days.</p>
               <div class="mb-3">
@@ -1553,13 +1564,16 @@ def create_app() -> Flask:
     def register_google_watches():
         creds = load_admin_credentials(config)
         if not creds:
-            session["save_notice"] = "error:Google is not connected."
+            session["save_notice"] = "error:Google is not connected — please connect Google first."
             return redirect(url_for("index"))
         active_cals = get_active_calendars(config.admin_db_file, config.google_calendar_id)
+        if not active_cals:
+            session["save_notice"] = "error:No calendars are selected. Tick at least one calendar in the Active Calendars section first."
+            return redirect(url_for("index"))
         base_url = request.host_url.rstrip("/").replace("http://", "https://", 1)
         webhook_url = f"{base_url}/webhooks/google-calendar"
         ok = 0
-        fail = 0
+        errors = []
         for cal_id in active_cals:
             try:
                 resp = register_calendar_watch(config, cal_id, webhook_url)
@@ -1572,12 +1586,17 @@ def create_app() -> Flask:
                 ok += 1
                 print(f"[watch] Registered Google Calendar watch for {cal_id}: channel {resp['id']}", flush=True)
             except Exception as exc:
-                fail += 1
-                print(f"[watch] Failed to register watch for {cal_id}: {exc}", flush=True)
-        if fail:
-            session["save_notice"] = f"error:Registered {ok} watch(es), {fail} failed. Is the app deployed on a public HTTPS URL?"
+                err_msg = str(exc)
+                errors.append(err_msg)
+                print(f"[watch] Failed to register watch for {cal_id}: {err_msg}", flush=True)
+        if errors:
+            first_err = errors[0][:200]
+            session["save_notice"] = (
+                f"error:Registered {ok} watch(es) but {len(errors)} failed. "
+                f"Google said: {first_err}"
+            )
         else:
-            session["save_notice"] = f"success:Registered {ok} Google Calendar watch(es). Events will now be processed instantly."
+            session["save_notice"] = f"success:Registered {ok} Google Calendar watch(es). Events will now be processed in real time."
         return redirect(url_for("index"))
 
     @app.post("/setup/stop-google-watches")
