@@ -200,6 +200,60 @@ def append_stats_row(
     )
 
 
+def update_invoice_paid_in_sheet(
+    creds: Credentials,
+    spreadsheet_id: str,
+    sheet_name: str,
+    invoice_number: str,
+) -> bool:
+    """
+    Find the row whose 'Invoice Number' matches and set 'Paid' to 'Paid'.
+    Returns True if a row was updated.
+    """
+    if not invoice_number:
+        return False
+    service = build_sheets_service_from_creds(creds)
+    resolved = _resolve_existing_sheet_name(service, spreadsheet_id, sheet_name)
+
+    resp = (
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range=_sheet_range(resolved))
+        .execute()
+    )
+    rows = resp.get("values", [])
+    if len(rows) < 2:
+        return False
+
+    header = rows[0]
+    try:
+        inv_col = header.index("Invoice Number")
+        paid_col = header.index("Paid")
+    except ValueError:
+        return False
+
+    safe = resolved.replace("'", "''")
+    updates = []
+    for row_idx, row in enumerate(rows[1:], start=2):
+        cell_val = row[inv_col].strip() if len(row) > inv_col else ""
+        if cell_val.upper() == invoice_number.upper():
+            current_paid = row[paid_col].strip() if len(row) > paid_col else ""
+            if current_paid != "Paid":
+                updates.append({
+                    "range": f"'{safe}'!{_col_letter(paid_col)}{row_idx}",
+                    "values": [["Paid"]],
+                })
+
+    if not updates:
+        return False
+
+    service.spreadsheets().values().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"valueInputOption": "USER_ENTERED", "data": updates},
+    ).execute()
+    return True
+
+
 def backfill_submitter_in_sheet(
     creds: Credentials,
     spreadsheet_id: str,

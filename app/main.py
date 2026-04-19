@@ -6,10 +6,13 @@ import time
 from .admin_store import (
     add_seen_submitter,
     get_active_calendars,
+    get_google_watches,
     get_sheet_target,
     get_stats_fields,
     get_submitter_aliases,
     init_admin_store,
+    set_google_watch,
+    delete_google_watch,
 )
 from .config import load_config
 from .event_processor import (
@@ -29,7 +32,14 @@ from .event_processor import (
     upsert_send_confirmation,
     validate_customer_fields,
 )
-from .google_calendar import list_recent_events, update_event_description, RateLimitError
+from .google_calendar import (
+    list_recent_events,
+    update_event_description,
+    register_calendar_watch,
+    stop_calendar_watch,
+    RateLimitError,
+)
+from .trigger import wait_for_poll
 from .google_sheets import append_stats_row, ensure_header
 from .google_admin import load_admin_credentials
 from .state import (
@@ -249,6 +259,33 @@ def run() -> None:
     while True:
         xero_client = build_xero_client(config)
         now = dt.datetime.now(dt.timezone.utc)
+
+        # Auto-renew Google Calendar watches expiring within 24 hours
+        try:
+            watches = get_google_watches(config.admin_db_file)
+            now_ms = int(now.timestamp() * 1000)
+            for cal_id, winfo in list(watches.items()):
+                exp_ms = int(winfo.get("expiration_ms") or 0)
+                if exp_ms and (exp_ms - now_ms) < 24 * 3600 * 1000:
+                    wurl = winfo.get("webhook_url", "")
+                    if wurl:
+                        try:
+                            stop_calendar_watch(config, winfo["channel_id"], winfo["resource_id"])
+                        except Exception:
+                            pass
+                        try:
+                            resp = register_calendar_watch(config, cal_id, wurl)
+                            set_google_watch(
+                                config.admin_db_file, cal_id,
+                                resp["id"], resp["resourceId"],
+                                int(resp.get("expiration") or 0),
+                                webhook_url=wurl,
+                            )
+                            print(f"[watch] Renewed Google Calendar watch for {cal_id}", flush=True)
+                        except Exception as exc:
+                            print(f"[watch] Failed to renew watch for {cal_id}: {exc}", flush=True)
+        except Exception:
+            pass
         time_min = now - dt.timedelta(days=365)
         time_max = now + dt.timedelta(days=365)
         active_calendars = get_active_calendars(
@@ -1047,7 +1084,7 @@ def run() -> None:
             backoff_seconds = max(config.poll_seconds, 5)
         else:
             backoff_seconds = min(backoff_seconds * 2, max_backoff)
-        time.sleep(backoff_seconds)
+        wait_for_poll(backoff_seconds)
 
 
 if __name__ == "__main__":

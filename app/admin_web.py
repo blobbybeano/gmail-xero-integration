@@ -43,7 +43,17 @@ from .google_admin import (
 )
 from .config import AppConfig
 from .xero_client import load_xero_token, save_xero_token, token_is_expired, refresh_xero_token
-from .google_sheets import backfill_submitter_in_sheet
+from .google_sheets import backfill_submitter_in_sheet, update_invoice_paid_in_sheet
+from .google_calendar import register_calendar_watch, stop_calendar_watch
+from .admin_store import (
+    get_google_watches,
+    set_google_watch,
+    delete_google_watch,
+    get_xero_webhook_key,
+    set_xero_webhook_key,
+)
+from .trigger import trigger_poll
+from .state import load_state
 
 
 XERO_AUTH_URL = "https://login.xero.com/identity/connect/authorize"
@@ -961,6 +971,34 @@ def create_app() -> Flask:
         if sheet_current_id and all(s.get("id") != sheet_current_id for s in spreadsheets):
             sheet_options += f'<option value="{escape(sheet_current_id)}" selected>Current saved ({escape(sheet_current_id)})</option>'
 
+        # --- Webhook state ---
+        watches = get_google_watches(config.admin_db_file)
+        xero_wh_key = get_xero_webhook_key(config.admin_db_file)
+        base_url = request.host_url.rstrip("/")
+        gcal_webhook_url = f"{base_url}/webhooks/google-calendar"
+        xero_webhook_url = f"{base_url}/webhooks/xero"
+
+        import time as _time
+        now_ms = int(_time.time() * 1000)
+        active_cals_for_wh = get_active_calendars(config.admin_db_file, config.google_calendar_id)
+        watch_rows_html = ""
+        for cal_id in active_cals_for_wh:
+            winfo = watches.get(cal_id)
+            if winfo:
+                exp_ms = int(winfo.get("expiration_ms") or 0)
+                if exp_ms > now_ms:
+                    exp_dt = dt.datetime.fromtimestamp(exp_ms / 1000, tz=dt.timezone.utc)
+                    exp_str = exp_dt.strftime("%d/%m/%Y %H:%M UTC")
+                    badge = f'<span class="text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full">Active — expires {escape(exp_str)}</span>'
+                else:
+                    badge = '<span class="text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full">Expired — re-register</span>'
+            else:
+                badge = '<span class="text-xs font-medium text-gray-500 bg-gray-100 px-2 py-0.5 rounded-full">Not registered</span>'
+            cal_name = next((c.get("summary_display") or c.get("summary") or cal_id for c in calendars if c.get("id") == cal_id), cal_id)
+            watch_rows_html += f'<div class="flex items-center justify-between py-2"><span class="text-sm text-gray-700 truncate">{escape(cal_name)}</span>{badge}</div>'
+        if not watch_rows_html:
+            watch_rows_html = '<p class="text-sm text-gray-400">No active calendars selected yet.</p>'
+
         # --- Xero credential hints ---
         xero_redirect = escape(config.xero_redirect_uri)
         google_redirect = escape(config.google_oauth_redirect_uri)
@@ -1212,6 +1250,90 @@ def create_app() -> Flask:
             </div>
           </form>
 
+          <!-- Webhooks Card -->
+          <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6 space-y-6">
+            <div>
+              <h2 class="font-semibold text-gray-900 mb-1">Webhooks &amp; Real-Time Updates</h2>
+              <p class="text-sm text-gray-500">Instead of waiting for the next poll, connect Google Calendar and Xero to push changes to this app the moment they happen.</p>
+            </div>
+
+            <!-- Google Calendar Push Notifications -->
+            <div class="border border-gray-100 rounded-xl p-4">
+              <div class="flex items-center justify-between mb-3">
+                <h3 class="text-sm font-semibold text-gray-800">Google Calendar — Push Notifications</h3>
+                {('<span class="text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full">Watching</span>' if watches else '<span class="text-xs font-medium text-gray-500 bg-gray-100 px-2 py-0.5 rounded-full">Polling only</span>')}
+              </div>
+              <p class="text-xs text-gray-500 mb-3">Click <strong>Register</strong> to tell Google to call this app whenever a calendar event changes. Watches auto-renew every 7 days.</p>
+              <div class="mb-3">
+                <label class="block text-xs font-medium text-gray-600 mb-1">Your webhook URL (set automatically — no action needed)</label>
+                <div class="flex gap-2">
+                  <input readonly value="{escape(gcal_webhook_url)}"
+                    class="flex-1 px-3 py-1.5 border border-gray-200 rounded-lg text-xs font-mono bg-gray-50 text-gray-600">
+                  <button type="button"
+                    onclick="navigator.clipboard.writeText('{gcal_webhook_url.replace(chr(39), chr(92)+chr(39))}');this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',2000)"
+                    class="px-3 py-1.5 text-xs font-medium bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg transition-colors">Copy</button>
+                </div>
+              </div>
+              <div class="divide-y divide-gray-50 mb-3">
+                {watch_rows_html}
+              </div>
+              <div class="flex gap-2">
+                <form method="post" action="/setup/register-google-watches">
+                  <button type="submit"
+                    class="px-4 py-2 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors {"opacity-50 pointer-events-none" if not google_ok else ""}">
+                    {"Register / Refresh Watches" if not watches else "Re-register Watches"}
+                  </button>
+                </form>
+                {"" if not watches else """<form method="post" action="/setup/stop-google-watches">
+                  <button type="submit" class="px-4 py-2 text-xs font-medium text-red-600 bg-red-50 hover:bg-red-100 rounded-lg border border-red-200 transition-colors">Stop Watches</button>
+                </form>"""}
+              </div>
+            </div>
+
+            <!-- Xero Webhooks -->
+            <div class="border border-gray-100 rounded-xl p-4">
+              <div class="flex items-center justify-between mb-3">
+                <h3 class="text-sm font-semibold text-gray-800">Xero — Invoice Payment Webhooks</h3>
+                {('<span class="text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full">Key saved</span>' if xero_wh_key else '<span class="text-xs font-medium text-gray-500 bg-gray-100 px-2 py-0.5 rounded-full">Not configured</span>')}
+              </div>
+              <p class="text-xs text-gray-500 mb-3">When an invoice is paid in Xero, Xero will call this app and the sheet row will be updated to <strong>Paid</strong> automatically.</p>
+
+              <div class="mb-3 p-3 bg-blue-50 border border-blue-200 rounded-lg text-xs text-blue-800 space-y-1">
+                <p class="font-semibold">You need to do this once in Xero:</p>
+                <ol class="list-decimal list-inside space-y-1 text-blue-700">
+                  <li>Go to <strong>developer.xero.com</strong> → your app → <strong>Webhooks</strong></li>
+                  <li>Add a new webhook, paste the URL below, tick <strong>Invoices</strong></li>
+                  <li>Copy the <strong>Webhooks Key</strong> shown and paste it below</li>
+                  <li>Click Save below — Xero will send a test ping to verify</li>
+                </ol>
+              </div>
+
+              <div class="mb-3">
+                <label class="block text-xs font-medium text-gray-600 mb-1">Webhook URL — paste this into the Xero Developer portal</label>
+                <div class="flex gap-2">
+                  <input readonly value="{escape(xero_webhook_url)}"
+                    class="flex-1 px-3 py-1.5 border border-gray-200 rounded-lg text-xs font-mono bg-gray-50 text-gray-600">
+                  <button type="button"
+                    onclick="navigator.clipboard.writeText('{xero_webhook_url.replace(chr(39), chr(92)+chr(39))}');this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',2000)"
+                    class="px-3 py-1.5 text-xs font-medium bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg transition-colors">Copy</button>
+                </div>
+              </div>
+
+              <form method="post" action="/save-xero-webhook-key">
+                <div class="mb-3">
+                  <label class="block text-xs font-medium text-gray-600 mb-1">Xero Webhook Signing Key</label>
+                  <input name="xero_webhook_key" type="password"
+                    placeholder="{"••••••••  (saved)" if xero_wh_key else "Paste the key from the Xero Developer portal"}"
+                    class="w-full px-3 py-1.5 border border-gray-300 rounded-lg text-xs font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                </div>
+                <button type="submit"
+                  class="px-4 py-2 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors">
+                  Save Webhook Key
+                </button>
+              </form>
+            </div>
+          </div>
+
           <form method="post" action="/save" enctype="multipart/form-data" class="space-y-6">
 
             <!-- Stats Fields -->
@@ -1321,6 +1443,154 @@ def create_app() -> Flask:
 
         session["save_notice"] = f"success:{msg}"
         set_json_setting(config.admin_db_file, "settings_version", {"updated": True})
+        return redirect(url_for("index"))
+
+    # ── Webhook endpoints ──────────────────────────────────────────────────────
+
+    @app.post("/webhooks/google-calendar")
+    def webhook_google_calendar():
+        """Receive Google Calendar push notifications and wake the poller."""
+        state_header = request.headers.get("X-Goog-Resource-State", "")
+        token = request.headers.get("X-Goog-Channel-Token", "")
+        if token != "gcal-bridge":
+            return "", 200
+        if state_header == "exists":
+            trigger_poll()
+            print("[webhook] Google Calendar event changed — poll triggered", flush=True)
+        return "", 200
+
+    @app.post("/webhooks/xero")
+    def webhook_xero():
+        """Receive Xero webhooks (invoice paid etc.) and update the sheet."""
+        import hmac as _hmac
+        import hashlib as _hashlib
+        import base64 as _base64
+
+        raw_body = request.get_data()
+        webhook_key = get_xero_webhook_key(config.admin_db_file)
+
+        sig = request.headers.get("x-xero-signature", "")
+        if webhook_key:
+            expected = _base64.b64encode(
+                _hmac.new(webhook_key.encode("utf-8"), raw_body, _hashlib.sha256).digest()
+            ).decode()
+            if not _hmac.compare_digest(sig, expected):
+                return "", 401
+
+        try:
+            payload = request.get_json(force=True, silent=True) or {}
+        except Exception:
+            return "", 200
+
+        events = payload.get("events", [])
+        if not events:
+            return "", 200
+
+        app_state = load_state(config.state_file)
+        inv_map = app_state.get("event_invoice_map", {})
+        inv_id_to_key = {v: k for k, v in inv_map.items()}
+
+        creds = load_admin_credentials(config)
+        sheet_target = get_sheet_target(config.admin_db_file)
+        spreadsheet_id = (sheet_target.get("spreadsheet_id") or "").strip()
+        sheet_name = (sheet_target.get("sheet_name") or "Sheet1").strip() or "Sheet1"
+
+        xero_tok = load_xero_token(config.xero_token_file)
+        xero_at = (xero_tok or {}).get("access_token", "")
+        xero_tenant = (xero_tok or {}).get("tenant_id", "")
+
+        for ev in events:
+            if ev.get("eventCategory") != "INVOICE":
+                continue
+            invoice_id = ev.get("resourceId", "")
+            if not invoice_id:
+                continue
+            print(f"[webhook] Xero invoice event: {ev.get('eventType')} {invoice_id}", flush=True)
+
+            if xero_at and xero_tenant:
+                try:
+                    resp = requests.get(
+                        f"https://api.xero.com/api.xro/2.0/Invoices/{invoice_id}",
+                        headers={
+                            "Authorization": f"Bearer {xero_at}",
+                            "Xero-tenant-id": xero_tenant,
+                            "Accept": "application/json",
+                        },
+                        timeout=10,
+                    )
+                    invoices = resp.json().get("Invoices", [])
+                    if invoices and invoices[0].get("Status") == "PAID":
+                        inv_number = invoices[0].get("InvoiceNumber", "")
+                        print(f"[webhook] Invoice {inv_number} is PAID — updating sheet", flush=True)
+                        if creds and spreadsheet_id and inv_number:
+                            try:
+                                updated = update_invoice_paid_in_sheet(
+                                    creds,
+                                    spreadsheet_id=spreadsheet_id,
+                                    sheet_name=sheet_name,
+                                    invoice_number=inv_number,
+                                )
+                                if updated:
+                                    print(f"[webhook] Sheet row updated for {inv_number}", flush=True)
+                            except Exception as exc:
+                                print(f"[webhook] Sheet update failed: {exc}", flush=True)
+                except Exception as exc:
+                    print(f"[webhook] Xero invoice fetch failed: {exc}", flush=True)
+
+        trigger_poll()
+        return "", 200
+
+    @app.post("/setup/register-google-watches")
+    @require_login
+    def register_google_watches():
+        creds = load_admin_credentials(config)
+        if not creds:
+            session["save_notice"] = "error:Google is not connected."
+            return redirect(url_for("index"))
+        active_cals = get_active_calendars(config.admin_db_file, config.google_calendar_id)
+        base_url = request.host_url.rstrip("/")
+        webhook_url = f"{base_url}/webhooks/google-calendar"
+        ok = 0
+        fail = 0
+        for cal_id in active_cals:
+            try:
+                resp = register_calendar_watch(config, cal_id, webhook_url)
+                set_google_watch(
+                    config.admin_db_file, cal_id,
+                    resp["id"], resp["resourceId"],
+                    int(resp.get("expiration") or 0),
+                    webhook_url=webhook_url,
+                )
+                ok += 1
+                print(f"[watch] Registered Google Calendar watch for {cal_id}: channel {resp['id']}", flush=True)
+            except Exception as exc:
+                fail += 1
+                print(f"[watch] Failed to register watch for {cal_id}: {exc}", flush=True)
+        if fail:
+            session["save_notice"] = f"error:Registered {ok} watch(es), {fail} failed. Is the app deployed on a public HTTPS URL?"
+        else:
+            session["save_notice"] = f"success:Registered {ok} Google Calendar watch(es). Events will now be processed instantly."
+        return redirect(url_for("index"))
+
+    @app.post("/setup/stop-google-watches")
+    @require_login
+    def stop_google_watches():
+        watches = get_google_watches(config.admin_db_file)
+        for cal_id, winfo in list(watches.items()):
+            try:
+                stop_calendar_watch(config, winfo["channel_id"], winfo["resource_id"])
+            except Exception:
+                pass
+            delete_google_watch(config.admin_db_file, cal_id)
+        session["save_notice"] = "success:All Google Calendar watches stopped. Polling mode resumed."
+        return redirect(url_for("index"))
+
+    @app.post("/save-xero-webhook-key")
+    @require_login
+    def save_xero_webhook_key():
+        key = (request.form.get("xero_webhook_key") or "").strip()
+        set_xero_webhook_key(config.admin_db_file, key)
+        session["save_notice"] = "success:Xero webhook key saved."
         return redirect(url_for("index"))
 
     return app

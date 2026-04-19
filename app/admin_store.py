@@ -158,3 +158,39 @@ def add_seen_submitter(db_path: str, email: str) -> None:
         return
     seen.add(clean)
     set_json_setting(db_path, "seen_submitters", sorted(seen))
+
+
+def get_google_watches(db_path: str) -> dict:
+    return get_json_setting(db_path, "google_watches", {})
+
+
+def set_google_watch(
+    db_path: str,
+    calendar_id: str,
+    channel_id: str,
+    resource_id: str,
+    expiration_ms: int,
+    webhook_url: str = "",
+) -> None:
+    watches = get_google_watches(db_path)
+    watches[calendar_id] = {
+        "channel_id": channel_id,
+        "resource_id": resource_id,
+        "expiration_ms": expiration_ms,
+        "webhook_url": webhook_url,
+    }
+    set_json_setting(db_path, "google_watches", watches)
+
+
+def delete_google_watch(db_path: str, calendar_id: str) -> None:
+    watches = get_google_watches(db_path)
+    watches.pop(calendar_id, None)
+    set_json_setting(db_path, "google_watches", watches)
+
+
+def get_xero_webhook_key(db_path: str) -> str:
+    return str(get_json_setting(db_path, "xero_webhook_key", "") or "").strip()
+
+
+def set_xero_webhook_key(db_path: str, key: str) -> None:
+    set_json_setting(db_path, "xero_webhook_key", key.strip())

@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import time
+import uuid
 from pathlib import Path
 from typing import Dict, List
 
@@ -98,6 +99,34 @@ def update_event_description(
                 raise RateLimitError("Google Calendar rate limit exceeded") from exc
             raise
     raise RateLimitError("Google Calendar rate limit exceeded")
+
+
+def register_calendar_watch(
+    config: AppConfig,
+    calendar_id: str,
+    webhook_url: str,
+) -> Dict:
+    """Register a Google Calendar push-notification watch. Returns the channel dict."""
+    service = build_calendar_service(config)
+    channel_id = str(uuid.uuid4())
+    body = {
+        "id": channel_id,
+        "type": "web_hook",
+        "address": webhook_url,
+        "token": "gcal-bridge",
+    }
+    return service.events().watch(calendarId=calendar_id, body=body).execute()
+
+
+def stop_calendar_watch(config: AppConfig, channel_id: str, resource_id: str) -> None:
+    """Stop an active Google Calendar push-notification watch."""
+    try:
+        service = build_calendar_service(config)
+        service.channels().stop(
+            body={"id": channel_id, "resourceId": resource_id}
+        ).execute()
+    except Exception:
+        pass
 
 
 class RateLimitError(RuntimeError):
