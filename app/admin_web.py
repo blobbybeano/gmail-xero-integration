@@ -616,6 +616,8 @@ def create_app() -> Flask:
         except Exception as exc:
             session["save_notice"] = f"error:Could not start Google OAuth: {exc}"
             return redirect(url_for("index"))
+        print(f"[Google OAuth] redirect_uri={config.google_oauth_redirect_uri}")
+        print(f"[Google OAuth] auth_url={auth_url}")
         session["oauth_state"] = state
         set_json_setting(config.admin_db_file, "oauth_pending_state", state)
         return redirect(auth_url)
