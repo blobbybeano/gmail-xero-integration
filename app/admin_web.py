@@ -61,6 +61,29 @@ STAT_OPTIONS = [
     ("job_cost_inc_vat", "Job cost (inc VAT)"),
 ]
 
+_BASE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Powwash Admin</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body {{ font-family: 'Inter', system-ui, sans-serif; }}
+  .status-dot-green {{ display:inline-block;width:10px;height:10px;border-radius:50%;background:#22c55e;margin-right:6px; }}
+  .status-dot-red {{ display:inline-block;width:10px;height:10px;border-radius:50%;background:#ef4444;margin-right:6px; }}
+  .status-dot-yellow {{ display:inline-block;width:10px;height:10px;border-radius:50%;background:#f59e0b;margin-right:6px; }}
+</style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+{body}
+</body>
+</html>"""
+
+
+def _page(body: str) -> str:
+    return _BASE_HTML.format(body=body)
+
 
 def _extract_spreadsheet_id(value: str) -> str:
     text = (value or "").strip()
@@ -99,25 +122,20 @@ def _validate_google_credentials_json(raw: bytes) -> tuple[bool, str]:
     return True, ""
 
 
-def _sheets_status_html(
+def _sheets_status_data(
     config: AppConfig, creds, target: dict[str, str]
 ) -> tuple[bool, str]:
     if not creds:
-        return False, (
-            "<p><b>Not connected:</b> click <i>Connect / Reconnect Google</i> first.</p>"
-        )
+        return False, "Not connected to Google yet."
 
     spreadsheet_id = (target.get("spreadsheet_id") or "").strip()
     sheet_name = (target.get("sheet_name") or "Sheet1").strip() or "Sheet1"
     if not spreadsheet_id:
-        return False, "<p><b>Not ready:</b> add a Spreadsheet URL/ID and click Save Settings.</p>"
+        return False, "No spreadsheet URL or ID saved yet."
 
     scopes = set(getattr(creds, "scopes", []) or [])
     if "https://www.googleapis.com/auth/spreadsheets" not in scopes:
-        return False, (
-            "<p><b>Not ready:</b> token is missing spreadsheets scope. "
-            "Reconnect Google from this page.</p>"
-        )
+        return False, "Token is missing spreadsheets scope. Reconnect Google."
 
     try:
         service = build_sheets_service_from_creds(creds)
@@ -150,26 +168,12 @@ def _sheets_status_html(
 
         if reason == "SERVICE_DISABLED":
             url = _first_url(text) or "https://console.cloud.google.com/apis/library/sheets.googleapis.com"
-            return False, (
-                "<p><b>Not ready:</b> Google Sheets API is disabled in your Google Cloud project.</p>"
-                f"<p>Enable it here: <a href='{escape(url)}' target='_blank'>{escape(url)}</a></p>"
-                "<p>Then wait 2-5 minutes and retry.</p>"
-            )
+            return False, f"Google Sheets API is disabled. Enable it at: {url}"
         if exc.resp and exc.resp.status == 404:
-            return False, (
-                "<p><b>Not ready:</b> spreadsheet not found. Check URL/ID and make sure "
-                "you connected the same Google account that owns the sheet.</p>"
-            )
+            return False, "Spreadsheet not found. Check the URL/ID."
         if exc.resp and exc.resp.status == 403:
-            return False, (
-                "<p><b>Not ready:</b> no access to this spreadsheet for the connected Google account.</p>"
-                "<p>Share the sheet with that account, then save again.</p>"
-                f"<p><small>{escape(message)}</small></p>"
-            )
-        return False, (
-            "<p><b>Not ready:</b> failed to access spreadsheet.</p>"
-            f"<p><small>{escape(message)}</small></p>"
-        )
+            return False, f"No access to this spreadsheet: {message}"
+        return False, f"Failed to access spreadsheet: {message}"
 
     workbook = (meta.get("properties", {}) or {}).get("title", "")
     tabs = {
@@ -177,35 +181,21 @@ def _sheets_status_html(
         for s in (meta.get("sheets") or [])
     }
     if sheet_name not in tabs:
-        return False, (
-            "<p><b>Partially ready:</b> spreadsheet is reachable, but the tab name was not found.</p>"
-            f"<p>Create a tab named <code>{escape(sheet_name)}</code> in "
-            f"<b>{escape(workbook or spreadsheet_id)}</b>, then retry.</p>"
-        )
+        return False, f"Spreadsheet found but tab '{sheet_name}' does not exist in '{workbook or spreadsheet_id}'."
 
-    return True, (
-        "<p><b>Connected:</b> Sheets target is valid and ready.</p>"
-        f"<p>Workbook: <b>{escape(workbook or spreadsheet_id)}</b> | "
-        f"Tab: <b>{escape(sheet_name)}</b></p>"
-    )
+    return True, f"Connected — {workbook or spreadsheet_id} / {sheet_name}"
 
 
-def _oauth_debug_html(config: AppConfig) -> str:
+def _oauth_client_id(config: AppConfig) -> str:
     path = Path(config.google_credentials_file)
-    client_id = ""
     if path.exists():
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             section = payload.get("web") or payload.get("installed") or {}
-            client_id = str(section.get("client_id") or "")
+            return str(section.get("client_id") or "")
         except Exception:
-            client_id = ""
-    return (
-        "<p><small>"
-        f"OAuth client_id in use: <code>{escape(client_id or 'unknown')}</code><br>"
-        f"OAuth redirect URI in use: <code>{escape(config.google_oauth_redirect_uri)}</code>"
-        "</small></p>"
-    )
+            return ""
+    return ""
 
 
 def _xero_scope_string(scopes: list[str]) -> str:
@@ -251,30 +241,18 @@ def _get_xero_tenant_id(access_token: str) -> str:
     return connections[0].get("tenantId", "")
 
 
-def _xero_status_html(config: AppConfig) -> str:
+def _xero_status_data(config: AppConfig) -> tuple[bool, str, str]:
+    """Returns (connected, status_text, tenant_id)"""
     token = load_xero_token(config.xero_token_file)
     has_credentials = bool(config.xero_client_id and config.xero_client_secret)
-    scope_text = _xero_scope_string(config.xero_scopes)
     if not has_credentials:
-        return (
-            "<p><b>Not ready:</b> missing XERO_CLIENT_ID / XERO_CLIENT_SECRET in environment.</p>"
-            f"<p><small>Callback URI to set in Xero app: <code>{escape(config.xero_redirect_uri)}</code></small></p>"
-        )
-
-    lines = [
-        f"<p><small>Callback URI to set in Xero app: <code>{escape(config.xero_redirect_uri)}</code><br>",
-        f"Scopes in use: <code>{escape(scope_text or 'none')}</code></small></p>",
-    ]
+        return False, "Missing XERO_CLIENT_ID / XERO_CLIENT_SECRET environment variables.", ""
     access = token.get("access_token")
     tenant = token.get("tenant_id")
     if access and tenant:
         exp = "expired" if token_is_expired(token) else "valid"
-        lines.append(
-            f"<p><b>Connected:</b> tenant <code>{escape(tenant)}</code> (token {exp}).</p>"
-        )
-    else:
-        lines.append("<p><b>Not connected:</b> click <i>Connect / Reconnect Xero</i>.</p>")
-    return "".join(lines)
+        return True, f"Connected (token {exp})", tenant
+    return False, "Not connected — click Connect Xero below.", ""
 
 
 def _save_submitter_aliases_from_form(config: AppConfig, form) -> dict[str, str]:
@@ -284,7 +262,7 @@ def _save_submitter_aliases_from_form(config: AppConfig, form) -> dict[str, str]
     for k, v in form.items():
         if not k.startswith(prefix):
             continue
-        email = k[len(prefix) :].strip().lower()
+        email = k[len(prefix):].strip().lower()
         name = (v or "").strip()
         if not email:
             continue
@@ -346,7 +324,7 @@ def _apply_alias_to_description(
         lines.insert(insert_at, f"Submitted by: {mapped_name}")
 
     new_block = "\n".join(lines)
-    new_description = description[: m.start()] + start + new_block + end + description[m.end() :]
+    new_description = description[: m.start()] + start + new_block + end + description[m.end():]
     return new_description, new_description != description
 
 
@@ -410,6 +388,46 @@ def _backfill_submitter_aliases(config: AppConfig, aliases: dict[str, str]) -> t
     return updated_count, error_count
 
 
+def _status_badge(ok: bool, text: str) -> str:
+    if ok:
+        return (
+            f'<span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-sm font-medium bg-green-100 text-green-800">'
+            f'<svg class="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"/></svg>'
+            f'{escape(text)}</span>'
+        )
+    return (
+        f'<span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-sm font-medium bg-red-100 text-red-800">'
+        f'<svg class="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm-1-5a1 1 0 012 0v1a1 1 0 01-2 0v-1zm0-8a1 1 0 012 0v4a1 1 0 01-2 0V5z" clip-rule="evenodd"/></svg>'
+        f'{escape(text)}</span>'
+    )
+
+
+def _btn_primary(label: str, href: str = "", form_action: str = "", extra_class: str = "") -> str:
+    if href:
+        return (
+            f'<a href="{href}" class="inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 '
+            f'text-white text-sm font-medium rounded-lg transition-colors {extra_class}">{label}</a>'
+        )
+    return (
+        f'<button type="submit" formaction="{form_action}" '
+        f'class="inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 '
+        f'text-white text-sm font-medium rounded-lg transition-colors {extra_class}">{label}</button>'
+    )
+
+
+def _btn_secondary(label: str, href: str = "", form_action: str = "") -> str:
+    if href:
+        return (
+            f'<a href="{href}" class="inline-flex items-center gap-2 px-4 py-2 bg-white hover:bg-gray-50 '
+            f'text-gray-700 text-sm font-medium rounded-lg border border-gray-300 transition-colors">{label}</a>'
+        )
+    return (
+        f'<button type="submit" formaction="{form_action}" '
+        f'class="inline-flex items-center gap-2 px-4 py-2 bg-white hover:bg-gray-50 '
+        f'text-gray-700 text-sm font-medium rounded-lg border border-gray-300 transition-colors">{label}</button>'
+    )
+
+
 def create_app() -> Flask:
     config = load_config()
     init_admin_store(config.admin_db_file)
@@ -424,21 +442,46 @@ def create_app() -> Flask:
             if not session.get("logged_in"):
                 return redirect(url_for("login"))
             return fn(*args, **kwargs)
-
         return wrapper
 
     @app.get("/login")
     def login():
-        return """
-        <h2>Powwash Admin Login</h2>
-        <form method="post">
-          <label>Username</label><br>
-          <input name="username"><br><br>
-          <label>Password</label><br>
-          <input name="password" type="password"><br><br>
-          <button type="submit">Log in</button>
-        </form>
-        """
+        return _page(f"""
+        <div class="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-50 to-blue-100 px-4">
+          <div class="w-full max-w-md">
+            <div class="bg-white rounded-2xl shadow-xl p-8">
+              <div class="text-center mb-8">
+                <div class="inline-flex items-center justify-center w-16 h-16 bg-indigo-100 rounded-2xl mb-4">
+                  <svg class="w-8 h-8 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                      d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/>
+                  </svg>
+                </div>
+                <h1 class="text-2xl font-bold text-gray-900">Powwash Admin</h1>
+                <p class="text-gray-500 text-sm mt-1">Sign in to manage your integration settings</p>
+              </div>
+              <form method="post" class="space-y-5">
+                <div>
+                  <label class="block text-sm font-medium text-gray-700 mb-1.5">Username</label>
+                  <input name="username" autocomplete="username"
+                    class="w-full px-4 py-2.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                    placeholder="Enter your username">
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-700 mb-1.5">Password</label>
+                  <input name="password" type="password" autocomplete="current-password"
+                    class="w-full px-4 py-2.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                    placeholder="Enter your password">
+                </div>
+                <button type="submit"
+                  class="w-full py-2.5 px-4 bg-indigo-600 hover:bg-indigo-700 text-white font-medium rounded-lg text-sm transition-colors">
+                  Sign in
+                </button>
+              </form>
+            </div>
+          </div>
+        </div>
+        """)
 
     @app.post("/login")
     def login_post():
@@ -447,7 +490,26 @@ def create_app() -> Flask:
         if username == config.admin_username and password == config.admin_password:
             session["logged_in"] = True
             return redirect(url_for("index"))
-        return "<p>Invalid login.</p><a href='/login'>Try again</a>", 401
+        return _page(f"""
+        <div class="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-50 to-blue-100 px-4">
+          <div class="w-full max-w-md">
+            <div class="bg-white rounded-2xl shadow-xl p-8">
+              <div class="text-center mb-6">
+                <div class="inline-flex items-center justify-center w-16 h-16 bg-red-100 rounded-2xl mb-4">
+                  <svg class="w-8 h-8 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                  </svg>
+                </div>
+                <h1 class="text-2xl font-bold text-gray-900">Invalid credentials</h1>
+                <p class="text-gray-500 text-sm mt-1">Please check your username and password.</p>
+              </div>
+              <a href="/login" class="block w-full text-center py-2.5 px-4 bg-indigo-600 hover:bg-indigo-700 text-white font-medium rounded-lg text-sm transition-colors">
+                Try again
+              </a>
+            </div>
+          </div>
+        </div>
+        """), 401
 
     @app.get("/logout")
     def logout():
@@ -458,7 +520,7 @@ def create_app() -> Flask:
     @require_login
     def connect_xero():
         if not config.xero_client_id or not config.xero_client_secret:
-            session["save_notice"] = "Xero connect failed: missing XERO_CLIENT_ID/XERO_CLIENT_SECRET."
+            session["save_notice"] = "error:Xero connect failed: missing XERO_CLIENT_ID/XERO_CLIENT_SECRET."
             return redirect(url_for("index"))
         state = secrets.token_urlsafe(24)
         session["xero_oauth_state"] = state
@@ -471,30 +533,48 @@ def create_app() -> Flask:
         state = request.args.get("state") or ""
         err = request.args.get("error") or ""
         if err:
-            return f"<p>Xero OAuth error: {escape(err)}</p>", 400
+            return _page(f"""
+            <div class="min-h-screen flex items-center justify-center bg-gray-50">
+              <div class="bg-white rounded-2xl shadow p-8 max-w-md w-full text-center">
+                <p class="text-red-600 font-medium mb-4">Xero OAuth error: {escape(err)}</p>
+                <a href="/" class="text-indigo-600 hover:underline text-sm">Back to dashboard</a>
+              </div>
+            </div>
+            """), 400
         expected_session = session.get("xero_oauth_state") or ""
         expected_store = str(
             get_json_setting(config.admin_db_file, "xero_oauth_pending_state", "")
         ).strip()
         state_ok = bool(state) and (state == expected_session or state == expected_store)
         if not code or not state_ok:
-            return (
-                "<p>Xero callback invalid state/code.</p>"
-                "<p>Use one host consistently for login + callback and retry.</p>",
-                400,
-            )
+            return _page("""
+            <div class="min-h-screen flex items-center justify-center bg-gray-50">
+              <div class="bg-white rounded-2xl shadow p-8 max-w-md w-full text-center">
+                <p class="text-red-600 font-medium mb-2">Xero callback invalid state/code.</p>
+                <p class="text-gray-500 text-sm mb-4">Use one host consistently for login and callback, then retry.</p>
+                <a href="/" class="text-indigo-600 hover:underline text-sm">Back to dashboard</a>
+              </div>
+            </div>
+            """), 400
         try:
             token = _exchange_xero_code(config, code)
             tenant_id = _get_xero_tenant_id(token.get("access_token", ""))
-        except Exception as exc:  # noqa: BLE001
-            return f"<p>Xero connect failed: {escape(str(exc))}</p>", 400
+        except Exception as exc:
+            return _page(f"""
+            <div class="min-h-screen flex items-center justify-center bg-gray-50">
+              <div class="bg-white rounded-2xl shadow p-8 max-w-md w-full text-center">
+                <p class="text-red-600 font-medium mb-4">Xero connect failed: {escape(str(exc))}</p>
+                <a href="/" class="text-indigo-600 hover:underline text-sm">Back to dashboard</a>
+              </div>
+            </div>
+            """), 400
 
         token["tenant_id"] = tenant_id
         save_xero_token(config.xero_token_file, token)
         session["logged_in"] = True
         session.pop("xero_oauth_state", None)
         set_json_setting(config.admin_db_file, "xero_oauth_pending_state", "")
-        session["save_notice"] = "Xero connected successfully."
+        session["save_notice"] = "success:Xero connected successfully."
         return redirect(url_for("index"))
 
     @app.post("/upload-google-credentials")
@@ -502,12 +582,12 @@ def create_app() -> Flask:
     def upload_google_credentials():
         f = request.files.get("google_credentials")
         if not f or not f.filename:
-            session["save_notice"] = "No credentials file selected."
+            session["save_notice"] = "error:No credentials file selected."
             return redirect(url_for("index"))
         raw = f.read()
         ok, err = _validate_google_credentials_json(raw)
         if not ok:
-            session["save_notice"] = f"Credentials upload failed: {err}"
+            session["save_notice"] = f"error:Credentials upload failed: {err}"
             return redirect(url_for("index"))
 
         path = Path(config.google_credentials_file)
@@ -519,7 +599,7 @@ def create_app() -> Flask:
             {"uploaded_name": f.filename, "stored_path": str(path)},
         )
         session["save_notice"] = (
-            f"Credentials uploaded to {path}. Reconnect Google to apply."
+            f"success:Credentials uploaded ({f.filename}). Now click Connect Google to authorise."
         )
         return redirect(url_for("index"))
 
@@ -541,17 +621,21 @@ def create_app() -> Flask:
         ).strip()
         state_ok = bool(state) and (state == expected_session or state == expected_store)
         if not code or not state_ok:
-            return (
-                "<p>OAuth callback invalid state/code.</p>"
-                "<p>Tip: use one host consistently for login + callback "
-                "(for example, both on localhost or both on 127.0.0.1).</p>",
-                400,
-            )
+            return _page("""
+            <div class="min-h-screen flex items-center justify-center bg-gray-50">
+              <div class="bg-white rounded-2xl shadow p-8 max-w-md w-full text-center">
+                <p class="text-red-600 font-medium mb-2">OAuth callback invalid state/code.</p>
+                <p class="text-gray-500 text-sm mb-4">Use one host consistently for login and callback, then retry.</p>
+                <a href="/" class="text-indigo-600 hover:underline text-sm">Back to dashboard</a>
+              </div>
+            </div>
+            """), 400
         creds = oauth_exchange_code(config, state=state, code=code)
         save_admin_credentials(config, creds)
         session["logged_in"] = True
         session.pop("oauth_state", None)
         set_json_setting(config.admin_db_file, "oauth_pending_state", "")
+        session["save_notice"] = "success:Google connected successfully."
         return redirect(url_for("index"))
 
     @app.get("/")
@@ -561,9 +645,9 @@ def create_app() -> Flask:
         active = set(get_active_calendars(config.admin_db_file, config.google_calendar_id))
         stats_selected = set(get_stats_fields(config.admin_db_file))
         target = get_sheet_target(config.admin_db_file)
-        sheets_ok, sheets_status = _sheets_status_html(config, creds, target)
-        oauth_debug = _oauth_debug_html(config)
-        xero_status = _xero_status_html(config)
+        sheets_ok, sheets_msg = _sheets_status_data(config, creds, target)
+        xero_ok, xero_msg, xero_tenant = _xero_status_data(config)
+        google_ok = creds is not None
         save_notice = session.pop("save_notice", "")
         creds_meta = get_json_setting(
             config.admin_db_file,
@@ -572,23 +656,44 @@ def create_app() -> Flask:
         )
         seen_submitters = get_seen_submitters(config.admin_db_file)
         submitter_aliases = get_submitter_aliases(config.admin_db_file)
+        client_id = _oauth_client_id(config)
 
         calendars = []
         spreadsheets = []
-        oauth_note = ""
+        calendar_error = ""
         if creds:
             try:
                 calendars = list_calendars(creds)
-            except Exception as exc:  # noqa: BLE001
-                oauth_note = f"Connected, but failed to load calendars: {exc}"
+            except Exception as exc:
+                calendar_error = f"Failed to load calendars: {exc}"
             try:
                 spreadsheets = list_spreadsheets(creds)
             except Exception:
                 pass
-        else:
-            oauth_note = "Google not connected yet."
 
-        cal_html = ""
+        # --- Notice banner ---
+        notice_html = ""
+        if save_notice:
+            is_error = save_notice.startswith("error:")
+            msg = save_notice[6:] if save_notice.startswith(("error:", "success:")) else save_notice
+            if is_error:
+                notice_html = f"""
+                <div class="mb-6 flex items-start gap-3 p-4 bg-red-50 border border-red-200 rounded-xl text-red-800 text-sm">
+                  <svg class="w-5 h-5 mt-0.5 shrink-0" fill="currentColor" viewBox="0 0 20 20">
+                    <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clip-rule="evenodd"/>
+                  </svg>
+                  <span>{escape(msg)}</span>
+                </div>"""
+            else:
+                notice_html = f"""
+                <div class="mb-6 flex items-start gap-3 p-4 bg-green-50 border border-green-200 rounded-xl text-green-800 text-sm">
+                  <svg class="w-5 h-5 mt-0.5 shrink-0" fill="currentColor" viewBox="0 0 20 20">
+                    <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"/>
+                  </svg>
+                  <span>{escape(msg)}</span>
+                </div>"""
+
+        # --- Calendars ---
         if calendars:
             my_rows = []
             other_rows = []
@@ -596,122 +701,284 @@ def create_app() -> Flask:
                 cid = c["id"] or ""
                 checked = "checked" if cid in active else ""
                 title = escape(c.get("summary_display") or c.get("summary") or cid)
-                primary_badge = " <b>(Primary)</b>" if c.get("primary") else ""
-                hint_bits = []
+                primary_badge = ' <span class="text-xs bg-indigo-100 text-indigo-700 px-1.5 py-0.5 rounded font-medium">Primary</span>' if c.get("primary") else ""
+                hints = []
                 if c.get("hidden"):
-                    hint_bits.append("hidden")
+                    hints.append("hidden")
                 if not c.get("selected", True):
-                    hint_bits.append("not selected")
-                hint = f" <small>({'; '.join(hint_bits)})</small>" if hint_bits else ""
+                    hints.append("not selected")
+                hint = f' <span class="text-gray-400 text-xs">({"; ".join(hints)})</span>' if hints else ""
                 row = (
-                    f"<label><input type='checkbox' name='active_calendars' "
-                    f"value='{escape(cid)}' {checked}> {title}{primary_badge}{hint}</label>"
+                    f'<label class="flex items-center gap-3 p-3 rounded-lg hover:bg-gray-50 cursor-pointer">'
+                    f'<input type="checkbox" name="active_calendars" value="{escape(cid)}" {checked} '
+                    f'class="w-4 h-4 text-indigo-600 rounded border-gray-300 focus:ring-indigo-500">'
+                    f'<span class="text-sm text-gray-800">{title}{primary_badge}{hint}</span>'
+                    f'</label>'
                 )
-                is_my_calendar = (
-                    c.get("primary")
-                    or c.get("is_birthdays")
-                    or (
-                        c.get("access_role") in {"owner", "writer"}
-                        and not c.get("is_holiday")
-                    )
+                is_my = (
+                    c.get("primary") or c.get("is_birthdays")
+                    or (c.get("access_role") in {"owner", "writer"} and not c.get("is_holiday"))
                 )
-                if is_my_calendar:
+                if is_my:
                     my_rows.append(row)
                 else:
                     other_rows.append(row)
-            parts = []
-            if my_rows:
-                parts.append("<b>My calendars</b><br>" + "<br>".join(my_rows))
-            if other_rows:
-                parts.append("<b>Other calendars</b><br>" + "<br>".join(other_rows))
-            cal_html = "<br><br>".join(parts)
-        else:
-            cal_html = "<p>No calendars loaded yet. Connect Google first.</p>"
 
-        stats_html = "<br>".join(
-            [
-                (
-                    f"<label><input type='checkbox' name='stats_fields' value='{key}' "
-                    f"{'checked' if key in stats_selected else ''}> {label}</label>"
-                )
-                for key, label in STAT_OPTIONS
-            ]
-        )
-        alias_rows = []
+            cal_html = ""
+            if my_rows:
+                cal_html += '<p class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">My Calendars</p>'
+                cal_html += "".join(my_rows)
+            if other_rows:
+                if my_rows:
+                    cal_html += '<div class="my-3 border-t border-gray-100"></div>'
+                cal_html += '<p class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Other Calendars</p>'
+                cal_html += "".join(other_rows)
+        elif calendar_error:
+            cal_html = f'<p class="text-sm text-red-600">{escape(calendar_error)}</p>'
+        else:
+            cal_html = '<p class="text-sm text-gray-500">No calendars loaded. Connect Google first.</p>'
+
+        # --- Stats fields ---
+        stats_html = ""
+        for key, label in STAT_OPTIONS:
+            checked = "checked" if key in stats_selected else ""
+            stats_html += (
+                f'<label class="flex items-center gap-3 p-2.5 rounded-lg hover:bg-gray-50 cursor-pointer">'
+                f'<input type="checkbox" name="stats_fields" value="{key}" {checked} '
+                f'class="w-4 h-4 text-indigo-600 rounded border-gray-300 focus:ring-indigo-500">'
+                f'<span class="text-sm text-gray-800">{escape(label)}</span>'
+                f'</label>'
+            )
+
+        # --- Submitter aliases ---
+        alias_rows_html = ""
         for email in seen_submitters:
             alias = submitter_aliases.get(email, "")
-            alias_rows.append(
-                "<div style='margin-bottom:6px'>"
-                f"<label style='display:inline-block;min-width:320px'>{escape(email)}</label> "
-                f"<input name='submitter_alias__{escape(email)}' value='{escape(alias)}' "
-                "placeholder='Display name'>"
-                "</div>"
+            alias_rows_html += (
+                f'<div class="flex items-center gap-3 py-2">'
+                f'<span class="text-sm text-gray-600 w-64 truncate" title="{escape(email)}">{escape(email)}</span>'
+                f'<input name="submitter_alias__{escape(email)}" value="{escape(alias)}" '
+                f'placeholder="Display name" '
+                f'class="flex-1 px-3 py-1.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">'
+                f'</div>'
             )
-        submitter_alias_html = (
-            "".join(alias_rows)
-            if alias_rows
-            else "<p><small>No submitters seen yet. Process some events first.</small></p>"
-        )
+        if not alias_rows_html:
+            alias_rows_html = '<p class="text-sm text-gray-500">No submitters seen yet — process some events first.</p>'
 
-        sheet_options = "".join(
-            [
-                f"<option value='{escape(s['id'])}'>{escape(s['name'])}</option>"
-                for s in spreadsheets
-            ]
-        )
-        sheet_current = escape(target.get("spreadsheet_id", ""))
-        sheet_name = escape(target.get("sheet_name", "Sheet1"))
-        if sheet_current and all(s.get("id") != sheet_current for s in spreadsheets):
-            sheet_options = (
-                f"<option value='{sheet_current}'>Current saved target ({sheet_current})</option>"
-                + sheet_options
-            )
+        # --- Spreadsheet options ---
+        sheet_options = '<option value="">-- Select a spreadsheet --</option>'
+        sheet_current_id = target.get("spreadsheet_id", "")
+        sheet_name_val = target.get("sheet_name", "Sheet1")
+        for s in spreadsheets:
+            sel = 'selected' if s.get("id") == sheet_current_id else ""
+            sheet_options += f'<option value="{escape(s["id"])}" {sel}>{escape(s["name"])}</option>'
+        if sheet_current_id and all(s.get("id") != sheet_current_id for s in spreadsheets):
+            sheet_options += f'<option value="{escape(sheet_current_id)}" selected>Current saved ({escape(sheet_current_id)})</option>'
 
-        return f"""
-        <h2>Powwash Integration Admin</h2>
-        <p><a href='/logout'>Logout</a></p>
-        <p><a href='/connect-google'>Connect / Reconnect Google</a></p>
-        <p><a href='/connect-xero'>Connect / Reconnect Xero</a></p>
-        <p>{escape(save_notice)}</p>
-        <p>{escape(oauth_note)}</p>
-        <h3>Xero Connection</h3>
-        {xero_status}
-        <hr>
-        <form method="post" action="/save" enctype="multipart/form-data">
-          <h3>Active Calendars</h3>
-          <p><small>Only calendars returned by the Google Calendar API are shown here. Google Tasks is not a Calendar API calendar.</small></p>
-          {cal_html}
-          <hr>
-          <h3>Google Sheets Target</h3>
-          {oauth_debug}
-          <p><small>Google credentials path: <code>{escape(config.google_credentials_file)}</code> | Last upload: <code>{escape((creds_meta or {}).get("uploaded_name", "") or "none")}</code></small></p>
-          <input type="file" name="google_credentials" accept=".json,application/json">
-          <button type="submit" formaction="/upload-google-credentials">Upload Credentials JSON</button>
-          <p><small>After upload, click <i>Connect / Reconnect Google</i> to issue a fresh token.</small></p>
-          <label>Spreadsheet URL or ID</label><br>
-          <input name="spreadsheet_input" style="width:680px" value="{sheet_current}"><br><br>
-          <label>Sheet tab name</label><br>
-          <input name="sheet_name" value="{sheet_name}"><br><br>
-          <label>Recent spreadsheets (optional)</label><br>
-          <select name="spreadsheet_pick">
-            <option value="">-- optional quick pick --</option>
-            {sheet_options}
-          </select>
-          <br><br>
-          <h3>Sheets Connection Check</h3>
-          {sheets_status}
-          <hr>
-          <h3>Stats to Post to Sheets</h3>
-          {stats_html}
-          <hr>
-          <h3>Submitter Display Names</h3>
-          <p><small>Map submitter e-mail to a display name used in calendar status and sheet rows.</small></p>
-          {submitter_alias_html}
-          <button type="submit" formaction="/apply-submitter-aliases">Save Names + Apply To Existing Entries</button>
-          <br><br>
-          <button type="submit">Save Settings</button>
-        </form>
-        """
+        # --- Xero credential hints ---
+        xero_has_creds = bool(config.xero_client_id and config.xero_client_secret)
+        xero_redirect = escape(config.xero_redirect_uri)
+        google_redirect = escape(config.google_oauth_redirect_uri)
+
+        return _page(f"""
+        <div class="max-w-4xl mx-auto px-4 py-8">
+
+          <!-- Header -->
+          <div class="flex items-center justify-between mb-8">
+            <div>
+              <h1 class="text-2xl font-bold text-gray-900">Powwash Integration</h1>
+              <p class="text-gray-500 text-sm mt-0.5">Google Calendar → Xero invoice automation</p>
+            </div>
+            <a href="/logout" class="text-sm text-gray-500 hover:text-gray-700 flex items-center gap-1.5">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                  d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/>
+              </svg>
+              Sign out
+            </a>
+          </div>
+
+          {notice_html}
+
+          <!-- Setup Steps Overview -->
+          <div class="bg-indigo-50 border border-indigo-100 rounded-2xl p-6 mb-6">
+            <h2 class="text-sm font-semibold text-indigo-900 mb-3 flex items-center gap-2">
+              <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+                <path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clip-rule="evenodd"/>
+              </svg>
+              Quick Setup Guide
+            </h2>
+            <ol class="space-y-2 text-sm text-indigo-800">
+              <li class="flex gap-2"><span class="font-bold shrink-0">1.</span>
+                <span>Create a <a href="https://console.cloud.google.com/apis/credentials" target="_blank" class="underline font-medium hover:text-indigo-600">Google Cloud OAuth 2.0 client</a> (type: <em>Web application</em>), add <code class="bg-indigo-100 px-1 rounded text-xs">{google_redirect}</code> as an authorised redirect URI, then download the JSON and upload it in the Google section below.</span>
+              </li>
+              <li class="flex gap-2"><span class="font-bold shrink-0">2.</span>
+                <span>Enable the <a href="https://console.cloud.google.com/apis/library/calendar-json.googleapis.com" target="_blank" class="underline font-medium hover:text-indigo-600">Google Calendar API</a> and <a href="https://console.cloud.google.com/apis/library/sheets.googleapis.com" target="_blank" class="underline font-medium hover:text-indigo-600">Google Sheets API</a> in your Google Cloud project.</span>
+              </li>
+              <li class="flex gap-2"><span class="font-bold shrink-0">3.</span>
+                <span>Create a <a href="https://developer.xero.com/app/manage" target="_blank" class="underline font-medium hover:text-indigo-600">Xero app</a> (type: <em>Web app</em>), set the redirect URI to <code class="bg-indigo-100 px-1 rounded text-xs">{xero_redirect}</code>, and add <code class="bg-indigo-100 px-1 rounded text-xs">XERO_CLIENT_ID</code> / <code class="bg-indigo-100 px-1 rounded text-xs">XERO_CLIENT_SECRET</code> as environment variables.</span>
+              </li>
+              <li class="flex gap-2"><span class="font-bold shrink-0">4.</span>
+                <span>Click <strong>Connect Google</strong> and <strong>Connect Xero</strong> below, then select your calendars and save.</span>
+              </li>
+            </ol>
+          </div>
+
+          <form method="post" action="/save" enctype="multipart/form-data" class="space-y-6">
+
+            <!-- Connection Status Row -->
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+
+              <!-- Google Card -->
+              <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-5">
+                <div class="flex items-start justify-between mb-3">
+                  <div class="flex items-center gap-3">
+                    <div class="w-10 h-10 bg-blue-50 rounded-xl flex items-center justify-center shrink-0">
+                      <svg class="w-5 h-5 text-blue-600" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M12.545 10.239v3.821h5.445c-.712 2.315-2.647 3.972-5.445 3.972a6.033 6.033 0 110-12.064c1.498 0 2.866.549 3.921 1.453l2.814-2.814A9.969 9.969 0 0012.545 2C7.021 2 2.543 6.477 2.543 12s4.478 10 10.002 10c8.396 0 10.249-7.85 9.426-11.748l-9.426-.013z"/>
+                      </svg>
+                    </div>
+                    <div>
+                      <h3 class="font-semibold text-gray-900 text-sm">Google</h3>
+                      <p class="text-xs text-gray-500">Calendar &amp; Sheets</p>
+                    </div>
+                  </div>
+                  {_status_badge(google_ok, "Connected" if google_ok else "Not connected")}
+                </div>
+
+                {"" if not client_id else f'<p class="text-xs text-gray-400 mb-3 font-mono truncate" title="{escape(client_id)}">Client: {escape(client_id[:40])}{"..." if len(client_id) > 40 else ""}</p>'}
+
+                <div class="space-y-3">
+                  <div>
+                    <p class="text-xs text-gray-500 mb-1.5 font-medium">Upload OAuth credentials JSON</p>
+                    <input type="file" name="google_credentials" accept=".json,application/json"
+                      class="block w-full text-xs text-gray-500 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-medium file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100">
+                    {"" if not (creds_meta or {}).get("uploaded_name") else f'<p class="text-xs text-gray-400 mt-1">Last upload: {escape((creds_meta or {{}}).get("uploaded_name", ""))}</p>'}
+                  </div>
+                  <div class="flex gap-2 flex-wrap">
+                    <button type="submit" formaction="/upload-google-credentials"
+                      class="px-3 py-1.5 text-xs font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors">
+                      Upload JSON
+                    </button>
+                    <a href="/connect-google"
+                      class="px-3 py-1.5 text-xs font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors">
+                      {"Reconnect Google" if google_ok else "Connect Google"}
+                    </a>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Xero Card -->
+              <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-5">
+                <div class="flex items-start justify-between mb-3">
+                  <div class="flex items-center gap-3">
+                    <div class="w-10 h-10 bg-blue-50 rounded-xl flex items-center justify-center shrink-0">
+                      <svg class="w-5 h-5 text-blue-700" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M12 2C6.477 2 2 6.477 2 12s4.477 10 10 10 10-4.477 10-10S17.523 2 12 2zm4.5 13.5h-9v-1.5h9v1.5zm0-3h-9V11h9v1.5zm0-3h-9V8h9v1.5z"/>
+                      </svg>
+                    </div>
+                    <div>
+                      <h3 class="font-semibold text-gray-900 text-sm">Xero</h3>
+                      <p class="text-xs text-gray-500">Invoice automation</p>
+                    </div>
+                  </div>
+                  {_status_badge(xero_ok, "Connected" if xero_ok else "Not connected")}
+                </div>
+
+                <div class="text-xs text-gray-500 mb-3 space-y-1">
+                  <p>{escape(xero_msg)}</p>
+                  {"" if not xero_tenant else f'<p class="font-mono text-gray-400 truncate" title="{escape(xero_tenant)}">Tenant: {escape(xero_tenant[:32])}{"..." if len(xero_tenant) > 32 else ""}</p>'}
+                  <p>Redirect URI: <code class="bg-gray-100 px-1 py-0.5 rounded">{xero_redirect}</code></p>
+                </div>
+
+                {"" if xero_has_creds else '<p class="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-3">Set <code>XERO_CLIENT_ID</code> and <code>XERO_CLIENT_SECRET</code> in your environment variables first.</p>'}
+
+                <a href="/connect-xero"
+                  class="inline-block px-3 py-1.5 text-xs font-medium text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors {"opacity-50 pointer-events-none" if not xero_has_creds else ""}">
+                  {"Reconnect Xero" if xero_ok else "Connect Xero"}
+                </a>
+              </div>
+            </div>
+
+            <!-- Active Calendars -->
+            <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
+              <div class="flex items-center justify-between mb-1">
+                <h2 class="font-semibold text-gray-900">Active Calendars</h2>
+                <span class="text-xs text-gray-400">{len(active)} selected</span>
+              </div>
+              <p class="text-sm text-gray-500 mb-4">Select which calendars to monitor for events marked with <strong>DONE</strong>.</p>
+              <div class="divide-y divide-gray-50">
+                {cal_html}
+              </div>
+            </div>
+
+            <!-- Google Sheets -->
+            <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
+              <div class="flex items-center justify-between mb-1">
+                <h2 class="font-semibold text-gray-900">Google Sheets Target</h2>
+                {_status_badge(sheets_ok, "Ready" if sheets_ok else "Not ready")}
+              </div>
+              <p class="text-sm text-gray-500 mb-4">{escape(sheets_msg)}</p>
+
+              <div class="space-y-4">
+                {"" if not spreadsheets else f"""
+                <div>
+                  <label class="block text-sm font-medium text-gray-700 mb-1.5">Pick from your spreadsheets</label>
+                  <select name="spreadsheet_pick" class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                    {sheet_options}
+                  </select>
+                </div>
+                """}
+                <div>
+                  <label class="block text-sm font-medium text-gray-700 mb-1.5">Spreadsheet URL or ID</label>
+                  <input name="spreadsheet_input" value="{escape(sheet_current_id)}"
+                    placeholder="Paste a Google Sheets URL or spreadsheet ID"
+                    class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-700 mb-1.5">Sheet tab name</label>
+                  <input name="sheet_name" value="{escape(sheet_name_val)}"
+                    placeholder="Sheet1"
+                    class="w-48 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                </div>
+              </div>
+            </div>
+
+            <!-- Stats Fields -->
+            <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
+              <h2 class="font-semibold text-gray-900 mb-1">Stats to Post to Sheets</h2>
+              <p class="text-sm text-gray-500 mb-4">Choose which data columns are written to your Google Sheet when an invoice is processed.</p>
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-1">
+                {stats_html}
+              </div>
+            </div>
+
+            <!-- Submitter Names -->
+            <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
+              <h2 class="font-semibold text-gray-900 mb-1">Submitter Display Names</h2>
+              <p class="text-sm text-gray-500 mb-4">Map a submitter's email address to a friendly display name used in calendar entries and sheet rows.</p>
+              <div class="divide-y divide-gray-100">
+                {alias_rows_html}
+              </div>
+              <div class="mt-4">
+                <button type="submit" formaction="/apply-submitter-aliases"
+                  class="px-4 py-2 bg-white hover:bg-gray-50 text-gray-700 text-sm font-medium rounded-lg border border-gray-300 transition-colors">
+                  Save Names &amp; Apply to Existing Entries
+                </button>
+              </div>
+            </div>
+
+            <!-- Save -->
+            <div class="flex justify-end pb-4">
+              <button type="submit"
+                class="px-6 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-medium rounded-lg text-sm transition-colors shadow-sm">
+                Save Settings
+              </button>
+            </div>
+
+          </form>
+        </div>
+        """)
 
     @app.post("/save")
     @require_login
@@ -734,19 +1001,14 @@ def create_app() -> Flask:
         set_sheet_target(config.admin_db_file, spreadsheet_id=spreadsheet_id, sheet_name=sheet_name)
         target = {"spreadsheet_id": spreadsheet_id, "sheet_name": sheet_name}
         creds = load_admin_credentials(config)
-        ok, _ = _sheets_status_html(config, creds, target)
+        ok, _ = _sheets_status_data(config, creds, target)
         aliases = _save_submitter_aliases_from_form(config, request.form)
-        session["save_notice"] = (
-            "Settings saved. Sheets connection is ready."
-            if ok
-            else "Settings saved. Follow the Sheets Connection Check steps below."
-        )
+        msg = "Settings saved. Sheets connection is ready." if ok else "Settings saved."
         if aliases:
-            session["save_notice"] += " Submitter names saved."
+            msg += " Submitter names saved."
+        session["save_notice"] = f"success:{msg}"
 
-        # Ensure worker can quickly detect settings refresh.
         set_json_setting(config.admin_db_file, "settings_version", {"updated": True})
-
         return redirect(url_for("index"))
 
     @app.post("/apply-submitter-aliases")
@@ -754,15 +1016,14 @@ def create_app() -> Flask:
     def apply_submitter_aliases():
         aliases = _save_submitter_aliases_from_form(config, request.form)
         if not aliases:
-            session["save_notice"] = "No submitter name mappings set."
+            session["save_notice"] = "error:No submitter name mappings set."
             return redirect(url_for("index"))
 
         updated, errors = _backfill_submitter_aliases(config, aliases)
-        session["save_notice"] = (
-            f"Submitter names saved. Updated {updated} existing calendar entries."
-        )
+        msg = f"Submitter names saved. Updated {updated} existing calendar entries."
         if errors:
-            session["save_notice"] += f" ({errors} updates failed.)"
+            msg += f" ({errors} updates failed.)"
+        session["save_notice"] = f"success:{msg}"
         set_json_setting(config.admin_db_file, "settings_version", {"updated": True})
         return redirect(url_for("index"))
 
