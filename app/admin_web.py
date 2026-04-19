@@ -1162,7 +1162,10 @@ def create_app() -> Flask:
               </div>
             </div>
 
-            <!-- Google Sheets -->
+          </form>
+
+          <!-- Google Sheets - standalone form -->
+          <form method="post" action="/save-sheet-target">
             <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
               <div class="flex items-center justify-between mb-1">
                 <h2 class="font-semibold text-gray-900">Google Sheets Target</h2>
@@ -1184,15 +1187,26 @@ def create_app() -> Flask:
                   <input name="spreadsheet_input" value="{escape(sheet_current_id)}"
                     placeholder="Paste a Google Sheets URL or spreadsheet ID"
                     class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                  {f'<p class="text-xs text-emerald-600 mt-1">&#10003; Currently saved: <span class="font-medium">{escape(sheet_current_id)}</span></p>' if sheet_current_id else '<p class="text-xs text-gray-400 mt-1">No spreadsheet saved yet.</p>'}
                 </div>
                 <div>
                   <label class="block text-sm font-medium text-gray-700 mb-1.5">Sheet tab name</label>
                   <input name="sheet_name" value="{escape(sheet_name_val)}"
                     placeholder="Sheet1"
                     class="w-48 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                  {f'<p class="text-xs text-emerald-600 mt-1">&#10003; Currently saved: <span class="font-medium">{escape(sheet_name_val)}</span></p>' if sheet_current_id else ""}
+                </div>
+                <div>
+                  <button type="submit"
+                    class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg transition-colors">
+                    Save Spreadsheet Settings
+                  </button>
                 </div>
               </div>
             </div>
+          </form>
+
+          <form method="post" action="/save" enctype="multipart/form-data" class="space-y-6">
 
             <!-- Stats Fields -->
             <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
@@ -1244,21 +1258,28 @@ def create_app() -> Flask:
             valid = DEFAULT_STATS_FIELDS
         set_stats_fields(config.admin_db_file, valid)
 
-        picked = (request.form.get("spreadsheet_pick") or "").strip()
-        entered = (request.form.get("spreadsheet_input") or "").strip()
-        spreadsheet_id = _extract_spreadsheet_id(picked or entered)
-        sheet_name = (request.form.get("sheet_name") or "Sheet1").strip()
-        set_sheet_target(config.admin_db_file, spreadsheet_id=spreadsheet_id, sheet_name=sheet_name)
-        target = {"spreadsheet_id": spreadsheet_id, "sheet_name": sheet_name}
-        creds = load_admin_credentials(config)
-        ok, _ = _sheets_status_data(config, creds, target)
         aliases = _save_submitter_aliases_from_form(config, request.form)
-        msg = "Settings saved. Sheets connection is ready." if ok else "Settings saved."
+        msg = "Settings saved."
         if aliases:
             msg += " Submitter names saved."
         session["save_notice"] = f"success:{msg}"
 
         set_json_setting(config.admin_db_file, "settings_version", {"updated": True})
+        return redirect(url_for("index"))
+
+    @app.post("/save-sheet-target")
+    @require_login
+    def save_sheet_target():
+        picked = (request.form.get("spreadsheet_pick") or "").strip()
+        entered = (request.form.get("spreadsheet_input") or "").strip()
+        spreadsheet_id = _extract_spreadsheet_id(picked or entered)
+        sheet_name = (request.form.get("sheet_name") or "Sheet1").strip() or "Sheet1"
+        set_sheet_target(config.admin_db_file, spreadsheet_id=spreadsheet_id, sheet_name=sheet_name)
+        target = {"spreadsheet_id": spreadsheet_id, "sheet_name": sheet_name}
+        creds = load_admin_credentials(config)
+        ok, _ = _sheets_status_data(config, creds, target)
+        msg = "Spreadsheet settings saved. Connection is ready." if ok else "Spreadsheet settings saved."
+        session["save_notice"] = f"success:{msg}"
         return redirect(url_for("index"))
 
     @app.post("/apply-submitter-aliases")
