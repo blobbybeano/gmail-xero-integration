@@ -25,6 +25,10 @@ def _base_url() -> str:
     explicit = os.getenv("APP_BASE_URL", "").strip().rstrip("/")
     if explicit:
         return explicit
+    # Fly.io provides FLY_APP_NAME in all deployed machines
+    fly_app = os.getenv("FLY_APP_NAME", "").strip()
+    if fly_app:
+        return f"https://{fly_app}.fly.dev"
     # Replit provides this in both dev and deployed environments
     replit_domain = os.getenv("REPLIT_DEV_DOMAIN", "").strip()
     if replit_domain:

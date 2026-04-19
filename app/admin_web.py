@@ -101,6 +101,34 @@ def _page(body: str) -> str:
     return _BASE_HTML.format(body=body)
 
 
+def _current_base_url() -> str:
+    """Return the public HTTPS base URL from the current request — works on any domain."""
+    base = request.host_url.rstrip("/")
+    return base.replace("http://", "https://", 1)
+
+
+def _url_row(label: str, url: str, hint: str) -> str:
+    """Render a copy-able URL row for the Deployment URLs panel."""
+    url_esc = escape(url)
+    url_js = url.replace("'", "\\'")
+    return (
+        f'<div class="flex items-center gap-3 px-5 py-3">'
+        f'<div class="min-w-0 flex-1">'
+        f'<p class="text-xs font-medium text-gray-700">{label}</p>'
+        f'<p class="text-xs text-gray-400 mt-0.5">{escape(hint)}</p>'
+        f'</div>'
+        f'<div class="flex items-center gap-2 shrink-0">'
+        f'<code class="text-xs font-mono text-indigo-700 bg-indigo-50 px-2 py-1 rounded truncate max-w-xs hidden sm:block">{url_esc}</code>'
+        f'<button type="button" '
+        f'onclick="navigator.clipboard.writeText(\'{url_js}\');this.textContent=\'Copied!\';setTimeout(()=>this.textContent=\'Copy\',1500)" '
+        f'class="shrink-0 px-2.5 py-1 text-xs font-medium bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg transition-colors">'
+        f'Copy'
+        f'</button>'
+        f'</div>'
+        f'</div>'
+    )
+
+
 def _extract_spreadsheet_id(value: str) -> str:
     text = (value or "").strip()
     if not text:
@@ -230,22 +258,28 @@ def _get_xero_creds(config: AppConfig) -> tuple[str, str]:
     return client_id, client_secret
 
 
-def _xero_authorization_url(config: AppConfig, state: str) -> str:
+def _xero_authorization_url(
+    config: AppConfig, state: str, redirect_uri: str | None = None
+) -> str:
     client_id, _ = _get_xero_creds(config)
+    uri = redirect_uri or config.xero_redirect_uri
     # Build manually so spaces in scope are encoded as %20 (not +) — Xero requires %20
     scope_str = _xero_scope_string(config.xero_scopes)
     base_params = urllib.parse.urlencode({
         "response_type": "code",
         "client_id": client_id,
-        "redirect_uri": config.xero_redirect_uri,
+        "redirect_uri": uri,
         "state": state,
     })
     scope_param = "scope=" + urllib.parse.quote(scope_str, safe="")
     return f"{XERO_AUTH_URL}?{base_params}&{scope_param}"
 
 
-def _exchange_xero_code(config: AppConfig, code: str) -> dict:
+def _exchange_xero_code(
+    config: AppConfig, code: str, redirect_uri: str | None = None
+) -> dict:
     client_id, client_secret = _get_xero_creds(config)
+    uri = redirect_uri or config.xero_redirect_uri
     basic = base64.b64encode(
         f"{client_id}:{client_secret}".encode()
     ).decode()
@@ -253,7 +287,7 @@ def _exchange_xero_code(config: AppConfig, code: str) -> dict:
     data = {
         "grant_type": "authorization_code",
         "code": code,
-        "redirect_uri": config.xero_redirect_uri,
+        "redirect_uri": uri,
     }
     response = requests.post(XERO_TOKEN_URL, headers=headers, data=data, timeout=30)
     response.raise_for_status()
@@ -652,9 +686,11 @@ def create_app() -> Flask:
             session["save_notice"] = "error:Xero connect failed: enter your Client ID and Secret in the Xero card first."
             return redirect(url_for("index"))
         state = secrets.token_urlsafe(24)
-        xero_auth_url = _xero_authorization_url(config, state)
+        dynamic_xero_redirect = _current_base_url() + "/xero/callback"
+        xero_auth_url = _xero_authorization_url(config, state, redirect_uri=dynamic_xero_redirect)
         session["xero_oauth_state"] = state
         session["xero_auth_url"] = xero_auth_url
+        session["xero_redirect_uri"] = dynamic_xero_redirect
         return redirect(url_for("index"))
 
     @app.get("/xero/callback")
@@ -687,7 +723,11 @@ def create_app() -> Flask:
             </div>
             """), 400
         try:
-            token = _exchange_xero_code(config, code)
+            dynamic_xero_redirect = (
+                session.get("xero_redirect_uri")
+                or _current_base_url() + "/xero/callback"
+            )
+            token = _exchange_xero_code(config, code, redirect_uri=dynamic_xero_redirect)
             tenant_id = _get_xero_tenant_id(token.get("access_token", ""))
         except Exception as exc:
             return _page(f"""
@@ -744,14 +784,16 @@ def create_app() -> Flask:
             )
             return redirect(url_for("index"))
         try:
-            auth_url, state = oauth_authorization_url(config)
+            dynamic_google_redirect = _current_base_url() + "/oauth/callback"
+            auth_url, state = oauth_authorization_url(config, redirect_uri=dynamic_google_redirect)
         except Exception as exc:
             session["save_notice"] = f"error:Could not start Google OAuth: {exc}"
             return redirect(url_for("index"))
-        print(f"[Google OAuth] redirect_uri={config.google_oauth_redirect_uri}")
+        print(f"[Google OAuth] redirect_uri={dynamic_google_redirect}")
         print(f"[Google OAuth] auth_url={auth_url}")
         session["oauth_state"] = state
         session["oauth_auth_url"] = auth_url
+        session["google_redirect_uri"] = dynamic_google_redirect
         set_json_setting(config.admin_db_file, "oauth_pending_state", state)
         set_json_setting(config.admin_db_file, "oauth_auth_url", auth_url)
         return redirect(url_for("index"))
@@ -782,7 +824,11 @@ def create_app() -> Flask:
               </div>
             </div>
             """), 400
-        creds = oauth_exchange_code(config, state=state, code=code)
+        dynamic_google_redirect = (
+            session.get("google_redirect_uri")
+            or _current_base_url() + "/oauth/callback"
+        )
+        creds = oauth_exchange_code(config, state=state, code=code, redirect_uri=dynamic_google_redirect)
         save_admin_credentials(config, creds)
         session["logged_in"] = True
         session.pop("oauth_state", None)
@@ -1406,9 +1452,10 @@ function toggleEnabled() {{
         else:
             gcal_watch_badge = '<span class="text-xs font-medium text-gray-500 bg-gray-100 px-2 py-0.5 rounded-full">Polling only</span>'
 
-        # --- Xero credential hints ---
-        xero_redirect = escape(config.xero_redirect_uri)
-        google_redirect = escape(config.google_oauth_redirect_uri)
+        # --- Deployment URLs (always computed from live request so they auto-update with domain) ---
+        _req_base = _current_base_url()
+        google_redirect = escape(_req_base + "/oauth/callback")
+        xero_redirect = escape(_req_base + "/xero/callback")
 
         # --- Pending Google auth URL block ---
         if pending_auth_url:
@@ -1471,6 +1518,26 @@ function toggleEnabled() {{
           </div>
 
           {notice_html}
+
+          <!-- Deployment URLs Panel -->
+          <div class="bg-white border border-gray-200 rounded-2xl shadow-sm mb-6 overflow-hidden">
+            <div class="flex items-center justify-between px-5 py-3 border-b border-gray-100 bg-gray-50">
+              <div class="flex items-center gap-2">
+                <svg class="w-4 h-4 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"/>
+                </svg>
+                <span class="text-sm font-semibold text-gray-800">Deployment URLs</span>
+                <span class="text-xs text-gray-400 font-normal ml-1">— auto-updates with your domain</span>
+              </div>
+              <span class="text-xs font-mono text-indigo-600 truncate max-w-xs">{escape(_req_base)}</span>
+            </div>
+            <div class="divide-y divide-gray-100">
+              {_url_row("Google OAuth redirect URI", _req_base + "/oauth/callback", "Register in Google Cloud Console → Credentials → OAuth client → Authorised redirect URIs")}
+              {_url_row("Xero OAuth redirect URI", _req_base + "/xero/callback", "Register in Xero Developer Portal → Your App → Redirect URIs")}
+              {_url_row("Google Calendar webhook", _req_base + "/webhooks/google-calendar", "Used automatically when you register watches below")}
+              {_url_row("Xero webhook", _req_base + "/webhooks/xero", "Paste into Xero Developer Portal → Your App → Webhooks")}
+            </div>
+          </div>
 
           <!-- Setup Steps Overview (collapsible) -->
           <details class="bg-indigo-50 border border-indigo-100 rounded-2xl mb-6 group">

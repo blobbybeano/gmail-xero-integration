@@ -45,11 +45,15 @@ def build_sheets_service_from_creds(creds: Credentials):
     return build("sheets", "v4", credentials=creds)
 
 
-def oauth_authorization_url(config: AppConfig) -> tuple[str, str]:
+def oauth_authorization_url(
+    config: AppConfig,
+    redirect_uri: str | None = None,
+) -> tuple[str, str]:
+    uri = redirect_uri or config.google_oauth_redirect_uri
     flow = Flow.from_client_secrets_file(
         config.google_credentials_file,
         scopes=_scopes(config),
-        redirect_uri=config.google_oauth_redirect_uri,
+        redirect_uri=uri,
     )
     state = secrets.token_urlsafe(24)
     auth_url, returned_state = flow.authorization_url(
@@ -65,12 +69,14 @@ def oauth_exchange_code(
     config: AppConfig,
     state: str,
     code: str,
+    redirect_uri: str | None = None,
 ) -> Credentials:
+    uri = redirect_uri or config.google_oauth_redirect_uri
     flow = Flow.from_client_secrets_file(
         config.google_credentials_file,
         scopes=_scopes(config),
         state=state,
-        redirect_uri=config.google_oauth_redirect_uri,
+        redirect_uri=uri,
     )
     flow.fetch_token(code=code)
     return flow.credentials

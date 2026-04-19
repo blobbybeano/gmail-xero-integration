@@ -9,9 +9,15 @@ primary_region = "lhr"
   WEB_PORT = "8080"
   PYTHONUNBUFFERED = "1"
   POLL_SECONDS = "20"
+  ADMIN_DB_FILE = "/data/admin.db"
+  STATE_FILE = "/data/state.json"
+  XERO_TOKEN_FILE = "/data/xero_token.json"
+  GOOGLE_TOKEN_FILE = "/data/google_token.json"
+  GOOGLE_ADMIN_TOKEN_FILE = "/data/google_admin_token.json"
+  GOOGLE_CREDENTIALS_FILE = "/data/credentials.json"
 
 [processes]
-  web = "gunicorn -b 0.0.0.0:8080 'app.admin_web:create_app()'"
+  web = "gunicorn -b 0.0.0.0:8080 --workers 1 --threads 4 --timeout 120 'app.admin_web:create_app()'"
   worker = "python -m app.main"
 
 [http_service]
@@ -26,3 +32,9 @@ primary_region = "lhr"
   memory = "512mb"
   cpu_kind = "shared"
   cpus = 1
+  processes = ["web", "worker"]
+
+[[mounts]]
+  source = "powwash_data"
+  destination = "/data"
+  processes = ["web", "worker"]
