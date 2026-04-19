@@ -418,6 +418,60 @@ def _status_badge(ok: bool, text: str) -> str:
     )
 
 
+def _xero_account_mapping_card(
+    xero_ok: bool,
+    revenue_accounts: list,
+    bank_accounts: list,
+    saved_invoice: str,
+    saved_payment: str,
+) -> str:
+    if not xero_ok:
+        return (
+            '<div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6 opacity-50">'
+            '<h2 class="font-semibold text-gray-900 mb-1">Xero Account Mapping</h2>'
+            '<p class="text-sm text-gray-400">Connect Xero first to configure account mapping.</p>'
+            '</div>'
+        )
+
+    def _opts(accounts, saved):
+        out = '<option value="">— select account —</option>'
+        for a in sorted(accounts, key=lambda x: x.get("Name", "")):
+            code = escape(a.get("Code", ""))
+            name = escape(a.get("Name", ""))
+            sel = ' selected' if a.get("Code", "") == saved else ""
+            out += f'<option value="{code}"{sel}>{name} ({code})</option>'
+        return out
+
+    rev_opts = _opts(revenue_accounts, saved_invoice)
+    bank_opts = _opts(bank_accounts, saved_payment)
+
+    return f"""
+    <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
+      <h2 class="font-semibold text-gray-900 mb-1">Xero Account Mapping</h2>
+      <p class="text-sm text-gray-500 mb-4">Choose which Xero accounts invoices and payments are posted to.</p>
+      <form method="post" action="/save-xero-accounts" class="space-y-4">
+        <div>
+          <label class="block text-xs font-medium text-gray-700 mb-1">Invoice income account <span class="text-gray-400 font-normal">(revenue / sales)</span></label>
+          <select name="invoice_account_code"
+            class="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300">
+            {rev_opts}
+          </select>
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-gray-700 mb-1">Payment bank account <span class="text-gray-400 font-normal">(where payments land)</span></label>
+          <select name="payment_account_code"
+            class="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300">
+            {bank_opts}
+          </select>
+        </div>
+        <button type="submit"
+          class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg transition-colors">
+          Save Account Mapping
+        </button>
+      </form>
+    </div>"""
+
+
 def _btn_primary(label: str, href: str = "", form_action: str = "", extra_class: str = "") -> str:
     if href:
         return (
@@ -545,6 +599,16 @@ def create_app() -> Flask:
             session["save_notice"] = "success:Xero credentials saved. Now click Connect Xero."
         else:
             session["save_notice"] = "error:No credentials entered."
+        return redirect(url_for("index"))
+
+    @app.post("/save-xero-accounts")
+    @require_login
+    def save_xero_accounts():
+        invoice_code = (request.form.get("invoice_account_code") or "").strip()
+        payment_code = (request.form.get("payment_account_code") or "").strip()
+        set_json_setting(config.admin_db_file, "xero_invoice_account_code", invoice_code)
+        set_json_setting(config.admin_db_file, "xero_payment_account_code", payment_code)
+        session["save_notice"] = "success:Xero account mapping saved."
         return redirect(url_for("index"))
 
     @app.get("/connect-xero")
@@ -719,6 +783,39 @@ def create_app() -> Flask:
         xero_has_creds = bool(stored_xero_id and stored_xero_secret)
         # Read once and clear (like save_notice) — shows after Connect click, gone on next refresh
         xero_pending_auth_url = session.pop("xero_auth_url", None) or "" if not xero_ok else ""
+
+        # Fetch Xero accounts for account-mapping UI
+        xero_revenue_accounts = []
+        xero_bank_accounts = []
+        if xero_ok:
+            try:
+                import json as _json
+                with open(config.xero_token_file, "r", encoding="utf-8") as _f:
+                    _tok = _json.load(_f)
+                _at = _tok["access_token"]
+                _cr = requests.get(
+                    "https://api.xero.com/connections",
+                    headers={"Authorization": f"Bearer {_at}", "Accept": "application/json"},
+                    timeout=10,
+                )
+                _tenant = _cr.json()[0]["tenantId"]
+                _ar = requests.get(
+                    "https://api.xero.com/api.xro/2.0/Accounts",
+                    headers={"Authorization": f"Bearer {_at}", "Xero-tenant-id": _tenant, "Accept": "application/json"},
+                    timeout=10,
+                )
+                for _a in _ar.json().get("Accounts", []):
+                    if _a.get("Status") != "ACTIVE":
+                        continue
+                    _t = _a.get("Type", "")
+                    if _t in ("REVENUE", "SALES", "OTHERINCOME"):
+                        xero_revenue_accounts.append(_a)
+                    elif _t == "BANK":
+                        xero_bank_accounts.append(_a)
+            except Exception:
+                pass
+        saved_invoice_account = str(get_json_setting(config.admin_db_file, "xero_invoice_account_code", ""))
+        saved_payment_account = str(get_json_setting(config.admin_db_file, "xero_payment_account_code", ""))
         pending_auth_url = (
             session.get("oauth_auth_url")
             or str(get_json_setting(config.admin_db_file, "oauth_auth_url", "")).strip()
@@ -899,29 +996,36 @@ def create_app() -> Flask:
 
           {notice_html}
 
-          <!-- Setup Steps Overview -->
-          <div class="bg-indigo-50 border border-indigo-100 rounded-2xl p-6 mb-6">
-            <h2 class="text-sm font-semibold text-indigo-900 mb-3 flex items-center gap-2">
-              <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
-                <path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clip-rule="evenodd"/>
+          <!-- Setup Steps Overview (collapsible) -->
+          <details class="bg-indigo-50 border border-indigo-100 rounded-2xl mb-6 group">
+            <summary class="flex items-center justify-between cursor-pointer px-6 py-4 list-none select-none">
+              <h2 class="text-sm font-semibold text-indigo-900 flex items-center gap-2">
+                <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+                  <path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clip-rule="evenodd"/>
+                </svg>
+                Quick Setup Guide
+              </h2>
+              <svg class="w-4 h-4 text-indigo-400 transition-transform duration-200 group-open:rotate-180" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
               </svg>
-              Quick Setup Guide
-            </h2>
-            <ol class="space-y-2 text-sm text-indigo-800">
-              <li class="flex gap-2"><span class="font-bold shrink-0">1.</span>
-                <span>Create a <a href="https://console.cloud.google.com/apis/credentials" target="_blank" class="underline font-medium hover:text-indigo-600">Google Cloud OAuth 2.0 client</a> (type: <em>Web application</em>), add <code class="bg-indigo-100 px-1 rounded text-xs">{google_redirect}</code> as an authorised redirect URI, then download the JSON and upload it in the Google section below.</span>
-              </li>
-              <li class="flex gap-2"><span class="font-bold shrink-0">2.</span>
-                <span>Enable the <a href="https://console.cloud.google.com/apis/library/calendar-json.googleapis.com" target="_blank" class="underline font-medium hover:text-indigo-600">Google Calendar API</a> and <a href="https://console.cloud.google.com/apis/library/sheets.googleapis.com" target="_blank" class="underline font-medium hover:text-indigo-600">Google Sheets API</a> in your Google Cloud project.</span>
-              </li>
-              <li class="flex gap-2"><span class="font-bold shrink-0">3.</span>
-                <span>Create a <a href="https://developer.xero.com/app/manage" target="_blank" class="underline font-medium hover:text-indigo-600">Xero app</a> (type: <em>Web app</em>), set the redirect URI to <code class="bg-indigo-100 px-1 rounded text-xs">{xero_redirect}</code>, and add <code class="bg-indigo-100 px-1 rounded text-xs">XERO_CLIENT_ID</code> / <code class="bg-indigo-100 px-1 rounded text-xs">XERO_CLIENT_SECRET</code> as environment variables.</span>
-              </li>
-              <li class="flex gap-2"><span class="font-bold shrink-0">4.</span>
-                <span>Click <strong>Connect Google</strong> and <strong>Connect Xero</strong> below, then select your calendars and save.</span>
-              </li>
-            </ol>
-          </div>
+            </summary>
+            <div class="px-6 pb-5">
+              <ol class="space-y-2 text-sm text-indigo-800">
+                <li class="flex gap-2"><span class="font-bold shrink-0">1.</span>
+                  <span>Create a <a href="https://console.cloud.google.com/apis/credentials" target="_blank" class="underline font-medium hover:text-indigo-600">Google Cloud OAuth 2.0 client</a> (type: <em>Web application</em>), add <code class="bg-indigo-100 px-1 rounded text-xs">{google_redirect}</code> as an authorised redirect URI, then download the JSON and upload it in the Google section below.</span>
+                </li>
+                <li class="flex gap-2"><span class="font-bold shrink-0">2.</span>
+                  <span>Enable the <a href="https://console.cloud.google.com/apis/library/calendar-json.googleapis.com" target="_blank" class="underline font-medium hover:text-indigo-600">Google Calendar API</a> and <a href="https://console.cloud.google.com/apis/library/sheets.googleapis.com" target="_blank" class="underline font-medium hover:text-indigo-600">Google Sheets API</a> in your Google Cloud project.</span>
+                </li>
+                <li class="flex gap-2"><span class="font-bold shrink-0">3.</span>
+                  <span>Create a <a href="https://developer.xero.com/app/manage" target="_blank" class="underline font-medium hover:text-indigo-600">Xero app</a> (type: <em>Web app</em>), set the redirect URI to <code class="bg-indigo-100 px-1 rounded text-xs">{xero_redirect}</code>, and add <code class="bg-indigo-100 px-1 rounded text-xs">XERO_CLIENT_ID</code> / <code class="bg-indigo-100 px-1 rounded text-xs">XERO_CLIENT_SECRET</code> as environment variables.</span>
+                </li>
+                <li class="flex gap-2"><span class="font-bold shrink-0">4.</span>
+                  <span>Click <strong>Connect Google</strong> and <strong>Connect Xero</strong> below, then select your calendars and save.</span>
+                </li>
+              </ol>
+            </div>
+          </details>
 
           <form method="post" action="/save" enctype="multipart/form-data" class="space-y-6">
 
@@ -1025,6 +1129,9 @@ def create_app() -> Flask:
                 </a>
               </div>
             </div>
+
+            <!-- Xero Account Mapping -->
+            {_xero_account_mapping_card(xero_ok, xero_revenue_accounts, xero_bank_accounts, saved_invoice_account, saved_payment_account)}
 
             <!-- Active Calendars -->
             <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
