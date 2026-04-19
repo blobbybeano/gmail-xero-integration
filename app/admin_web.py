@@ -624,19 +624,26 @@ def create_app() -> Flask:
 
     @app.get("/oauth/callback")
     def oauth_callback():
+        print(f"[OAuth Callback] ALL args from Google: {dict(request.args)}")
         code = request.args.get("code") or ""
         state = request.args.get("state") or ""
+        google_error = request.args.get("error") or ""
+        if google_error:
+            print(f"[OAuth Callback] Google returned ERROR: {google_error}")
         expected_session = session.get("oauth_state") or ""
         expected_store = str(
             get_json_setting(config.admin_db_file, "oauth_pending_state", "")
         ).strip()
         state_ok = bool(state) and (state == expected_session or state == expected_store)
         if not code or not state_ok:
-            return _page("""
+            error_detail = google_error or ("missing code" if not code else "state mismatch")
+            print(f"[OAuth Callback] Failing: code={'present' if code else 'MISSING'}, state_ok={state_ok}, google_error={google_error!r}")
+            return _page(f"""
             <div class="min-h-screen flex items-center justify-center bg-gray-50">
               <div class="bg-white rounded-2xl shadow p-8 max-w-md w-full text-center">
-                <p class="text-red-600 font-medium mb-2">OAuth callback invalid state/code.</p>
-                <p class="text-gray-500 text-sm mb-4">Use one host consistently for login and callback, then retry.</p>
+                <p class="text-red-600 font-medium mb-2">OAuth callback failed.</p>
+                <p class="text-gray-700 text-sm mb-2">Google said: <strong>{error_detail}</strong></p>
+                <p class="text-gray-500 text-sm mb-4">code={'present' if code else 'missing'} &nbsp;|&nbsp; state_ok={state_ok}</p>
                 <a href="/" class="text-indigo-600 hover:underline text-sm">Back to dashboard</a>
               </div>
             </div>
