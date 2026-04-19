@@ -194,3 +194,11 @@ def get_xero_webhook_key(db_path: str) -> str:
 
 def set_xero_webhook_key(db_path: str, key: str) -> None:
     set_json_setting(db_path, "xero_webhook_key", key.strip())
+
+
+def get_xero_webhook_verified(db_path: str) -> bool:
+    return bool(get_json_setting(db_path, "xero_webhook_verified", False))
+
+
+def set_xero_webhook_verified(db_path: str, verified: bool) -> None:
+    set_json_setting(db_path, "xero_webhook_verified", verified)

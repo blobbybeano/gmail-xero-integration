@@ -51,6 +51,8 @@ from .admin_store import (
     delete_google_watch,
     get_xero_webhook_key,
     set_xero_webhook_key,
+    get_xero_webhook_verified,
+    set_xero_webhook_verified,
 )
 from .trigger import trigger_poll
 from .state import load_state
@@ -974,6 +976,7 @@ def create_app() -> Flask:
         # --- Webhook state ---
         watches = get_google_watches(config.admin_db_file)
         xero_wh_key = get_xero_webhook_key(config.admin_db_file)
+        xero_wh_verified = get_xero_webhook_verified(config.admin_db_file)
         base_url = request.host_url.rstrip("/")
         # Replit proxies HTTPS → HTTP internally; always show the public HTTPS URL
         base_url = base_url.replace("http://", "https://", 1)
@@ -1296,7 +1299,7 @@ def create_app() -> Flask:
             <div class="border border-gray-100 rounded-xl p-4">
               <div class="flex items-center justify-between mb-3">
                 <h3 class="text-sm font-semibold text-gray-800">Xero — Invoice Payment Webhooks</h3>
-                {('<span class="text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full">Key saved</span>' if xero_wh_key else '<span class="text-xs font-medium text-gray-500 bg-gray-100 px-2 py-0.5 rounded-full">Not configured</span>')}
+                {('<span class="text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full">&#10003; Verified</span>' if xero_wh_verified else ('<span class="text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full">Key saved — awaiting verification</span>' if xero_wh_key else '<span class="text-xs font-medium text-gray-500 bg-gray-100 px-2 py-0.5 rounded-full">Not configured</span>'))}
               </div>
               <p class="text-xs text-gray-500 mb-3">When an invoice is paid in Xero, Xero will call this app and the sheet row will be updated to <strong>Paid</strong> automatically.</p>
 
@@ -1486,6 +1489,9 @@ def create_app() -> Flask:
 
         events = payload.get("events", [])
         if not events:
+            # This is an intent-to-receive verification ping from Xero — mark as verified
+            set_xero_webhook_verified(config.admin_db_file, True)
+            print("[webhook] Xero intent-to-receive verified successfully", flush=True)
             return "", 200
 
         app_state = load_state(config.state_file)
@@ -1592,7 +1598,8 @@ def create_app() -> Flask:
     def save_xero_webhook_key():
         key = (request.form.get("xero_webhook_key") or "").strip()
         set_xero_webhook_key(config.admin_db_file, key)
-        session["save_notice"] = "success:Xero webhook key saved."
+        set_xero_webhook_verified(config.admin_db_file, False)
+        session["save_notice"] = "success:Xero webhook key saved. Now click \"Send intent to receive\" in the Xero Developer portal to verify."
         return redirect(url_for("index"))
 
     return app
