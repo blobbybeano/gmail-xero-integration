@@ -8,10 +8,15 @@ from app.admin_web import create_app
 from app.main import run as run_poller
 
 def _start_poller():
-    try:
-        run_poller()
-    except Exception as exc:
-        print(f"[poller] fatal error: {exc}", flush=True)
+    import time
+    delay = 5
+    while True:
+        try:
+            run_poller()
+        except Exception as exc:
+            print(f"[poller] fatal error: {exc} — restarting in {delay}s", flush=True)
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
 
 poller_thread = threading.Thread(target=_start_poller, name="calendar-poller", daemon=True)
 poller_thread.start()

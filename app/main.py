@@ -229,6 +229,7 @@ def run() -> None:
             return state
 
     while True:
+        xero_client = build_xero_client(config)
         now = dt.datetime.now(dt.timezone.utc)
         time_min = now - dt.timedelta(days=365)
         time_max = now + dt.timedelta(days=365)

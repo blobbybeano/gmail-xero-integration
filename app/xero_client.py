@@ -56,11 +56,15 @@ class XeroClient:
     def _refresh_access_token(self) -> bool:
         if not self.refresh_token:
             return False
-        refreshed = refresh_xero_token(
-            client_id=self.client_id,
-            client_secret=self.client_secret,
-            refresh_token=self.refresh_token,
-        )
+        try:
+            refreshed = refresh_xero_token(
+                client_id=self.client_id,
+                client_secret=self.client_secret,
+                refresh_token=self.refresh_token,
+            )
+        except Exception as exc:
+            print(f"[xero] token refresh failed: {exc}", flush=True)
+            return False
         refreshed["tenant_id"] = self.tenant_id
         save_xero_token(self.token_file, refreshed)
         self.access_token = refreshed.get("access_token", self.access_token)
