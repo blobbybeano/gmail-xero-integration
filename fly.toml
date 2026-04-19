@@ -1,40 +1,23 @@
-app = "powwash-gcal-xero"
-primary_region = "lhr"
+# fly.toml app configuration file generated for gmail-xero-integration on 2026-04-19T23:52:37Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'gmail-xero-integration'
+primary_region = 'ams'
 
 [build]
-  dockerfile = "Dockerfile"
-
-[env]
-  WEB_HOST = "0.0.0.0"
-  WEB_PORT = "8080"
-  PYTHONUNBUFFERED = "1"
-  POLL_SECONDS = "20"
-  ADMIN_DB_FILE = "/data/admin.db"
-  STATE_FILE = "/data/state.json"
-  XERO_TOKEN_FILE = "/data/xero_token.json"
-  GOOGLE_TOKEN_FILE = "/data/google_token.json"
-  GOOGLE_ADMIN_TOKEN_FILE = "/data/google_admin_token.json"
-  GOOGLE_CREDENTIALS_FILE = "/data/credentials.json"
-
-[processes]
-  web = "gunicorn -b 0.0.0.0:8080 --workers 1 --threads 4 --timeout 120 'app.admin_web:create_app()'"
-  worker = "python -m app.main"
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = false
+  auto_stop_machines = 'stop'
   auto_start_machines = true
-  min_machines_running = 1
-  processes = ["web"]
+  min_machines_running = 0
+  processes = ['app']
 
 [[vm]]
-  memory = "512mb"
-  cpu_kind = "shared"
+  memory = '1gb'
+  cpu_kind = 'shared'
   cpus = 1
-  processes = ["web", "worker"]
-
-[[mounts]]
-  source = "powwash_data"
-  destination = "/data"
-  processes = ["web", "worker"]
+  memory_mb = 256
