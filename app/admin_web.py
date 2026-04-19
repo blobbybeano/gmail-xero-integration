@@ -446,27 +446,9 @@ def create_app() -> Flask:
 
     @app.get("/login")
     def login():
-        from .config import _base_url
-        direct_url = escape(_base_url())
         return _page(f"""
         <div class="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-50 to-blue-100 px-4">
           <div class="w-full max-w-md">
-            <div class="mb-4 flex items-start gap-3 p-4 bg-amber-50 border border-amber-200 rounded-xl text-amber-900 text-sm">
-              <svg class="w-5 h-5 mt-0.5 shrink-0 text-amber-500" fill="currentColor" viewBox="0 0 20 20">
-                <path fill-rule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clip-rule="evenodd"/>
-              </svg>
-              <div>
-                <p class="font-semibold mb-1">Use this app in its own browser tab</p>
-                <p class="text-amber-800 text-xs mb-2">Google &amp; Xero login won't work inside embedded frames. Bookmark and always open via:</p>
-                <a href="{direct_url}" target="_blank"
-                   class="inline-flex items-center gap-1 font-mono text-xs bg-white border border-amber-300 rounded-lg px-2 py-1 text-amber-900 hover:bg-amber-100 break-all">
-                  {direct_url}
-                  <svg class="w-3 h-3 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/>
-                  </svg>
-                </a>
-              </div>
-            </div>
             <div class="bg-white rounded-2xl shadow-xl p-8">
               <div class="text-center mb-8">
                 <div class="inline-flex items-center justify-center w-16 h-16 bg-indigo-100 rounded-2xl mb-4">
@@ -637,8 +619,10 @@ def create_app() -> Flask:
         print(f"[Google OAuth] redirect_uri={config.google_oauth_redirect_uri}")
         print(f"[Google OAuth] auth_url={auth_url}")
         session["oauth_state"] = state
+        session["oauth_auth_url"] = auth_url
         set_json_setting(config.admin_db_file, "oauth_pending_state", state)
-        return redirect(auth_url)
+        set_json_setting(config.admin_db_file, "oauth_auth_url", auth_url)
+        return redirect(url_for("index"))
 
     @app.get("/oauth/callback")
     def oauth_callback():
@@ -672,6 +656,8 @@ def create_app() -> Flask:
         session.pop("oauth_state", None)
         set_json_setting(config.admin_db_file, "oauth_pending_state", "")
         session["save_notice"] = "success:Google connected successfully."
+        session.pop("oauth_auth_url", None)
+        set_json_setting(config.admin_db_file, "oauth_auth_url", "")
         return redirect(url_for("index"))
 
     @app.get("/")
@@ -694,6 +680,10 @@ def create_app() -> Flask:
         submitter_aliases = get_submitter_aliases(config.admin_db_file)
         client_id = _oauth_client_id(config)
         creds_file_exists = Path(config.google_credentials_file).exists()
+        pending_auth_url = (
+            session.get("oauth_auth_url")
+            or str(get_json_setting(config.admin_db_file, "oauth_auth_url", "")).strip()
+        ) if not google_ok else ""
 
         calendars = []
         spreadsheets = []
@@ -816,8 +806,23 @@ def create_app() -> Flask:
         xero_has_creds = bool(config.xero_client_id and config.xero_client_secret)
         xero_redirect = escape(config.xero_redirect_uri)
         google_redirect = escape(config.google_oauth_redirect_uri)
-        from .config import _base_url
-        app_direct_url = escape(_base_url())
+
+        # --- Pending Google auth URL block ---
+        if pending_auth_url:
+            _esc_url = escape(pending_auth_url)
+            _js_url = pending_auth_url.replace("'", "\\'")
+            _preview = escape(pending_auth_url[:72]) + "..."
+            pending_auth_url_html = (
+                f'<div class="mt-3 p-3 bg-blue-50 border border-blue-200 rounded-xl">'
+                f'<p class="text-xs font-semibold text-blue-800 mb-1">&#128279; Open this link in a new tab to authorise Google:</p>'
+                f'<a href="{_esc_url}" target="_blank" class="block text-xs text-blue-700 underline break-all hover:text-blue-900 mb-2">{_preview}</a>'
+                f'<button type="button" onclick="navigator.clipboard.writeText(\'{_js_url}\');this.textContent=\'Copied!\';setTimeout(()=>this.textContent=\'Copy link\',2000)" '
+                f'class="px-2 py-1 text-xs font-medium bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors">Copy link</button>'
+                f'<p class="text-xs text-blue-600 mt-1.5">After approving in Google, come back here — the status will update automatically.</p>'
+                f'</div>'
+            )
+        else:
+            pending_auth_url_html = ""
 
         return _page(f"""
         <div class="max-w-4xl mx-auto px-4 py-8">
@@ -838,24 +843,6 @@ def create_app() -> Flask:
           </div>
 
           {notice_html}
-
-          <!-- Direct URL Banner -->
-          <div class="mb-6 flex items-start gap-3 p-4 bg-amber-50 border border-amber-200 rounded-xl text-amber-900 text-sm">
-            <svg class="w-5 h-5 mt-0.5 shrink-0 text-amber-500" fill="currentColor" viewBox="0 0 20 20">
-              <path fill-rule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clip-rule="evenodd"/>
-            </svg>
-            <div>
-              <p class="font-semibold mb-1">Open this app in its own browser tab for OAuth to work</p>
-              <p class="text-amber-800 mb-2">Google's login pages won't load inside embedded frames. Always use the direct link below when connecting Google or Xero.</p>
-              <a href="{app_direct_url}" target="_blank"
-                 class="inline-flex items-center gap-1.5 font-mono text-xs bg-white border border-amber-300 rounded-lg px-3 py-1.5 text-amber-900 hover:bg-amber-100 transition-colors">
-                {app_direct_url}
-                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/>
-                </svg>
-              </a>
-            </div>
-          </div>
 
           <!-- Setup Steps Overview -->
           <div class="bg-indigo-50 border border-indigo-100 rounded-2xl p-6 mb-6">
@@ -915,17 +902,19 @@ def create_app() -> Flask:
 
                   <div class="mb-3">
                     {"" if creds_file_exists else '<p class="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">No credentials file uploaded yet. Select your JSON file and click <strong>Upload JSON</strong> first.</p>'}
-                    {"" if not creds_file_exists else '<p class="text-xs text-green-700 bg-green-50 border border-green-200 rounded-lg px-3 py-2">&#10003; Credentials file uploaded. Click <strong>Connect Google</strong> to authorise.</p>'}
+                    {"" if not creds_file_exists else '<p class="text-xs text-green-700 bg-green-50 border border-green-200 rounded-lg px-3 py-2">&#10003; Credentials file uploaded. Click <strong>Connect Google</strong> to generate your authorisation link.</p>'}
                   </div>
 
-                  <div class="flex gap-2 flex-wrap">
+                  {pending_auth_url_html}
+
+                  <div class="flex gap-2 flex-wrap mt-3">
                     <button type="submit" formaction="/upload-google-credentials"
                       class="px-3 py-1.5 text-xs font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors">
                       Upload JSON
                     </button>
                     <a href="/connect-google"
                       class="px-3 py-1.5 text-xs font-medium text-white {"bg-blue-600 hover:bg-blue-700" if creds_file_exists else "bg-gray-300 cursor-not-allowed"} rounded-lg transition-colors">
-                      {"Reconnect Google" if google_ok else "Connect Google"}
+                      {"Reconnect" if google_ok else ("New link" if pending_auth_url else "Connect Google")}
                     </a>
                   </div>
                 </div>
