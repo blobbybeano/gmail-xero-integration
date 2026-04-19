@@ -43,6 +43,7 @@ from .google_admin import (
 )
 from .config import AppConfig
 from .xero_client import load_xero_token, save_xero_token, token_is_expired, refresh_xero_token
+from .google_sheets import backfill_submitter_in_sheet
 
 
 XERO_AUTH_URL = "https://login.xero.com/identity/connect/authorize"
@@ -1299,6 +1300,25 @@ def create_app() -> Flask:
         msg = f"Submitter names saved. Updated {updated} existing calendar entries."
         if errors:
             msg += f" ({errors} updates failed.)"
+
+        creds = load_admin_credentials(config)
+        sheet_target = get_sheet_target(config.admin_db_file)
+        spreadsheet_id = (sheet_target.get("spreadsheet_id") or "").strip()
+        sheet_name = (sheet_target.get("sheet_name") or "Sheet1").strip() or "Sheet1"
+        sheet_updated = 0
+        if creds and spreadsheet_id:
+            try:
+                sheet_updated = backfill_submitter_in_sheet(
+                    creds,
+                    spreadsheet_id=spreadsheet_id,
+                    sheet_name=sheet_name,
+                    aliases=aliases,
+                )
+            except Exception:
+                pass
+        if sheet_updated:
+            msg += f" Updated {sheet_updated} sheet row(s)."
+
         session["save_notice"] = f"success:{msg}"
         set_json_setting(config.admin_db_file, "settings_version", {"updated": True})
         return redirect(url_for("index"))

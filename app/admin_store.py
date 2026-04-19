@@ -8,6 +8,7 @@ from typing import Any
 
 DEFAULT_STATS_FIELDS = [
     "submitter",
+    "customer",
     "invoice_number",
     "receipt_details",
     "slot_datetime",

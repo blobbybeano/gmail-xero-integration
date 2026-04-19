@@ -10,6 +10,7 @@ from .google_admin import build_sheets_service_from_creds
 
 STAT_LABELS = {
     "submitter": "Submitted By",
+    "customer": "Customer",
     "invoice_number": "Invoice Number",
     "receipt_details": "Receipt Details",
     "slot_datetime": "Diary Slot Date/Time",
@@ -85,9 +86,9 @@ def ensure_header(
         .execute()
     )
     values = header_resp.get("values", [])
-    if values:
+    expected = ["Logged At", "Event ID"] + [STAT_LABELS.get(f, f) for f in stats_fields]
+    if values and values[0] == expected:
         return
-    headers = ["Logged At", "Event ID"] + [STAT_LABELS.get(f, f) for f in stats_fields]
     (
         service.spreadsheets()
         .values()
@@ -95,7 +96,7 @@ def ensure_header(
             spreadsheetId=spreadsheet_id,
             range=_header_cell(resolved_sheet_name),
             valueInputOption="USER_ENTERED",
-            body={"values": [headers]},
+            body={"values": [expected]},
         )
         .execute()
     )
@@ -108,10 +109,12 @@ def append_stats_row(
     event_key: str,
     stats_fields: list[str],
     payload: dict[str, Any],
+    event_id_display: str = "",
 ) -> None:
     service = build_sheets_service_from_creds(creds)
     resolved_sheet_name = _resolve_existing_sheet_name(service, spreadsheet_id, sheet_name)
-    row = [datetime.now(timezone.utc).isoformat(), event_key]
+    display_id = event_id_display or event_key
+    row = [datetime.now(timezone.utc).isoformat(), display_id]
     for field in stats_fields:
         value = payload.get(field, "")
         row.append("" if value is None else str(value))
@@ -128,3 +131,57 @@ def append_stats_row(
         )
         .execute()
     )
+
+
+def backfill_submitter_in_sheet(
+    creds: Credentials,
+    spreadsheet_id: str,
+    sheet_name: str,
+    aliases: dict[str, str],
+) -> int:
+    """Find rows where 'Submitted By' matches a known email and replace with the alias."""
+    if not aliases:
+        return 0
+    service = build_sheets_service_from_creds(creds)
+    resolved = _resolve_existing_sheet_name(service, spreadsheet_id, sheet_name)
+
+    resp = (
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range=_sheet_range(resolved))
+        .execute()
+    )
+    rows = resp.get("values", [])
+    if len(rows) < 2:
+        return 0
+
+    header = rows[0]
+    try:
+        sub_col = header.index("Submitted By")
+    except ValueError:
+        return 0
+
+    lower_aliases = {k.lower(): v for k, v in aliases.items()}
+    safe = resolved.replace("'", "''")
+    col_letter = chr(ord("A") + sub_col)
+
+    updates = []
+    for row_idx, row in enumerate(rows[1:], start=2):
+        if len(row) <= sub_col:
+            continue
+        current = row[sub_col].strip()
+        new_val = lower_aliases.get(current.lower())
+        if new_val and new_val != current:
+            updates.append({
+                "range": f"'{safe}'!{col_letter}{row_idx}",
+                "values": [[new_val]],
+            })
+
+    if not updates:
+        return 0
+
+    service.spreadsheets().values().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"valueInputOption": "USER_ENTERED", "data": updates},
+    ).execute()
+    return len(updates)

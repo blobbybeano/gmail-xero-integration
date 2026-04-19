@@ -186,11 +186,13 @@ def run() -> None:
         start = (event.get("start", {}) or {}).get("dateTime") or (event.get("start", {}) or {}).get("date") or ""
         end = (event.get("end", {}) or {}).get("dateTime") or (event.get("end", {}) or {}).get("date") or ""
         slot_text = f"{start} -> {end}".strip(" ->")
+        customer_fields = parse_customer_fields(event.get("description"))
         payload = {
             "submitter": submitter_display
             or (event.get("creator", {}) or {}).get("email")
             or (event.get("organizer", {}) or {}).get("email")
             or "",
+            "customer": customer_fields.get("name") or "",
             "invoice_number": invoice.get("InvoiceNumber") or "",
             "receipt_details": "",
             "slot_datetime": slot_text,
@@ -203,6 +205,7 @@ def run() -> None:
             "job_cost_ex_vat": invoice.get("SubTotal") or "",
             "job_cost_inc_vat": invoice.get("Total") or "",
         }
+        event_id_display = event_key.split(":", 1)[-1] if ":" in event_key else event_key
         try:
             ensure_header(
                 admin_creds,
@@ -217,6 +220,7 @@ def run() -> None:
                 event_key=event_key,
                 stats_fields=stats_fields,
                 payload=payload,
+                event_id_display=event_id_display,
             )
             print(f"Sheets row appended for {event_key}")
             return set_sheet_log_marker(state, event_key, marker)
