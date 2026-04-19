@@ -975,6 +975,8 @@ def create_app() -> Flask:
         watches = get_google_watches(config.admin_db_file)
         xero_wh_key = get_xero_webhook_key(config.admin_db_file)
         base_url = request.host_url.rstrip("/")
+        # Replit proxies HTTPS → HTTP internally; always show the public HTTPS URL
+        base_url = base_url.replace("http://", "https://", 1)
         gcal_webhook_url = f"{base_url}/webhooks/google-calendar"
         xero_webhook_url = f"{base_url}/webhooks/xero"
 
@@ -1548,7 +1550,7 @@ def create_app() -> Flask:
             session["save_notice"] = "error:Google is not connected."
             return redirect(url_for("index"))
         active_cals = get_active_calendars(config.admin_db_file, config.google_calendar_id)
-        base_url = request.host_url.rstrip("/")
+        base_url = request.host_url.rstrip("/").replace("http://", "https://", 1)
         webhook_url = f"{base_url}/webhooks/google-calendar"
         ok = 0
         fail = 0
