@@ -100,7 +100,7 @@ def load_config() -> AppConfig:
         xero_scopes=_split_csv(
             os.getenv(
                 "XERO_SCOPES",
-                "offline_access accounting.transactions accounting.contacts",
+                "offline_access accounting.invoices accounting.payments accounting.contacts accounting.settings",
             )
         ),
         xero_access_token=os.getenv("XERO_ACCESS_TOKEN", ""),
