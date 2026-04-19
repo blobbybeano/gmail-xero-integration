@@ -446,9 +446,27 @@ def create_app() -> Flask:
 
     @app.get("/login")
     def login():
+        from .config import _base_url
+        direct_url = escape(_base_url())
         return _page(f"""
         <div class="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-50 to-blue-100 px-4">
           <div class="w-full max-w-md">
+            <div class="mb-4 flex items-start gap-3 p-4 bg-amber-50 border border-amber-200 rounded-xl text-amber-900 text-sm">
+              <svg class="w-5 h-5 mt-0.5 shrink-0 text-amber-500" fill="currentColor" viewBox="0 0 20 20">
+                <path fill-rule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clip-rule="evenodd"/>
+              </svg>
+              <div>
+                <p class="font-semibold mb-1">Use this app in its own browser tab</p>
+                <p class="text-amber-800 text-xs mb-2">Google &amp; Xero login won't work inside embedded frames. Bookmark and always open via:</p>
+                <a href="{direct_url}" target="_blank"
+                   class="inline-flex items-center gap-1 font-mono text-xs bg-white border border-amber-300 rounded-lg px-2 py-1 text-amber-900 hover:bg-amber-100 break-all">
+                  {direct_url}
+                  <svg class="w-3 h-3 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/>
+                  </svg>
+                </a>
+              </div>
+            </div>
             <div class="bg-white rounded-2xl shadow-xl p-8">
               <div class="text-center mb-8">
                 <div class="inline-flex items-center justify-center w-16 h-16 bg-indigo-100 rounded-2xl mb-4">
@@ -798,6 +816,8 @@ def create_app() -> Flask:
         xero_has_creds = bool(config.xero_client_id and config.xero_client_secret)
         xero_redirect = escape(config.xero_redirect_uri)
         google_redirect = escape(config.google_oauth_redirect_uri)
+        from .config import _base_url
+        app_direct_url = escape(_base_url())
 
         return _page(f"""
         <div class="max-w-4xl mx-auto px-4 py-8">
@@ -818,6 +838,24 @@ def create_app() -> Flask:
           </div>
 
           {notice_html}
+
+          <!-- Direct URL Banner -->
+          <div class="mb-6 flex items-start gap-3 p-4 bg-amber-50 border border-amber-200 rounded-xl text-amber-900 text-sm">
+            <svg class="w-5 h-5 mt-0.5 shrink-0 text-amber-500" fill="currentColor" viewBox="0 0 20 20">
+              <path fill-rule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clip-rule="evenodd"/>
+            </svg>
+            <div>
+              <p class="font-semibold mb-1">Open this app in its own browser tab for OAuth to work</p>
+              <p class="text-amber-800 mb-2">Google's login pages won't load inside embedded frames. Always use the direct link below when connecting Google or Xero.</p>
+              <a href="{app_direct_url}" target="_blank"
+                 class="inline-flex items-center gap-1.5 font-mono text-xs bg-white border border-amber-300 rounded-lg px-3 py-1.5 text-amber-900 hover:bg-amber-100 transition-colors">
+                {app_direct_url}
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/>
+                </svg>
+              </a>
+            </div>
+          </div>
 
           <!-- Setup Steps Overview -->
           <div class="bg-indigo-50 border border-indigo-100 rounded-2xl p-6 mb-6">
