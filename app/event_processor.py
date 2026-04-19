@@ -121,7 +121,6 @@ def ensure_notes_template(description: str | None) -> str:
         "[/contact]\n"
         "\n"
         "[invoice]\n"
-        "\n"
         "[/invoice]\n"
         "\n"
         "DONE Y/N =\n"
@@ -136,7 +135,7 @@ def ensure_notes_template(description: str | None) -> str:
 
     # Ensure invoice block exists. If missing, insert before DONE if present.
     if not _has_invoice_block(description):
-        invoice_block = "[invoice]\n\n[/invoice]\n"
+        invoice_block = "[invoice]\n[/invoice]\n"
         done_repl = f"{invoice_block}DONE"
         lines = description.splitlines()
         for i, line in enumerate(lines):
@@ -213,15 +212,18 @@ def normalize_user_sections(description: str | None) -> str:
             out.append(raw.rstrip())
         return "\n".join(out)
 
+    def _wrap_block(open_tag: str, content: str, close_tag: str) -> str:
+        return f"{open_tag}\n{content}\n{close_tag}" if content else f"{open_tag}\n{close_tag}"
+
     text = re.sub(
         r"(\[contact\])(.*?)(\[/contact\])",
-        lambda m: f"{m.group(1)}\n{_norm_contact(m.group(2).strip())}\n{m.group(3)}",
+        lambda m: _wrap_block(m.group(1), _norm_contact(m.group(2).strip()), m.group(3)),
         text,
         flags=re.I | re.S,
     )
     text = re.sub(
         r"(\[invoice\])(.*?)(\[/invoice\])",
-        lambda m: f"{m.group(1)}\n{_norm_invoice(m.group(2).strip())}\n{m.group(3)}",
+        lambda m: _wrap_block(m.group(1), _norm_invoice(m.group(2).strip()), m.group(3)),
         text,
         flags=re.I | re.S,
     )
@@ -608,7 +610,7 @@ def upsert_invoice_summary(
     while cleaned and not cleaned[-1].strip():
         cleaned.pop()
     if cleaned:
-        summary_lines = ["", ""] + summary_lines
+        summary_lines = [""] + summary_lines
     updated = cleaned + summary_lines
     return "\n".join(updated)
 
@@ -643,7 +645,7 @@ def upsert_send_confirmation(
     while cleaned and not cleaned[-1].strip():
         cleaned.pop()
     if cleaned:
-        summary_lines = ["", ""] + summary_lines
+        summary_lines = [""] + summary_lines
     updated = cleaned + summary_lines
     return "\n".join(updated)
 
@@ -684,7 +686,7 @@ def upsert_send_failure(
     while cleaned and not cleaned[-1].strip():
         cleaned.pop()
     if cleaned:
-        summary_lines = ["", ""] + summary_lines
+        summary_lines = [""] + summary_lines
     return "\n".join(cleaned + summary_lines)
 
 
