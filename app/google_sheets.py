@@ -21,6 +21,18 @@ STAT_LABELS = {
     "job_cost_inc_vat": "Job Cost Inc VAT",
 }
 
+_FIXED_HEADERS = ["Logged At", "Event ID"]
+
+
+def _col_letter(idx: int) -> str:
+    result = ""
+    while True:
+        result = chr(ord("A") + idx % 26) + result
+        idx = idx // 26 - 1
+        if idx < 0:
+            break
+    return result
+
 
 def _sheet_range(sheet_name: str) -> str:
     safe = sheet_name.replace("'", "''")
@@ -30,11 +42,6 @@ def _sheet_range(sheet_name: str) -> str:
 def _header_range(sheet_name: str) -> str:
     safe = sheet_name.replace("'", "''")
     return f"'{safe}'!A1:Z1"
-
-
-def _header_cell(sheet_name: str) -> str:
-    safe = sheet_name.replace("'", "''")
-    return f"'{safe}'!A1"
 
 
 def _resolve_existing_sheet_name(
@@ -69,15 +76,8 @@ def _resolve_existing_sheet_name(
     return titles[0]
 
 
-def ensure_header(
-    creds: Credentials,
-    spreadsheet_id: str,
-    sheet_name: str,
-    stats_fields: list[str],
-) -> None:
-    service = build_sheets_service_from_creds(creds)
-    resolved_sheet_name = _resolve_existing_sheet_name(service, spreadsheet_id, sheet_name)
-    header_resp = (
+def _read_header(service, spreadsheet_id: str, resolved_sheet_name: str) -> list[str]:
+    resp = (
         service.spreadsheets()
         .values()
         .get(
@@ -86,21 +86,66 @@ def ensure_header(
         )
         .execute()
     )
-    values = header_resp.get("values", [])
-    expected = ["Logged At", "Event ID"] + [STAT_LABELS.get(f, f) for f in stats_fields]
-    if values and values[0] == expected:
-        return
+    values = resp.get("values", [])
+    return values[0] if values else []
+
+
+def ensure_header(
+    creds: Credentials,
+    spreadsheet_id: str,
+    sheet_name: str,
+    stats_fields: list[str],
+) -> list[str]:
+    """
+    Ensure the header row exists and contains all expected columns.
+
+    - If no header exists: write the full expected header.
+    - If a header already exists: only APPEND any missing columns to the right.
+      Existing columns are never moved or removed, so old data rows stay aligned.
+
+    Returns the final header list (existing + any newly added columns).
+    """
+    service = build_sheets_service_from_creds(creds)
+    resolved = _resolve_existing_sheet_name(service, spreadsheet_id, sheet_name)
+    existing = _read_header(service, spreadsheet_id, resolved)
+
+    expected_labels = _FIXED_HEADERS + [STAT_LABELS.get(f, f) for f in stats_fields]
+
+    if not existing:
+        safe = resolved.replace("'", "''")
+        (
+            service.spreadsheets()
+            .values()
+            .update(
+                spreadsheetId=spreadsheet_id,
+                range=f"'{safe}'!A1",
+                valueInputOption="USER_ENTERED",
+                body={"values": [expected_labels]},
+            )
+            .execute()
+        )
+        return expected_labels
+
+    missing = [lbl for lbl in expected_labels if lbl not in existing]
+    if not missing:
+        return existing
+
+    next_col = len(existing)
+    safe = resolved.replace("'", "''")
+    start_letter = _col_letter(next_col)
+    end_letter = _col_letter(next_col + len(missing) - 1)
     (
         service.spreadsheets()
         .values()
         .update(
             spreadsheetId=spreadsheet_id,
-            range=_header_cell(resolved_sheet_name),
+            range=f"'{safe}'!{start_letter}1:{end_letter}1",
             valueInputOption="USER_ENTERED",
-            body={"values": [expected]},
+            body={"values": [missing]},
         )
         .execute()
     )
+    return existing + missing
 
 
 def append_stats_row(
@@ -112,20 +157,41 @@ def append_stats_row(
     payload: dict[str, Any],
     event_id_display: str = "",
 ) -> None:
+    """
+    Append a data row to the sheet, placing each value under its correct column
+    header regardless of column order. New columns added later won't misalign
+    existing rows.
+    """
     service = build_sheets_service_from_creds(creds)
-    resolved_sheet_name = _resolve_existing_sheet_name(service, spreadsheet_id, sheet_name)
-    display_id = event_id_display or event_key
-    row = [datetime.now(timezone.utc).isoformat(), display_id]
-    for field in stats_fields:
-        value = payload.get(field, "")
-        row.append("" if value is None else str(value))
+    resolved = _resolve_existing_sheet_name(service, spreadsheet_id, sheet_name)
+    header = _read_header(service, spreadsheet_id, resolved)
 
+    if not header:
+        return
+
+    col_index: dict[str, int] = {label: i for i, label in enumerate(header)}
+
+    row: list[str] = [""] * len(header)
+
+    def _set(label: str, value: Any) -> None:
+        idx = col_index.get(label)
+        if idx is not None:
+            row[idx] = "" if value is None else str(value)
+
+    _set("Logged At", datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M"))
+    _set("Event ID", event_id_display or event_key)
+
+    for field, label in STAT_LABELS.items():
+        if field in payload:
+            _set(label, payload[field])
+
+    safe = resolved.replace("'", "''")
     (
         service.spreadsheets()
         .values()
         .append(
             spreadsheetId=spreadsheet_id,
-            range=_sheet_range(resolved_sheet_name),
+            range=f"'{safe}'!A:A",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body={"values": [row]},
@@ -164,7 +230,7 @@ def backfill_submitter_in_sheet(
 
     lower_aliases = {k.lower(): v for k, v in aliases.items()}
     safe = resolved.replace("'", "''")
-    col_letter = chr(ord("A") + sub_col)
+    col_letter = _col_letter(sub_col)
 
     updates = []
     for row_idx, row in enumerate(rows[1:], start=2):
