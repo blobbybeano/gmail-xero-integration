@@ -840,7 +840,21 @@ def create_app() -> Flask:
             session.get("google_redirect_uri")
             or _current_base_url() + "/oauth/callback"
         )
-        creds = oauth_exchange_code(config, state=state, code=code, redirect_uri=dynamic_google_redirect)
+        try:
+            creds = oauth_exchange_code(config, state=state, code=code, redirect_uri=dynamic_google_redirect)
+        except Exception as exc:
+            print(f"[OAuth Callback] token exchange failed: {exc}")
+            return _page(f"""
+            <div class="min-h-screen flex items-center justify-center bg-gray-50">
+              <div class="bg-white rounded-2xl shadow p-8 max-w-md w-full text-center">
+                <p class="text-red-600 font-medium mb-2">Google token exchange failed.</p>
+                <p class="text-gray-700 text-sm mb-2">{escape(str(exc))}</p>
+                <p class="text-gray-500 text-sm mb-4">Make sure <strong>{escape(dynamic_google_redirect)}</strong> is listed
+                as an authorised redirect URI in your Google Cloud Console OAuth client.</p>
+                <a href="/settings" class="text-indigo-600 hover:underline text-sm">Back to settings</a>
+              </div>
+            </div>
+            """), 400
         save_admin_credentials(config, creds)
         session["logged_in"] = True
         session.pop("oauth_state", None)
