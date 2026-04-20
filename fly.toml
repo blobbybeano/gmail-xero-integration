@@ -1,4 +1,4 @@
-app = "powwash-gcal-xero"
+app = "gmail-xero-integration"
 primary_region = "lhr"
 
 [build]

@@ -58,7 +58,6 @@ def oauth_authorization_url(
     state = secrets.token_urlsafe(24)
     auth_url, returned_state = flow.authorization_url(
         access_type="offline",
-        include_granted_scopes="true",
         state=state,
         prompt="consent",
     )
