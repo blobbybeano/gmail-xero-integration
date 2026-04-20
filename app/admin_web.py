@@ -565,8 +565,20 @@ def _btn_secondary(label: str, href: str = "", form_action: str = "") -> str:
     )
 
 
+def _bootstrap_credentials(config) -> None:
+    """Write credentials from env vars to disk on first boot (Fly.io / Docker)."""
+    import os
+    creds_b64 = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
+    if creds_b64:
+        creds_path = Path(config.google_credentials_file)
+        if not creds_path.exists():
+            creds_path.parent.mkdir(parents=True, exist_ok=True)
+            creds_path.write_bytes(base64.b64decode(creds_b64))
+
+
 def create_app() -> Flask:
     config = load_config()
+    _bootstrap_credentials(config)
     init_admin_store(config.admin_db_file)
 
     app = Flask(__name__)
