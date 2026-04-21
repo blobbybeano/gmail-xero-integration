@@ -231,6 +231,9 @@ def upsert_xero_tenant(
     enabled: bool | None = None,
     invoice_account: str | None = None,
     payment_account: str | None = None,
+    branding_theme_id: str | None = None,
+    premium_theme_id: str | None = None,
+    premium_threshold: float | None = None,
 ) -> None:
     """Create or update a single tenant's config without touching other tenants."""
     tenants = get_xero_tenants(db_path)
@@ -244,6 +247,12 @@ def upsert_xero_tenant(
                 t["invoiceAccount"] = invoice_account
             if payment_account is not None:
                 t["paymentAccount"] = payment_account
+            if branding_theme_id is not None:
+                t["brandingThemeId"] = branding_theme_id
+            if premium_theme_id is not None:
+                t["premiumThemeId"] = premium_theme_id
+            if premium_threshold is not None:
+                t["premiumThreshold"] = premium_threshold
             set_xero_tenants(db_path, tenants)
             return
     entry: dict = {
@@ -252,6 +261,9 @@ def upsert_xero_tenant(
         "enabled": True if enabled is None else enabled,
         "invoiceAccount": invoice_account or "",
         "paymentAccount": payment_account or "",
+        "brandingThemeId": branding_theme_id or "",
+        "premiumThemeId": premium_theme_id or "",
+        "premiumThreshold": premium_threshold,
     }
     tenants.append(entry)
     set_xero_tenants(db_path, tenants)

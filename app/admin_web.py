@@ -523,12 +523,27 @@ def _xero_tenant_cards(
             out += f'<option value="{code}"{sel}>{name} ({code})</option>'
         return out
 
+    def _theme_opts(themes, saved, blank_label="— use Xero default —"):
+        out = f'<option value="">{blank_label}</option>'
+        for th in themes:
+            tid_val = escape(th.get("BrandingThemeID", ""))
+            tname_val = escape(th.get("Name", tid_val))
+            sel = ' selected' if th.get("BrandingThemeID", "") == saved else ""
+            out += f'<option value="{tid_val}"{sel}>{tname_val}</option>'
+        return out
+
     def _saved_badge(accounts, code):
         if not code:
             return '<p class="text-xs text-gray-400 mt-1">No account saved yet.</p>'
         name = _find_name(accounts, code)
         label = escape(f"{name} ({code})") if name else escape(code)
         return f'<p class="text-xs text-emerald-600 mt-1">&#10003; Saved: <span class="font-medium">{label}</span></p>'
+
+    def _theme_saved_badge(themes, theme_id):
+        if not theme_id:
+            return '<p class="text-xs text-gray-400 mt-1">Using Xero default template.</p>'
+        name = next((escape(th.get("Name", theme_id)) for th in themes if th.get("BrandingThemeID") == theme_id), escape(theme_id))
+        return f'<p class="text-xs text-emerald-600 mt-1">&#10003; Saved: <span class="font-medium">{name}</span></p>'
 
     cards_html = ""
     for t in tenant_accounts:
@@ -537,23 +552,36 @@ def _xero_tenant_cards(
         enabled = t.get("enabled", True)
         rev_accounts = t.get("revenueAccounts", [])
         bank_accounts = t.get("bankAccounts", [])
+        themes = t.get("brandingThemes", [])
         saved_inv = t.get("invoiceAccount", "")
         saved_pay = t.get("paymentAccount", "")
+        saved_theme = t.get("brandingThemeId", "")
+        saved_premium_theme = t.get("premiumThemeId", "")
+        saved_threshold = t.get("premiumThreshold")
+        threshold_val = f'{saved_threshold:g}' if saved_threshold is not None else ""
 
         toggle_color = "bg-emerald-500" if enabled else "bg-gray-300"
         toggle_label = "Active" if enabled else "Paused"
-        toggle_dot = "translate-x-5" if enabled else "translate-x-0"
-        status_text = (
-            '<span class="text-emerald-600 text-xs font-medium">● Active — invoices will be created here</span>'
-            if enabled else
-            '<span class="text-gray-400 text-xs font-medium">○ Paused — this organisation is skipped</span>'
-        )
         border_cls = "border-emerald-200" if enabled else "border-gray-200"
 
         rev_opts = _opts(rev_accounts, saved_inv)
         bank_opts = _opts(bank_accounts, saved_pay)
         rev_badge = _saved_badge(rev_accounts, saved_inv)
         bank_badge = _saved_badge(bank_accounts, saved_pay)
+        theme_opts = _theme_opts(themes, saved_theme)
+        theme_badge = _theme_saved_badge(themes, saved_theme)
+
+        premium_theme_opts = _theme_opts(themes, saved_premium_theme, blank_label="— same as default —")
+        premium_theme_badge = _theme_saved_badge(themes, saved_premium_theme)
+
+        no_themes_msg = (
+            '' if themes else
+            '<p class="text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2 mt-1">'
+            'No branding themes found — create one in Xero first (Settings → Invoice Settings → New Style).'
+            '</p>'
+        )
+
+        advanced_open = ' open' if (saved_premium_theme or saved_threshold) else ''
 
         cards_html += f"""
         <details class="bg-white rounded-2xl shadow-sm border {border_cls} overflow-hidden group/org">
@@ -584,6 +612,8 @@ def _xero_tenant_cards(
           <div class="px-5 pb-5 pt-4 border-t border-gray-100">
             <p class="text-xs text-gray-400 font-mono mb-4">{tid}</p>
             <form method="post" action="/save-xero-tenant/{tid}" class="space-y-4">
+
+              <!-- Account mapping -->
               <div>
                 <label class="block text-xs font-medium text-gray-700 mb-1">Invoice income account <span class="text-gray-400 font-normal">(revenue / sales)</span></label>
                 <select name="invoice_account_code"
@@ -600,9 +630,57 @@ def _xero_tenant_cards(
                 </select>
                 {bank_badge}
               </div>
+
+              <!-- Invoice template -->
+              <div class="pt-1 border-t border-gray-100">
+                <label class="block text-xs font-medium text-gray-700 mb-1">Invoice template <span class="text-gray-400 font-normal">(branding theme)</span></label>
+                <select name="branding_theme_id"
+                  class="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300 {"opacity-40" if not themes else ""}">
+                  {theme_opts}
+                </select>
+                {theme_badge}
+                {no_themes_msg}
+              </div>
+
+              <!-- Advanced -->
+              <details class="border border-gray-100 rounded-xl overflow-hidden group/adv"{advanced_open}>
+                <summary class="flex items-center justify-between px-4 py-3 bg-gray-50 cursor-pointer list-none select-none hover:bg-gray-100 transition-colors">
+                  <div class="flex items-center gap-2">
+                    <svg class="w-3.5 h-3.5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"/>
+                    </svg>
+                    <span class="text-xs font-semibold text-gray-700">Advanced — premium template rules</span>
+                  </div>
+                  <svg class="w-3.5 h-3.5 text-gray-400 transition-transform duration-200 group-open/adv:rotate-180 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+                  </svg>
+                </summary>
+                <div class="px-4 py-3 space-y-3">
+                  <p class="text-xs text-gray-500">Use a different invoice template when the job total is above a set amount — handy for VIP or large-spend clients.</p>
+                  <div>
+                    <label class="block text-xs font-medium text-gray-700 mb-1">Premium template <span class="text-gray-400 font-normal">(used when spend is above threshold)</span></label>
+                    <select name="premium_theme_id"
+                      class="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300 {"opacity-40" if not themes else ""}">
+                      {premium_theme_opts}
+                    </select>
+                    {premium_theme_badge}
+                  </div>
+                  <div>
+                    <label class="block text-xs font-medium text-gray-700 mb-1">Spend threshold <span class="text-gray-400 font-normal">(£ — jobs above this use the premium template)</span></label>
+                    <div class="relative">
+                      <span class="absolute left-3 top-1/2 -translate-y-1/2 text-sm text-gray-400 pointer-events-none">£</span>
+                      <input type="number" name="premium_threshold" value="{threshold_val}" min="0" step="0.01"
+                        placeholder="e.g. 500"
+                        class="w-full pl-7 pr-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-300">
+                    </div>
+                    {f'<p class="text-xs text-emerald-600 mt-1">&#10003; Threshold: £{threshold_val}</p>' if threshold_val else '<p class="text-xs text-gray-400 mt-1">No threshold set — premium template unused.</p>'}
+                  </div>
+                </div>
+              </details>
+
               <button type="submit"
                 class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg transition-colors">
-                Save Mapping
+                Save
               </button>
             </form>
           </div>
@@ -774,11 +852,21 @@ def create_app() -> Flask:
     def save_xero_tenant(tenant_id: str):
         invoice_code = (request.form.get("invoice_account_code") or "").strip()
         payment_code = (request.form.get("payment_account_code") or "").strip()
+        branding_theme_id = (request.form.get("branding_theme_id") or "").strip()
+        premium_theme_id = (request.form.get("premium_theme_id") or "").strip()
+        premium_threshold_raw = (request.form.get("premium_threshold") or "").strip()
+        try:
+            premium_threshold = float(premium_threshold_raw) if premium_threshold_raw else None
+        except ValueError:
+            premium_threshold = None
         upsert_xero_tenant(
             config.admin_db_file,
             tenant_id,
             invoice_account=invoice_code,
             payment_account=payment_code,
+            branding_theme_id=branding_theme_id,
+            premium_theme_id=premium_theme_id if premium_theme_id else None,
+            premium_threshold=premium_threshold,
         )
         session["save_notice"] = "success:Account mapping saved."
         return redirect(url_for("index"))
@@ -1427,6 +1515,23 @@ function toggleEnabled() {{
                                 _bank.append(_a)
                     except Exception:
                         pass
+                    _themes: list = []
+                    try:
+                        _tr = requests.get(
+                            "https://api.xero.com/api.xro/2.0/BrandingThemes",
+                            headers={
+                                "Authorization": f"Bearer {_at}",
+                                "Xero-tenant-id": _tid,
+                                "Accept": "application/json",
+                            },
+                            timeout=10,
+                        )
+                        _themes = sorted(
+                            _tr.json().get("BrandingThemes", []),
+                            key=lambda x: (x.get("SortOrder", 999), x.get("Name", "")),
+                        )
+                    except Exception:
+                        pass
                     _cfg = _saved_tenants.get(_tid, {})
                     xero_tenant_account_data.append({
                         "tenantId": _tid,
@@ -1436,6 +1541,10 @@ function toggleEnabled() {{
                         "paymentAccount": _cfg.get("paymentAccount", ""),
                         "revenueAccounts": _rev,
                         "bankAccounts": _bank,
+                        "brandingThemes": _themes,
+                        "brandingThemeId": _cfg.get("brandingThemeId", ""),
+                        "premiumThemeId": _cfg.get("premiumThemeId", ""),
+                        "premiumThreshold": _cfg.get("premiumThreshold"),
                     })
             except Exception:
                 pass
