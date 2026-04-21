@@ -556,47 +556,57 @@ def _xero_tenant_cards(
         bank_badge = _saved_badge(bank_accounts, saved_pay)
 
         cards_html += f"""
-        <div class="bg-white rounded-2xl shadow-sm border {border_cls} p-6">
-          <div class="flex items-start justify-between mb-4">
-            <div>
-              <h3 class="font-semibold text-gray-900 text-base">{tname}</h3>
-              <p class="text-xs text-gray-400 font-mono mt-0.5">{tid}</p>
-              <div class="mt-1">{status_text}</div>
+        <details class="bg-white rounded-2xl shadow-sm border {border_cls} overflow-hidden group/org">
+          <summary class="flex items-center justify-between px-5 py-4 cursor-pointer list-none select-none hover:bg-gray-50 transition-colors">
+            <div class="flex items-center gap-3">
+              <div class="w-2.5 h-2.5 rounded-full {"bg-emerald-400" if enabled else "bg-gray-300"} shrink-0 mt-0.5"></div>
+              <div>
+                <span class="font-semibold text-gray-900 text-sm">{tname}</span>
+                <p class="text-xs {"text-emerald-600" if enabled else "text-gray-400"} mt-0.5">{"Active" if enabled else "Paused"}</p>
+              </div>
             </div>
-            <form method="post" action="/toggle-xero-tenant/{tid}">
-              <button type="submit" title="Toggle {tname}"
-                class="flex items-center gap-2 px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors
-                       {'border-emerald-300 bg-emerald-50 text-emerald-700 hover:bg-emerald-100' if enabled else 'border-gray-300 bg-gray-50 text-gray-600 hover:bg-gray-100'}">
-                <span class="inline-flex w-9 h-5 rounded-full {toggle_color} relative transition-colors">
-                  <span class="absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transform transition-transform {toggle_dot}"></span>
-                </span>
-                {toggle_label}
+            <div class="flex items-center gap-2">
+              <form method="post" action="/toggle-xero-tenant/{tid}" onclick="event.stopPropagation()">
+                <button type="submit" title="Toggle {tname}"
+                  class="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-lg border transition-colors
+                         {'border-emerald-300 bg-emerald-50 text-emerald-700 hover:bg-emerald-100' if enabled else 'border-gray-300 bg-gray-50 text-gray-600 hover:bg-gray-100'}">
+                  <span class="inline-flex w-7 h-4 rounded-full {toggle_color} relative transition-colors">
+                    <span class="absolute top-0.5 left-0.5 w-3 h-3 bg-white rounded-full shadow transform transition-transform {"translate-x-3" if enabled else "translate-x-0"}"></span>
+                  </span>
+                  {toggle_label}
+                </button>
+              </form>
+              <svg class="w-4 h-4 text-gray-400 transition-transform duration-200 group-open/org:rotate-180 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+              </svg>
+            </div>
+          </summary>
+          <div class="px-5 pb-5 pt-4 border-t border-gray-100">
+            <p class="text-xs text-gray-400 font-mono mb-4">{tid}</p>
+            <form method="post" action="/save-xero-tenant/{tid}" class="space-y-4">
+              <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">Invoice income account <span class="text-gray-400 font-normal">(revenue / sales)</span></label>
+                <select name="invoice_account_code"
+                  class="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300">
+                  {rev_opts}
+                </select>
+                {rev_badge}
+              </div>
+              <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">Payment bank account <span class="text-gray-400 font-normal">(where payments land)</span></label>
+                <select name="payment_account_code"
+                  class="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300">
+                  {bank_opts}
+                </select>
+                {bank_badge}
+              </div>
+              <button type="submit"
+                class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg transition-colors">
+                Save Mapping
               </button>
             </form>
           </div>
-          <form method="post" action="/save-xero-tenant/{tid}" class="space-y-4">
-            <div>
-              <label class="block text-xs font-medium text-gray-700 mb-1">Invoice income account <span class="text-gray-400 font-normal">(revenue / sales)</span></label>
-              <select name="invoice_account_code"
-                class="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300">
-                {rev_opts}
-              </select>
-              {rev_badge}
-            </div>
-            <div>
-              <label class="block text-xs font-medium text-gray-700 mb-1">Payment bank account <span class="text-gray-400 font-normal">(where payments land)</span></label>
-              <select name="payment_account_code"
-                class="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300">
-                {bank_opts}
-              </select>
-              {bank_badge}
-            </div>
-            <button type="submit"
-              class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg transition-colors">
-              Save Mapping
-            </button>
-          </form>
-        </div>"""
+        </details>"""
 
     return f"""
     <div class="space-y-4">
@@ -1661,24 +1671,29 @@ function toggleEnabled() {{
           {notice_html}
 
           <!-- Deployment URLs Panel -->
-          <div class="bg-white border border-gray-200 rounded-2xl shadow-sm mb-6 overflow-hidden">
-            <div class="flex items-center justify-between px-5 py-3 border-b border-gray-100 bg-gray-50">
+          <details class="bg-white border border-gray-200 rounded-2xl shadow-sm mb-6 overflow-hidden group">
+            <summary class="flex items-center justify-between px-5 py-3 border-b border-gray-100 bg-gray-50 cursor-pointer list-none select-none hover:bg-gray-100 transition-colors">
               <div class="flex items-center gap-2">
                 <svg class="w-4 h-4 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"/>
                 </svg>
                 <span class="text-sm font-semibold text-gray-800">Deployment URLs</span>
-                <span class="text-xs text-gray-400 font-normal ml-1">— auto-updates with your domain</span>
+                <span class="text-xs text-gray-400 font-normal ml-1">— tap to expand</span>
               </div>
-              <span class="text-xs font-mono text-indigo-600 truncate max-w-xs">{escape(_req_base)}</span>
-            </div>
+              <div class="flex items-center gap-2">
+                <span class="text-xs font-mono text-indigo-600 truncate max-w-xs hidden sm:block">{escape(_req_base)}</span>
+                <svg class="w-4 h-4 text-gray-400 transition-transform duration-200 group-open:rotate-180" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+                </svg>
+              </div>
+            </summary>
             <div class="divide-y divide-gray-100">
               {_url_row("Google OAuth redirect URI", _req_base + "/oauth/callback", "Register in Google Cloud Console → Credentials → OAuth client → Authorised redirect URIs")}
               {_url_row("Xero OAuth redirect URI", _req_base + "/xero/callback", "Register in Xero Developer Portal → Your App → Redirect URIs")}
               {_url_row("Google Calendar webhook", _req_base + "/webhooks/google-calendar", "Used automatically when you register watches below")}
               {_url_row("Xero webhook", _req_base + "/webhooks/xero", "Paste into Xero Developer Portal → Your App → Webhooks")}
             </div>
-          </div>
+          </details>
 
           <!-- Setup Steps Overview (collapsible) -->
           <details class="bg-indigo-50 border border-indigo-100 rounded-2xl mb-6 group">
@@ -1717,8 +1732,8 @@ function toggleEnabled() {{
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
 
               <!-- Google Card -->
-              <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-5">
-                <div class="flex items-start justify-between mb-3">
+              <details class="bg-white rounded-2xl shadow-sm border border-gray-200 group {'border-green-200' if google_ok else ''}">
+                <summary class="flex items-center justify-between p-5 cursor-pointer list-none select-none hover:bg-gray-50 rounded-2xl transition-colors">
                   <div class="flex items-center gap-3">
                     <div class="w-10 h-10 bg-blue-50 rounded-xl flex items-center justify-center shrink-0">
                       <svg class="w-5 h-5 text-blue-600" viewBox="0 0 24 24" fill="currentColor">
@@ -1730,27 +1745,28 @@ function toggleEnabled() {{
                       <p class="text-xs text-gray-500">Calendar &amp; Sheets</p>
                     </div>
                   </div>
-                  {_status_badge(google_ok, "Connected" if google_ok else "Not connected")}
-                </div>
+                  <div class="flex items-center gap-2">
+                    {_status_badge(google_ok, "Connected" if google_ok else "Not connected")}
+                    <svg class="w-4 h-4 text-gray-400 transition-transform duration-200 group-open:rotate-180 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+                    </svg>
+                  </div>
+                </summary>
 
-                {"" if not client_id else f'<p class="text-xs text-gray-400 mb-3 font-mono truncate" title="{escape(client_id)}">Client: {escape(client_id[:40])}{"..." if len(client_id) > 40 else ""}</p>'}
-
-                <div class="space-y-3">
+                <div class="px-5 pb-5 border-t border-gray-100 pt-4 space-y-3">
+                  {"" if not client_id else f'<p class="text-xs text-gray-400 mb-2 font-mono truncate" title="{escape(client_id)}">Client: {escape(client_id[:40])}{"..." if len(client_id) > 40 else ""}</p>'}
                   <div>
                     <p class="text-xs text-gray-500 mb-1.5 font-medium">Upload OAuth credentials JSON</p>
                     <input type="file" name="google_credentials" accept=".json,application/json"
                       class="block w-full text-xs text-gray-500 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-medium file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100">
                     {"" if not (creds_meta or {}).get("uploaded_name") else f'<p class="text-xs text-gray-400 mt-1">Last upload: {escape((creds_meta or {{}}).get("uploaded_name", ""))}</p>'}
                   </div>
-
-                  <div class="mb-3">
+                  <div>
                     {"" if creds_file_exists else '<p class="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">No credentials file uploaded yet. Select your JSON file and click <strong>Upload JSON</strong> first.</p>'}
-                    {"" if not creds_file_exists else '<p class="text-xs text-green-700 bg-green-50 border border-green-200 rounded-lg px-3 py-2">&#10003; Credentials file uploaded. Click <strong>Connect Google</strong> to generate your authorisation link.</p>'}
+                    {"" if not creds_file_exists else '<p class="text-xs text-green-700 bg-green-50 border border-green-200 rounded-lg px-3 py-2">&#10003; Credentials file uploaded. Click <strong>Connect Google</strong> to authorise.</p>'}
                   </div>
-
                   {pending_auth_url_html}
-
-                  <div class="flex gap-2 flex-wrap mt-3">
+                  <div class="flex gap-2 flex-wrap pt-1">
                     <button type="submit" formaction="/upload-google-credentials"
                       class="px-3 py-1.5 text-xs font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors">
                       Upload JSON
@@ -1760,12 +1776,13 @@ function toggleEnabled() {{
                       {"Reconnect" if google_ok else ("New link" if pending_auth_url else "Connect Google")}
                     </a>
                   </div>
+
                 </div>
-              </div>
+              </details>
 
               <!-- Xero Card -->
-              <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-5">
-                <div class="flex items-start justify-between mb-3">
+              <details class="bg-white rounded-2xl shadow-sm border border-gray-200 group">
+                <summary class="flex items-center justify-between p-5 cursor-pointer list-none select-none hover:bg-gray-50 rounded-2xl transition-colors">
                   <div class="flex items-center gap-3">
                     <div class="w-10 h-10 bg-blue-50 rounded-xl flex items-center justify-center shrink-0">
                       <svg class="w-5 h-5 text-blue-700" viewBox="0 0 24 24" fill="currentColor">
@@ -1777,41 +1794,45 @@ function toggleEnabled() {{
                       <p class="text-xs text-gray-500">Invoice automation</p>
                     </div>
                   </div>
-                  {_status_badge(xero_ok, "Connected" if xero_ok else "Not connected")}
-                </div>
-
-                <div class="text-xs text-gray-500 mb-3 space-y-1">
-                  <p>{escape(xero_msg)}</p>
-                  {"" if not xero_tenant else f'<p class="font-mono text-gray-400 truncate" title="{escape(xero_tenant)}">Tenant: {escape(xero_tenant[:32])}{"..." if len(xero_tenant) > 32 else ""}</p>'}
-                  <p>Redirect URI: <code class="bg-gray-100 px-1 py-0.5 rounded text-xs">{xero_redirect}</code></p>
-                </div>
-
-                <div class="space-y-2 mb-3">
-                  <div>
-                    <label class="block text-xs font-medium text-gray-600 mb-1">Client ID</label>
-                    <input name="xero_client_id" value="{escape(stored_xero_id)}"
-                      placeholder="Paste your Xero Client ID"
-                      class="w-full px-3 py-1.5 border border-gray-300 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono">
+                  <div class="flex items-center gap-2">
+                    {_status_badge(xero_ok, "Connected" if xero_ok else "Not connected")}
+                    <svg class="w-4 h-4 text-gray-400 transition-transform duration-200 group-open:rotate-180 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+                    </svg>
                   </div>
-                  <div>
-                    <label class="block text-xs font-medium text-gray-600 mb-1">Client Secret</label>
-                    <input name="xero_client_secret" type="password"
-                      placeholder="{"••••••••  (saved)" if stored_xero_secret else "Paste your Xero Client Secret"}"
-                      class="w-full px-3 py-1.5 border border-gray-300 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono">
+                </summary>
+
+                <div class="px-5 pb-5 border-t border-gray-100 pt-4 space-y-3">
+                  <div class="text-xs text-gray-500 space-y-0.5">
+                    <p>{escape(xero_msg)}</p>
+                    {"" if not xero_tenant else f'<p class="font-mono text-gray-400 truncate" title="{escape(xero_tenant)}">Tenant: {escape(xero_tenant[:32])}{"..." if len(xero_tenant) > 32 else ""}</p>'}
+                    <p>Redirect URI: <code class="bg-gray-100 px-1 py-0.5 rounded text-xs">{xero_redirect}</code></p>
                   </div>
-                  <button type="submit" formaction="/save-xero-creds"
-                    class="px-3 py-1.5 text-xs font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors">
-                    Save Credentials
-                  </button>
+                  <div class="space-y-2">
+                    <div>
+                      <label class="block text-xs font-medium text-gray-600 mb-1">Client ID</label>
+                      <input name="xero_client_id" value="{escape(stored_xero_id)}"
+                        placeholder="Paste your Xero Client ID"
+                        class="w-full px-3 py-1.5 border border-gray-300 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono">
+                    </div>
+                    <div>
+                      <label class="block text-xs font-medium text-gray-600 mb-1">Client Secret</label>
+                      <input name="xero_client_secret" type="password"
+                        placeholder="{"••••••••  (saved)" if stored_xero_secret else "Paste your Xero Client Secret"}"
+                        class="w-full px-3 py-1.5 border border-gray-300 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono">
+                    </div>
+                    <button type="submit" formaction="/save-xero-creds"
+                      class="px-3 py-1.5 text-xs font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors">
+                      Save Credentials
+                    </button>
+                  </div>
+                  {xero_pending_auth_url_html}
+                  <a href="/connect-xero"
+                    class="inline-block mt-1 px-3 py-1.5 text-xs font-medium text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors {"opacity-50 pointer-events-none" if not xero_has_creds else ""}">
+                    {"Reconnect Xero" if xero_ok else ("New link" if xero_pending_auth_url else "Connect Xero")}
+                  </a>
                 </div>
-
-                {xero_pending_auth_url_html}
-
-                <a href="/connect-xero"
-                  class="inline-block mt-3 px-3 py-1.5 text-xs font-medium text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors {"opacity-50 pointer-events-none" if not xero_has_creds else ""}">
-                  {"Reconnect Xero" if xero_ok else ("New link" if xero_pending_auth_url else "Connect Xero")}
-                </a>
-              </div>
+              </details>
             </div>
 
             <!-- Xero Account Mapping -->
@@ -1831,16 +1852,30 @@ function toggleEnabled() {{
 
           </form>
 
-          <!-- Google Sheets - standalone form -->
+          <!-- Google Sheets Target - collapsible standalone form -->
           <form method="post" action="/save-sheet-target">
-            <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
-              <div class="flex items-center justify-between mb-1">
-                <h2 class="font-semibold text-gray-900">Google Sheets Target</h2>
-                {_status_badge(sheets_ok, "Ready" if sheets_ok else "Not ready")}
-              </div>
-              <p class="text-sm text-gray-500 mb-4">{escape(sheets_msg)}</p>
-
-              <div class="space-y-4">
+            <details class="bg-white rounded-2xl shadow-sm border border-gray-200 overflow-hidden group" {"open" if not sheets_ok else ""}>
+              <summary class="flex items-center justify-between px-5 py-4 cursor-pointer list-none select-none hover:bg-gray-50 transition-colors">
+                <div class="flex items-center gap-3">
+                  <div class="w-9 h-9 bg-emerald-50 rounded-xl flex items-center justify-center shrink-0">
+                    <svg class="w-4 h-4 text-emerald-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+                    </svg>
+                  </div>
+                  <div>
+                    <h2 class="font-semibold text-gray-900 text-sm">Google Sheets Target</h2>
+                    <p class="text-xs text-gray-500">Where invoice data is logged</p>
+                  </div>
+                </div>
+                <div class="flex items-center gap-2">
+                  {_status_badge(sheets_ok, "Ready" if sheets_ok else "Not ready")}
+                  <svg class="w-4 h-4 text-gray-400 transition-transform duration-200 group-open:rotate-180 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+                  </svg>
+                </div>
+              </summary>
+              <div class="px-5 pb-5 pt-4 border-t border-gray-100 space-y-4">
+                <p class="text-sm text-gray-500">{escape(sheets_msg)}</p>
                 {"" if not spreadsheets else f"""
                 <div>
                   <label class="block text-sm font-medium text-gray-700 mb-1.5">Pick from your spreadsheets</label>
@@ -1854,23 +1889,21 @@ function toggleEnabled() {{
                   <input name="spreadsheet_input" value="{escape(sheet_current_id)}"
                     placeholder="Paste a Google Sheets URL or spreadsheet ID"
                     class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
-                  {f'<p class="text-xs text-emerald-600 mt-1">&#10003; Currently saved: <span class="font-medium">{escape(sheet_current_id)}</span></p>' if sheet_current_id else '<p class="text-xs text-gray-400 mt-1">No spreadsheet saved yet.</p>'}
+                  {f'<p class="text-xs text-emerald-600 mt-1">&#10003; Saved: <span class="font-medium">{escape(sheet_current_id)}</span></p>' if sheet_current_id else '<p class="text-xs text-gray-400 mt-1">No spreadsheet saved yet.</p>'}
                 </div>
                 <div>
                   <label class="block text-sm font-medium text-gray-700 mb-1.5">Sheet tab name</label>
                   <input name="sheet_name" value="{escape(sheet_name_val)}"
                     placeholder="Sheet1"
                     class="w-48 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
-                  {f'<p class="text-xs text-emerald-600 mt-1">&#10003; Currently saved: <span class="font-medium">{escape(sheet_name_val)}</span></p>' if sheet_current_id else ""}
+                  {f'<p class="text-xs text-emerald-600 mt-1">&#10003; Saved: <span class="font-medium">{escape(sheet_name_val)}</span></p>' if sheet_current_id else ""}
                 </div>
-                <div>
-                  <button type="submit"
-                    class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg transition-colors">
-                    Save Spreadsheet Settings
-                  </button>
-                </div>
+                <button type="submit"
+                  class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg transition-colors">
+                  Save Spreadsheet Settings
+                </button>
               </div>
-            </div>
+            </details>
           </form>
 
           <!-- Webhooks Card -->
