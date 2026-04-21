@@ -37,6 +37,9 @@ class XeroClient:
         token_file: str = "",
         sales_account_code: str = "",
         payment_account_code: str = "",
+        branding_theme_id: str = "",
+        premium_theme_id: str = "",
+        premium_threshold: float | None = None,
     ):
         self.access_token = access_token
         self.tenant_id = tenant_id
@@ -48,6 +51,9 @@ class XeroClient:
         self.token_file = token_file
         self.sales_account_code = sales_account_code or DEFAULT_SALES_ACCOUNT_CODE
         self.payment_account_code = payment_account_code or DEFAULT_PAYMENT_ACCOUNT_CODE
+        self.branding_theme_id = branding_theme_id or ""
+        self.premium_theme_id = premium_theme_id or ""
+        self.premium_threshold = premium_threshold
 
     def _headers(self) -> Dict[str, str]:
         return {
@@ -89,12 +95,23 @@ class XeroClient:
         response.raise_for_status()
         return response.json()
 
+    def _pick_branding_theme(self, line_items: list | None) -> str:
+        """Return the branding theme ID to use based on line-item pre-VAT subtotal."""
+        if self.premium_theme_id and self.premium_threshold is not None:
+            subtotal = sum(
+                float(li.get("UnitAmount", 0)) * float(li.get("Quantity", 1))
+                for li in (line_items or [])
+            )
+            if subtotal >= self.premium_threshold:
+                return self.premium_theme_id
+        return self.branding_theme_id
+
     def create_invoice_from_event(
         self, event: Dict, contact: Dict | None = None, line_items: list | None = None
     ) -> Dict:
         """
-        Minimal example: create a draft ACCREC invoice referencing the event.
-        Customize this to match your accounting workflow.
+        Create a draft ACCREC invoice referencing the event.
+        Branding theme is chosen automatically based on pre-VAT subtotal vs premium threshold.
         """
         today = dt.date.today().isoformat()
         contact_payload = (
@@ -121,6 +138,9 @@ class XeroClient:
             "Reference": _short_reference(event),
             "Status": "DRAFT",
         }
+        theme_id = self._pick_branding_theme(prepared_line_items or line_items)
+        if theme_id:
+            payload["BrandingThemeID"] = theme_id
 
         if self.dry_run:
             return {"dry_run": True, "payload": payload, "Contacts": []}
@@ -318,11 +338,35 @@ class XeroClient:
             )
         return response.json()
 
+    def rename_contact(self, contact_id: str, new_name: str) -> Dict:
+        """Rename an existing Xero contact."""
+        payload = {"Contacts": [{"ContactID": contact_id, "Name": new_name}]}
+        if self.dry_run:
+            return {"dry_run": True, "payload": payload}
+        url = f"{self.base_url}/Contacts"
+        response = self._request("POST", url, json=payload)
+        if not response.ok:
+            raise RuntimeError(
+                f"Xero contact rename failed: {response.status_code} {response.text}"
+            )
+        return response.json()
+
+    @staticmethod
+    def _contact_addr_line1(contact: Dict) -> str:
+        """Return AddressLine1 from a contact's POBOX address, lower-stripped."""
+        for addr in contact.get("Addresses", []):
+            if addr.get("AddressType") == "POBOX" and addr.get("AddressLine1", "").strip():
+                return addr["AddressLine1"].strip()
+        return ""
+
     def ensure_contact(self, name: str, email: str, phone: str, address: Dict | None) -> Dict:
         """
-        Find contact by name. If a matching email exists, reuse it.
-        If name matches but email differs, create a new contact with
-        'Name (email)' format.
+        Find contact by name.
+        - Same name + same email + SAME address → reuse existing.
+        - Same name + same email + DIFFERENT address → rename original to
+          'Name (original address line 1)', create new 'Name (new address line 1)'.
+        - Same name + different email → create new as 'Name (email)'.
+        - No match → create new with given name.
         """
         contacts_resp = self.find_contacts_by_name(name)
         contacts = contacts_resp.get("Contacts", [])
@@ -330,6 +374,24 @@ class XeroClient:
         if contacts and email:
             for contact in contacts:
                 if contact.get("EmailAddress", "").lower() == email.lower():
+                    new_line1 = (address or {}).get("AddressLine1", "").strip()
+                    orig_line1 = self._contact_addr_line1(contact)
+                    if new_line1 and orig_line1 and new_line1.lower() != orig_line1.lower():
+                        # Different address — archive the original, create a fresh contact
+                        renamed_name = f"{name} ({orig_line1})"
+                        new_contact_name = f"{name} ({new_line1})"
+                        try:
+                            self.rename_contact(contact["ContactID"], renamed_name)
+                        except Exception as exc:
+                            print(f"[xero] rename_contact failed: {exc}", flush=True)
+                        created = self.create_contact(new_contact_name, email, phone, address)
+                        return {
+                            "contact": _extract_first_contact(created),
+                            "created": True,
+                            "address_split": True,
+                            "orig_name": renamed_name,
+                            "new_name": new_contact_name,
+                        }
                     return {"contact": contact, "created": False}
 
         if contacts and email:
@@ -374,10 +436,16 @@ def build_xero_client(config: AppConfig) -> XeroClient | None:
         tenant_id = chosen["tenantId"]
         sales_account_code = chosen.get("invoiceAccount", "") or DEFAULT_SALES_ACCOUNT_CODE
         payment_account_code = chosen.get("paymentAccount", "") or DEFAULT_PAYMENT_ACCOUNT_CODE
+        branding_theme_id = chosen.get("brandingThemeId", "") or ""
+        premium_theme_id = chosen.get("premiumThemeId", "") or ""
+        premium_threshold = chosen.get("premiumThreshold")
     else:
         tenant_id = config.xero_tenant_id or token.get("tenant_id", "")
         sales_account_code = DEFAULT_SALES_ACCOUNT_CODE
         payment_account_code = DEFAULT_PAYMENT_ACCOUNT_CODE
+        branding_theme_id = ""
+        premium_theme_id = ""
+        premium_threshold = None
 
     refresh_token = token.get("refresh_token")
     if refresh_token and (not access_token or token_is_expired(token)):
@@ -405,6 +473,9 @@ def build_xero_client(config: AppConfig) -> XeroClient | None:
         token_file=config.xero_token_file,
         sales_account_code=sales_account_code,
         payment_account_code=payment_account_code,
+        branding_theme_id=branding_theme_id,
+        premium_theme_id=premium_theme_id,
+        premium_threshold=premium_threshold,
     )
 
 

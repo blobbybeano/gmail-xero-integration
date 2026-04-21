@@ -484,6 +484,10 @@ def run() -> None:
                                 print(
                                     f"Contact processed for event {event['id']}: {existing_contact_id}"
                                 )
+                                _feed.push(
+                                    f"Customer saved to Xero: {customer.get('name', '')}",
+                                    "success",
+                                )
                             else:
                                 print(f"Event {event_id}: contact not saved (no ContactID)")
                         elif blocking_errors:
@@ -516,6 +520,10 @@ def run() -> None:
                                     )
                                     print(
                                         f"Contact updated for event {event['id']}: {existing_contact_id}"
+                                    )
+                                    _feed.push(
+                                        f"Customer details updated in Xero: {customer.get('name', '')}",
+                                        "info",
                                     )
                                 # Always advance marker to avoid repeated checks for same update.
                                 state = set_contact_update_marker(
@@ -832,6 +840,22 @@ def run() -> None:
                                 address=address if address else None,
                             )
                             contact = contact_result.get("contact")
+                            _cname = customer.get("name", "")
+                            if contact_result.get("address_split"):
+                                _feed.push(
+                                    f"New address for {_cname} — archived as \"{contact_result.get('orig_name', '')}\" and created \"{contact_result.get('new_name', '')}\"",
+                                    "info",
+                                )
+                            elif contact_result.get("created"):
+                                _feed.push(
+                                    f"New customer saved to Xero: {_cname}",
+                                    "success",
+                                )
+                            else:
+                                _feed.push(
+                                    f"Customer matched in Xero: {_cname}",
+                                    "info",
+                                )
                             if contact and contact.get("ContactID"):
                                 state = set_contact_for_event(
                                     state, event_key, contact["ContactID"]
