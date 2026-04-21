@@ -17,13 +17,15 @@ def event_contains_keyword(event: Dict, keyword: str) -> bool:
 
 def done_choice_is_yes(description: str | None, keyword: str = "DONE") -> bool:
     """
-    DONE gate for processing.
-    Accepts both legacy and prompt styles:
-      DONE
-      DONE Y
-      DONE YES
-      DONE Y/N =Y
-      DONE Y/N = YES
+    Submit gate for draft processing.
+    Accepts Y/N prompt styles such as:
+      Y/N =Y
+      Y/N = YES
+      done y/n = y
+
+    Notes:
+    - A plain `DONE` line no longer triggers processing.
+    - SEND lines are ignored here (handled by send_choice_is_yes).
     """
     if not description:
         return False
@@ -31,21 +33,15 @@ def done_choice_is_yes(description: str | None, keyword: str = "DONE") -> bool:
 
     text = _normalize_description(description)
     text = _strip_bracket_blocks(text)
-    key = keyword.strip().lower()
 
     for raw in text.splitlines():
         line = raw.strip()
         if not line:
             continue
         lower = line.lower()
-
-        if lower == key:
-            return True
-        if re.fullmatch(rf"{re.escape(key)}\s+(y|yes)", lower):
-            return True
-        if re.search(rf"\b{re.escape(key)}\b[^\n]*?(?:=|:)\s*(y|yes)\b", lower):
-            return True
-        if re.search(rf"\b{re.escape(key)}\b[^\n]*?\by/n\b[^\n]*?(y|yes)\b", lower):
+        if "send" in lower:
+            continue
+        if re.fullmatch(r"(?:done\s+)?y\s*/\s*n\s*(?:=|:)?\s*(y|yes)\b", lower):
             return True
     return False
 
@@ -114,6 +110,10 @@ def extract_event_details(event: Dict) -> Dict:
 
 def ensure_notes_template(description: str | None) -> str:
     template = (
+        "[notes]\n"
+        "\n"
+        "[/notes]\n"
+        "\n"
         "[contact]\n"
         "Customer name:\n"
         "Customer email address:\n"
@@ -123,11 +123,16 @@ def ensure_notes_template(description: str | None) -> str:
         "[invoice]\n"
         "[/invoice]\n"
         "\n"
-        "DONE Y/N =\n"
+        "Y/N =\n"
     )
 
     if not description:
         return template
+
+    # Ensure notes block exists for freeform job notes that the parser ignores.
+    if not _has_notes_block(description):
+        notes_block = "[notes]\n\n[/notes]\n\n"
+        description = f"{notes_block}{description.lstrip()}"
 
     # Ensure core customer fields exist; if not, append full template.
     if "Customer name:" not in description or "Customer email address:" not in description:
@@ -423,10 +428,20 @@ def _normalize_description(description: str) -> str:
 def _strip_bracket_blocks(text: str) -> str:
     import re
 
-    # Remove [contact]...[/contact] and [invoice]...[/invoice] blocks.
+    # Remove non-command blocks from keyword parsing.
+    # [notes] is intentionally ignored by automation.
+    # [contact]/[invoice] are parsed separately by dedicated extractors.
+    # [app-status] is NOT removed here because SEND/PAYMENT controls live there.
+    text = re.sub(r"\[notes\].*?\[/notes\]", "", text, flags=re.I | re.S)
     text = re.sub(r"\[contact\].*?\[/contact\]", "", text, flags=re.I | re.S)
     text = re.sub(r"\[invoice\].*?\[/invoice\]", "", text, flags=re.I | re.S)
     return text
+
+
+def _has_notes_block(description: str) -> bool:
+    import re
+
+    return bool(re.search(r"\[notes\].*?\[/notes\]", description, re.I | re.S))
 
 
 def _strip_error_hint(value: str) -> str:

@@ -4,11 +4,14 @@ primary_region = "lhr"
 [build]
   dockerfile = "Dockerfile"
 
+[deploy]
+  strategy = "immediate"
+
 [env]
   WEB_HOST = "0.0.0.0"
   WEB_PORT = "8080"
   PYTHONUNBUFFERED = "1"
-  POLL_SECONDS = "20"
+  POLL_SECONDS = "300"
   ADMIN_DB_FILE = "/data/admin.db"
   STATE_FILE = "/data/state.json"
   XERO_TOKEN_FILE = "/data/xero_token.json"
@@ -17,8 +20,7 @@ primary_region = "lhr"
   GOOGLE_CREDENTIALS_FILE = "/data/credentials.json"
 
 [processes]
-  web = "gunicorn -b 0.0.0.0:8080 --workers 1 --threads 4 --timeout 120 'app.admin_web:create_app()'"
-  worker = "python -m app.main"
+  app = "gunicorn -b 0.0.0.0:8080 --workers 1 --threads 2 --timeout 120 run:app"
 
 [http_service]
   internal_port = 8080
@@ -26,15 +28,15 @@ primary_region = "lhr"
   auto_stop_machines = false
   auto_start_machines = true
   min_machines_running = 1
-  processes = ["web"]
+  processes = ["app"]
 
 [[vm]]
-  memory = "512mb"
+  memory = "256mb"
   cpu_kind = "shared"
   cpus = 1
-  processes = ["web", "worker"]
+  processes = ["app"]
 
 [[mounts]]
   source = "powwash_data"
   destination = "/data"
-  processes = ["web", "worker"]
+  processes = ["app"]

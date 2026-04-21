@@ -413,7 +413,7 @@ def run() -> None:
                     state = mark_prefilled(state, event_key)
 
             # Process any event with DONE/SEND, regardless of when it was created.
-            has_done = done_choice_is_yes(event.get("description"), config.keyword)
+            has_done = done_choice_is_yes(event.get("description"))
             # Only send when user explicitly answers Y/YES.
             has_send = send_choice_is_yes(event.get("description"))
             if (has_done or has_send) and event.get("id"):
