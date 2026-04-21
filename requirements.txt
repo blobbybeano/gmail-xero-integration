@@ -4,13 +4,4 @@ google-auth-oauthlib==1.2.0
 Flask==3.0.3
 gunicorn==22.0.0
 python-dotenv==1.0.1
-xero-python==10.0.0
 requests==2.31.0
-Flask
-google-api-python-client
-google-auth
-google-auth-oauthlib
-gunicorn
-python-dotenv
-requests
-xero-python
