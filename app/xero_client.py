@@ -8,7 +8,7 @@ from typing import Dict
 import requests
 
 from .config import AppConfig
-from .admin_store import get_json_setting
+from .admin_store import get_json_setting, get_xero_tenants
 
 TOKEN_URL = "https://identity.xero.com/connect/token"
 DEFAULT_SALES_ACCOUNT_CODE = "200"
@@ -35,6 +35,8 @@ class XeroClient:
         client_secret: str = "",
         refresh_token: str = "",
         token_file: str = "",
+        sales_account_code: str = "",
+        payment_account_code: str = "",
     ):
         self.access_token = access_token
         self.tenant_id = tenant_id
@@ -44,6 +46,8 @@ class XeroClient:
         self.client_secret = client_secret
         self.refresh_token = refresh_token
         self.token_file = token_file
+        self.sales_account_code = sales_account_code or DEFAULT_SALES_ACCOUNT_CODE
+        self.payment_account_code = payment_account_code or DEFAULT_PAYMENT_ACCOUNT_CODE
 
     def _headers(self) -> Dict[str, str]:
         return {
@@ -111,7 +115,7 @@ class XeroClient:
                     "Description": event.get("description") or "Calendar event",
                     "Quantity": 1,
                     "UnitAmount": 0,
-                    "AccountCode": DEFAULT_SALES_ACCOUNT_CODE,
+                    "AccountCode": self.sales_account_code,
                 }
             ],
             "Reference": _short_reference(event),
@@ -159,7 +163,7 @@ class XeroClient:
         for item in line_items:
             line = dict(item)
             if not line.get("AccountCode") and not line.get("AccountID"):
-                line["AccountCode"] = DEFAULT_SALES_ACCOUNT_CODE
+                line["AccountCode"] = self.sales_account_code
             prepared.append(line)
         return prepared
 
@@ -216,9 +220,10 @@ class XeroClient:
         invoice_id: str,
         amount: float,
         *,
-        account_code: str = DEFAULT_PAYMENT_ACCOUNT_CODE,
+        account_code: str = "",
         when: str | None = None,
     ) -> Dict:
+        account_code = account_code or self.payment_account_code
         if amount <= 0:
             return {"skipped": True, "reason": "No amount due"}
         payment_date = when or dt.date.today().isoformat()
@@ -347,13 +352,11 @@ def _extract_first_contact(response: Dict) -> Dict:
 
 def build_xero_client(config: AppConfig) -> XeroClient | None:
     """
-    Build a Xero client from either env vars or xero_token.json (preferred).
-    If a refresh token exists, automatically refresh access token and persist.
-    Credentials are read from env vars first, then from the admin JSON store.
+    Build a Xero client using the first enabled tenant from per-tenant config,
+    falling back to the token's stored tenant_id if no per-tenant config exists.
     """
     token = load_xero_token(config.xero_token_file)
 
-    # Read credentials from env vars first, fall back to admin JSON store
     client_id = config.xero_client_id or str(
         get_json_setting(config.admin_db_file, "xero_client_id", "")
     ).strip()
@@ -362,7 +365,19 @@ def build_xero_client(config: AppConfig) -> XeroClient | None:
     ).strip()
 
     access_token = config.xero_access_token or token.get("access_token", "")
-    tenant_id = config.xero_tenant_id or token.get("tenant_id", "")
+
+    # Determine tenant: prefer first enabled tenant from per-tenant config
+    tenants = get_xero_tenants(config.admin_db_file)
+    enabled_tenants = [t for t in tenants if t.get("enabled", True)]
+    if enabled_tenants:
+        chosen = enabled_tenants[0]
+        tenant_id = chosen["tenantId"]
+        sales_account_code = chosen.get("invoiceAccount", "") or DEFAULT_SALES_ACCOUNT_CODE
+        payment_account_code = chosen.get("paymentAccount", "") or DEFAULT_PAYMENT_ACCOUNT_CODE
+    else:
+        tenant_id = config.xero_tenant_id or token.get("tenant_id", "")
+        sales_account_code = DEFAULT_SALES_ACCOUNT_CODE
+        payment_account_code = DEFAULT_PAYMENT_ACCOUNT_CODE
 
     refresh_token = token.get("refresh_token")
     if refresh_token and (not access_token or token_is_expired(token)):
@@ -372,7 +387,6 @@ def build_xero_client(config: AppConfig) -> XeroClient | None:
             refresh_token=refresh_token,
         )
         token = {**token, **refreshed}
-        # Refresh response doesn't include tenant_id, preserve it.
         token["tenant_id"] = tenant_id
         save_xero_token(config.xero_token_file, token)
         access_token = token.get("access_token", "")
@@ -389,6 +403,8 @@ def build_xero_client(config: AppConfig) -> XeroClient | None:
         client_secret=client_secret,
         refresh_token=refresh_token or "",
         token_file=config.xero_token_file,
+        sales_account_code=sales_account_code,
+        payment_account_code=payment_account_code,
     )
 
 

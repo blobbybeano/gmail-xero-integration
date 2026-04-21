@@ -210,3 +210,48 @@ def get_enabled(db_path: str) -> bool:
 
 def set_enabled(db_path: str, enabled: bool) -> None:
     set_json_setting(db_path, "system_enabled", enabled)
+
+
+def get_xero_tenants(db_path: str) -> list[dict]:
+    """Return list of per-tenant configs: {tenantId, tenantName, enabled, invoiceAccount, paymentAccount}"""
+    raw = get_json_setting(db_path, "xero_tenants", [])
+    if not isinstance(raw, list):
+        return []
+    return raw
+
+
+def set_xero_tenants(db_path: str, tenants: list[dict]) -> None:
+    set_json_setting(db_path, "xero_tenants", tenants)
+
+
+def upsert_xero_tenant(
+    db_path: str,
+    tenant_id: str,
+    tenant_name: str = "",
+    enabled: bool | None = None,
+    invoice_account: str | None = None,
+    payment_account: str | None = None,
+) -> None:
+    """Create or update a single tenant's config without touching other tenants."""
+    tenants = get_xero_tenants(db_path)
+    for t in tenants:
+        if t.get("tenantId") == tenant_id:
+            if tenant_name:
+                t["tenantName"] = tenant_name
+            if enabled is not None:
+                t["enabled"] = enabled
+            if invoice_account is not None:
+                t["invoiceAccount"] = invoice_account
+            if payment_account is not None:
+                t["paymentAccount"] = payment_account
+            set_xero_tenants(db_path, tenants)
+            return
+    entry: dict = {
+        "tenantId": tenant_id,
+        "tenantName": tenant_name,
+        "enabled": True if enabled is None else enabled,
+        "invoiceAccount": invoice_account or "",
+        "paymentAccount": payment_account or "",
+    }
+    tenants.append(entry)
+    set_xero_tenants(db_path, tenants)

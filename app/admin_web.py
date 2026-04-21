@@ -55,6 +55,9 @@ from .admin_store import (
     set_xero_webhook_key,
     get_xero_webhook_verified,
     set_xero_webhook_verified,
+    get_xero_tenants,
+    set_xero_tenants,
+    upsert_xero_tenant,
 )
 from .trigger import trigger_poll
 from .state import load_state, get_last_sync
@@ -306,6 +309,18 @@ def _get_xero_tenant_id(access_token: str) -> str:
     return connections[0].get("tenantId", "")
 
 
+def _get_all_xero_connections(access_token: str) -> list[dict]:
+    """Return all authorised Xero connections as [{tenantId, tenantName}]."""
+    headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+    response = requests.get(XERO_CONNECTIONS_URL, headers=headers, timeout=30)
+    response.raise_for_status()
+    return [
+        {"tenantId": c.get("tenantId", ""), "tenantName": c.get("tenantName", c.get("tenantId", ""))}
+        for c in response.json()
+        if c.get("tenantId")
+    ]
+
+
 def _xero_status_data(config: AppConfig) -> tuple[bool, str, str]:
     """Returns (connected, status_text, tenant_id)"""
     token = load_xero_token(config.xero_token_file)
@@ -468,18 +483,28 @@ def _status_badge(ok: bool, text: str) -> str:
     )
 
 
-def _xero_account_mapping_card(
+def _xero_tenant_cards(
     xero_ok: bool,
-    revenue_accounts: list,
-    bank_accounts: list,
-    saved_invoice: str,
-    saved_payment: str,
+    tenant_accounts: list[dict],
 ) -> str:
+    """Render per-tenant cards with enable toggle and separate account mapping.
+
+    tenant_accounts: list of {tenantId, tenantName, enabled, invoiceAccount,
+                               paymentAccount, revenueAccounts, bankAccounts}
+    """
     if not xero_ok:
         return (
             '<div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6 opacity-50">'
-            '<h2 class="font-semibold text-gray-900 mb-1">Xero Account Mapping</h2>'
-            '<p class="text-sm text-gray-400">Connect Xero first to configure account mapping.</p>'
+            '<h2 class="font-semibold text-gray-900 mb-1">Xero Organisations</h2>'
+            '<p class="text-sm text-gray-400">Connect Xero first to configure organisations and account mapping.</p>'
+            '</div>'
+        )
+
+    if not tenant_accounts:
+        return (
+            '<div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">'
+            '<h2 class="font-semibold text-gray-900 mb-1">Xero Organisations</h2>'
+            '<p class="text-sm text-gray-400">No organisations found — reconnect Xero to discover them.</p>'
             '</div>'
         )
 
@@ -503,39 +528,83 @@ def _xero_account_mapping_card(
             return '<p class="text-xs text-gray-400 mt-1">No account saved yet.</p>'
         name = _find_name(accounts, code)
         label = escape(f"{name} ({code})") if name else escape(code)
-        return f'<p class="text-xs text-emerald-600 mt-1">&#10003; Currently saved: <span class="font-medium">{label}</span></p>'
+        return f'<p class="text-xs text-emerald-600 mt-1">&#10003; Saved: <span class="font-medium">{label}</span></p>'
 
-    rev_opts = _opts(revenue_accounts, saved_invoice)
-    bank_opts = _opts(bank_accounts, saved_payment)
-    rev_badge = _saved_badge(revenue_accounts, saved_invoice)
-    bank_badge = _saved_badge(bank_accounts, saved_payment)
+    cards_html = ""
+    for t in tenant_accounts:
+        tid = escape(t["tenantId"])
+        tname = escape(t.get("tenantName") or t["tenantId"])
+        enabled = t.get("enabled", True)
+        rev_accounts = t.get("revenueAccounts", [])
+        bank_accounts = t.get("bankAccounts", [])
+        saved_inv = t.get("invoiceAccount", "")
+        saved_pay = t.get("paymentAccount", "")
+
+        toggle_color = "bg-emerald-500" if enabled else "bg-gray-300"
+        toggle_label = "Active" if enabled else "Paused"
+        toggle_dot = "translate-x-5" if enabled else "translate-x-0"
+        status_text = (
+            '<span class="text-emerald-600 text-xs font-medium">● Active — invoices will be created here</span>'
+            if enabled else
+            '<span class="text-gray-400 text-xs font-medium">○ Paused — this organisation is skipped</span>'
+        )
+        border_cls = "border-emerald-200" if enabled else "border-gray-200"
+
+        rev_opts = _opts(rev_accounts, saved_inv)
+        bank_opts = _opts(bank_accounts, saved_pay)
+        rev_badge = _saved_badge(rev_accounts, saved_inv)
+        bank_badge = _saved_badge(bank_accounts, saved_pay)
+
+        cards_html += f"""
+        <div class="bg-white rounded-2xl shadow-sm border {border_cls} p-6">
+          <div class="flex items-start justify-between mb-4">
+            <div>
+              <h3 class="font-semibold text-gray-900 text-base">{tname}</h3>
+              <p class="text-xs text-gray-400 font-mono mt-0.5">{tid}</p>
+              <div class="mt-1">{status_text}</div>
+            </div>
+            <form method="post" action="/toggle-xero-tenant/{tid}">
+              <button type="submit" title="Toggle {tname}"
+                class="flex items-center gap-2 px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors
+                       {'border-emerald-300 bg-emerald-50 text-emerald-700 hover:bg-emerald-100' if enabled else 'border-gray-300 bg-gray-50 text-gray-600 hover:bg-gray-100'}">
+                <span class="inline-flex w-9 h-5 rounded-full {toggle_color} relative transition-colors">
+                  <span class="absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transform transition-transform {toggle_dot}"></span>
+                </span>
+                {toggle_label}
+              </button>
+            </form>
+          </div>
+          <form method="post" action="/save-xero-tenant/{tid}" class="space-y-4">
+            <div>
+              <label class="block text-xs font-medium text-gray-700 mb-1">Invoice income account <span class="text-gray-400 font-normal">(revenue / sales)</span></label>
+              <select name="invoice_account_code"
+                class="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300">
+                {rev_opts}
+              </select>
+              {rev_badge}
+            </div>
+            <div>
+              <label class="block text-xs font-medium text-gray-700 mb-1">Payment bank account <span class="text-gray-400 font-normal">(where payments land)</span></label>
+              <select name="payment_account_code"
+                class="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300">
+                {bank_opts}
+              </select>
+              {bank_badge}
+            </div>
+            <button type="submit"
+              class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg transition-colors">
+              Save Mapping
+            </button>
+          </form>
+        </div>"""
 
     return f"""
-    <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
-      <h2 class="font-semibold text-gray-900 mb-1">Xero Account Mapping</h2>
-      <p class="text-sm text-gray-500 mb-4">Choose which Xero accounts invoices and payments are posted to.</p>
-      <form method="post" action="/save-xero-accounts" class="space-y-4">
-        <div>
-          <label class="block text-xs font-medium text-gray-700 mb-1">Invoice income account <span class="text-gray-400 font-normal">(revenue / sales)</span></label>
-          <select name="invoice_account_code"
-            class="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300">
-            {rev_opts}
-          </select>
-          {rev_badge}
-        </div>
-        <div>
-          <label class="block text-xs font-medium text-gray-700 mb-1">Payment bank account <span class="text-gray-400 font-normal">(where payments land)</span></label>
-          <select name="payment_account_code"
-            class="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300">
-            {bank_opts}
-          </select>
-          {bank_badge}
-        </div>
-        <button type="submit"
-          class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg transition-colors">
-          Save Account Mapping
-        </button>
-      </form>
+    <div class="space-y-4">
+      <div class="flex items-center justify-between">
+        <h2 class="font-semibold text-gray-900">Xero Organisations</h2>
+        <p class="text-xs text-gray-400">{len(tenant_accounts)} organisation{"s" if len(tenant_accounts) != 1 else ""} connected</p>
+      </div>
+      {cards_html}
     </div>"""
 
 
@@ -690,6 +759,31 @@ def create_app() -> Flask:
         session["save_notice"] = "success:Xero account mapping saved."
         return redirect(url_for("index"))
 
+    @app.post("/save-xero-tenant/<tenant_id>")
+    @require_login
+    def save_xero_tenant(tenant_id: str):
+        invoice_code = (request.form.get("invoice_account_code") or "").strip()
+        payment_code = (request.form.get("payment_account_code") or "").strip()
+        upsert_xero_tenant(
+            config.admin_db_file,
+            tenant_id,
+            invoice_account=invoice_code,
+            payment_account=payment_code,
+        )
+        session["save_notice"] = "success:Account mapping saved."
+        return redirect(url_for("index"))
+
+    @app.post("/toggle-xero-tenant/<tenant_id>")
+    @require_login
+    def toggle_xero_tenant(tenant_id: str):
+        tenants = get_xero_tenants(config.admin_db_file)
+        current = next((t for t in tenants if t["tenantId"] == tenant_id), {})
+        new_enabled = not current.get("enabled", True)
+        upsert_xero_tenant(config.admin_db_file, tenant_id, enabled=new_enabled)
+        label = "enabled" if new_enabled else "paused"
+        session["save_notice"] = f"success:Organisation {label}."
+        return redirect(url_for("index"))
+
     @app.get("/connect-xero")
     @require_login
     def connect_xero():
@@ -753,6 +847,13 @@ def create_app() -> Flask:
 
         token["tenant_id"] = tenant_id
         save_xero_token(config.xero_token_file, token)
+        # Register every authorised connection as a per-tenant config entry
+        try:
+            all_conns = _get_all_xero_connections(token.get("access_token", ""))
+            for conn in all_conns:
+                upsert_xero_tenant(config.admin_db_file, conn["tenantId"], tenant_name=conn["tenantName"])
+        except Exception:
+            pass
         session["logged_in"] = True
         session.pop("xero_oauth_state", None)
         session.pop("xero_auth_url", None)
@@ -1277,13 +1378,11 @@ function toggleEnabled() {{
         # Read once and clear (like save_notice) — shows after Connect click, gone on next refresh
         xero_pending_auth_url = session.pop("xero_auth_url", None) or "" if not xero_ok else ""
 
-        # Fetch Xero accounts for account-mapping UI
-        xero_revenue_accounts = []
-        xero_bank_accounts = []
+        # Fetch Xero accounts per tenant for account-mapping UI
+        xero_tenant_account_data: list[dict] = []
         if xero_ok:
             try:
                 _tok = load_xero_token(config.xero_token_file)
-                # Refresh token if expired before fetching accounts
                 if token_is_expired(_tok) and _tok.get("refresh_token"):
                     _cid, _csec = _get_xero_creds(config)
                     if _cid and _csec:
@@ -1291,29 +1390,45 @@ function toggleEnabled() {{
                         _tok = {**_tok, **_refreshed}
                         save_xero_token(config.xero_token_file, _tok)
                 _at = _tok.get("access_token", "")
-                _cr = requests.get(
-                    "https://api.xero.com/connections",
-                    headers={"Authorization": f"Bearer {_at}", "Accept": "application/json"},
-                    timeout=10,
-                )
-                _tenant = _cr.json()[0]["tenantId"]
-                _ar = requests.get(
-                    "https://api.xero.com/api.xro/2.0/Accounts",
-                    headers={"Authorization": f"Bearer {_at}", "Xero-tenant-id": _tenant, "Accept": "application/json"},
-                    timeout=10,
-                )
-                for _a in _ar.json().get("Accounts", []):
-                    if _a.get("Status") != "ACTIVE":
-                        continue
-                    _t = _a.get("Type", "")
-                    if _t in ("REVENUE", "SALES", "OTHERINCOME"):
-                        xero_revenue_accounts.append(_a)
-                    elif _t == "BANK":
-                        xero_bank_accounts.append(_a)
+                _all_conns = _get_all_xero_connections(_at)
+                _saved_tenants = {t["tenantId"]: t for t in get_xero_tenants(config.admin_db_file)}
+                for _conn in _all_conns:
+                    _tid = _conn["tenantId"]
+                    _tname = _conn.get("tenantName", _tid)
+                    _rev: list = []
+                    _bank: list = []
+                    try:
+                        _ar = requests.get(
+                            "https://api.xero.com/api.xro/2.0/Accounts",
+                            headers={
+                                "Authorization": f"Bearer {_at}",
+                                "Xero-tenant-id": _tid,
+                                "Accept": "application/json",
+                            },
+                            timeout=10,
+                        )
+                        for _a in _ar.json().get("Accounts", []):
+                            if _a.get("Status") != "ACTIVE":
+                                continue
+                            _typ = _a.get("Type", "")
+                            if _typ in ("REVENUE", "SALES", "OTHERINCOME"):
+                                _rev.append(_a)
+                            elif _typ == "BANK":
+                                _bank.append(_a)
+                    except Exception:
+                        pass
+                    _cfg = _saved_tenants.get(_tid, {})
+                    xero_tenant_account_data.append({
+                        "tenantId": _tid,
+                        "tenantName": _tname,
+                        "enabled": _cfg.get("enabled", True),
+                        "invoiceAccount": _cfg.get("invoiceAccount", ""),
+                        "paymentAccount": _cfg.get("paymentAccount", ""),
+                        "revenueAccounts": _rev,
+                        "bankAccounts": _bank,
+                    })
             except Exception:
                 pass
-        saved_invoice_account = str(get_json_setting(config.admin_db_file, "xero_invoice_account_code", "") or "")
-        saved_payment_account = str(get_json_setting(config.admin_db_file, "xero_payment_account_code", "") or "")
         pending_auth_url = (
             session.get("oauth_auth_url")
             or str(get_json_setting(config.admin_db_file, "oauth_auth_url", "")).strip()
@@ -1700,7 +1815,7 @@ function toggleEnabled() {{
             </div>
 
             <!-- Xero Account Mapping -->
-            {_xero_account_mapping_card(xero_ok, xero_revenue_accounts, xero_bank_accounts, saved_invoice_account, saved_payment_account)}
+            {_xero_tenant_cards(xero_ok, xero_tenant_account_data)}
 
             <!-- Active Calendars -->
             <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
