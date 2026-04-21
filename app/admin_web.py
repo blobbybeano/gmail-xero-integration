@@ -1776,6 +1776,46 @@ function toggleEnabled() {{
                     </a>
                   </div>
 
+                  <!-- Calendar Push Notifications (nested) -->
+                  <details class="mt-2 border border-gray-100 rounded-xl overflow-hidden group/gcal">
+                    <summary class="flex items-center justify-between px-4 py-3 bg-gray-50 cursor-pointer list-none select-none hover:bg-gray-100 transition-colors">
+                      <div class="flex items-center gap-2">
+                        <svg class="w-3.5 h-3.5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/>
+                        </svg>
+                        <span class="text-xs font-semibold text-gray-700">Calendar push notifications</span>
+                      </div>
+                      <div class="flex items-center gap-2">
+                        {gcal_watch_badge}
+                        <svg class="w-3.5 h-3.5 text-gray-400 transition-transform duration-200 group-open/gcal:rotate-180 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+                        </svg>
+                      </div>
+                    </summary>
+                    <div class="px-4 py-3 space-y-3">
+                      <p class="text-xs text-gray-500">Instant notifications when calendar events change — auto-renews, register once only.</p>
+                      <div>
+                        <label class="block text-xs font-medium text-gray-600 mb-1">Webhook URL <span class="text-gray-400 font-normal">(set automatically)</span></label>
+                        <div class="flex gap-2">
+                          <input readonly value="{escape(gcal_webhook_url)}"
+                            class="flex-1 px-3 py-1.5 border border-gray-200 rounded-lg text-xs font-mono bg-gray-50 text-gray-600">
+                          <button type="button"
+                            onclick="navigator.clipboard.writeText('{gcal_webhook_url.replace(chr(39), chr(92)+chr(39))}');this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',2000)"
+                            class="px-3 py-1.5 text-xs font-medium bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg transition-colors">Copy</button>
+                        </div>
+                      </div>
+                      <div class="divide-y divide-gray-50">
+                        {watch_rows_html}
+                      </div>
+                      <div class="flex gap-2 flex-wrap">
+                        <button type="submit" formaction="/setup/register-google-watches"
+                          class="px-3 py-1.5 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors {"opacity-50 pointer-events-none" if not google_ok else ""}">
+                          {"Register / Refresh" if not watches else "Re-register"}
+                        </button>
+                        {"" if not watches else '<button type="submit" formaction="/setup/stop-google-watches" class="px-3 py-1.5 text-xs font-medium text-red-600 bg-red-50 hover:bg-red-100 rounded-lg border border-red-200 transition-colors">Stop</button>'}
+                      </div>
+                    </div>
+                  </details>
                 </div>
               </details>
 
@@ -1830,19 +1870,68 @@ function toggleEnabled() {{
                     class="inline-block mt-1 px-3 py-1.5 text-xs font-medium text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors {"opacity-50 pointer-events-none" if not xero_has_creds else ""}">
                     {"Reconnect Xero" if xero_ok else ("New link" if xero_pending_auth_url else "Connect Xero")}
                   </a>
+
+                  <!-- Xero Invoice Payment Webhooks (nested) -->
+                  <details class="mt-2 border border-gray-100 rounded-xl overflow-hidden group/xwh">
+                    <summary class="flex items-center justify-between px-4 py-3 bg-gray-50 cursor-pointer list-none select-none hover:bg-gray-100 transition-colors">
+                      <div class="flex items-center gap-2">
+                        <svg class="w-3.5 h-3.5 text-blue-700" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+                        </svg>
+                        <span class="text-xs font-semibold text-gray-700">Invoice payment webhooks</span>
+                      </div>
+                      <div class="flex items-center gap-2">
+                        {('<span class="text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full">&#10003; Verified</span>' if xero_wh_verified else ('<span class="text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full">Key saved</span>' if xero_wh_key else '<span class="text-xs font-medium text-gray-500 bg-gray-100 px-2 py-0.5 rounded-full">Not set up</span>'))}
+                        <svg class="w-3.5 h-3.5 text-gray-400 transition-transform duration-200 group-open/xwh:rotate-180 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+                        </svg>
+                      </div>
+                    </summary>
+                    <div class="px-4 py-3 space-y-3">
+                      <p class="text-xs text-gray-500">When an invoice is marked paid in Xero, this app updates the sheet row to <strong>Paid</strong> automatically.</p>
+                      <div class="p-3 bg-blue-50 border border-blue-100 rounded-lg text-xs text-blue-800 space-y-1">
+                        <p class="font-semibold">One-time setup in Xero:</p>
+                        <ol class="list-decimal list-inside space-y-0.5 text-blue-700">
+                          <li>Go to <strong>developer.xero.com</strong> → your app → <strong>Webhooks</strong></li>
+                          <li>Add webhook URL below, tick <strong>Invoices</strong></li>
+                          <li>Copy the <strong>Webhooks Key</strong> shown, paste it below and save</li>
+                        </ol>
+                      </div>
+                      <div>
+                        <label class="block text-xs font-medium text-gray-600 mb-1">Webhook URL <span class="text-gray-400 font-normal">(paste into Xero portal)</span></label>
+                        <div class="flex gap-2">
+                          <input readonly value="{escape(xero_webhook_url)}"
+                            class="flex-1 px-3 py-1.5 border border-gray-200 rounded-lg text-xs font-mono bg-gray-50 text-gray-600">
+                          <button type="button"
+                            onclick="navigator.clipboard.writeText('{xero_webhook_url.replace(chr(39), chr(92)+chr(39))}');this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',2000)"
+                            class="px-3 py-1.5 text-xs font-medium bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg transition-colors">Copy</button>
+                        </div>
+                      </div>
+                      <div>
+                        <label class="block text-xs font-medium text-gray-600 mb-1">Xero Webhooks Key</label>
+                        <input name="xero_webhook_key" type="password"
+                          placeholder="{"••••••••  (saved)" if xero_wh_key else "Paste the signing key from Xero"}"
+                          class="w-full px-3 py-1.5 border border-gray-300 rounded-lg text-xs font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                      </div>
+                      <button type="submit" formaction="/save-xero-webhook-key"
+                        class="px-3 py-1.5 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors">
+                        Save Webhook Key
+                      </button>
+                    </div>
+                  </details>
                 </div>
               </details>
             </div>
           </form>
 
           <!-- Google Sheets Target - collapsible standalone form - directly under connectivity -->
-          <form method="post" action="/save-sheet-target">
+          <form method="post" action="/save-sheet-target" class="mt-4">
             <details class="bg-white rounded-2xl shadow-sm border border-gray-200 overflow-hidden group" {"open" if not sheets_ok else ""}>
               <summary class="flex items-center justify-between px-5 py-4 cursor-pointer list-none select-none hover:bg-gray-50 transition-colors">
                 <div class="flex items-center gap-3">
-                  <div class="w-9 h-9 bg-emerald-50 rounded-xl flex items-center justify-center shrink-0">
-                    <svg class="w-4 h-4 text-emerald-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+                  <div class="w-9 h-9 bg-blue-50 rounded-xl flex items-center justify-center shrink-0">
+                    <svg class="w-4 h-4 text-blue-600" viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M12.545 10.239v3.821h5.445c-.712 2.315-2.647 3.972-5.445 3.972a6.033 6.033 0 110-12.064c1.498 0 2.866.549 3.921 1.453l2.814-2.814A9.969 9.969 0 0012.545 2C7.021 2 2.543 6.477 2.543 12s4.478 10 10.002 10c8.396 0 10.249-7.85 9.426-11.748l-9.426-.013z"/>
                     </svg>
                   </div>
                   <div>
@@ -1891,90 +1980,6 @@ function toggleEnabled() {{
 
           <!-- Xero Organisations -->
           {_xero_tenant_cards(xero_ok, xero_tenant_account_data)}
-
-          <!-- Webhooks Card -->
-          <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6 space-y-6">
-            <div>
-              <h2 class="font-semibold text-gray-900 mb-1">Webhooks &amp; Real-Time Updates</h2>
-              <p class="text-sm text-gray-500">Instead of waiting for the next poll, connect Google Calendar and Xero to push changes to this app the moment they happen.</p>
-            </div>
-
-            <!-- Google Calendar Push Notifications -->
-            <div class="border border-gray-100 rounded-xl p-4">
-              <div class="flex items-center justify-between mb-3">
-                <h3 class="text-sm font-semibold text-gray-800">Google Calendar — Push Notifications</h3>
-                {gcal_watch_badge}
-              </div>
-              <p class="text-xs text-gray-500 mb-3">Click <strong>Register</strong> to tell Google to call this app whenever a calendar event changes. Watches auto-renew every 7 days.</p>
-              <div class="mb-3">
-                <label class="block text-xs font-medium text-gray-600 mb-1">Your webhook URL (set automatically — no action needed)</label>
-                <div class="flex gap-2">
-                  <input readonly value="{escape(gcal_webhook_url)}"
-                    class="flex-1 px-3 py-1.5 border border-gray-200 rounded-lg text-xs font-mono bg-gray-50 text-gray-600">
-                  <button type="button"
-                    onclick="navigator.clipboard.writeText('{gcal_webhook_url.replace(chr(39), chr(92)+chr(39))}');this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',2000)"
-                    class="px-3 py-1.5 text-xs font-medium bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg transition-colors">Copy</button>
-                </div>
-              </div>
-              <div class="divide-y divide-gray-50 mb-3">
-                {watch_rows_html}
-              </div>
-              <div class="flex gap-2">
-                <form method="post" action="/setup/register-google-watches">
-                  <button type="submit"
-                    class="px-4 py-2 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors {"opacity-50 pointer-events-none" if not google_ok else ""}">
-                    {"Register / Refresh Watches" if not watches else "Re-register Watches"}
-                  </button>
-                </form>
-                {"" if not watches else """<form method="post" action="/setup/stop-google-watches">
-                  <button type="submit" class="px-4 py-2 text-xs font-medium text-red-600 bg-red-50 hover:bg-red-100 rounded-lg border border-red-200 transition-colors">Stop Watches</button>
-                </form>"""}
-              </div>
-            </div>
-
-            <!-- Xero Webhooks -->
-            <div class="border border-gray-100 rounded-xl p-4">
-              <div class="flex items-center justify-between mb-3">
-                <h3 class="text-sm font-semibold text-gray-800">Xero — Invoice Payment Webhooks</h3>
-                {('<span class="text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full">&#10003; Verified</span>' if xero_wh_verified else ('<span class="text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full">Key saved — awaiting verification</span>' if xero_wh_key else '<span class="text-xs font-medium text-gray-500 bg-gray-100 px-2 py-0.5 rounded-full">Not configured</span>'))}
-              </div>
-              <p class="text-xs text-gray-500 mb-3">When an invoice is paid in Xero, Xero will call this app and the sheet row will be updated to <strong>Paid</strong> automatically.</p>
-
-              <div class="mb-3 p-3 bg-blue-50 border border-blue-200 rounded-lg text-xs text-blue-800 space-y-1">
-                <p class="font-semibold">You need to do this once in Xero:</p>
-                <ol class="list-decimal list-inside space-y-1 text-blue-700">
-                  <li>Go to <strong>developer.xero.com</strong> → your app → <strong>Webhooks</strong></li>
-                  <li>Add a new webhook, paste the URL below, tick <strong>Invoices</strong></li>
-                  <li>Copy the <strong>Webhooks Key</strong> shown and paste it below</li>
-                  <li>Click Save below — Xero will send a test ping to verify</li>
-                </ol>
-              </div>
-
-              <div class="mb-3">
-                <label class="block text-xs font-medium text-gray-600 mb-1">Webhook URL — paste this into the Xero Developer portal</label>
-                <div class="flex gap-2">
-                  <input readonly value="{escape(xero_webhook_url)}"
-                    class="flex-1 px-3 py-1.5 border border-gray-200 rounded-lg text-xs font-mono bg-gray-50 text-gray-600">
-                  <button type="button"
-                    onclick="navigator.clipboard.writeText('{xero_webhook_url.replace(chr(39), chr(92)+chr(39))}');this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',2000)"
-                    class="px-3 py-1.5 text-xs font-medium bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg transition-colors">Copy</button>
-                </div>
-              </div>
-
-              <form method="post" action="/save-xero-webhook-key">
-                <div class="mb-3">
-                  <label class="block text-xs font-medium text-gray-600 mb-1">Xero Webhook Signing Key</label>
-                  <input name="xero_webhook_key" type="password"
-                    placeholder="{"••••••••  (saved)" if xero_wh_key else "Paste the key from the Xero Developer portal"}"
-                    class="w-full px-3 py-1.5 border border-gray-300 rounded-lg text-xs font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500">
-                </div>
-                <button type="submit"
-                  class="px-4 py-2 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors">
-                  Save Webhook Key
-                </button>
-              </form>
-            </div>
-          </div>
 
           <form method="post" action="/save" enctype="multipart/form-data" class="space-y-6">
 
