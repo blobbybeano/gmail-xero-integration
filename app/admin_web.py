@@ -1485,7 +1485,7 @@ function toggleEnabled() {{
             other_rows = []
             for c in calendars:
                 cid = c["id"] or ""
-                checked = "checked" if cid in active else ""
+                checked = "checked" if (cid in active or (c.get("primary") and "primary" in active)) else ""
                 title = escape(c.get("summary_display") or c.get("summary") or cid)
                 primary_badge = ' <span class="text-xs bg-indigo-100 text-indigo-700 px-1.5 py-0.5 rounded font-medium">Primary</span>' if c.get("primary") else ""
                 hints = []
@@ -1726,9 +1726,8 @@ function toggleEnabled() {{
             </div>
           </details>
 
-          <form method="post" action="/save" enctype="multipart/form-data" class="space-y-6">
-
-            <!-- Connection Status Row -->
+          <!-- Connection Status Row -->
+          <form method="post" action="/save" enctype="multipart/form-data" id="conn-form">
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
 
               <!-- Google Card -->
@@ -1834,25 +1833,9 @@ function toggleEnabled() {{
                 </div>
               </details>
             </div>
-
-            <!-- Xero Account Mapping -->
-            {_xero_tenant_cards(xero_ok, xero_tenant_account_data)}
-
-            <!-- Active Calendars -->
-            <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
-              <div class="flex items-center justify-between mb-1">
-                <h2 class="font-semibold text-gray-900">Active Calendars</h2>
-                <span class="text-xs text-gray-400">{len(active)} selected</span>
-              </div>
-              <p class="text-sm text-gray-500 mb-4">Select which calendars to monitor for events marked with <strong>DONE</strong>.</p>
-              <div class="divide-y divide-gray-50">
-                {cal_html}
-              </div>
-            </div>
-
           </form>
 
-          <!-- Google Sheets Target - collapsible standalone form -->
+          <!-- Google Sheets Target - collapsible standalone form - directly under connectivity -->
           <form method="post" action="/save-sheet-target">
             <details class="bg-white rounded-2xl shadow-sm border border-gray-200 overflow-hidden group" {"open" if not sheets_ok else ""}>
               <summary class="flex items-center justify-between px-5 py-4 cursor-pointer list-none select-none hover:bg-gray-50 transition-colors">
@@ -1905,6 +1888,9 @@ function toggleEnabled() {{
               </div>
             </details>
           </form>
+
+          <!-- Xero Organisations -->
+          {_xero_tenant_cards(xero_ok, xero_tenant_account_data)}
 
           <!-- Webhooks Card -->
           <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6 space-y-6">
@@ -1991,6 +1977,18 @@ function toggleEnabled() {{
           </div>
 
           <form method="post" action="/save" enctype="multipart/form-data" class="space-y-6">
+
+            <!-- Active Calendars -->
+            <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
+              <div class="flex items-center justify-between mb-1">
+                <h2 class="font-semibold text-gray-900">Active Calendars</h2>
+                <span class="text-xs text-gray-400">{len(active)} selected</span>
+              </div>
+              <p class="text-sm text-gray-500 mb-4">Select which calendars to monitor for events marked with <strong>DONE</strong>.</p>
+              <div class="divide-y divide-gray-50">
+                {cal_html}
+              </div>
+            </div>
 
             <!-- Stats Fields -->
             <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
