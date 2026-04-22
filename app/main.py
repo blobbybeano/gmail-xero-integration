@@ -113,6 +113,13 @@ def run() -> None:
         last_sync = lookback_floor
 
     xero_client = build_xero_client(config)
+    _xero_built_at: float = time.time()
+    _XERO_REBUILD_INTERVAL = 3300  # rebuild token ~55 min (Xero tokens last 30 min)
+
+    _headers_initialized: set[str] = set()  # sheet keys that have had ensure_header run
+
+    _last_watch_check: float = 0.0
+    _WATCH_CHECK_INTERVAL = 3600  # re-check watches at most once per hour
 
     backoff_seconds = max(config.poll_seconds, 5)
     max_backoff = max(backoff_seconds, 60)
@@ -723,8 +730,11 @@ def run() -> None:
         return ""
 
     while True:
-        xero_client = build_xero_client(config)
         now = dt.datetime.now(dt.timezone.utc)
+        # Rebuild Xero client only when the cached one is stale or missing.
+        if xero_client is None or (time.time() - _xero_built_at) > _XERO_REBUILD_INTERVAL:
+            xero_client = build_xero_client(config)
+            _xero_built_at = time.time()
 
         # Global on/off toggle
         _enabled = get_enabled(config.admin_db_file)
@@ -743,90 +753,95 @@ def run() -> None:
             config.admin_db_file, config.google_calendar_id
         )
 
-        # Auto-manage Google Calendar watches for active calendars:
-        # - create missing watches
-        # - renew watches expiring within 24h
-        # - remove watches for calendars no longer active
-        try:
-            watches = get_google_watches(config.admin_db_file)
-            now_ms = int(now.timestamp() * 1000)
-            renew_before_ms = 24 * 3600 * 1000
-            base_url = _webhook_base_url().rstrip("/")
-            webhook_url = f"{base_url}/webhooks/google-calendar" if base_url else ""
+        # Auto-manage Google Calendar watches — run at most once per hour.
+        _now_ts = time.time()
+        if (_now_ts - _last_watch_check) >= _WATCH_CHECK_INTERVAL:
+            _last_watch_check = _now_ts
+            _run_watch_check = True
+        else:
+            _run_watch_check = False
 
-            # Remove watches for de-selected calendars.
-            for cal_id, winfo in list(watches.items()):
-                if cal_id in active_calendars:
-                    continue
-                try:
-                    if winfo.get("channel_id") and winfo.get("resource_id"):
-                        stop_calendar_watch(
-                            config, winfo["channel_id"], winfo["resource_id"]
+        if _run_watch_check:
+            try:
+                watches = get_google_watches(config.admin_db_file)
+                now_ms = int(now.timestamp() * 1000)
+                renew_before_ms = 24 * 3600 * 1000
+                base_url = _webhook_base_url().rstrip("/")
+                webhook_url = f"{base_url}/webhooks/google-calendar" if base_url else ""
+
+                # Remove watches for de-selected calendars.
+                for cal_id, winfo in list(watches.items()):
+                    if cal_id in active_calendars:
+                        continue
+                    try:
+                        if winfo.get("channel_id") and winfo.get("resource_id"):
+                            stop_calendar_watch(
+                                config, winfo["channel_id"], winfo["resource_id"]
+                            )
+                    except Exception:
+                        pass
+                    delete_google_watch(config.admin_db_file, cal_id)
+                    print(f"[watch] Removed watch for inactive calendar {cal_id}", flush=True)
+
+                # Ensure active calendars always have a valid watch.
+                for cal_id in active_calendars:
+                    winfo = watches.get(cal_id) or {}
+                    exp_ms = int(winfo.get("expiration_ms") or 0)
+                    url_mismatch = bool(
+                        webhook_url
+                        and winfo.get("webhook_url")
+                        and winfo.get("webhook_url") != webhook_url
+                    )
+                    needs_register = (
+                        not winfo
+                        or not winfo.get("channel_id")
+                        or not winfo.get("resource_id")
+                        or not exp_ms
+                        or (exp_ms - now_ms) < renew_before_ms
+                        or url_mismatch
+                    )
+                    if not needs_register:
+                        continue
+                    if not webhook_url:
+                        print(
+                            f"[watch] Skipping watch for {cal_id}: no public base URL configured",
+                            flush=True,
                         )
-                except Exception:
-                    pass
-                delete_google_watch(config.admin_db_file, cal_id)
-                print(f"[watch] Removed watch for inactive calendar {cal_id}", flush=True)
+                        continue
 
-            # Ensure active calendars always have a valid watch.
-            for cal_id in active_calendars:
-                winfo = watches.get(cal_id) or {}
-                exp_ms = int(winfo.get("expiration_ms") or 0)
-                url_mismatch = bool(
-                    webhook_url
-                    and winfo.get("webhook_url")
-                    and winfo.get("webhook_url") != webhook_url
-                )
-                needs_register = (
-                    not winfo
-                    or not winfo.get("channel_id")
-                    or not winfo.get("resource_id")
-                    or not exp_ms
-                    or (exp_ms - now_ms) < renew_before_ms
-                    or url_mismatch
-                )
-                if not needs_register:
-                    continue
-                if not webhook_url:
-                    print(
-                        f"[watch] Skipping watch for {cal_id}: no public base URL configured",
-                        flush=True,
-                    )
-                    continue
-
-                try:
-                    if winfo.get("channel_id") and winfo.get("resource_id"):
-                        stop_calendar_watch(
-                            config, winfo["channel_id"], winfo["resource_id"]
+                    try:
+                        if winfo.get("channel_id") and winfo.get("resource_id"):
+                            stop_calendar_watch(
+                                config, winfo["channel_id"], winfo["resource_id"]
+                            )
+                    except Exception:
+                        pass
+                    try:
+                        resp = register_calendar_watch(config, cal_id, webhook_url)
+                        set_google_watch(
+                            config.admin_db_file,
+                            cal_id,
+                            resp["id"],
+                            resp["resourceId"],
+                            int(resp.get("expiration") or 0),
+                            webhook_url=webhook_url,
                         )
-                except Exception:
-                    pass
-                try:
-                    resp = register_calendar_watch(config, cal_id, webhook_url)
-                    set_google_watch(
-                        config.admin_db_file,
-                        cal_id,
-                        resp["id"],
-                        resp["resourceId"],
-                        int(resp.get("expiration") or 0),
-                        webhook_url=webhook_url,
-                    )
-                    print(
-                        f"[watch] Registered/renewed Google Calendar watch for {cal_id}",
-                        flush=True,
-                    )
-                except Exception as exc:
-                    print(
-                        f"[watch] Failed to register/renew watch for {cal_id}: {exc}",
-                        flush=True,
-                    )
-                    _feed.push(
-                        f"Google webhook renewal failed for {cal_id}: {str(exc).splitlines()[0][:100]}",
-                        "error",
-                    )
-        except Exception as exc:
-            print(f"[watch] Auto-watch manager failed: {exc}", flush=True)
-            _feed.push(f"Google webhook manager error: {str(exc).splitlines()[0][:100]}", "error")
+                        print(
+                            f"[watch] Registered/renewed Google Calendar watch for {cal_id}",
+                            flush=True,
+                        )
+                    except Exception as exc:
+                        print(
+                            f"[watch] Failed to register/renew watch for {cal_id}: {exc}",
+                            flush=True,
+                        )
+                        _feed.push(
+                            f"Google webhook renewal failed for {cal_id}: {str(exc).splitlines()[0][:100]}",
+                            "error",
+                        )
+            except Exception as exc:
+                print(f"[watch] Auto-watch manager failed: {exc}", flush=True)
+                _feed.push(f"Google webhook manager error: {str(exc).splitlines()[0][:100]}", "error")
 
         events: list[dict] = []
         for calendar_id in active_calendars:
@@ -860,7 +875,9 @@ def run() -> None:
             and sales_sheet_target.get("sheet_name")
             and sales_stats_fields
         )
-        if sheet_enabled and admin_creds:
+        # ensure_header is cached: only call it when the sheet target changes.
+        _sheet_key = f"{sheet_target.get('spreadsheet_id')}:{sheet_target.get('sheet_name')}"
+        if sheet_enabled and admin_creds and _sheet_key not in _headers_initialized:
             try:
                 ensure_header(
                     admin_creds,
@@ -868,11 +885,13 @@ def run() -> None:
                     sheet_name=sheet_target["sheet_name"],
                     stats_fields=stats_fields,
                 )
+                _headers_initialized.add(_sheet_key)
             except Exception as exc:
                 print(f"Sheets header setup failed: {exc}")
                 sheet_enabled = False
 
-        if sales_sheet_enabled and admin_creds:
+        _sales_sheet_key = f"{sales_sheet_target.get('spreadsheet_id')}:{sales_sheet_target.get('sheet_name')}"
+        if sales_sheet_enabled and admin_creds and _sales_sheet_key not in _headers_initialized:
             try:
                 ensure_header(
                     admin_creds,
@@ -880,6 +899,7 @@ def run() -> None:
                     sheet_name=sales_sheet_target["sheet_name"],
                     stats_fields=sales_stats_fields,
                 )
+                _headers_initialized.add(_sales_sheet_key)
             except Exception as exc:
                 print(f"Sales sheet header setup failed: {exc}")
                 sales_sheet_enabled = False

@@ -12,6 +12,7 @@ primary_region = "lhr"
   WEB_PORT = "8080"
   PYTHONUNBUFFERED = "1"
   POLL_SECONDS = "300"
+  APP_BASE_URL = "https://gmail-xero-integration.fly.dev"
   ADMIN_DB_FILE = "/data/admin.db"
   STATE_FILE = "/data/state.json"
   XERO_TOKEN_FILE = "/data/xero_token.json"
@@ -20,7 +21,7 @@ primary_region = "lhr"
   GOOGLE_CREDENTIALS_FILE = "/data/credentials.json"
 
 [processes]
-  app = "gunicorn -b 0.0.0.0:8080 --workers 1 --threads 2 --timeout 120 run:app"
+  app = "gunicorn -b 0.0.0.0:8080 --workers 1 --threads 4 --timeout 120 run:app"
 
 [http_service]
   internal_port = 8080
