@@ -428,11 +428,14 @@ def build_xero_client(config: AppConfig) -> XeroClient | None:
 
     access_token = config.xero_access_token or token.get("access_token", "")
 
-    # Determine tenant: prefer first enabled tenant from per-tenant config
+    # Determine tenant: prefer first enabled tenant from per-tenant config.
+    # If tenants are configured but all disabled, still use the first configured
+    # tenant rather than falling back to the token's stored tenant_id (which may
+    # point to a demo/wrong org from the initial OAuth flow).
     tenants = get_xero_tenants(config.admin_db_file)
     enabled_tenants = [t for t in tenants if t.get("enabled", True)]
-    if enabled_tenants:
-        chosen = enabled_tenants[0]
+    chosen = enabled_tenants[0] if enabled_tenants else (tenants[0] if tenants else None)
+    if chosen:
         tenant_id = chosen["tenantId"]
         sales_account_code = chosen.get("invoiceAccount", "") or DEFAULT_SALES_ACCOUNT_CODE
         payment_account_code = chosen.get("paymentAccount", "") or DEFAULT_PAYMENT_ACCOUNT_CODE
