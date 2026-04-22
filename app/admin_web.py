@@ -169,6 +169,60 @@ def _validate_google_credentials_json(raw: bytes) -> tuple[bool, str]:
     return True, ""
 
 
+_xero_acct_cache: "dict[str, tuple[float, list, list, list]]" = {}
+_XERO_CACHE_TTL = 300  # seconds (5 min)
+
+
+def _get_tenant_acct_themes(at: str, tid: str) -> "tuple[list, list, list]":
+    """Return (revenue_accounts, bank_accounts, branding_themes) for a Xero tenant.
+    Results are cached for _XERO_CACHE_TTL seconds so the settings page doesn't
+    make live API calls on every load."""
+    key = f"{at[-12:]}:{tid}" if at else tid
+    cached = _xero_acct_cache.get(key)
+    if cached:
+        ts, rev, bank, themes = cached
+        if time.time() - ts < _XERO_CACHE_TTL:
+            return rev, bank, themes
+    hdrs = {
+        "Authorization": f"Bearer {at}",
+        "Xero-tenant-id": tid,
+        "Accept": "application/json",
+    }
+    rev: list = []
+    bank: list = []
+    try:
+        _ar = requests.get(
+            "https://api.xero.com/api.xro/2.0/Accounts",
+            headers=hdrs,
+            timeout=10,
+        )
+        for _a in _ar.json().get("Accounts", []):
+            if _a.get("Status") != "ACTIVE":
+                continue
+            _typ = _a.get("Type", "")
+            if _typ in ("REVENUE", "SALES", "OTHERINCOME"):
+                rev.append(_a)
+            elif _typ == "BANK":
+                bank.append(_a)
+    except Exception:
+        pass
+    themes: list = []
+    try:
+        _tr = requests.get(
+            "https://api.xero.com/api.xro/2.0/BrandingThemes",
+            headers=hdrs,
+            timeout=10,
+        )
+        themes = sorted(
+            _tr.json().get("BrandingThemes", []),
+            key=lambda x: (x.get("SortOrder", 999), x.get("Name", "")),
+        )
+    except Exception:
+        pass
+    _xero_acct_cache[key] = (time.time(), rev, bank, themes)
+    return rev, bank, themes
+
+
 def _sheets_status_data(
     config: AppConfig, creds, target: dict[str, str]
 ) -> tuple[bool, str]:
@@ -1493,45 +1547,7 @@ function toggleEnabled() {{
                 for _conn in _all_conns:
                     _tid = _conn["tenantId"]
                     _tname = _conn.get("tenantName", _tid)
-                    _rev: list = []
-                    _bank: list = []
-                    try:
-                        _ar = requests.get(
-                            "https://api.xero.com/api.xro/2.0/Accounts",
-                            headers={
-                                "Authorization": f"Bearer {_at}",
-                                "Xero-tenant-id": _tid,
-                                "Accept": "application/json",
-                            },
-                            timeout=10,
-                        )
-                        for _a in _ar.json().get("Accounts", []):
-                            if _a.get("Status") != "ACTIVE":
-                                continue
-                            _typ = _a.get("Type", "")
-                            if _typ in ("REVENUE", "SALES", "OTHERINCOME"):
-                                _rev.append(_a)
-                            elif _typ == "BANK":
-                                _bank.append(_a)
-                    except Exception:
-                        pass
-                    _themes: list = []
-                    try:
-                        _tr = requests.get(
-                            "https://api.xero.com/api.xro/2.0/BrandingThemes",
-                            headers={
-                                "Authorization": f"Bearer {_at}",
-                                "Xero-tenant-id": _tid,
-                                "Accept": "application/json",
-                            },
-                            timeout=10,
-                        )
-                        _themes = sorted(
-                            _tr.json().get("BrandingThemes", []),
-                            key=lambda x: (x.get("SortOrder", 999), x.get("Name", "")),
-                        )
-                    except Exception:
-                        pass
+                    _rev, _bank, _themes = _get_tenant_acct_themes(_at, _tid)
                     _cfg = _saved_tenants.get(_tid, {})
                     xero_tenant_account_data.append({
                         "tenantId": _tid,

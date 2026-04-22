@@ -91,9 +91,10 @@ def run() -> None:
         last_sync = run_started_at - dt.timedelta(minutes=5)
     if last_sync > run_started_at:
         last_sync = run_started_at
-    # Keep a short startup lookback so we catch near-recent edits without replaying
-    # large historical backlogs on every restart.
-    lookback_floor = run_started_at - dt.timedelta(minutes=10)
+    # Allow up to 4 hours of lookback on restart so events missed during crashes
+    # or brief downtime are caught on the next startup. The is_processed check
+    # in the event loop prevents double-processing of already-handled events.
+    lookback_floor = run_started_at - dt.timedelta(hours=4)
     if last_sync < lookback_floor:
         last_sync = lookback_floor
 
