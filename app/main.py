@@ -820,8 +820,13 @@ def run() -> None:
                         f"[watch] Failed to register/renew watch for {cal_id}: {exc}",
                         flush=True,
                     )
+                    _feed.push(
+                        f"Google webhook renewal failed for {cal_id}: {str(exc).splitlines()[0][:100]}",
+                        "error",
+                    )
         except Exception as exc:
             print(f"[watch] Auto-watch manager failed: {exc}", flush=True)
+            _feed.push(f"Google webhook manager error: {str(exc).splitlines()[0][:100]}", "error")
 
         events: list[dict] = []
         for calendar_id in active_calendars:

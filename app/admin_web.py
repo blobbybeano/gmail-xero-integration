@@ -1456,6 +1456,50 @@ def create_app() -> Flask:
         watch_count = len(watches)
         enabled = get_enabled(config.admin_db_file)
 
+        # Build home-page warnings
+        _dash_warnings: list[str] = []
+        if not google_ok:
+            _dash_warnings.append(
+                "Google not connected \u2014 calendar events cannot be read and webhooks cannot be "
+                "registered. Go to Settings to reconnect."
+            )
+        if not xero_ok:
+            _dash_warnings.append(
+                "Xero not connected \u2014 invoices cannot be created. Go to Settings to reconnect."
+            )
+        _now_ms = int(time.time() * 1000)
+        _active_cals = get_active_calendars(config.admin_db_file, config.google_calendar_id)
+        for _cal_id in _active_cals:
+            _winfo = watches.get(_cal_id) or {}
+            _exp_ms = int(_winfo.get("expiration_ms") or 0)
+            if not _winfo or not _winfo.get("channel_id"):
+                _dash_warnings.append(
+                    f"No webhook registered for calendar {_cal_id} \u2014 events will only be "
+                    "caught by the polling fallback (check Settings \u2192 Calendars)."
+                )
+            elif _exp_ms and _exp_ms < _now_ms:
+                _dash_warnings.append(
+                    f"Google webhook expired for {_cal_id} \u2014 automatic renewal will be "
+                    "attempted on the next poll cycle."
+                )
+
+        def _warning_banner(msg: str) -> str:
+            return (
+                f'<div class="flex items-start gap-3 px-4 py-3 rounded-lg border '
+                f'border-amber-600/40 bg-amber-950/40 text-amber-300 text-sm">'
+                f'<span class="shrink-0 text-amber-400 mt-0.5">\u26a0</span>'
+                f'<span>{escape(msg)}</span>'
+                f'</div>'
+            )
+
+        warnings_html = (
+            '<div class="mx-6 mt-4 flex flex-col gap-2">'
+            + "".join(_warning_banner(w) for w in _dash_warnings)
+            + "</div>"
+            if _dash_warnings
+            else ""
+        )
+
         recent_logs = _feed.recent(500)
         last_seq_val = recent_logs[-1]["seq"] if recent_logs else 0
 
@@ -1642,6 +1686,8 @@ def create_app() -> Flask:
       </a>
     </div>
   </header>
+
+  {warnings_html}
 
   <!-- Status signals -->
   <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 px-6 pt-5 pb-4">

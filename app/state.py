@@ -139,3 +139,14 @@ def set_sheet_log_marker(state: Dict, event_id: str, marker: str) -> Dict:
     mapping[event_id] = marker
     state["event_sheet_log_updates"] = mapping
     return state
+
+
+def get_sales_log_marker(state: Dict, event_id: str) -> str | None:
+    return state.get("event_sales_log_updates", {}).get(event_id)
+
+
+def set_sales_log_marker(state: Dict, event_id: str, marker: str) -> Dict:
+    mapping = state.get("event_sales_log_updates", {})
+    mapping[event_id] = marker
+    state["event_sales_log_updates"] = mapping
+    return state
