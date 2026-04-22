@@ -1,0 +1,37 @@
+so i have been working on it and ammended some stuff, before what happened was:
+Google webhook not registering
+Error: WebHook callback must be HTTPS: http://localhost:8080/webhooks/google-calendar
+Cause: Fly app was reading local-style .env values, so webhook URL became localhost.
+Fix:
+app/config.py: only load .env in local dev (not Fly).
+app/main.py: stronger base URL selection (APP_BASE_URL / Fly domain), ignore localhost for webhook registration.
+fly.toml: set explicit production URLs (APP_BASE_URL, Google/Xero redirect URIs).
+Added .dockerignore so local .env and token files aren’t baked into deploy images.
+Poller instability due to Xero refresh errors
+Error: repeated 400 Client Error to https://identity.xero.com/connect/token, poller restart loops.
+Cause: bad/mismatched runtime auth state plus hard-fail refresh path.
+Fix:
+app/xero_client.py: token refresh failures no longer crash the poller loop; app continues running (so Google watch renewal still works).
+“Xero connected” but “No organisations found”
+Error pattern: UI showed connected token but no selectable orgs.
+Cause: status check only looked at token presence, not valid tenant/org lookup.
+Fix:
+app/admin_web.py: Xero status now validates connections, refreshes token when needed, and surfaces real lookup errors.
+Fallback to saved tenant configs instead of silent empty state.
+Added visual spacing/margin around the Xero Organisations section.
+Sales routing missing per-user mapping
+Gap: sales tracking wasn’t per submitter like cash.
+Fix:
+Added per-user sales sheet routing + backlog + auto-flush when routing is later configured:
+app/admin_store.py
+app/admin_web.py
+app/main.py
+Production image contamination by local files
+Risk: local secrets/state entering container image and causing inconsistent behavior.
+Fix:
+Added .dockerignore entries for .env, local tokens, db/state, etc.
+
+
+I want you to make double sure that i can rely on the webhooks to keep refreshing indefinately and that i wont have to worry about my xero or anything from googels side getting dissconnected.
+
+If something is not working or set up then there must be a warning on the home page

@@ -19,6 +19,17 @@ DEFAULT_STATS_FIELDS = [
     "job_cost_inc_vat",
 ]
 
+DEFAULT_SALES_STATS_FIELDS = [
+    "submitter",
+    "customer",
+    "slot_datetime",
+    "payment_method",
+    "invoice_number",
+    "sales_item_desc",
+    "sales_item_ex_vat",
+    "sales_item_inc_vat",
+]
+
 
 def _clean_email(value: str) -> str:
     return (value or "").strip().lower()
@@ -116,6 +127,40 @@ def set_sheet_target(db_path: str, spreadsheet_id: str, sheet_name: str) -> None
             "sheet_name": sheet_name.strip() or "Sheet1",
         },
     )
+
+
+def get_sales_sheet_target(db_path: str) -> dict[str, str]:
+    target = get_json_setting(
+        db_path,
+        "sales_sheet_target",
+        {"spreadsheet_id": "", "sheet_name": "Sales"},
+    )
+    return {
+        "spreadsheet_id": str(target.get("spreadsheet_id", "")).strip(),
+        "sheet_name": str(target.get("sheet_name", "Sales")).strip() or "Sales",
+    }
+
+
+def set_sales_sheet_target(db_path: str, spreadsheet_id: str, sheet_name: str) -> None:
+    set_json_setting(
+        db_path,
+        "sales_sheet_target",
+        {
+            "spreadsheet_id": spreadsheet_id.strip(),
+            "sheet_name": sheet_name.strip() or "Sales",
+        },
+    )
+
+
+def get_sales_stats_fields(db_path: str) -> list[str]:
+    value = get_json_setting(db_path, "sales_stats_fields", DEFAULT_SALES_STATS_FIELDS)
+    if not value:
+        return []
+    return [str(v) for v in value]
+
+
+def set_sales_stats_fields(db_path: str, fields: list[str]) -> None:
+    set_json_setting(db_path, "sales_stats_fields", fields)
 
 
 def get_submitter_aliases(db_path: str) -> dict[str, str]:
@@ -220,67 +265,134 @@ def get_xero_tenants(db_path: str) -> list[dict]:
     return raw
 
 
-def set_xero_tenants(db_path: str, tenants: list[dict]) -> None:
-    set_json_setting(db_path, "xero_tenants", tenants)
-
-
-CASH_STATS_FIELDS = [
-    "event_id",
-    "date",
-    "slot_datetime",
-    "calendar_user",
-    "customer",
-    "customer_email",
-    "customer_phone",
-    "line_items",
-    "ex_vat",
-    "inc_vat",
-    "recorded_at",
-]
-
-
-def get_cash_sheets(db_path: str) -> dict[str, str]:
-    """Returns {calendar_user_email: spreadsheet_id}."""
-    raw = get_json_setting(db_path, "cash_sheets", {})
+def get_cash_submitter_sheets(db_path: str) -> dict[str, dict[str, str]]:
+    """
+    Per-submitter cash sheet routing.
+    Shape:
+      {
+        "<submitter_email>": {"spreadsheet_id": "...", "sheet_name": "..."},
+        ...
+      }
+    """
+    raw = get_json_setting(db_path, "cash_submitter_sheets", {})
     if not isinstance(raw, dict):
         return {}
-    return raw
+    out: dict[str, dict[str, str]] = {}
+    for email, cfg in raw.items():
+        clean_email = _clean_email(str(email))
+        if not clean_email or not isinstance(cfg, dict):
+            continue
+        sid = str(cfg.get("spreadsheet_id", "")).strip()
+        sname = str(cfg.get("sheet_name", "Sheet1")).strip() or "Sheet1"
+        out[clean_email] = {
+            "spreadsheet_id": sid,
+            "sheet_name": sname,
+        }
+    return out
 
 
-def set_cash_sheet(db_path: str, user_email: str, spreadsheet_id: str) -> None:
-    """Assign (or remove) a cash spreadsheet for a calendar user."""
-    sheets = get_cash_sheets(db_path)
-    key = (user_email or "").strip().lower()
-    if not key:
-        return
-    if spreadsheet_id and spreadsheet_id.strip():
-        sheets[key] = spreadsheet_id.strip()
-    else:
-        sheets.pop(key, None)
-    set_json_setting(db_path, "cash_sheets", sheets)
+def set_cash_submitter_sheets(
+    db_path: str,
+    mapping: dict[str, dict[str, str]],
+) -> None:
+    cleaned: dict[str, dict[str, str]] = {}
+    for email, cfg in (mapping or {}).items():
+        clean_email = _clean_email(str(email))
+        if not clean_email or not isinstance(cfg, dict):
+            continue
+        sid = str(cfg.get("spreadsheet_id", "")).strip()
+        sname = str(cfg.get("sheet_name", "Sheet1")).strip() or "Sheet1"
+        cleaned[clean_email] = {
+            "spreadsheet_id": sid,
+            "sheet_name": sname,
+        }
+    set_json_setting(db_path, "cash_submitter_sheets", cleaned)
 
 
-def get_pending_cash_entries(db_path: str) -> list[dict]:
-    """Return buffered cash entries for users who don't have a sheet yet."""
-    raw = get_json_setting(db_path, "pending_cash_entries", [])
+def get_cash_backlog(db_path: str) -> list[dict]:
+    """
+    Pending cash entries waiting for submitter-specific sheet routing.
+    """
+    raw = get_json_setting(db_path, "cash_backlog", [])
     if not isinstance(raw, list):
         return []
-    return raw
+    out: list[dict] = []
+    for row in raw:
+        if isinstance(row, dict):
+            out.append(row)
+    return out
 
 
-def add_pending_cash_entry(db_path: str, entry: dict) -> None:
-    """Buffer a cash entry until the user's sheet is configured."""
-    entries = get_pending_cash_entries(db_path)
-    entries.append(entry)
-    set_json_setting(db_path, "pending_cash_entries", entries)
+def set_cash_backlog(db_path: str, rows: list[dict]) -> None:
+    safe_rows = [r for r in (rows or []) if isinstance(r, dict)]
+    set_json_setting(db_path, "cash_backlog", safe_rows)
 
 
-def remove_pending_cash_entries(db_path: str, entry_ids: list[str]) -> None:
-    """Remove buffered entries by their entry_id once they have been written."""
-    id_set = set(entry_ids)
-    entries = get_pending_cash_entries(db_path)
-    remaining = [e for e in entries if e.get("entry_id") not in id_set]
-    set_json_setting(db_path, "pending_cash_entries", remaining)
+def get_sales_submitter_sheets(db_path: str) -> dict[str, dict[str, str]]:
+    """
+    Per-submitter sales sheet routing.
+    Shape:
+      {
+        "<submitter_email>": {"spreadsheet_id": "...", "sheet_name": "..."},
+        ...
+      }
+    """
+    raw = get_json_setting(db_path, "sales_submitter_sheets", {})
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict[str, str]] = {}
+    for email, cfg in raw.items():
+        clean_email = _clean_email(str(email))
+        if not clean_email or not isinstance(cfg, dict):
+            continue
+        sid = str(cfg.get("spreadsheet_id", "")).strip()
+        sname = str(cfg.get("sheet_name", "Sales")).strip() or "Sales"
+        out[clean_email] = {
+            "spreadsheet_id": sid,
+            "sheet_name": sname,
+        }
+    return out
+
+
+def set_sales_submitter_sheets(
+    db_path: str,
+    mapping: dict[str, dict[str, str]],
+) -> None:
+    cleaned: dict[str, dict[str, str]] = {}
+    for email, cfg in (mapping or {}).items():
+        clean_email = _clean_email(str(email))
+        if not clean_email or not isinstance(cfg, dict):
+            continue
+        sid = str(cfg.get("spreadsheet_id", "")).strip()
+        sname = str(cfg.get("sheet_name", "Sales")).strip() or "Sales"
+        cleaned[clean_email] = {
+            "spreadsheet_id": sid,
+            "sheet_name": sname,
+        }
+    set_json_setting(db_path, "sales_submitter_sheets", cleaned)
+
+
+def get_sales_backlog(db_path: str) -> list[dict]:
+    """
+    Pending sales entries waiting for submitter-specific sheet routing.
+    """
+    raw = get_json_setting(db_path, "sales_backlog", [])
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for row in raw:
+        if isinstance(row, dict):
+            out.append(row)
+    return out
+
+
+def set_sales_backlog(db_path: str, rows: list[dict]) -> None:
+    safe_rows = [r for r in (rows or []) if isinstance(r, dict)]
+    set_json_setting(db_path, "sales_backlog", safe_rows)
+
+
+def set_xero_tenants(db_path: str, tenants: list[dict]) -> None:
+    set_json_setting(db_path, "xero_tenants", tenants)
 
 
 def upsert_xero_tenant(

@@ -16,9 +16,16 @@ from flask import Flask, redirect, request, session, url_for
 from googleapiclient.errors import HttpError
 
 from .admin_store import (
+    DEFAULT_SALES_STATS_FIELDS,
     DEFAULT_STATS_FIELDS,
     get_active_calendars,
+    get_cash_backlog,
+    get_cash_submitter_sheets,
     get_json_setting,
+    get_sales_backlog,
+    get_sales_sheet_target,
+    get_sales_stats_fields,
+    get_sales_submitter_sheets,
     get_sheet_target,
     get_seen_submitters,
     get_stats_fields,
@@ -26,7 +33,11 @@ from .admin_store import (
     init_admin_store,
     set_submitter_aliases,
     set_active_calendars,
+    set_cash_submitter_sheets,
     set_json_setting,
+    set_sales_sheet_target,
+    set_sales_stats_fields,
+    set_sales_submitter_sheets,
     set_sheet_target,
     set_stats_fields,
 )
@@ -44,17 +55,10 @@ from .google_admin import (
 from .config import AppConfig
 from .xero_client import load_xero_token, save_xero_token, token_is_expired, refresh_xero_token
 from .google_sheets import backfill_submitter_in_sheet, update_invoice_paid_in_sheet
-from .google_calendar import register_calendar_watch, stop_calendar_watch
 from .admin_store import (
-    CASH_STATS_FIELDS,
-    get_cash_sheets,
     get_enabled,
-    get_pending_cash_entries,
-    set_cash_sheet,
     set_enabled,
     get_google_watches,
-    set_google_watch,
-    delete_google_watch,
     get_xero_webhook_key,
     set_xero_webhook_key,
     get_xero_webhook_verified,
@@ -82,6 +86,17 @@ STAT_OPTIONS = [
     ("payment_method", "Payment method"),
     ("job_cost_ex_vat", "Job cost (ex VAT)"),
     ("job_cost_inc_vat", "Job cost (inc VAT)"),
+]
+
+SALES_STAT_OPTIONS = [
+    ("submitter", "Person who submitted"),
+    ("customer", "Customer name"),
+    ("slot_datetime", "Diary slot date/time"),
+    ("payment_method", "Payment method"),
+    ("invoice_number", "Invoice number"),
+    ("sales_item_desc", "Sales item"),
+    ("sales_item_ex_vat", "Sales value (ex VAT)"),
+    ("sales_item_inc_vat", "Sales value (inc VAT)"),
 ]
 
 _BASE_HTML = """<!DOCTYPE html>
@@ -198,7 +213,7 @@ def _get_tenant_acct_themes(at: str, tid: str) -> "tuple[list, list, list]":
         _ar = requests.get(
             "https://api.xero.com/api.xro/2.0/Accounts",
             headers=hdrs,
-            timeout=10,
+            timeout=5,
         )
         for _a in _ar.json().get("Accounts", []):
             if _a.get("Status") != "ACTIVE":
@@ -215,7 +230,7 @@ def _get_tenant_acct_themes(at: str, tid: str) -> "tuple[list, list, list]":
         _tr = requests.get(
             "https://api.xero.com/api.xro/2.0/BrandingThemes",
             headers=hdrs,
-            timeout=10,
+            timeout=5,
         )
         themes = sorted(
             _tr.json().get("BrandingThemes", []),
@@ -369,8 +384,10 @@ def _get_xero_tenant_id(access_token: str) -> str:
 
 def _get_all_xero_connections(access_token: str) -> list[dict]:
     """Return all authorised Xero connections as [{tenantId, tenantName}]."""
+    if not access_token:
+        return []
     headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
-    response = requests.get(XERO_CONNECTIONS_URL, headers=headers, timeout=30)
+    response = requests.get(XERO_CONNECTIONS_URL, headers=headers, timeout=10)
     response.raise_for_status()
     return [
         {"tenantId": c.get("tenantId", ""), "tenantName": c.get("tenantName", c.get("tenantId", ""))}
@@ -386,12 +403,43 @@ def _xero_status_data(config: AppConfig) -> tuple[bool, str, str]:
     has_credentials = bool(client_id and client_secret)
     if not has_credentials:
         return False, "Enter your Xero Client ID and Secret below, then click Save.", ""
-    access = token.get("access_token")
-    tenant = token.get("tenant_id")
-    if access and tenant:
-        exp = "expired" if token_is_expired(token) else "valid"
-        return True, f"Connected (token {exp})", tenant
-    return False, "Not connected — click Connect Xero below.", ""
+    access = token.get("access_token", "")
+    tenant = token.get("tenant_id", "")
+    refresh_token = token.get("refresh_token", "")
+
+    if not access:
+        return False, "Not connected — click Connect Xero below.", ""
+
+    if token_is_expired(token):
+        if not (client_id and client_secret and refresh_token):
+            return False, "Xero token expired — reconnect Xero.", ""
+        try:
+            refreshed = refresh_xero_token(client_id, client_secret, refresh_token)
+            token = {**token, **refreshed}
+            save_xero_token(config.xero_token_file, token)
+            access = token.get("access_token", "")
+            tenant = token.get("tenant_id", tenant)
+        except Exception as exc:
+            short = str(exc).splitlines()[0][:180]
+            return False, f"Xero token refresh failed: {short}", ""
+
+    try:
+        connections = _get_all_xero_connections(access)
+    except Exception as exc:
+        short = str(exc).splitlines()[0][:180]
+        return False, f"Connected token, but organisation lookup failed: {short}", tenant
+
+    if not connections:
+        return False, "Connected token, but no organisations are authorised. Reconnect Xero and choose an organisation.", ""
+
+    valid_tenants = {c.get("tenantId", "") for c in connections}
+    if not tenant or tenant not in valid_tenants:
+        tenant = next(iter(valid_tenants))
+        token["tenant_id"] = tenant
+        save_xero_token(config.xero_token_file, token)
+
+    count = len(connections)
+    return True, f"Connected ({count} organisation{'s' if count != 1 else ''})", tenant
 
 
 def _save_submitter_aliases_from_form(config: AppConfig, form) -> dict[str, str]:
@@ -411,6 +459,58 @@ def _save_submitter_aliases_from_form(config: AppConfig, form) -> dict[str, str]
             next_aliases.pop(email, None)
     set_submitter_aliases(config.admin_db_file, next_aliases)
     return next_aliases
+
+
+def _save_cash_submitter_sheets_from_form(config: AppConfig, form) -> dict[str, dict[str, str]]:
+    current = get_cash_submitter_sheets(config.admin_db_file)
+    next_map = dict(current)
+    prefix_id = "cash_sheet_id__"
+    prefix_name = "cash_sheet_name__"
+
+    candidate_emails: set[str] = set()
+    for k in form.keys():
+        if k.startswith(prefix_id):
+            candidate_emails.add(k[len(prefix_id):].strip().lower())
+        elif k.startswith(prefix_name):
+            candidate_emails.add(k[len(prefix_name):].strip().lower())
+
+    for email in candidate_emails:
+        raw_id = (form.get(f"{prefix_id}{email}") or "").strip()
+        sid = _extract_spreadsheet_id(raw_id)
+        sname = (form.get(f"{prefix_name}{email}") or "Sheet1").strip() or "Sheet1"
+        if sid:
+            next_map[email] = {"spreadsheet_id": sid, "sheet_name": sname}
+        else:
+            next_map.pop(email, None)
+
+    set_cash_submitter_sheets(config.admin_db_file, next_map)
+    return next_map
+
+
+def _save_sales_submitter_sheets_from_form(config: AppConfig, form) -> dict[str, dict[str, str]]:
+    current = get_sales_submitter_sheets(config.admin_db_file)
+    next_map = dict(current)
+    prefix_id = "sales_sheet_id__"
+    prefix_name = "sales_sheet_name__"
+
+    candidate_emails: set[str] = set()
+    for k in form.keys():
+        if k.startswith(prefix_id):
+            candidate_emails.add(k[len(prefix_id):].strip().lower())
+        elif k.startswith(prefix_name):
+            candidate_emails.add(k[len(prefix_name):].strip().lower())
+
+    for email in candidate_emails:
+        raw_id = (form.get(f"{prefix_id}{email}") or "").strip()
+        sid = _extract_spreadsheet_id(raw_id)
+        sname = (form.get(f"{prefix_name}{email}") or "Sales").strip() or "Sales"
+        if sid:
+            next_map[email] = {"spreadsheet_id": sid, "sheet_name": sname}
+        else:
+            next_map.pop(email, None)
+
+    set_sales_submitter_sheets(config.admin_db_file, next_map)
+    return next_map
 
 
 def _apply_alias_to_description(
@@ -544,6 +644,7 @@ def _status_badge(ok: bool, text: str) -> str:
 def _xero_tenant_cards(
     xero_ok: bool,
     tenant_accounts: list[dict],
+    warning_message: str = "",
 ) -> str:
     """Render per-tenant cards with enable toggle and separate account mapping.
 
@@ -552,16 +653,22 @@ def _xero_tenant_cards(
     """
     if not xero_ok:
         return (
-            '<div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6 opacity-50">'
+            '<div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6 opacity-50 mt-4">'
             '<h2 class="font-semibold text-gray-900 mb-1">Xero Organisations</h2>'
             '<p class="text-sm text-gray-400">Connect Xero first to configure organisations and account mapping.</p>'
             '</div>'
         )
 
     if not tenant_accounts:
+        warning_html = (
+            f'<p class="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-3">{escape(warning_message)}</p>'
+            if warning_message
+            else ""
+        )
         return (
-            '<div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">'
+            '<div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6 mt-4">'
             '<h2 class="font-semibold text-gray-900 mb-1">Xero Organisations</h2>'
+            f'{warning_html}'
             '<p class="text-sm text-gray-400">No organisations found — reconnect Xero to discover them.</p>'
             '</div>'
         )
@@ -744,12 +851,19 @@ def _xero_tenant_cards(
           </div>
         </details>"""
 
+    warning_html = (
+        f'<div class="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">{escape(warning_message)}</div>'
+        if warning_message
+        else ""
+    )
+
     return f"""
-    <div class="space-y-4">
+    <div class="space-y-4 mt-4">
       <div class="flex items-center justify-between">
         <h2 class="font-semibold text-gray-900">Xero Organisations</h2>
         <p class="text-xs text-gray-400">{len(tenant_accounts)} organisation{"s" if len(tenant_accounts) != 1 else ""} connected</p>
       </div>
+      {warning_html}
       {cards_html}
     </div>"""
 
@@ -791,9 +905,49 @@ def _bootstrap_credentials(config) -> None:
             creds_path.write_bytes(base64.b64decode(creds_b64))
 
 
+def _save_admin_auth_file(config: AppConfig, username: str, password: str) -> None:
+    path = Path(config.admin_auth_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "username": username.strip(),
+        "password": password,
+        "updated_at": int(time.time()),
+    }
+    path.write_text(json.dumps(payload, indent=2))
+
+
+def _load_admin_auth(config: AppConfig) -> tuple[str, str]:
+    """
+    Read admin auth from persistent file first, env fallback second.
+    """
+    path = Path(config.admin_auth_file)
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text())
+            username = str(raw.get("username", "")).strip()
+            password = str(raw.get("password", ""))
+            if username and password:
+                return username, password
+        except Exception:
+            pass
+    return config.admin_username, config.admin_password
+
+
+def _bootstrap_admin_auth(config: AppConfig) -> None:
+    """
+    Ensure a persistent admin auth file exists.
+    """
+    username, password = _load_admin_auth(config)
+    if not username or not password:
+        return
+    if not Path(config.admin_auth_file).exists():
+        _save_admin_auth_file(config, username, password)
+
+
 def create_app() -> Flask:
     config = load_config()
     _bootstrap_credentials(config)
+    _bootstrap_admin_auth(config)
     init_admin_store(config.admin_db_file)
 
     app = Flask(__name__)
@@ -842,6 +996,9 @@ def create_app() -> Flask:
                   Sign in
                 </button>
               </form>
+              <p class="text-center mt-4 text-xs text-gray-500">
+                Can't sign in? <a href="/admin/reset-login" class="text-indigo-600 hover:text-indigo-700">Reset admin login</a>
+              </p>
             </div>
           </div>
         </div>
@@ -851,7 +1008,8 @@ def create_app() -> Flask:
     def login_post():
         username = (request.form.get("username") or "").strip()
         password = request.form.get("password") or ""
-        if username == config.admin_username and password == config.admin_password:
+        expected_user, expected_pass = _load_admin_auth(config)
+        if username == expected_user and password == expected_pass:
             session["logged_in"] = True
             return redirect(url_for("dashboard"))
         return _page(f"""
@@ -879,6 +1037,122 @@ def create_app() -> Flask:
     def logout():
         session.clear()
         return redirect(url_for("login"))
+
+    @app.get("/admin/reset-login")
+    def reset_login_page():
+        token_set = bool((config.admin_reset_token or "").strip())
+        hint = (
+            ""
+            if token_set
+            else '<p class="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-4">ADMIN_RESET_TOKEN is not set in environment/secrets yet.</p>'
+        )
+        return _page(
+            f"""
+        <div class="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-50 to-blue-100 px-4">
+          <div class="w-full max-w-md">
+            <div class="bg-white rounded-2xl shadow-xl p-8">
+              <h1 class="text-2xl font-bold text-gray-900 mb-2">Reset Admin Login</h1>
+              <p class="text-gray-500 text-sm mb-6">Use your reset token to replace admin username/password stored on volume.</p>
+              {hint}
+              <form method="post" class="space-y-4">
+                <div>
+                  <label class="block text-sm font-medium text-gray-700 mb-1.5">Reset token</label>
+                  <input name="reset_token" type="password" class="w-full px-4 py-2.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" placeholder="ADMIN_RESET_TOKEN">
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-700 mb-1.5">New username</label>
+                  <input name="new_username" class="w-full px-4 py-2.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" placeholder="admin@example.com">
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-700 mb-1.5">New password</label>
+                  <input name="new_password" type="password" class="w-full px-4 py-2.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" placeholder="New password">
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-700 mb-1.5">Confirm password</label>
+                  <input name="confirm_password" type="password" class="w-full px-4 py-2.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" placeholder="Repeat password">
+                </div>
+                <button type="submit" class="w-full py-2.5 px-4 bg-indigo-600 hover:bg-indigo-700 text-white font-medium rounded-lg text-sm transition-colors">Reset Login</button>
+              </form>
+              <a href="/login" class="block text-center mt-4 text-sm text-gray-500 hover:text-gray-700">Back to login</a>
+            </div>
+          </div>
+        </div>
+        """
+        )
+
+    @app.post("/admin/reset-login")
+    def reset_login_post():
+        configured_token = (config.admin_reset_token or "").strip()
+        provided_token = (request.form.get("reset_token") or "").strip()
+        new_username = (request.form.get("new_username") or "").strip()
+        new_password = request.form.get("new_password") or ""
+        confirm_password = request.form.get("confirm_password") or ""
+
+        if not configured_token:
+            return _page(
+                """
+            <div class="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-50 to-blue-100 px-4">
+              <div class="bg-white rounded-2xl shadow-xl p-8 w-full max-w-md">
+                <h1 class="text-2xl font-bold text-red-700 mb-2">Reset Unavailable</h1>
+                <p class="text-sm text-gray-600">ADMIN_RESET_TOKEN is not configured on this deployment.</p>
+                <a href="/login" class="inline-block mt-4 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm">Back to login</a>
+              </div>
+            </div>
+            """
+            ), 400
+
+        if not provided_token or not secrets.compare_digest(provided_token, configured_token):
+            return _page(
+                """
+            <div class="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-50 to-blue-100 px-4">
+              <div class="bg-white rounded-2xl shadow-xl p-8 w-full max-w-md">
+                <h1 class="text-2xl font-bold text-red-700 mb-2">Invalid Reset Token</h1>
+                <p class="text-sm text-gray-600">The reset token is invalid.</p>
+                <a href="/admin/reset-login" class="inline-block mt-4 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm">Try again</a>
+              </div>
+            </div>
+            """
+            ), 401
+
+        if not new_username or not new_password:
+            return _page(
+                """
+            <div class="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-50 to-blue-100 px-4">
+              <div class="bg-white rounded-2xl shadow-xl p-8 w-full max-w-md">
+                <h1 class="text-2xl font-bold text-red-700 mb-2">Missing Fields</h1>
+                <p class="text-sm text-gray-600">Username and password are required.</p>
+                <a href="/admin/reset-login" class="inline-block mt-4 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm">Try again</a>
+              </div>
+            </div>
+            """
+            ), 400
+
+        if new_password != confirm_password:
+            return _page(
+                """
+            <div class="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-50 to-blue-100 px-4">
+              <div class="bg-white rounded-2xl shadow-xl p-8 w-full max-w-md">
+                <h1 class="text-2xl font-bold text-red-700 mb-2">Password Mismatch</h1>
+                <p class="text-sm text-gray-600">New password and confirmation do not match.</p>
+                <a href="/admin/reset-login" class="inline-block mt-4 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm">Try again</a>
+              </div>
+            </div>
+            """
+            ), 400
+
+        _save_admin_auth_file(config, new_username, new_password)
+        session.clear()
+        return _page(
+            """
+        <div class="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-50 to-blue-100 px-4">
+          <div class="bg-white rounded-2xl shadow-xl p-8 w-full max-w-md">
+            <h1 class="text-2xl font-bold text-emerald-700 mb-2">Login Reset Complete</h1>
+            <p class="text-sm text-gray-600">Admin credentials were saved to persistent storage.</p>
+            <a href="/login" class="inline-block mt-4 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm">Go to login</a>
+          </div>
+        </div>
+        """
+        )
 
     @app.post("/save-xero-creds")
     @require_login
@@ -934,10 +1208,29 @@ def create_app() -> Flask:
     def toggle_xero_tenant(tenant_id: str):
         tenants = get_xero_tenants(config.admin_db_file)
         current = next((t for t in tenants if t["tenantId"] == tenant_id), {})
-        new_enabled = not current.get("enabled", True)
-        upsert_xero_tenant(config.admin_db_file, tenant_id, enabled=new_enabled)
-        label = "enabled" if new_enabled else "paused"
-        session["save_notice"] = f"success:Organisation {label}."
+        if not current:
+            session["save_notice"] = "error:Organisation not found."
+            return redirect(url_for("index"))
+
+        # Single-active-tenant model: selecting one tenant enables it and pauses others.
+        if current.get("enabled", True):
+            session["save_notice"] = "success:Organisation already active."
+            return redirect(url_for("index"))
+
+        for t in tenants:
+            t["enabled"] = (t.get("tenantId") == tenant_id)
+        set_xero_tenants(config.admin_db_file, tenants)
+
+        # Keep token tenant in sync with selected active tenant.
+        try:
+            tok = load_xero_token(config.xero_token_file)
+            if tok:
+                tok["tenant_id"] = tenant_id
+                save_xero_token(config.xero_token_file, tok)
+        except Exception:
+            pass
+
+        session["save_notice"] = "success:Active organisation switched."
         return redirect(url_for("index"))
 
     @app.get("/connect-xero")
@@ -990,7 +1283,9 @@ def create_app() -> Flask:
                 or _current_base_url() + "/xero/callback"
             )
             token = _exchange_xero_code(config, code, redirect_uri=dynamic_xero_redirect)
-            tenant_id = _get_xero_tenant_id(token.get("access_token", ""))
+            all_conns = _get_all_xero_connections(token.get("access_token", ""))
+            if not all_conns:
+                raise RuntimeError("No Xero organisation connections returned.")
         except Exception as exc:
             return _page(f"""
             <div class="min-h-screen flex items-center justify-center bg-gray-50">
@@ -1001,15 +1296,40 @@ def create_app() -> Flask:
             </div>
             """), 400
 
+        existing_tenants = get_xero_tenants(config.admin_db_file)
+        existing_by_id = {t.get("tenantId"): t for t in existing_tenants if t.get("tenantId")}
+        existing_active = next(
+            (t.get("tenantId") for t in existing_tenants if t.get("enabled", True) and t.get("tenantId")),
+            "",
+        )
+        previous_token = str(load_xero_token(config.xero_token_file).get("tenant_id", "") or "").strip()
+        conn_ids = {c["tenantId"] for c in all_conns}
+        tenant_id = (
+            existing_active
+            if existing_active in conn_ids
+            else (previous_token if previous_token in conn_ids else all_conns[0]["tenantId"])
+        )
+
+        rebuilt_tenants: list[dict] = []
+        for conn in all_conns:
+            tid = conn["tenantId"]
+            saved = existing_by_id.get(tid, {})
+            rebuilt_tenants.append(
+                {
+                    "tenantId": tid,
+                    "tenantName": conn.get("tenantName", tid),
+                    "enabled": tid == tenant_id,
+                    "invoiceAccount": saved.get("invoiceAccount", ""),
+                    "paymentAccount": saved.get("paymentAccount", ""),
+                    "brandingThemeId": saved.get("brandingThemeId", ""),
+                    "premiumThemeId": saved.get("premiumThemeId", ""),
+                    "premiumThreshold": saved.get("premiumThreshold"),
+                }
+            )
+        set_xero_tenants(config.admin_db_file, rebuilt_tenants)
+
         token["tenant_id"] = tenant_id
         save_xero_token(config.xero_token_file, token)
-        # Register every authorised connection as a per-tenant config entry
-        try:
-            all_conns = _get_all_xero_connections(token.get("access_token", ""))
-            for conn in all_conns:
-                upsert_xero_tenant(config.admin_db_file, conn["tenantId"], tenant_name=conn["tenantName"])
-        except Exception:
-            pass
         session["logged_in"] = True
         session.pop("xero_oauth_state", None)
         session.pop("xero_auth_url", None)
@@ -1516,6 +1836,8 @@ function toggleEnabled() {{
         active = set(get_active_calendars(config.admin_db_file, config.google_calendar_id))
         stats_selected = set(get_stats_fields(config.admin_db_file))
         target = get_sheet_target(config.admin_db_file)
+        sales_target = get_sales_sheet_target(config.admin_db_file)
+        sales_stats_selected = set(get_sales_stats_fields(config.admin_db_file))
         sheets_ok, sheets_msg = _sheets_status_data(config, creds, target)
         xero_ok, xero_msg, xero_tenant = _xero_status_data(config)
         google_ok = creds is not None
@@ -1527,6 +1849,10 @@ function toggleEnabled() {{
         )
         seen_submitters = get_seen_submitters(config.admin_db_file)
         submitter_aliases = get_submitter_aliases(config.admin_db_file)
+        cash_submitter_sheets = get_cash_submitter_sheets(config.admin_db_file)
+        cash_backlog = get_cash_backlog(config.admin_db_file)
+        sales_submitter_sheets = get_sales_submitter_sheets(config.admin_db_file)
+        sales_backlog = get_sales_backlog(config.admin_db_file)
         client_id = _oauth_client_id(config)
         creds_file_exists = Path(config.google_credentials_file).exists()
         stored_xero_id, stored_xero_secret = _get_xero_creds(config)
@@ -1536,6 +1862,7 @@ function toggleEnabled() {{
 
         # Fetch Xero accounts per tenant for account-mapping UI
         xero_tenant_account_data: list[dict] = []
+        xero_tenant_warning = ""
         if xero_ok:
             try:
                 _tok = load_xero_token(config.xero_token_file)
@@ -1551,12 +1878,16 @@ function toggleEnabled() {{
                 for _conn in _all_conns:
                     _tid = _conn["tenantId"]
                     _tname = _conn.get("tenantName", _tid)
-                    _rev, _bank, _themes = _get_tenant_acct_themes(_at, _tid)
                     _cfg = _saved_tenants.get(_tid, {})
+                    _enabled = _cfg.get("enabled", _tid == xero_tenant)
+                    if _enabled:
+                        _rev, _bank, _themes = _get_tenant_acct_themes(_at, _tid)
+                    else:
+                        _rev, _bank, _themes = [], [], []
                     xero_tenant_account_data.append({
                         "tenantId": _tid,
                         "tenantName": _tname,
-                        "enabled": _cfg.get("enabled", True),
+                        "enabled": _enabled,
                         "invoiceAccount": _cfg.get("invoiceAccount", ""),
                         "paymentAccount": _cfg.get("paymentAccount", ""),
                         "revenueAccounts": _rev,
@@ -1566,8 +1897,30 @@ function toggleEnabled() {{
                         "premiumThemeId": _cfg.get("premiumThemeId", ""),
                         "premiumThreshold": _cfg.get("premiumThreshold"),
                     })
-            except Exception:
-                pass
+            except Exception as exc:
+                _saved_only = get_xero_tenants(config.admin_db_file)
+                for _cfg in _saved_only:
+                    _tid = _cfg.get("tenantId") or ""
+                    if not _tid:
+                        continue
+                    xero_tenant_account_data.append(
+                        {
+                            "tenantId": _tid,
+                            "tenantName": _cfg.get("tenantName") or _tid,
+                            "enabled": _cfg.get("enabled", _tid == xero_tenant),
+                            "invoiceAccount": _cfg.get("invoiceAccount", ""),
+                            "paymentAccount": _cfg.get("paymentAccount", ""),
+                            "revenueAccounts": [],
+                            "bankAccounts": [],
+                            "brandingThemes": [],
+                            "brandingThemeId": _cfg.get("brandingThemeId", ""),
+                            "premiumThemeId": _cfg.get("premiumThemeId", ""),
+                            "premiumThreshold": _cfg.get("premiumThreshold"),
+                        }
+                    )
+                xero_tenant_warning = (
+                    f"Could not refresh organisation list from Xero: {str(exc).splitlines()[0][:240]}"
+                )
         pending_auth_url = (
             session.get("oauth_auth_url")
             or str(get_json_setting(config.admin_db_file, "oauth_auth_url", "")).strip()
@@ -1585,12 +1938,6 @@ function toggleEnabled() {{
                 spreadsheets = list_spreadsheets(creds)
             except Exception:
                 pass
-
-        cash_sheets = get_cash_sheets(config.admin_db_file)
-        pending_cash = get_pending_cash_entries(config.admin_db_file)
-        seen_users = get_seen_submitters(config.admin_db_file)
-        active_cals = get_active_calendars(config.admin_db_file, config.google_calendar_id)
-        cash_users = sorted(set(seen_users) | set(active_cals) | set(cash_sheets.keys()))
 
         # --- Notice banner ---
         notice_html = ""
@@ -1670,6 +2017,16 @@ function toggleEnabled() {{
                 f'<span class="text-sm text-gray-800">{escape(label)}</span>'
                 f'</label>'
             )
+        sales_stats_html = ""
+        for key, label in SALES_STAT_OPTIONS:
+            checked = "checked" if key in sales_stats_selected else ""
+            sales_stats_html += (
+                f'<label class="flex items-center gap-3 p-2 rounded-lg hover:bg-gray-50 cursor-pointer">'
+                f'<input type="checkbox" name="sales_stats_fields" value="{key}" {checked} '
+                f'class="w-4 h-4 text-indigo-600 rounded border-gray-300 focus:ring-indigo-500">'
+                f'<span class="text-sm text-gray-800">{escape(label)}</span>'
+                f'</label>'
+            )
 
         # --- Submitter aliases ---
         alias_rows_html = ""
@@ -1686,15 +2043,97 @@ function toggleEnabled() {{
         if not alias_rows_html:
             alias_rows_html = '<p class="text-sm text-gray-500">No submitters seen yet — process some events first.</p>'
 
+        sales_backlog_counts: dict[str, int] = {}
+        for row in sales_backlog:
+            email = str(row.get("submitter_email", "")).strip().lower()
+            if not email:
+                continue
+            sales_backlog_counts[email] = sales_backlog_counts.get(email, 0) + 1
+
+        sales_rows_html = ""
+        for email in seen_submitters:
+            mapped = sales_submitter_sheets.get(email, {})
+            sid = mapped.get("spreadsheet_id", "")
+            sname = mapped.get("sheet_name", "Sales")
+            pending = sales_backlog_counts.get(email, 0)
+            pending_badge = (
+                f'<span class="text-xs text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full">{pending} pending</span>'
+                if pending
+                else '<span class="text-xs text-gray-400">No backlog</span>'
+            )
+            sales_rows_html += (
+                f'<div class="py-3 border-b border-gray-100 last:border-b-0">'
+                f'<div class="flex items-center justify-between gap-3 mb-2">'
+                f'<span class="text-sm text-gray-700 truncate" title="{escape(email)}">{escape(email)}</span>'
+                f'{pending_badge}'
+                f'</div>'
+                f'<div class="grid grid-cols-1 sm:grid-cols-3 gap-2">'
+                f'<input name="sales_sheet_id__{escape(email)}" value="{escape(sid)}" '
+                f'placeholder="Spreadsheet URL or ID" '
+                f'class="sm:col-span-2 px-3 py-1.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">'
+                f'<input name="sales_sheet_name__{escape(email)}" value="{escape(sname)}" '
+                f'placeholder="Sheet tab (e.g. Sales)" '
+                f'class="px-3 py-1.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">'
+                f'</div>'
+                f'</div>'
+            )
+        if not sales_rows_html:
+            sales_rows_html = '<p class="text-sm text-gray-500">No submitters seen yet — process some events first.</p>'
+
+        cash_backlog_counts: dict[str, int] = {}
+        for row in cash_backlog:
+            email = str(row.get("submitter_email", "")).strip().lower()
+            if not email:
+                continue
+            cash_backlog_counts[email] = cash_backlog_counts.get(email, 0) + 1
+
+        cash_rows_html = ""
+        for email in seen_submitters:
+            mapped = cash_submitter_sheets.get(email, {})
+            sid = mapped.get("spreadsheet_id", "")
+            sname = mapped.get("sheet_name", "Sheet1")
+            pending = cash_backlog_counts.get(email, 0)
+            pending_badge = (
+                f'<span class="text-xs text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full">{pending} pending</span>'
+                if pending
+                else '<span class="text-xs text-gray-400">No backlog</span>'
+            )
+            cash_rows_html += (
+                f'<div class="py-3 border-b border-gray-100 last:border-b-0">'
+                f'<div class="flex items-center justify-between gap-3 mb-2">'
+                f'<span class="text-sm text-gray-700 truncate" title="{escape(email)}">{escape(email)}</span>'
+                f'{pending_badge}'
+                f'</div>'
+                f'<div class="grid grid-cols-1 sm:grid-cols-3 gap-2">'
+                f'<input name="cash_sheet_id__{escape(email)}" value="{escape(sid)}" '
+                f'placeholder="Spreadsheet URL or ID" '
+                f'class="sm:col-span-2 px-3 py-1.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">'
+                f'<input name="cash_sheet_name__{escape(email)}" value="{escape(sname)}" '
+                f'placeholder="Sheet tab (e.g. Cash)" '
+                f'class="px-3 py-1.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">'
+                f'</div>'
+                f'</div>'
+            )
+        if not cash_rows_html:
+            cash_rows_html = '<p class="text-sm text-gray-500">No submitters seen yet — process some events first.</p>'
+
         # --- Spreadsheet options ---
         sheet_options = '<option value="">-- Select a spreadsheet --</option>'
         sheet_current_id = target.get("spreadsheet_id", "")
         sheet_name_val = target.get("sheet_name", "Sheet1")
+        sales_sheet_current_id = sales_target.get("spreadsheet_id", "")
+        sales_sheet_name_val = sales_target.get("sheet_name", "Sales")
         for s in spreadsheets:
             sel = 'selected' if s.get("id") == sheet_current_id else ""
             sheet_options += f'<option value="{escape(s["id"])}" {sel}>{escape(s["name"])}</option>'
         if sheet_current_id and all(s.get("id") != sheet_current_id for s in spreadsheets):
             sheet_options += f'<option value="{escape(sheet_current_id)}" selected>Current saved ({escape(sheet_current_id)})</option>'
+        sales_sheet_options = '<option value="">-- Select a spreadsheet --</option>'
+        for s in spreadsheets:
+            sel = 'selected' if s.get("id") == sales_sheet_current_id else ""
+            sales_sheet_options += f'<option value="{escape(s["id"])}" {sel}>{escape(s["name"])}</option>'
+        if sales_sheet_current_id and all(s.get("id") != sales_sheet_current_id for s in spreadsheets):
+            sales_sheet_options += f'<option value="{escape(sales_sheet_current_id)}" selected>Current saved ({escape(sales_sheet_current_id)})</option>'
 
         # --- Webhook state ---
         watches = get_google_watches(config.admin_db_file)
@@ -1825,7 +2264,7 @@ function toggleEnabled() {{
             <div class="divide-y divide-gray-100">
               {_url_row("Google OAuth redirect URI", _req_base + "/oauth/callback", "Register in Google Cloud Console → Credentials → OAuth client → Authorised redirect URIs")}
               {_url_row("Xero OAuth redirect URI", _req_base + "/xero/callback", "Register in Xero Developer Portal → Your App → Redirect URIs")}
-              {_url_row("Google Calendar webhook", _req_base + "/webhooks/google-calendar", "Used automatically when you register watches below")}
+              {_url_row("Google Calendar webhook", _req_base + "/webhooks/google-calendar", "Auto-managed for active calendars (created and renewed automatically)")}
               {_url_row("Xero webhook", _req_base + "/webhooks/xero", "Paste into Xero Developer Portal → Your App → Webhooks")}
             </div>
           </details>
@@ -1928,7 +2367,7 @@ function toggleEnabled() {{
                       </div>
                     </summary>
                     <div class="px-4 py-3 space-y-3">
-                      <p class="text-xs text-gray-500">Instant notifications when calendar events change — auto-renews, register once only.</p>
+                      <p class="text-xs text-gray-500">Instant notifications when calendar events change. Watches are auto-created and auto-renewed for active calendars.</p>
                       <div>
                         <label class="block text-xs font-medium text-gray-600 mb-1">Webhook URL <span class="text-gray-400 font-normal">(set automatically)</span></label>
                         <div class="flex gap-2">
@@ -1942,13 +2381,7 @@ function toggleEnabled() {{
                       <div class="divide-y divide-gray-50">
                         {watch_rows_html}
                       </div>
-                      <div class="flex gap-2 flex-wrap">
-                        <button type="submit" formaction="/setup/register-google-watches"
-                          class="px-3 py-1.5 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors {"opacity-50 pointer-events-none" if not google_ok else ""}">
-                          {"Register / Refresh" if not watches else "Re-register"}
-                        </button>
-                        {"" if not watches else '<button type="submit" formaction="/setup/stop-google-watches" class="px-3 py-1.5 text-xs font-medium text-red-600 bg-red-50 hover:bg-red-100 rounded-lg border border-red-200 transition-colors">Stop</button>'}
-                      </div>
+                      <p class="text-xs text-gray-500">No manual step needed. Ticking or unticking calendars in <strong>Active Calendars</strong> applies automatically.</p>
                     </div>
                   </details>
                 </div>
@@ -2059,7 +2492,7 @@ function toggleEnabled() {{
             </div>
           </form>
 
-          <!-- Google Sheets Target - collapsible standalone form - directly under connectivity -->
+          <!-- Google Sheets Configuration - collapsible standalone form - directly under connectivity -->
           <form method="post" action="/save-sheet-target" class="mt-4">
             <details class="bg-white rounded-2xl shadow-sm border border-gray-200 overflow-hidden group" {"open" if not sheets_ok else ""}>
               <summary class="flex items-center justify-between px-5 py-4 cursor-pointer list-none select-none hover:bg-gray-50 transition-colors">
@@ -2070,8 +2503,8 @@ function toggleEnabled() {{
                     </svg>
                   </div>
                   <div>
-                    <h2 class="font-semibold text-gray-900 text-sm">Google Sheets Target</h2>
-                    <p class="text-xs text-gray-500">Where invoice data is logged</p>
+                    <h2 class="font-semibold text-gray-900 text-sm">Google Sheets Configuration</h2>
+                    <p class="text-xs text-gray-500">Main invoice sheet + internal sales sheet + cash routing</p>
                   </div>
                 </div>
                 <div class="flex items-center gap-2">
@@ -2105,94 +2538,81 @@ function toggleEnabled() {{
                     class="w-48 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
                   {f'<p class="text-xs text-emerald-600 mt-1">&#10003; Saved: <span class="font-medium">{escape(sheet_name_val)}</span></p>' if sheet_current_id else ""}
                 </div>
+
+                <details class="border border-gray-200 rounded-xl overflow-hidden group/sales" open>
+                  <summary class="flex items-center justify-between px-4 py-3 bg-gray-50 cursor-pointer list-none select-none hover:bg-gray-100 transition-colors">
+                    <div>
+                      <h3 class="text-sm font-semibold text-gray-900">Sales Tracking (Internal)</h3>
+                      <p class="text-xs text-gray-500">Logs values from lines below <strong>⬇Sales⬇</strong> in [invoice]</p>
+                    </div>
+                    <svg class="w-4 h-4 text-gray-400 transition-transform duration-200 group-open/sales:rotate-180 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+                    </svg>
+                  </summary>
+                  <div class="px-4 py-4 border-t border-gray-100 space-y-4">
+                    {"" if not spreadsheets else f"""
+                    <div>
+                      <label class="block text-sm font-medium text-gray-700 mb-1.5">Sales spreadsheet (optional quick pick)</label>
+                      <select name="sales_spreadsheet_pick" class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                        {sales_sheet_options}
+                      </select>
+                    </div>
+                    """}
+                    <div>
+                      <label class="block text-sm font-medium text-gray-700 mb-1.5">Sales spreadsheet URL or ID</label>
+                      <input name="sales_spreadsheet_input" value="{escape(sales_sheet_current_id)}"
+                        placeholder="Paste a Google Sheets URL or spreadsheet ID"
+                        class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                      {f'<p class="text-xs text-emerald-600 mt-1">&#10003; Saved: <span class="font-medium">{escape(sales_sheet_current_id)}</span></p>' if sales_sheet_current_id else '<p class="text-xs text-gray-400 mt-1">No sales spreadsheet saved yet.</p>'}
+                    </div>
+                    <div>
+                      <label class="block text-sm font-medium text-gray-700 mb-1.5">Sales sheet tab name</label>
+                      <input name="sales_sheet_name" value="{escape(sales_sheet_name_val)}"
+                        placeholder="Sales"
+                        class="w-48 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                      {f'<p class="text-xs text-emerald-600 mt-1">&#10003; Saved: <span class="font-medium">{escape(sales_sheet_name_val)}</span></p>' if sales_sheet_current_id else ""}
+                    </div>
+                    <details class="border border-gray-200 rounded-lg overflow-hidden group/sadv">
+                      <summary class="flex items-center justify-between px-3 py-2 bg-gray-50 cursor-pointer list-none select-none hover:bg-gray-100 transition-colors">
+                        <span class="text-sm font-medium text-gray-700">Advanced: Sales fields to post</span>
+                        <svg class="w-4 h-4 text-gray-400 transition-transform duration-200 group-open/sadv:rotate-180 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+                        </svg>
+                      </summary>
+                      <div class="px-3 py-3 border-t border-gray-100">
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-1">
+                          {sales_stats_html}
+                        </div>
+                      </div>
+                    </details>
+
+                    <div class="border-t border-gray-100 pt-4">
+                      <h4 class="text-sm font-semibold text-gray-900 mb-1">Sales Routing (Per Submitter)</h4>
+                      <p class="text-sm text-gray-500 mb-3">Sales lines are posted to each submitter's own sheet. If not mapped, the default sales sheet above is used; if that is also empty, entries queue until mapping is added here.</p>
+                      <div>
+                        {sales_rows_html}
+                      </div>
+                    </div>
+                  </div>
+                </details>
+
+                <div class="border-t border-gray-100 pt-4">
+                  <h3 class="text-sm font-semibold text-gray-900 mb-1">Cash Routing (Per Submitter)</h3>
+                  <p class="text-sm text-gray-500 mb-3">CASH payments are sent to each submitter's own sheet. If not mapped yet, entries queue until mapping is added here.</p>
+                  <div>
+                    {cash_rows_html}
+                  </div>
+                </div>
                 <button type="submit"
                   class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg transition-colors">
-                  Save Spreadsheet Settings
+                  Save Sheets Configuration
                 </button>
               </div>
             </details>
           </form>
 
-          <!-- Cash Payments -->
-          <details class="bg-white rounded-2xl shadow-sm border border-gray-200 group" {'' if cash_sheets or not pending_cash else 'open'}>
-            <summary class="flex items-center justify-between px-5 py-4 cursor-pointer list-none select-none hover:bg-gray-50 rounded-2xl transition-colors">
-              <div class="flex items-center gap-3">
-                <div class="w-9 h-9 bg-green-50 rounded-xl flex items-center justify-center shrink-0">
-                  <svg class="w-4 h-4 text-green-700" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 9V7a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2m2 4h10a2 2 0 002-2v-6a2 2 0 00-2-2H9a2 2 0 00-2 2v6a2 2 0 002 2zm7-5a2 2 0 11-4 0 2 2 0 014 0z"/>
-                  </svg>
-                </div>
-                <div>
-                  <h2 class="font-semibold text-gray-900 text-sm">Cash Payments</h2>
-                  <p class="text-xs text-gray-500">Per-user sheets for cash transactions</p>
-                </div>
-              </div>
-              <div class="flex items-center gap-2">
-                {f'<span class="text-xs font-medium text-amber-600 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-200">{len(pending_cash)} buffered</span>' if pending_cash else ''}
-                {_status_badge(bool(cash_sheets), f"{len(cash_sheets)} configured" if cash_sheets else "No sheets set")}
-                <svg class="w-4 h-4 text-gray-400 transition-transform duration-200 group-open:rotate-180 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
-                </svg>
-              </div>
-            </summary>
-            <div class="px-5 pb-5 pt-4 border-t border-gray-100 space-y-5">
-              <p class="text-sm text-gray-500">
-                When a calendar event is marked <strong>PAYMENT TYPE = CASH</strong> and <strong>Y/N = Y</strong>,
-                the totals stay on the calendar and the transaction is logged to that user's Google Sheet.
-                Each user (identified by their Google email) gets their own sheet tab.
-              </p>
-
-              <!-- Per-user sheet assignments -->
-              <div class="space-y-3">
-                <h3 class="text-xs font-semibold text-gray-700 uppercase tracking-wide">Assign sheets per user</h3>
-                {(lambda rows: rows if rows else '<p class="text-xs text-gray-400 italic">No users seen yet — sheets will appear here once someone processes a cash payment or diary entry.</p>')(
-                  "".join(
-                    f'''<form method="post" action="/setup/save-cash-sheet" class="flex items-center gap-2">
-                      <input type="hidden" name="user_email" value="{escape(u)}">
-                      <span class="text-xs text-gray-600 font-medium w-48 shrink-0 truncate" title="{escape(u)}">{escape(u)}</span>
-                      <input name="spreadsheet_id" value="{escape(cash_sheets.get(u.lower(), ''))}"
-                        placeholder="Spreadsheet URL or ID"
-                        class="flex-1 px-2.5 py-1.5 border border-gray-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-green-500">
-                      <button type="submit" class="px-3 py-1.5 text-xs font-medium text-white bg-green-600 hover:bg-green-700 rounded-lg transition-colors shrink-0">Save</button>
-                      {"" if not cash_sheets.get(u.lower()) else
-                       f'<form method="post" action="/setup/save-cash-sheet" style="display:inline"><input type="hidden" name="user_email" value="{escape(u)}"><input type="hidden" name="spreadsheet_id" value=""><button type="submit" class="px-2.5 py-1.5 text-xs text-red-600 bg-red-50 hover:bg-red-100 rounded-lg border border-red-200 transition-colors shrink-0">Remove</button></form>'}
-                    </form>'''
-                    for u in cash_users
-                  )
-                )}
-              </div>
-
-              <!-- Buffered (pending) entries -->
-              {f"""
-              <div class="space-y-2">
-                <h3 class="text-xs font-semibold text-gray-700 uppercase tracking-wide">Buffered entries — {len(pending_cash)} waiting</h3>
-                <p class="text-xs text-gray-500">These were recorded before a sheet was configured. They will be written automatically when you save a sheet for that user.</p>
-                <div class="overflow-x-auto">
-                  <table class="w-full text-xs border-collapse">
-                    <thead>
-                      <tr class="bg-gray-50 text-gray-500">
-                        <th class="text-left px-2 py-1.5 font-medium border border-gray-100">User</th>
-                        <th class="text-left px-2 py-1.5 font-medium border border-gray-100">Customer</th>
-                        <th class="text-left px-2 py-1.5 font-medium border border-gray-100">Date</th>
-                        <th class="text-right px-2 py-1.5 font-medium border border-gray-100">Ex VAT</th>
-                        <th class="text-right px-2 py-1.5 font-medium border border-gray-100">Inc VAT</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {"".join(
-                        f'<tr class="border-b border-gray-50 hover:bg-gray-50"><td class="px-2 py-1.5 border border-gray-100 text-gray-600 font-mono text-xs truncate max-w-[120px]">{escape(str(e.get("calendar_user",""))[:30])}</td><td class="px-2 py-1.5 border border-gray-100">{escape(str(e.get("customer","")))}</td><td class="px-2 py-1.5 border border-gray-100">{escape(str(e.get("date","")))}</td><td class="px-2 py-1.5 border border-gray-100 text-right">{escape(str(e.get("ex_vat","")))}</td><td class="px-2 py-1.5 border border-gray-100 text-right font-medium">{escape(str(e.get("inc_vat","")))}</td></tr>'
-                        for e in pending_cash
-                      )}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-              """ if pending_cash else ""}
-            </div>
-          </details>
-
           <!-- Xero Organisations -->
-          {_xero_tenant_cards(xero_ok, xero_tenant_account_data)}
+          {_xero_tenant_cards(xero_ok, xero_tenant_account_data, xero_tenant_warning)}
 
           <form method="post" action="/save" enctype="multipart/form-data" class="space-y-6">
 
@@ -2202,7 +2622,7 @@ function toggleEnabled() {{
                 <h2 class="font-semibold text-gray-900">Active Calendars</h2>
                 <span class="text-xs text-gray-400">{len(active)} selected</span>
               </div>
-              <p class="text-sm text-gray-500 mb-4">Select which calendars to monitor for events marked with <strong>DONE</strong>.</p>
+              <p class="text-sm text-gray-500 mb-4">Select which calendars to monitor for entries finalised with <strong>Y/N = Y</strong>.</p>
               <div class="divide-y divide-gray-50">
                 {cal_html}
               </div>
@@ -2265,6 +2685,7 @@ function toggleEnabled() {{
         session["save_notice"] = f"success:{msg}"
 
         set_json_setting(config.admin_db_file, "settings_version", {"updated": True})
+        trigger_poll()
         return redirect(url_for("index"))
 
     @app.post("/save-sheet-target")
@@ -2275,28 +2696,40 @@ function toggleEnabled() {{
         spreadsheet_id = _extract_spreadsheet_id(picked or entered)
         sheet_name = (request.form.get("sheet_name") or "Sheet1").strip() or "Sheet1"
         set_sheet_target(config.admin_db_file, spreadsheet_id=spreadsheet_id, sheet_name=sheet_name)
+
+        sales_picked = (request.form.get("sales_spreadsheet_pick") or "").strip()
+        sales_entered = (request.form.get("sales_spreadsheet_input") or "").strip()
+        sales_spreadsheet_id = _extract_spreadsheet_id(sales_picked or sales_entered)
+        sales_sheet_name = (request.form.get("sales_sheet_name") or "Sales").strip() or "Sales"
+        set_sales_sheet_target(
+            config.admin_db_file,
+            spreadsheet_id=sales_spreadsheet_id,
+            sheet_name=sales_sheet_name,
+        )
+        sales_fields = request.form.getlist("sales_stats_fields")
+        valid_sales = [k for k in sales_fields if k in {k for k, _ in SALES_STAT_OPTIONS}]
+        if not valid_sales:
+            valid_sales = DEFAULT_SALES_STATS_FIELDS
+        set_sales_stats_fields(config.admin_db_file, valid_sales)
+
+        sales_routes = _save_sales_submitter_sheets_from_form(config, request.form)
+        cash_routes = _save_cash_submitter_sheets_from_form(config, request.form)
         target = {"spreadsheet_id": spreadsheet_id, "sheet_name": sheet_name}
         creds = load_admin_credentials(config)
         ok, _ = _sheets_status_data(config, creds, target)
-        msg = "Spreadsheet settings saved. Connection is ready." if ok else "Spreadsheet settings saved."
-        session["save_notice"] = f"success:{msg}"
-        return redirect(url_for("index"))
-
-    @app.post("/setup/save-cash-sheet")
-    @require_login
-    def save_cash_sheet():
-        user_email = (request.form.get("user_email") or "").strip().lower()
-        spreadsheet_raw = (request.form.get("spreadsheet_id") or "").strip()
-        spreadsheet_id = _extract_spreadsheet_id(spreadsheet_raw)
-        if not user_email:
-            session["save_notice"] = "error:No user email provided."
-            return redirect(url_for("index"))
-        set_cash_sheet(config.admin_db_file, user_email, spreadsheet_id)
-        if spreadsheet_id:
-            session["save_notice"] = f"success:Cash sheet saved for {user_email}. Buffered entries will be flushed automatically on the next cash payment."
+        if ok:
+            msg = "Sheets configuration saved. Connection is ready."
         else:
-            session["save_notice"] = f"success:Cash sheet removed for {user_email}."
-        return redirect(url_for("index") + "#cash-section")
+            msg = "Sheets configuration saved."
+        if cash_routes:
+            msg += " Cash routing updated."
+        if sales_routes:
+            msg += " Sales routing updated."
+        if sales_spreadsheet_id:
+            msg += " Sales sheet updated."
+        session["save_notice"] = f"success:{msg}"
+        trigger_poll()
+        return redirect(url_for("index"))
 
     @app.post("/apply-submitter-aliases")
     @require_login
@@ -2437,54 +2870,20 @@ function toggleEnabled() {{
     @app.post("/setup/register-google-watches")
     @require_login
     def register_google_watches():
-        creds = load_admin_credentials(config)
-        if not creds:
-            session["save_notice"] = "error:Google is not connected — please connect Google first."
-            return redirect(url_for("index"))
-        active_cals = get_active_calendars(config.admin_db_file, config.google_calendar_id)
-        if not active_cals:
-            session["save_notice"] = "error:No calendars are selected. Tick at least one calendar in the Active Calendars section first."
-            return redirect(url_for("index"))
-        base_url = request.host_url.rstrip("/").replace("http://", "https://", 1)
-        webhook_url = f"{base_url}/webhooks/google-calendar"
-        ok = 0
-        errors = []
-        for cal_id in active_cals:
-            try:
-                resp = register_calendar_watch(config, cal_id, webhook_url)
-                set_google_watch(
-                    config.admin_db_file, cal_id,
-                    resp["id"], resp["resourceId"],
-                    int(resp.get("expiration") or 0),
-                    webhook_url=webhook_url,
-                )
-                ok += 1
-                print(f"[watch] Registered Google Calendar watch for {cal_id}: channel {resp['id']}", flush=True)
-            except Exception as exc:
-                err_msg = str(exc)
-                errors.append(err_msg)
-                print(f"[watch] Failed to register watch for {cal_id}: {err_msg}", flush=True)
-        if errors:
-            first_err = errors[0][:200]
-            session["save_notice"] = (
-                f"error:Registered {ok} watch(es) but {len(errors)} failed. "
-                f"Google said: {first_err}"
-            )
-        else:
-            session["save_notice"] = f"success:Registered {ok} Google Calendar watch(es). Events will now be processed in real time."
+        trigger_poll()
+        session["save_notice"] = (
+            "success:Google Calendar watches are auto-managed now. "
+            "Save Active Calendars and the app will create/renew watches automatically."
+        )
         return redirect(url_for("index"))
 
     @app.post("/setup/stop-google-watches")
     @require_login
     def stop_google_watches():
-        watches = get_google_watches(config.admin_db_file)
-        for cal_id, winfo in list(watches.items()):
-            try:
-                stop_calendar_watch(config, winfo["channel_id"], winfo["resource_id"])
-            except Exception:
-                pass
-            delete_google_watch(config.admin_db_file, cal_id)
-        session["save_notice"] = "success:All Google Calendar watches stopped. Polling mode resumed."
+        session["save_notice"] = (
+            "success:Manual stop is disabled. "
+            "Untick calendars in Active Calendars to remove their watches."
+        )
         return redirect(url_for("index"))
 
     @app.post("/save-xero-webhook-key")

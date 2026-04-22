@@ -69,7 +69,7 @@ def payment_choice(description: str | None) -> str:
       PAYMENT TYPE = CARD
       PAYMENT = INVOICE
       PAYMENT TYPE = CASH
-      CARD OR INVOICE = CARD
+      CARD / INVOICE / CASH = CARD
     """
     if not description:
         return ""
@@ -83,7 +83,7 @@ def payment_choice(description: str | None) -> str:
             continue
         if "payment" in line or "card" in line or "invoice" in line or "cash" in line:
             m = re.search(
-                r"(payment(?:\s*type)?|card\s*or\s*invoice)\s*(?:\([^)]*\))?\s*(?:=|:)?\s*(card|invoice|cash)\b",
+                r"(payment(?:\s*type)?|card\s*(?:or|/)\s*invoice(?:\s*(?:or|/)\s*cash)?)\s*(?:\([^)]*\))?\s*(?:=|:)?\s*(card|invoice|cash)\b",
                 line,
                 flags=re.I,
             )
@@ -122,9 +122,11 @@ def ensure_notes_template(description: str | None) -> str:
         "[/contact]\n"
         "\n"
         "[invoice]\n"
+        "\n"
+        "⬇Sales⬇\n"
+        "\n"
         "[/invoice]\n"
         "\n"
-        "PAYMENT TYPE (CASH/CARD/INVOICE) =\n"
         "Y/N =\n"
     )
 
@@ -142,7 +144,7 @@ def ensure_notes_template(description: str | None) -> str:
 
     # Ensure invoice block exists. If missing, insert before DONE if present.
     if not _has_invoice_block(description):
-        invoice_block = "[invoice]\n[/invoice]\n"
+        invoice_block = "[invoice]\n\n⬇Sales⬇\n\n[/invoice]\n"
         done_repl = f"{invoice_block}DONE"
         lines = description.splitlines()
         for i, line in enumerate(lines):
@@ -481,9 +483,31 @@ def extract_invoice_lines(description: str | None) -> list[dict]:
       item - 7.50
     Returns list of line items with Description, UnitAmount, Quantity, TaxType (optional).
     """
-    if not description:
+    block = _extract_invoice_block(description)
+    if not block:
         return []
+    invoice_part, sales_part = _split_invoice_sales(block)
+    combined = "\n".join(
+        part for part in (invoice_part, sales_part) if (part or "").strip()
+    ).strip()
+    return _parse_line_items(combined)
 
+
+def extract_sales_lines(description: str | None) -> list[dict]:
+    """
+    Extract internal sales lines from the [invoice] block section below the
+    "⬇Sales⬇" marker.
+    """
+    block = _extract_invoice_block(description)
+    if not block:
+        return []
+    _, sales_part = _split_invoice_sales(block)
+    return _parse_line_items(sales_part)
+
+
+def _extract_invoice_block(description: str | None) -> str:
+    if not description:
+        return ""
     import html
     import re
 
@@ -495,11 +519,33 @@ def extract_invoice_lines(description: str | None) -> list[dict]:
     if not block_match:
         block_match = re.search(r"<invoice>(.*?)</invoice>", text, re.I | re.S)
     if not block_match:
-        return []
-
+        return ""
     block = block_match.group(1)
     block = re.sub(r"<[^>]+>", "", block).strip()
-    block = block.replace("\r", "\n")
+    return block.replace("\r", "\n")
+
+
+def _split_invoice_sales(block: str) -> tuple[str, str]:
+    """
+    Split invoice block into:
+    - customer-facing invoice lines (before sales marker)
+    - internal sales lines (after sales marker)
+    """
+    import re
+
+    marker = re.search(r"^\s*[⬇↓]?\s*sales\s*[⬇↓]?\s*$", block, flags=re.I | re.M)
+    if not marker:
+        return block, ""
+    before = block[: marker.start()].strip()
+    after = block[marker.end() :].strip()
+    return before, after
+
+
+def _parse_line_items(block: str) -> list[dict]:
+    import re
+
+    if not block:
+        return []
 
     lines: list[dict] = []
     for raw_line in block.splitlines():
@@ -601,15 +647,11 @@ def upsert_invoice_summary(
         plain = re.sub(r"<[^>]+>", "", line).strip().lower()
         return (
             "invoice total" in plain
-            or "total (ex vat)" in plain
-            or "total (inc vat)" in plain
             or "send y/n" in plain
             or "invoice sent" in plain
             or "invoice link" in plain
             or "submitted by:" in plain
             or "submitted at:" in plain
-            or "cash payment recorded" in plain
-            or "recorded at:" in plain
         )
 
     cleaned = [line for line in lines if not is_summary_line(line)]
@@ -619,7 +661,7 @@ def upsert_invoice_summary(
     summary_lines.append(STATUS_START)
     summary_lines.append(f"<b>Invoice total (ex VAT): £{subtotal:.2f}</b>")
     summary_lines.append(f"<b>Invoice total (inc VAT): £{total:.2f}</b>")
-    summary_lines.append(f"PAYMENT TYPE (CASH/CARD/INVOICE) = {current_payment}")
+    summary_lines.append(f"PAYMENT TYPE (CARD/INVOICE/CASH) = {current_payment}")
     if sent:
         summary_lines.append("<b>Invoice sent ✅</b>")
         if invoice_url:
@@ -671,40 +713,35 @@ def upsert_send_confirmation(
     return "\n".join(updated)
 
 
-def upsert_cash_summary(
+def upsert_cash_confirmation(
     description: str,
-    subtotal: float,
-    total: float,
     *,
-    recorded_at: str | None = None,
+    submitter: str | None = None,
+    submitted_at: str | None = None,
 ) -> str:
-    """
-    Replace/upsert the [app-status] block in a calendar event description with a
-    cash payment receipt showing ex-VAT and inc-VAT totals.
-    The rest of the event content (notes, contact, invoice lines) is preserved.
-    """
-    import re
-
     STATUS_START = "[app-status]"
     STATUS_END = "[/app-status]"
-    lines = _status_base_lines(description)
+    cleaned = _status_base_lines(description)
+    totals = _extract_existing_totals(description)
+    payment = _extract_existing_payment_type(description)
 
     summary_lines: list[str] = []
     summary_lines.append(STATUS_START)
-    summary_lines.append(f"<b>Total (ex VAT): £{subtotal:.2f}</b>")
-    summary_lines.append(f"<b>Total (inc VAT): £{total:.2f}</b>")
-    summary_lines.append("PAYMENT TYPE (CASH/CARD/INVOICE) = CASH")
+    if totals[0]:
+        summary_lines.append(totals[0])
+    if totals[1]:
+        summary_lines.append(totals[1])
+    if payment:
+        summary_lines.append(payment)
     summary_lines.append("<b>Cash payment recorded ✅</b>")
-    if recorded_at:
-        summary_lines.append(f"Recorded at: {recorded_at}")
+    summary_lines.append("Draft invoice removed from Xero.")
     summary_lines.append(STATUS_END)
 
-    while lines and not lines[-1].strip():
-        lines.pop()
-    if lines:
+    while cleaned and not cleaned[-1].strip():
+        cleaned.pop()
+    if cleaned:
         summary_lines = [""] + summary_lines
-    updated = lines + summary_lines
-    return "\n".join(updated)
+    return "\n".join(cleaned + summary_lines)
 
 
 def upsert_send_failure(
