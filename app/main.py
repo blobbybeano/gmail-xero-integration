@@ -53,7 +53,7 @@ from .google_calendar import (
     stop_calendar_watch,
     RateLimitError,
 )
-from .trigger import wait_for_poll
+from .trigger import wait_for_poll, consume_watch_check
 from .google_sheets import append_stats_row, ensure_header
 from .google_admin import load_admin_credentials
 from .state import (
@@ -753,9 +753,10 @@ def run() -> None:
             config.admin_db_file, config.google_calendar_id
         )
 
-        # Auto-manage Google Calendar watches — run at most once per hour.
+        # Auto-manage Google Calendar watches — run at most once per hour,
+        # or immediately when calendar settings change (triggered by the settings page).
         _now_ts = time.time()
-        if (_now_ts - _last_watch_check) >= _WATCH_CHECK_INTERVAL:
+        if consume_watch_check() or (_now_ts - _last_watch_check) >= _WATCH_CHECK_INTERVAL:
             _last_watch_check = _now_ts
             _run_watch_check = True
         else:

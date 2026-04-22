@@ -67,7 +67,7 @@ from .admin_store import (
     set_xero_tenants,
     upsert_xero_tenant,
 )
-from .trigger import trigger_poll
+from .trigger import trigger_poll, trigger_watch_check
 from .state import load_state, get_last_sync
 from .log_feed import feed as _feed
 
@@ -2717,6 +2717,8 @@ function toggleEnabled() {{
         if not calendars:
             calendars = [config.google_calendar_id]
         set_active_calendars(config.admin_db_file, calendars)
+        trigger_watch_check()  # immediately register/remove watches for the new selection
+        trigger_poll()         # wake poller so the watch check runs without delay
 
         stats_fields = request.form.getlist("stats_fields")
         valid = [k for k in stats_fields if k in {k for k, _ in STAT_OPTIONS}]
