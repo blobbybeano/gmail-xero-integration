@@ -1210,7 +1210,7 @@ def run() -> None:
                             if pay_mode not in {"card", "invoice", "cash"}:
                                 failed_description = upsert_send_failure(
                                     event.get("description") or "",
-                                    "Choose PAYMENT TYPE as CARD, INVOICE or CASH before SEND",
+                                    "Choose PAYMENT TYPE as CARD or INVOICE before SEND",
                                     invoice_url=(
                                         xero_client.get_online_invoice_url(invoice_id)
                                         if invoice_id
@@ -1613,7 +1613,7 @@ def run() -> None:
                             if pay_mode not in {"card", "invoice", "cash"}:
                                 failed_description = upsert_send_failure(
                                     event.get("description") or "",
-                                    "Choose PAYMENT TYPE as CARD, INVOICE or CASH before SEND",
+                                    "Choose PAYMENT TYPE as CARD or INVOICE before SEND",
                                     invoice_url=(
                                         xero_client.get_online_invoice_url(invoice_id)
                                         if invoice_id

@@ -661,7 +661,7 @@ def upsert_invoice_summary(
     summary_lines.append(STATUS_START)
     summary_lines.append(f"<b>Invoice total (ex VAT): £{subtotal:.2f}</b>")
     summary_lines.append(f"<b>Invoice total (inc VAT): £{total:.2f}</b>")
-    summary_lines.append(f"PAYMENT TYPE (CARD/INVOICE/CASH) = {current_payment}")
+    summary_lines.append(f"PAYMENT TYPE (CARD/INVOICE) = {current_payment}")
     if sent:
         summary_lines.append("<b>Invoice sent ✅</b>")
         if invoice_url:
