@@ -46,7 +46,11 @@ from .xero_client import load_xero_token, save_xero_token, token_is_expired, ref
 from .google_sheets import backfill_submitter_in_sheet, update_invoice_paid_in_sheet
 from .google_calendar import register_calendar_watch, stop_calendar_watch
 from .admin_store import (
+    CASH_STATS_FIELDS,
+    get_cash_sheets,
     get_enabled,
+    get_pending_cash_entries,
+    set_cash_sheet,
     set_enabled,
     get_google_watches,
     set_google_watch,
@@ -1582,6 +1586,12 @@ function toggleEnabled() {{
             except Exception:
                 pass
 
+        cash_sheets = get_cash_sheets(config.admin_db_file)
+        pending_cash = get_pending_cash_entries(config.admin_db_file)
+        seen_users = get_seen_submitters(config.admin_db_file)
+        active_cals = get_active_calendars(config.admin_db_file, config.google_calendar_id)
+        cash_users = sorted(set(seen_users) | set(active_cals) | set(cash_sheets.keys()))
+
         # --- Notice banner ---
         notice_html = ""
         if save_notice:
@@ -2103,6 +2113,84 @@ function toggleEnabled() {{
             </details>
           </form>
 
+          <!-- Cash Payments -->
+          <details class="bg-white rounded-2xl shadow-sm border border-gray-200 group" {'' if cash_sheets or not pending_cash else 'open'}>
+            <summary class="flex items-center justify-between px-5 py-4 cursor-pointer list-none select-none hover:bg-gray-50 rounded-2xl transition-colors">
+              <div class="flex items-center gap-3">
+                <div class="w-9 h-9 bg-green-50 rounded-xl flex items-center justify-center shrink-0">
+                  <svg class="w-4 h-4 text-green-700" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 9V7a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2m2 4h10a2 2 0 002-2v-6a2 2 0 00-2-2H9a2 2 0 00-2 2v6a2 2 0 002 2zm7-5a2 2 0 11-4 0 2 2 0 014 0z"/>
+                  </svg>
+                </div>
+                <div>
+                  <h2 class="font-semibold text-gray-900 text-sm">Cash Payments</h2>
+                  <p class="text-xs text-gray-500">Per-user sheets for cash transactions</p>
+                </div>
+              </div>
+              <div class="flex items-center gap-2">
+                {f'<span class="text-xs font-medium text-amber-600 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-200">{len(pending_cash)} buffered</span>' if pending_cash else ''}
+                {_status_badge(bool(cash_sheets), f"{len(cash_sheets)} configured" if cash_sheets else "No sheets set")}
+                <svg class="w-4 h-4 text-gray-400 transition-transform duration-200 group-open:rotate-180 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+                </svg>
+              </div>
+            </summary>
+            <div class="px-5 pb-5 pt-4 border-t border-gray-100 space-y-5">
+              <p class="text-sm text-gray-500">
+                When a calendar event is marked <strong>PAYMENT TYPE = CASH</strong> and <strong>Y/N = Y</strong>,
+                the totals stay on the calendar and the transaction is logged to that user's Google Sheet.
+                Each user (identified by their Google email) gets their own sheet tab.
+              </p>
+
+              <!-- Per-user sheet assignments -->
+              <div class="space-y-3">
+                <h3 class="text-xs font-semibold text-gray-700 uppercase tracking-wide">Assign sheets per user</h3>
+                {(lambda rows: rows if rows else '<p class="text-xs text-gray-400 italic">No users seen yet — sheets will appear here once someone processes a cash payment or diary entry.</p>')(
+                  "".join(
+                    f'''<form method="post" action="/setup/save-cash-sheet" class="flex items-center gap-2">
+                      <input type="hidden" name="user_email" value="{escape(u)}">
+                      <span class="text-xs text-gray-600 font-medium w-48 shrink-0 truncate" title="{escape(u)}">{escape(u)}</span>
+                      <input name="spreadsheet_id" value="{escape(cash_sheets.get(u.lower(), ''))}"
+                        placeholder="Spreadsheet URL or ID"
+                        class="flex-1 px-2.5 py-1.5 border border-gray-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-green-500">
+                      <button type="submit" class="px-3 py-1.5 text-xs font-medium text-white bg-green-600 hover:bg-green-700 rounded-lg transition-colors shrink-0">Save</button>
+                      {"" if not cash_sheets.get(u.lower()) else
+                       f'<form method="post" action="/setup/save-cash-sheet" style="display:inline"><input type="hidden" name="user_email" value="{escape(u)}"><input type="hidden" name="spreadsheet_id" value=""><button type="submit" class="px-2.5 py-1.5 text-xs text-red-600 bg-red-50 hover:bg-red-100 rounded-lg border border-red-200 transition-colors shrink-0">Remove</button></form>'}
+                    </form>'''
+                    for u in cash_users
+                  )
+                )}
+              </div>
+
+              <!-- Buffered (pending) entries -->
+              {f"""
+              <div class="space-y-2">
+                <h3 class="text-xs font-semibold text-gray-700 uppercase tracking-wide">Buffered entries — {len(pending_cash)} waiting</h3>
+                <p class="text-xs text-gray-500">These were recorded before a sheet was configured. They will be written automatically when you save a sheet for that user.</p>
+                <div class="overflow-x-auto">
+                  <table class="w-full text-xs border-collapse">
+                    <thead>
+                      <tr class="bg-gray-50 text-gray-500">
+                        <th class="text-left px-2 py-1.5 font-medium border border-gray-100">User</th>
+                        <th class="text-left px-2 py-1.5 font-medium border border-gray-100">Customer</th>
+                        <th class="text-left px-2 py-1.5 font-medium border border-gray-100">Date</th>
+                        <th class="text-right px-2 py-1.5 font-medium border border-gray-100">Ex VAT</th>
+                        <th class="text-right px-2 py-1.5 font-medium border border-gray-100">Inc VAT</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {"".join(
+                        f'<tr class="border-b border-gray-50 hover:bg-gray-50"><td class="px-2 py-1.5 border border-gray-100 text-gray-600 font-mono text-xs truncate max-w-[120px]">{escape(str(e.get("calendar_user",""))[:30])}</td><td class="px-2 py-1.5 border border-gray-100">{escape(str(e.get("customer","")))}</td><td class="px-2 py-1.5 border border-gray-100">{escape(str(e.get("date","")))}</td><td class="px-2 py-1.5 border border-gray-100 text-right">{escape(str(e.get("ex_vat","")))}</td><td class="px-2 py-1.5 border border-gray-100 text-right font-medium">{escape(str(e.get("inc_vat","")))}</td></tr>'
+                        for e in pending_cash
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              """ if pending_cash else ""}
+            </div>
+          </details>
+
           <!-- Xero Organisations -->
           {_xero_tenant_cards(xero_ok, xero_tenant_account_data)}
 
@@ -2193,6 +2281,22 @@ function toggleEnabled() {{
         msg = "Spreadsheet settings saved. Connection is ready." if ok else "Spreadsheet settings saved."
         session["save_notice"] = f"success:{msg}"
         return redirect(url_for("index"))
+
+    @app.post("/setup/save-cash-sheet")
+    @require_login
+    def save_cash_sheet():
+        user_email = (request.form.get("user_email") or "").strip().lower()
+        spreadsheet_raw = (request.form.get("spreadsheet_id") or "").strip()
+        spreadsheet_id = _extract_spreadsheet_id(spreadsheet_raw)
+        if not user_email:
+            session["save_notice"] = "error:No user email provided."
+            return redirect(url_for("index"))
+        set_cash_sheet(config.admin_db_file, user_email, spreadsheet_id)
+        if spreadsheet_id:
+            session["save_notice"] = f"success:Cash sheet saved for {user_email}. Buffered entries will be flushed automatically on the next cash payment."
+        else:
+            session["save_notice"] = f"success:Cash sheet removed for {user_email}."
+        return redirect(url_for("index") + "#cash-section")
 
     @app.post("/apply-submitter-aliases")
     @require_login

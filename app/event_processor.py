@@ -64,10 +64,11 @@ def send_choice_is_yes(description: str | None) -> bool:
 def payment_choice(description: str | None) -> str:
     """
     Parse payment type from notes outside [contact]/[invoice] blocks.
-    Returns: "card", "invoice", or "".
+    Returns: "card", "invoice", "cash", or "".
     Accepts tolerant formats like:
       PAYMENT TYPE = CARD
       PAYMENT = INVOICE
+      PAYMENT TYPE = CASH
       CARD OR INVOICE = CARD
     """
     if not description:
@@ -80,9 +81,9 @@ def payment_choice(description: str | None) -> str:
         line = raw.strip()
         if not line:
             continue
-        if "payment" in line or "card" in line or "invoice" in line:
+        if "payment" in line or "card" in line or "invoice" in line or "cash" in line:
             m = re.search(
-                r"(payment(?:\s*type)?|card\s*or\s*invoice)\s*(?:\([^)]*\))?\s*(?:=|:)?\s*(card|invoice)\b",
+                r"(payment(?:\s*type)?|card\s*or\s*invoice)\s*(?:\([^)]*\))?\s*(?:=|:)?\s*(card|invoice|cash)\b",
                 line,
                 flags=re.I,
             )
@@ -123,6 +124,7 @@ def ensure_notes_template(description: str | None) -> str:
         "[invoice]\n"
         "[/invoice]\n"
         "\n"
+        "PAYMENT TYPE (CASH/CARD/INVOICE) =\n"
         "Y/N =\n"
     )
 
@@ -599,11 +601,15 @@ def upsert_invoice_summary(
         plain = re.sub(r"<[^>]+>", "", line).strip().lower()
         return (
             "invoice total" in plain
+            or "total (ex vat)" in plain
+            or "total (inc vat)" in plain
             or "send y/n" in plain
             or "invoice sent" in plain
             or "invoice link" in plain
             or "submitted by:" in plain
             or "submitted at:" in plain
+            or "cash payment recorded" in plain
+            or "recorded at:" in plain
         )
 
     cleaned = [line for line in lines if not is_summary_line(line)]
@@ -613,7 +619,7 @@ def upsert_invoice_summary(
     summary_lines.append(STATUS_START)
     summary_lines.append(f"<b>Invoice total (ex VAT): £{subtotal:.2f}</b>")
     summary_lines.append(f"<b>Invoice total (inc VAT): £{total:.2f}</b>")
-    summary_lines.append(f"PAYMENT TYPE (CARD/INVOICE) = {current_payment}")
+    summary_lines.append(f"PAYMENT TYPE (CASH/CARD/INVOICE) = {current_payment}")
     if sent:
         summary_lines.append("<b>Invoice sent ✅</b>")
         if invoice_url:
@@ -662,6 +668,42 @@ def upsert_send_confirmation(
     if cleaned:
         summary_lines = [""] + summary_lines
     updated = cleaned + summary_lines
+    return "\n".join(updated)
+
+
+def upsert_cash_summary(
+    description: str,
+    subtotal: float,
+    total: float,
+    *,
+    recorded_at: str | None = None,
+) -> str:
+    """
+    Replace/upsert the [app-status] block in a calendar event description with a
+    cash payment receipt showing ex-VAT and inc-VAT totals.
+    The rest of the event content (notes, contact, invoice lines) is preserved.
+    """
+    import re
+
+    STATUS_START = "[app-status]"
+    STATUS_END = "[/app-status]"
+    lines = _status_base_lines(description)
+
+    summary_lines: list[str] = []
+    summary_lines.append(STATUS_START)
+    summary_lines.append(f"<b>Total (ex VAT): £{subtotal:.2f}</b>")
+    summary_lines.append(f"<b>Total (inc VAT): £{total:.2f}</b>")
+    summary_lines.append("PAYMENT TYPE (CASH/CARD/INVOICE) = CASH")
+    summary_lines.append("<b>Cash payment recorded ✅</b>")
+    if recorded_at:
+        summary_lines.append(f"Recorded at: {recorded_at}")
+    summary_lines.append(STATUS_END)
+
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if lines:
+        summary_lines = [""] + summary_lines
+    updated = lines + summary_lines
     return "\n".join(updated)
 
 

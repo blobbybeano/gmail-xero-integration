@@ -11,3 +11,5 @@ token.json
 state.json
 certs/
 admin.db
+
+.git.backup.*

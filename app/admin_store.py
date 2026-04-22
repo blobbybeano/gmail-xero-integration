@@ -224,6 +224,65 @@ def set_xero_tenants(db_path: str, tenants: list[dict]) -> None:
     set_json_setting(db_path, "xero_tenants", tenants)
 
 
+CASH_STATS_FIELDS = [
+    "event_id",
+    "date",
+    "slot_datetime",
+    "calendar_user",
+    "customer",
+    "customer_email",
+    "customer_phone",
+    "line_items",
+    "ex_vat",
+    "inc_vat",
+    "recorded_at",
+]
+
+
+def get_cash_sheets(db_path: str) -> dict[str, str]:
+    """Returns {calendar_user_email: spreadsheet_id}."""
+    raw = get_json_setting(db_path, "cash_sheets", {})
+    if not isinstance(raw, dict):
+        return {}
+    return raw
+
+
+def set_cash_sheet(db_path: str, user_email: str, spreadsheet_id: str) -> None:
+    """Assign (or remove) a cash spreadsheet for a calendar user."""
+    sheets = get_cash_sheets(db_path)
+    key = (user_email or "").strip().lower()
+    if not key:
+        return
+    if spreadsheet_id and spreadsheet_id.strip():
+        sheets[key] = spreadsheet_id.strip()
+    else:
+        sheets.pop(key, None)
+    set_json_setting(db_path, "cash_sheets", sheets)
+
+
+def get_pending_cash_entries(db_path: str) -> list[dict]:
+    """Return buffered cash entries for users who don't have a sheet yet."""
+    raw = get_json_setting(db_path, "pending_cash_entries", [])
+    if not isinstance(raw, list):
+        return []
+    return raw
+
+
+def add_pending_cash_entry(db_path: str, entry: dict) -> None:
+    """Buffer a cash entry until the user's sheet is configured."""
+    entries = get_pending_cash_entries(db_path)
+    entries.append(entry)
+    set_json_setting(db_path, "pending_cash_entries", entries)
+
+
+def remove_pending_cash_entries(db_path: str, entry_ids: list[str]) -> None:
+    """Remove buffered entries by their entry_id once they have been written."""
+    id_set = set(entry_ids)
+    entries = get_pending_cash_entries(db_path)
+    remaining = [e for e in entries if e.get("entry_id") not in id_set]
+    set_json_setting(db_path, "pending_cash_entries", remaining)
+
+
 def upsert_xero_tenant(
     db_path: str,
     tenant_id: str,

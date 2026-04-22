@@ -4,21 +4,28 @@ import datetime as dt
 import time
 
 from .admin_store import (
+    CASH_STATS_FIELDS,
+    add_pending_cash_entry,
     add_seen_submitter,
     get_active_calendars,
+    get_cash_sheets,
     get_enabled,
     get_google_watches,
+    get_pending_cash_entries,
     get_seen_submitters,
     get_sheet_target,
     get_stats_fields,
     get_submitter_aliases,
     init_admin_store,
+    remove_pending_cash_entries,
+    set_cash_sheet,
     set_google_watch,
     delete_google_watch,
 )
 from .config import load_config
 from .event_processor import (
     apply_validation_hints,
+    compute_invoice_totals,
     done_choice_is_yes,
     ensure_notes_template,
     normalize_user_sections,
@@ -29,6 +36,7 @@ from .event_processor import (
     parse_event_address,
     parse_event_address_debug,
     payment_choice,
+    upsert_cash_summary,
     upsert_send_failure,
     upsert_invoice_summary,
     upsert_send_confirmation,
@@ -261,6 +269,125 @@ def run() -> None:
             print(f"Sheets append failed for {event_key}: {exc}")
             return state
 
+    def _append_cash_if_enabled(
+        *,
+        event: dict,
+        event_key: str,
+        subtotal: float,
+        total: float,
+        calendar_user: str,
+        submitter_display: str,
+        admin_creds,
+        state: dict,
+    ) -> dict:
+        """Write a cash payment row to the per-user cash sheet, or buffer it."""
+        import uuid as _uuid
+
+        cash_sheets = get_cash_sheets(config.admin_db_file)
+        spreadsheet_id = cash_sheets.get((calendar_user or "").lower().strip(), "")
+
+        customer_fields = parse_customer_fields(event.get("description"))
+        start = (event.get("start", {}) or {}).get("dateTime") or (event.get("start", {}) or {}).get("date") or ""
+        end = (event.get("end", {}) or {}).get("dateTime") or (event.get("end", {}) or {}).get("date") or ""
+
+        def _fmt_british(iso_str: str) -> str:
+            if not iso_str:
+                return ""
+            try:
+                if "T" in iso_str:
+                    obj = dt.datetime.fromisoformat(iso_str)
+                    return obj.strftime("%d/%m/%Y %H:%M")
+                else:
+                    obj = dt.date.fromisoformat(iso_str)
+                    return obj.strftime("%d/%m/%Y")
+            except Exception:
+                return iso_str
+
+        start_fmt = _fmt_british(start)
+        end_fmt = _fmt_british(end)
+        slot_text = f"{start_fmt} – {end_fmt}".strip(" –") if start_fmt != end_fmt else start_fmt
+        date_part = start.split("T", 1)[0] if start else ""
+        event_id_raw = event.get("id") or ""
+        suffix = event_id_raw[-4:] if event_id_raw else "0000"
+        event_id_display = f"GC-{date_part.replace('-','')}-{suffix}" if date_part else (event_id_raw or event_key)
+        invoice_lines = extract_invoice_lines(event.get("description"))
+        line_items_text = "; ".join(
+            f"{li.get('Description', '')} £{li.get('UnitAmount', 0):.2f}{'+VAT' if li.get('TaxType') == 'OUTPUT2' else ''}"
+            for li in invoice_lines
+        )
+        recorded_at = _fmt_british(dt.datetime.now(dt.timezone.utc).isoformat())
+
+        payload = {
+            "event_id": event_id_display,
+            "date": _fmt_british(date_part) if date_part else "",
+            "slot_datetime": slot_text,
+            "calendar_user": calendar_user,
+            "customer": customer_fields.get("name") or "",
+            "customer_email": customer_fields.get("email") or "",
+            "customer_phone": customer_fields.get("phone") or "",
+            "line_items": line_items_text,
+            "ex_vat": f"£{subtotal:.2f}",
+            "inc_vat": f"£{total:.2f}",
+            "recorded_at": recorded_at,
+        }
+
+        if not spreadsheet_id or not admin_creds:
+            entry = dict(payload)
+            entry["entry_id"] = str(_uuid.uuid4())
+            entry["event_key"] = event_key
+            entry["calendar_user"] = calendar_user
+            add_pending_cash_entry(config.admin_db_file, entry)
+            print(f"Cash payment buffered (no sheet configured for {calendar_user}): {event_key}")
+            _feed.push(f"Cash payment buffered — no sheet configured for {calendar_user or 'this calendar'}", "warn")
+            return state
+
+        sheet_name = (calendar_user.split("@")[0] or "Cash").title()
+        try:
+            ensure_header(
+                admin_creds,
+                spreadsheet_id=spreadsheet_id,
+                sheet_name=sheet_name,
+                stats_fields=CASH_STATS_FIELDS,
+            )
+            append_stats_row(
+                admin_creds,
+                spreadsheet_id=spreadsheet_id,
+                sheet_name=sheet_name,
+                event_key=event_key,
+                stats_fields=CASH_STATS_FIELDS,
+                payload=payload,
+                event_id_display=event_id_display,
+            )
+            print(f"Cash sheet row appended for {event_key}")
+            _feed.push(f"Cash payment logged to sheet for {calendar_user}", "success")
+
+            # Flush any buffered entries for this user
+            pending = get_pending_cash_entries(config.admin_db_file)
+            user_pending = [e for e in pending if e.get("calendar_user", "").lower() == calendar_user.lower()]
+            flushed_ids: list[str] = []
+            for entry in user_pending:
+                try:
+                    ensure_header(admin_creds, spreadsheet_id=spreadsheet_id, sheet_name=sheet_name, stats_fields=CASH_STATS_FIELDS)
+                    append_stats_row(
+                        admin_creds,
+                        spreadsheet_id=spreadsheet_id,
+                        sheet_name=sheet_name,
+                        event_key=entry.get("event_key", "pending"),
+                        stats_fields=CASH_STATS_FIELDS,
+                        payload={k: entry.get(k, "") for k in CASH_STATS_FIELDS},
+                        event_id_display=entry.get("event_id", ""),
+                    )
+                    flushed_ids.append(entry["entry_id"])
+                    print(f"Flushed buffered cash entry {entry['entry_id']} to sheet")
+                except Exception as exc:
+                    print(f"Failed to flush cash entry {entry.get('entry_id')}: {exc}")
+            if flushed_ids:
+                remove_pending_cash_entries(config.admin_db_file, flushed_ids)
+                _feed.push(f"Flushed {len(flushed_ids)} buffered cash entries to sheet", "success")
+        except Exception as exc:
+            print(f"Cash sheet append failed for {event_key}: {exc}")
+        return state
+
     _was_enabled = True
 
     while True:
@@ -437,9 +564,16 @@ def run() -> None:
                 invoice_lines = extract_invoice_lines(event.get("description"))
                 existing_invoice_id = get_invoice_for_event(state, event_key)
                 last_processed_update = get_processed_update_marker(state, event_key)
+                cash_pay_mode = payment_choice(event.get("description"))
                 # If DONE + invoice lines exist but we still have no invoice_id,
                 # keep retrying until draft creation succeeds.
-                pending_draft = bool(has_done and invoice_lines and not existing_invoice_id)
+                # Cash payments never create a Xero draft, so exclude them from this check.
+                pending_draft = bool(
+                    has_done
+                    and invoice_lines
+                    and not existing_invoice_id
+                    and cash_pay_mode != "cash"
+                )
                 # Skip reprocessing only when unchanged and nothing is pending.
                 if (
                     last_processed_update
@@ -450,6 +584,49 @@ def run() -> None:
                 if has_done and not invoice_lines:
                     print(f"Event {event_id}: no invoice lines found, skipping invoice")
                     _feed.push(f"No job details in \"{event.get('summary', event_id)}\" — awaiting line items", "warn")
+
+                # ── CASH PAYMENT FLOW ─────────────────────────────────────────
+                if has_done and invoice_lines and cash_pay_mode == "cash" and not is_processed(state, event_key):
+                    subtotal, total = compute_invoice_totals(invoice_lines)
+                    recorded_at = _format_display_datetime()
+                    cash_desc = upsert_cash_summary(
+                        event.get("description") or "",
+                        subtotal=subtotal,
+                        total=total,
+                        recorded_at=recorded_at,
+                    )
+                    if cash_desc != (event.get("description") or ""):
+                        updated = safe_update(
+                            event_id=event.get("id"),
+                            description=cash_desc,
+                            label="Cash payment",
+                            calendar_id=calendar_id,
+                        )
+                        if updated:
+                            event["description"] = cash_desc
+                            event_updated = updated.get("updated") or event_updated
+                    cash_user = submitter_email or calendar_id
+                    state = _append_cash_if_enabled(
+                        event=event,
+                        event_key=event_key,
+                        subtotal=subtotal,
+                        total=total,
+                        calendar_user=cash_user,
+                        submitter_display=submitter_display,
+                        admin_creds=admin_creds,
+                        state=state,
+                    )
+                    state = mark_processed(state, event_key)
+                    state = set_processed_update_marker(state, event_key, event_updated)
+                    save_state(config.state_file, state)
+                    _feed.push(
+                        f"Cash payment recorded for \"{event.get('summary', event_id)}\" — £{total:.2f}",
+                        "success",
+                    )
+                    print(f"Cash payment recorded for {event_id}: £{total:.2f} (ex VAT £{subtotal:.2f})")
+                    continue
+                # ─────────────────────────────────────────────────────────────
+
                 if is_processed(state, event_key):
                     # If we have a stored contact, update it only when the event changed.
                     existing_contact_id = get_contact_for_event(state, event_key)

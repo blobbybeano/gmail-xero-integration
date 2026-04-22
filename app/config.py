@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List
 
 from dotenv import load_dotenv
 
 
-# Always prefer current .env values over stale exported shell vars.
-load_dotenv(override=True)
+# Local development: load .env and prefer it over exported shell vars.
+# On Fly/production we rely on platform env vars/secrets and do NOT load .env.
+if not os.getenv("FLY_APP_NAME"):
+    load_dotenv(override=True)
 
 
 def _split_csv(value: str | None) -> List[str]:
@@ -64,6 +67,8 @@ class AppConfig:
     run_once: bool
     admin_username: str
     admin_password: str
+    admin_auth_file: str
+    admin_reset_token: str
     web_secret_key: str
     web_host: str
     web_port: int
@@ -71,6 +76,8 @@ class AppConfig:
 
 
 def load_config() -> AppConfig:
+    admin_db_file = os.getenv("ADMIN_DB_FILE", "admin.db")
+    admin_auth_default = str(Path(admin_db_file).with_name("admin_auth.json"))
     return AppConfig(
         google_credentials_file=os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json"),
         google_token_file=os.getenv("GOOGLE_TOKEN_FILE", "google_token.json"),
@@ -117,8 +124,10 @@ def load_config() -> AppConfig:
         run_once=os.getenv("RUN_ONCE", "false").lower() == "true",
         admin_username=os.getenv("ADMIN_USERNAME", "admin"),
         admin_password=os.getenv("ADMIN_PASSWORD", "changeme"),
+        admin_auth_file=os.getenv("ADMIN_AUTH_FILE", admin_auth_default),
+        admin_reset_token=os.getenv("ADMIN_RESET_TOKEN", ""),
         web_secret_key=os.getenv("WEB_SECRET_KEY", "change-me"),
         web_host=os.getenv("WEB_HOST", "0.0.0.0"),
         web_port=int(os.getenv("WEB_PORT", "8080")),
-        admin_db_file=os.getenv("ADMIN_DB_FILE", "admin.db"),
+        admin_db_file=admin_db_file,
     )
