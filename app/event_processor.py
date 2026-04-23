@@ -122,9 +122,7 @@ def ensure_notes_template(description: str | None) -> str:
         "[/contact]\n"
         "\n"
         "[invoice]\n"
-        "\n"
         "⬇Sales⬇\n"
-        "\n"
         "[/invoice]\n"
         "\n"
         "Y/N =\n"
@@ -144,16 +142,16 @@ def ensure_notes_template(description: str | None) -> str:
 
     # Ensure invoice block exists. If missing, insert before DONE if present.
     if not _has_invoice_block(description):
-        invoice_block = "[invoice]\n\n⬇Sales⬇\n\n[/invoice]\n"
+        invoice_block = "[invoice]\n⬇Sales⬇\n[/invoice]\n"
         done_repl = f"{invoice_block}DONE"
         lines = description.splitlines()
         for i, line in enumerate(lines):
             if line.strip().upper() == "DONE":
                 lines[i] = done_repl
-                return "\n".join(lines)
-        return f"{description.rstrip()}\n\n{invoice_block}"
+                return _normalize_entry_layout("\n".join(lines))
+        return _normalize_entry_layout(f"{description.rstrip()}\n\n{invoice_block}")
 
-    return description
+    return _normalize_entry_layout(description)
 
 
 def normalize_user_sections(description: str | None) -> str:
@@ -236,7 +234,30 @@ def normalize_user_sections(description: str | None) -> str:
         text,
         flags=re.I | re.S,
     )
-    return text
+    return _normalize_entry_layout(text)
+
+
+def _normalize_entry_layout(text: str) -> str:
+    """
+    Keep notes/contact/invoice blocks compact and predictable.
+    """
+    import re
+
+    if not text:
+        return ""
+
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = "\n".join(line.rstrip() for line in text.split("\n"))
+
+    # No blank lines immediately inside contact/invoice tags.
+    text = re.sub(r"(\[contact\])\n+", r"\1\n", text, flags=re.I)
+    text = re.sub(r"\n+(\[/contact\])", r"\n\1", text, flags=re.I)
+    text = re.sub(r"(\[invoice\])\n+", r"\1\n", text, flags=re.I)
+    text = re.sub(r"\n+(\[/invoice\])", r"\n\1", text, flags=re.I)
+
+    # Keep exactly one blank line between major blocks.
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip() + "\n"
 
 
 def parse_customer_fields(description: str | None) -> Dict:
@@ -675,7 +696,7 @@ def upsert_invoice_summary(
     if cleaned:
         summary_lines = [""] + summary_lines
     updated = cleaned + summary_lines
-    return "\n".join(updated)
+    return _normalize_entry_layout("\n".join(updated))
 
 
 def upsert_send_confirmation(
@@ -710,7 +731,7 @@ def upsert_send_confirmation(
     if cleaned:
         summary_lines = [""] + summary_lines
     updated = cleaned + summary_lines
-    return "\n".join(updated)
+    return _normalize_entry_layout("\n".join(updated))
 
 
 def upsert_cash_confirmation(
@@ -741,7 +762,7 @@ def upsert_cash_confirmation(
         cleaned.pop()
     if cleaned:
         summary_lines = [""] + summary_lines
-    return "\n".join(cleaned + summary_lines)
+    return _normalize_entry_layout("\n".join(cleaned + summary_lines))
 
 
 def upsert_send_failure(
@@ -781,7 +802,7 @@ def upsert_send_failure(
         cleaned.pop()
     if cleaned:
         summary_lines = [""] + summary_lines
-    return "\n".join(cleaned + summary_lines)
+    return _normalize_entry_layout("\n".join(cleaned + summary_lines))
 
 
 def _status_base_lines(description: str) -> list[str]:

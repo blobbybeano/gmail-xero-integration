@@ -480,7 +480,7 @@ def run() -> None:
                         "invoice_number": "",
                         "slot_datetime": slot_text,
                         "payment_method": payment_method.upper() if payment_method else "",
-                        "sales_item_desc": line.get("Description") or "",
+                        "sales_item_desc": f"{line.get('Description') or ''} = £{ex_vat:.2f} ex VAT",
                         "sales_item_ex_vat": f"{ex_vat:.2f}",
                         "sales_item_inc_vat": f"{inc_vat:.2f}",
                     },
