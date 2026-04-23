@@ -2066,6 +2066,7 @@ function toggleEnabled() {{
                 </div>"""
 
         # --- Calendars ---
+        my_cal_ids: set[str] = set()
         if calendars:
             my_rows = []
             other_rows = []
@@ -2093,6 +2094,8 @@ function toggleEnabled() {{
                 )
                 if is_my:
                     my_rows.append(row)
+                    if cid:
+                        my_cal_ids.add(cid)
                 else:
                     other_rows.append(row)
 
@@ -2133,9 +2136,9 @@ function toggleEnabled() {{
             if cid:
                 cash_backlog_by_cal[cid] = cash_backlog_by_cal.get(cid, 0) + 1
 
-        # Show active calendars + any previously configured ones (so unticking doesn't lose config)
+        # Show all "My Calendars" + active + any previously configured — so unticking never loses config
         configured_cal_ids = set(calendar_sales_sheets.keys()) | set(calendar_cash_sheets.keys())
-        all_routing_cals = sorted(active | configured_cal_ids)
+        all_routing_cals = sorted(my_cal_ids | active | configured_cal_ids)
 
         cal_routing_html = ""
         for cid in all_routing_cals:
@@ -2777,13 +2780,6 @@ function toggleEnabled() {{
                   </div>
                 </details>
 
-                <div class="border-t border-gray-100 pt-4">
-                  <h3 class="text-sm font-semibold text-gray-900 mb-1">Calendar Routing</h3>
-                  <p class="text-sm text-gray-500 mb-3">Assign a sales sheet and a cash sheet to each active calendar. Sales and cash entries for events on that calendar route here. If a sales sheet isn't set, the default sales sheet above is used. Entries queue until a sheet is configured.</p>
-                  <div>
-                    {cal_routing_html}
-                  </div>
-                </div>
                 <button type="submit"
                   class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg transition-colors">
                   Save Sheets Configuration
@@ -2806,6 +2802,15 @@ function toggleEnabled() {{
               <p class="text-sm text-gray-500 mb-4">Select which calendars to monitor for entries finalised with <strong>Y/N = Y</strong>.</p>
               <div class="divide-y divide-gray-50">
                 {cal_html}
+              </div>
+            </div>
+
+            <!-- Calendar Sheet Routing -->
+            <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
+              <h2 class="font-semibold text-gray-900 mb-1">Calendar Sheet Routing</h2>
+              <p class="text-sm text-gray-500 mb-4">Set which Google Sheet to post <strong>sales lines</strong> and <strong>cash payments</strong> to for each of your calendars. Paste the spreadsheet URL (or ID) and the tab name. If a sales sheet is left blank, the default sales sheet in Sheets Configuration is used instead.</p>
+              <div class="divide-y divide-gray-100">
+                {cal_routing_html}
               </div>
             </div>
 
@@ -2860,6 +2865,9 @@ function toggleEnabled() {{
         if not valid:
             valid = DEFAULT_STATS_FIELDS
         set_stats_fields(config.admin_db_file, valid)
+
+        _save_calendar_sales_sheets_from_form(config, request.form)
+        _save_calendar_cash_sheets_from_form(config, request.form)
 
         aliases = _save_submitter_aliases_from_form(config, request.form)
         msg = "Settings saved."
