@@ -2133,9 +2133,19 @@ function toggleEnabled() {{
             if cid:
                 cash_backlog_by_cal[cid] = cash_backlog_by_cal.get(cid, 0) + 1
 
+        # Show active calendars + any previously configured ones (so unticking doesn't lose config)
+        configured_cal_ids = set(calendar_sales_sheets.keys()) | set(calendar_cash_sheets.keys())
+        all_routing_cals = sorted(active | configured_cal_ids)
+
         cal_routing_html = ""
-        for cid in sorted(active):
+        for cid in all_routing_cals:
             label = escape(cal_id_to_name.get(cid, cid))
+            is_active = cid in active
+            status_badge = (
+                '<span class="text-xs bg-green-100 text-green-700 px-1.5 py-0.5 rounded font-medium ml-1">Monitoring</span>'
+                if is_active else
+                '<span class="text-xs bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded font-medium ml-1">Paused</span>'
+            )
             sales_mapped = calendar_sales_sheets.get(cid, {})
             cash_mapped = calendar_cash_sheets.get(cid, {})
             s_sid = escape(sales_mapped.get("spreadsheet_id", ""))
@@ -2154,7 +2164,7 @@ function toggleEnabled() {{
             )
             cal_routing_html += (
                 f'<div class="py-3 border-b border-gray-100 last:border-b-0">'
-                f'<p class="text-sm font-medium text-gray-800 mb-2">{label}</p>'
+                f'<p class="text-sm font-medium text-gray-800 mb-2">{label}{status_badge}</p>'
                 f'<div class="grid grid-cols-1 gap-3">'
                 f'<div>'
                 f'<p class="text-xs text-gray-500 mb-1">Sales sheet {s_badge}</p>'
@@ -2182,7 +2192,7 @@ function toggleEnabled() {{
                 f'</div>'
             )
         if not cal_routing_html:
-            cal_routing_html = '<p class="text-sm text-gray-500">No active calendars. Tick calendars above and save first.</p>'
+            cal_routing_html = '<p class="text-sm text-gray-500">No calendars configured yet. Tick calendars above, save, then set their sheets here.</p>'
 
         # --- Stats fields ---
         stats_html = ""
