@@ -101,6 +101,7 @@ SALES_STAT_OPTIONS = [
     ("sales_item_desc", "Sales item"),
     ("sales_item_ex_vat", "Sales value (ex VAT)"),
     ("sales_item_inc_vat", "Sales value (inc VAT)"),
+    ("sales_total_ex_vat", "Sales total (ex VAT)"),
 ]
 
 _BASE_HTML = """<!DOCTYPE html>
