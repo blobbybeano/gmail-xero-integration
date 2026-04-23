@@ -391,6 +391,76 @@ def set_sales_backlog(db_path: str, rows: list[dict]) -> None:
     set_json_setting(db_path, "sales_backlog", safe_rows)
 
 
+def get_calendar_sales_sheets(db_path: str) -> dict[str, dict[str, str]]:
+    """
+    Per-calendar sales sheet routing.
+    Shape:
+      {
+        "<calendar_id>": {"spreadsheet_id": "...", "sheet_name": "..."},
+        ...
+      }
+    """
+    raw = get_json_setting(db_path, "calendar_sales_sheets", {})
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict[str, str]] = {}
+    for cal_id, cfg in raw.items():
+        cid = str(cal_id).strip()
+        if not cid or not isinstance(cfg, dict):
+            continue
+        sid = str(cfg.get("spreadsheet_id", "")).strip()
+        sname = str(cfg.get("sheet_name", "Sales")).strip() or "Sales"
+        out[cid] = {"spreadsheet_id": sid, "sheet_name": sname}
+    return out
+
+
+def set_calendar_sales_sheets(db_path: str, mapping: dict[str, dict[str, str]]) -> None:
+    cleaned: dict[str, dict[str, str]] = {}
+    for cal_id, cfg in (mapping or {}).items():
+        cid = str(cal_id).strip()
+        if not cid or not isinstance(cfg, dict):
+            continue
+        sid = str(cfg.get("spreadsheet_id", "")).strip()
+        sname = str(cfg.get("sheet_name", "Sales")).strip() or "Sales"
+        cleaned[cid] = {"spreadsheet_id": sid, "sheet_name": sname}
+    set_json_setting(db_path, "calendar_sales_sheets", cleaned)
+
+
+def get_calendar_cash_sheets(db_path: str) -> dict[str, dict[str, str]]:
+    """
+    Per-calendar cash sheet routing.
+    Shape:
+      {
+        "<calendar_id>": {"spreadsheet_id": "...", "sheet_name": "..."},
+        ...
+      }
+    """
+    raw = get_json_setting(db_path, "calendar_cash_sheets", {})
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict[str, str]] = {}
+    for cal_id, cfg in raw.items():
+        cid = str(cal_id).strip()
+        if not cid or not isinstance(cfg, dict):
+            continue
+        sid = str(cfg.get("spreadsheet_id", "")).strip()
+        sname = str(cfg.get("sheet_name", "Sheet1")).strip() or "Sheet1"
+        out[cid] = {"spreadsheet_id": sid, "sheet_name": sname}
+    return out
+
+
+def set_calendar_cash_sheets(db_path: str, mapping: dict[str, dict[str, str]]) -> None:
+    cleaned: dict[str, dict[str, str]] = {}
+    for cal_id, cfg in (mapping or {}).items():
+        cid = str(cal_id).strip()
+        if not cid or not isinstance(cfg, dict):
+            continue
+        sid = str(cfg.get("spreadsheet_id", "")).strip()
+        sname = str(cfg.get("sheet_name", "Sheet1")).strip() or "Sheet1"
+        cleaned[cid] = {"spreadsheet_id": sid, "sheet_name": sname}
+    set_json_setting(db_path, "calendar_cash_sheets", cleaned)
+
+
 def set_xero_tenants(db_path: str, tenants: list[dict]) -> None:
     set_json_setting(db_path, "xero_tenants", tenants)
 

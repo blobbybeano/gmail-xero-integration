@@ -19,6 +19,8 @@ from .admin_store import (
     DEFAULT_SALES_STATS_FIELDS,
     DEFAULT_STATS_FIELDS,
     get_active_calendars,
+    get_calendar_cash_sheets,
+    get_calendar_sales_sheets,
     get_cash_backlog,
     get_cash_submitter_sheets,
     get_json_setting,
@@ -31,6 +33,8 @@ from .admin_store import (
     get_stats_fields,
     get_submitter_aliases,
     init_admin_store,
+    set_calendar_cash_sheets,
+    set_calendar_sales_sheets,
     set_submitter_aliases,
     set_active_calendars,
     set_cash_submitter_sheets,
@@ -510,6 +514,58 @@ def _save_sales_submitter_sheets_from_form(config: AppConfig, form) -> dict[str,
             next_map.pop(email, None)
 
     set_sales_submitter_sheets(config.admin_db_file, next_map)
+    return next_map
+
+
+def _save_calendar_sales_sheets_from_form(config: AppConfig, form) -> dict[str, dict[str, str]]:
+    current = get_calendar_sales_sheets(config.admin_db_file)
+    next_map = dict(current)
+    prefix_id = "cal_sales_sheet_id__"
+    prefix_name = "cal_sales_sheet_name__"
+
+    candidate_cals: set[str] = set()
+    for k in form.keys():
+        if k.startswith(prefix_id):
+            candidate_cals.add(k[len(prefix_id):].strip())
+        elif k.startswith(prefix_name):
+            candidate_cals.add(k[len(prefix_name):].strip())
+
+    for cal_id in candidate_cals:
+        raw_id = (form.get(f"{prefix_id}{cal_id}") or "").strip()
+        sid = _extract_spreadsheet_id(raw_id)
+        sname = (form.get(f"{prefix_name}{cal_id}") or "Sales").strip() or "Sales"
+        if sid:
+            next_map[cal_id] = {"spreadsheet_id": sid, "sheet_name": sname}
+        else:
+            next_map.pop(cal_id, None)
+
+    set_calendar_sales_sheets(config.admin_db_file, next_map)
+    return next_map
+
+
+def _save_calendar_cash_sheets_from_form(config: AppConfig, form) -> dict[str, dict[str, str]]:
+    current = get_calendar_cash_sheets(config.admin_db_file)
+    next_map = dict(current)
+    prefix_id = "cal_cash_sheet_id__"
+    prefix_name = "cal_cash_sheet_name__"
+
+    candidate_cals: set[str] = set()
+    for k in form.keys():
+        if k.startswith(prefix_id):
+            candidate_cals.add(k[len(prefix_id):].strip())
+        elif k.startswith(prefix_name):
+            candidate_cals.add(k[len(prefix_name):].strip())
+
+    for cal_id in candidate_cals:
+        raw_id = (form.get(f"{prefix_id}{cal_id}") or "").strip()
+        sid = _extract_spreadsheet_id(raw_id)
+        sname = (form.get(f"{prefix_name}{cal_id}") or "Sheet1").strip() or "Sheet1"
+        if sid:
+            next_map[cal_id] = {"spreadsheet_id": sid, "sheet_name": sname}
+        else:
+            next_map.pop(cal_id, None)
+
+    set_calendar_cash_sheets(config.admin_db_file, next_map)
     return next_map
 
 
@@ -1899,6 +1955,8 @@ function toggleEnabled() {{
         cash_backlog = get_cash_backlog(config.admin_db_file)
         sales_submitter_sheets = get_sales_submitter_sheets(config.admin_db_file)
         sales_backlog = get_sales_backlog(config.admin_db_file)
+        calendar_sales_sheets = get_calendar_sales_sheets(config.admin_db_file)
+        calendar_cash_sheets = get_calendar_cash_sheets(config.admin_db_file)
         client_id = _oauth_client_id(config)
         creds_file_exists = Path(config.google_credentials_file).exists()
         stored_xero_id, stored_xero_secret = _get_xero_creds(config)
@@ -2051,6 +2109,80 @@ function toggleEnabled() {{
             cal_html = f'<p class="text-sm text-red-600">{escape(calendar_error)}</p>'
         else:
             cal_html = '<p class="text-sm text-gray-500">No calendars loaded. Connect Google first.</p>'
+
+        # --- Calendar routing UI ---
+        cal_id_to_name: dict[str, str] = {
+            c["id"]: (c.get("summary_display") or c.get("summary") or c["id"])
+            for c in calendars
+            if c.get("id")
+        }
+        # Also include any active calendar IDs that may not be in the fetched list
+        for cid in active:
+            if cid not in cal_id_to_name:
+                cal_id_to_name[cid] = cid
+
+        sales_backlog_by_cal: dict[str, int] = {}
+        for row in sales_backlog:
+            cid = str(row.get("calendar_id", "")).strip()
+            if cid:
+                sales_backlog_by_cal[cid] = sales_backlog_by_cal.get(cid, 0) + 1
+
+        cash_backlog_by_cal: dict[str, int] = {}
+        for row in cash_backlog:
+            cid = str(row.get("calendar_id", "")).strip()
+            if cid:
+                cash_backlog_by_cal[cid] = cash_backlog_by_cal.get(cid, 0) + 1
+
+        cal_routing_html = ""
+        for cid in sorted(active):
+            label = escape(cal_id_to_name.get(cid, cid))
+            sales_mapped = calendar_sales_sheets.get(cid, {})
+            cash_mapped = calendar_cash_sheets.get(cid, {})
+            s_sid = escape(sales_mapped.get("spreadsheet_id", ""))
+            s_sname = escape(sales_mapped.get("sheet_name", "Sales"))
+            c_sid = escape(cash_mapped.get("spreadsheet_id", ""))
+            c_sname = escape(cash_mapped.get("sheet_name", "Sheet1"))
+            s_pending = sales_backlog_by_cal.get(cid, 0)
+            c_pending = cash_backlog_by_cal.get(cid, 0)
+            s_badge = (
+                f'<span class="text-xs text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full">{s_pending} sales pending</span>'
+                if s_pending else ""
+            )
+            c_badge = (
+                f'<span class="text-xs text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full">{c_pending} cash pending</span>'
+                if c_pending else ""
+            )
+            cal_routing_html += (
+                f'<div class="py-3 border-b border-gray-100 last:border-b-0">'
+                f'<p class="text-sm font-medium text-gray-800 mb-2">{label}</p>'
+                f'<div class="grid grid-cols-1 gap-3">'
+                f'<div>'
+                f'<p class="text-xs text-gray-500 mb-1">Sales sheet {s_badge}</p>'
+                f'<div class="grid grid-cols-1 sm:grid-cols-3 gap-2">'
+                f'<input name="cal_sales_sheet_id__{escape(cid)}" value="{s_sid}" '
+                f'placeholder="Spreadsheet URL or ID" '
+                f'class="sm:col-span-2 px-3 py-1.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">'
+                f'<input name="cal_sales_sheet_name__{escape(cid)}" value="{s_sname}" '
+                f'placeholder="Tab name (e.g. Sales)" '
+                f'class="px-3 py-1.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">'
+                f'</div>'
+                f'</div>'
+                f'<div>'
+                f'<p class="text-xs text-gray-500 mb-1">Cash sheet {c_badge}</p>'
+                f'<div class="grid grid-cols-1 sm:grid-cols-3 gap-2">'
+                f'<input name="cal_cash_sheet_id__{escape(cid)}" value="{c_sid}" '
+                f'placeholder="Spreadsheet URL or ID" '
+                f'class="sm:col-span-2 px-3 py-1.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">'
+                f'<input name="cal_cash_sheet_name__{escape(cid)}" value="{c_sname}" '
+                f'placeholder="Tab name (e.g. Cash)" '
+                f'class="px-3 py-1.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">'
+                f'</div>'
+                f'</div>'
+                f'</div>'
+                f'</div>'
+            )
+        if not cal_routing_html:
+            cal_routing_html = '<p class="text-sm text-gray-500">No active calendars. Tick calendars above and save first.</p>'
 
         # --- Stats fields ---
         stats_html = ""
@@ -2632,21 +2764,14 @@ function toggleEnabled() {{
                       </div>
                     </details>
 
-                    <div class="border-t border-gray-100 pt-4">
-                      <h4 class="text-sm font-semibold text-gray-900 mb-1">Sales Routing (Per Submitter)</h4>
-                      <p class="text-sm text-gray-500 mb-3">Sales lines are posted to each submitter's own sheet. If not mapped, the default sales sheet above is used; if that is also empty, entries queue until mapping is added here.</p>
-                      <div>
-                        {sales_rows_html}
-                      </div>
-                    </div>
                   </div>
                 </details>
 
                 <div class="border-t border-gray-100 pt-4">
-                  <h3 class="text-sm font-semibold text-gray-900 mb-1">Cash Routing (Per Submitter)</h3>
-                  <p class="text-sm text-gray-500 mb-3">CASH payments are sent to each submitter's own sheet. If not mapped yet, entries queue until mapping is added here.</p>
+                  <h3 class="text-sm font-semibold text-gray-900 mb-1">Calendar Routing</h3>
+                  <p class="text-sm text-gray-500 mb-3">Assign a sales sheet and a cash sheet to each active calendar. Sales and cash entries for events on that calendar route here. If a sales sheet isn't set, the default sales sheet above is used. Entries queue until a sheet is configured.</p>
                   <div>
-                    {cash_rows_html}
+                    {cal_routing_html}
                   </div>
                 </div>
                 <button type="submit"
@@ -2760,8 +2885,10 @@ function toggleEnabled() {{
             valid_sales = DEFAULT_SALES_STATS_FIELDS
         set_sales_stats_fields(config.admin_db_file, valid_sales)
 
-        sales_routes = _save_sales_submitter_sheets_from_form(config, request.form)
-        cash_routes = _save_cash_submitter_sheets_from_form(config, request.form)
+        _save_sales_submitter_sheets_from_form(config, request.form)
+        _save_cash_submitter_sheets_from_form(config, request.form)
+        cal_sales_routes = _save_calendar_sales_sheets_from_form(config, request.form)
+        cal_cash_routes = _save_calendar_cash_sheets_from_form(config, request.form)
         target = {"spreadsheet_id": spreadsheet_id, "sheet_name": sheet_name}
         creds = load_admin_credentials(config)
         ok, _ = _sheets_status_data(config, creds, target)
@@ -2769,10 +2896,8 @@ function toggleEnabled() {{
             msg = "Sheets configuration saved. Connection is ready."
         else:
             msg = "Sheets configuration saved."
-        if cash_routes:
-            msg += " Cash routing updated."
-        if sales_routes:
-            msg += " Sales routing updated."
+        if cal_sales_routes or cal_cash_routes:
+            msg += " Calendar routing updated."
         if sales_spreadsheet_id:
             msg += " Sales sheet updated."
         session["save_notice"] = f"success:{msg}"

@@ -9,6 +9,8 @@ from .admin_store import (
     add_seen_submitter,
     get_cash_backlog,
     get_cash_submitter_sheets,
+    get_calendar_cash_sheets,
+    get_calendar_sales_sheets,
     get_active_calendars,
     get_enabled,
     get_google_watches,
@@ -305,8 +307,9 @@ def run() -> None:
         if not sales_lines:
             return state
 
-        mapping = get_sales_submitter_sheets(config.admin_db_file)
-        route = mapping.get(submitter_email.lower()) or {}
+        calendar_id = (event.get("_calendar_id") or config.google_calendar_id or "").strip()
+        cal_mapping = get_calendar_sales_sheets(config.admin_db_file)
+        route = cal_mapping.get(calendar_id) or {}
         spreadsheet_id = str(route.get("spreadsheet_id", "")).strip()
         sheet_name = str(route.get("sheet_name", "Sales")).strip() or "Sales"
         if not spreadsheet_id:
@@ -382,6 +385,7 @@ def run() -> None:
             backlog = get_sales_backlog(config.admin_db_file)
             row = {
                 "event_key": event_key,
+                "calendar_id": calendar_id,
                 "submitter_email": submitter_email.lower(),
                 "stats_fields": sales_stats_fields,
                 "rows": payload_rows,
@@ -400,7 +404,7 @@ def run() -> None:
             if not replaced:
                 backlog.append(row)
                 print(
-                    f"Sales row queued for {event_key}: no sales sheet mapped for {submitter_email}",
+                    f"Sales row queued for {event_key}: no sales sheet mapped for calendar {calendar_id}",
                     flush=True,
                 )
             set_sales_backlog(config.admin_db_file, backlog)
@@ -440,6 +444,7 @@ def run() -> None:
             backlog = get_sales_backlog(config.admin_db_file)
             row = {
                 "event_key": event_key,
+                "calendar_id": calendar_id,
                 "submitter_email": submitter_email.lower(),
                 "stats_fields": sales_stats_fields,
                 "rows": payload_rows,
@@ -472,12 +477,9 @@ def run() -> None:
         state: dict,
     ) -> dict:
         """
-        Route CASH payments to submitter-specific sheets.
-        If submitter has no sheet mapping yet, store in backlog for replay.
+        Route CASH payments to calendar-specific sheets.
+        If the calendar has no sheet mapping yet, store in backlog for replay.
         """
-        if not submitter_email:
-            print(f"Cash row skipped for {event_key}: missing submitter email")
-            return state
         if not admin_creds:
             print(f"Cash row deferred for {event_key}: Google credentials unavailable")
             return state
@@ -486,8 +488,9 @@ def run() -> None:
         if not cash_stats_fields:
             cash_stats_fields = [f for f in DEFAULT_STATS_FIELDS if f != "paid_status"]
 
-        mapping = get_cash_submitter_sheets(config.admin_db_file)
-        route = mapping.get(submitter_email.lower()) or {}
+        calendar_id = (event.get("_calendar_id") or config.google_calendar_id or "").strip()
+        cal_mapping = get_calendar_cash_sheets(config.admin_db_file)
+        route = cal_mapping.get(calendar_id) or {}
         spreadsheet_id = str(route.get("spreadsheet_id", "")).strip()
         sheet_name = str(route.get("sheet_name", "Sheet1")).strip() or "Sheet1"
 
@@ -522,6 +525,7 @@ def run() -> None:
             backlog = get_cash_backlog(config.admin_db_file)
             row = {
                 "event_key": event_key,
+                "calendar_id": calendar_id,
                 "submitter_email": submitter_email.lower(),
                 "stats_fields": cash_stats_fields,
                 "payload": payload,
@@ -538,7 +542,7 @@ def run() -> None:
                 backlog.append(row)
             set_cash_backlog(config.admin_db_file, backlog)
             print(
-                f"Cash row queued for {event_key}: no cash sheet mapped for {submitter_email}",
+                f"Cash row queued for {event_key}: no cash sheet mapped for calendar {calendar_id}",
                 flush=True,
             )
             return state
@@ -563,7 +567,7 @@ def run() -> None:
                 payload=payload,
                 event_id_display=event_id_display,
             )
-            print(f"Cash sheet row appended for {event_key} -> {submitter_email}", flush=True)
+            print(f"Cash sheet row appended for {event_key} -> calendar {calendar_id}", flush=True)
             _feed.push(f"Cash row logged for {submitter_display or submitter_email}", "success")
             return set_sheet_log_marker(state, event_key, marker)
         except Exception as exc:
@@ -571,6 +575,7 @@ def run() -> None:
             backlog = get_cash_backlog(config.admin_db_file)
             row = {
                 "event_key": event_key,
+                "calendar_id": calendar_id,
                 "submitter_email": submitter_email.lower(),
                 "stats_fields": cash_stats_fields,
                 "payload": payload,
@@ -594,11 +599,11 @@ def run() -> None:
         backlog = get_cash_backlog(config.admin_db_file)
         if not backlog:
             return
-        mapping = get_cash_submitter_sheets(config.admin_db_file)
+        cal_mapping = get_calendar_cash_sheets(config.admin_db_file)
         remaining: list[dict] = []
         for row in backlog:
-            submitter_email = str(row.get("submitter_email", "")).strip().lower()
-            route = mapping.get(submitter_email) or {}
+            calendar_id = str(row.get("calendar_id", "")).strip()
+            route = cal_mapping.get(calendar_id) or {}
             spreadsheet_id = str(route.get("spreadsheet_id", "")).strip()
             sheet_name = str(route.get("sheet_name", "Sheet1")).strip() or "Sheet1"
             if not spreadsheet_id:
@@ -627,12 +632,12 @@ def run() -> None:
                     event_id_display=event_id_display,
                 )
                 print(
-                    f"Cash backlog flushed for {submitter_email}: {event_key}",
+                    f"Cash backlog flushed for calendar {calendar_id}: {event_key}",
                     flush=True,
                 )
             except Exception as exc:
                 print(
-                    f"Cash backlog flush failed for {submitter_email}: {exc}",
+                    f"Cash backlog flush failed for calendar {calendar_id}: {exc}",
                     flush=True,
                 )
                 remaining.append(row)
@@ -645,13 +650,17 @@ def run() -> None:
         backlog = get_sales_backlog(config.admin_db_file)
         if not backlog:
             return
-        mapping = get_sales_submitter_sheets(config.admin_db_file)
+        cal_mapping = get_calendar_sales_sheets(config.admin_db_file)
+        sales_target = get_sales_sheet_target(config.admin_db_file)
         remaining: list[dict] = []
         for row in backlog:
-            submitter_email = str(row.get("submitter_email", "")).strip().lower()
-            route = mapping.get(submitter_email) or {}
+            calendar_id = str(row.get("calendar_id", "")).strip()
+            route = cal_mapping.get(calendar_id) or {}
             spreadsheet_id = str(route.get("spreadsheet_id", "")).strip()
             sheet_name = str(route.get("sheet_name", "Sales")).strip() or "Sales"
+            if not spreadsheet_id:
+                spreadsheet_id = sales_target.get("spreadsheet_id", "").strip()
+                sheet_name = sales_target.get("sheet_name", "Sales").strip() or "Sales"
             if not spreadsheet_id:
                 remaining.append(row)
                 continue
@@ -685,12 +694,12 @@ def run() -> None:
                         event_id_display=event_id_display,
                     )
                 print(
-                    f"Sales backlog flushed for {submitter_email}: {row.get('event_key', '')}",
+                    f"Sales backlog flushed for calendar {calendar_id}: {row.get('event_key', '')}",
                     flush=True,
                 )
             except Exception as exc:
                 print(
-                    f"Sales backlog flush failed for {submitter_email}: {exc}",
+                    f"Sales backlog flush failed for calendar {calendar_id}: {exc}",
                     flush=True,
                 )
                 remaining.append(row)
