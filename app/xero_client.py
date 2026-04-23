@@ -213,25 +213,63 @@ class XeroClient:
         return invoices[0]
 
     def delete_draft_invoice(self, invoice_id: str) -> Dict:
-        """Void a DRAFT invoice so it no longer appears as outstanding.
-        Idempotent: if the invoice is already VOIDED this returns without error."""
-        payload = {"Invoices": [{"InvoiceID": invoice_id, "Status": "VOIDED"}]}
+        """
+        Remove an invoice from active receivables.
+
+        Behavior:
+        - DRAFT invoices are set to DELETED
+        - non-DRAFT invoices are set to VOIDED
+
+        Idempotent:
+        - already DELETED/VOIDED is treated as success
+        """
+        target_status = "DELETED"
+        try:
+            current = self.get_invoice(invoice_id)
+            current_status = str(current.get("Status") or "").upper()
+            if current_status in {"DELETED", "VOIDED"}:
+                return {"Invoices": [current]}
+            if current_status and current_status != "DRAFT":
+                target_status = "VOIDED"
+        except Exception:
+            # If lookup fails, fall back to DELETED attempt first.
+            current_status = ""
+
+        payload = {"Invoices": [{"InvoiceID": invoice_id, "Status": target_status}]}
         if self.dry_run:
             return {"dry_run": True, "payload": payload}
         url = f"{self.base_url}/Invoices"
         response = self._request("POST", url, json=payload)
-        if not response.ok:
+        if response.ok:
+            body = response.json()
+            try:
+                refreshed = self.get_invoice(invoice_id)
+                refreshed_status = str(refreshed.get("Status") or "").upper()
+                if refreshed_status in {"DELETED", "VOIDED"}:
+                    return {"Invoices": [refreshed]}
+            except Exception:
+                # Some tenants stop returning DELETED invoices by id; treat successful POST as success.
+                return body
+            # API accepted but invoice still active: return body for higher-level handling/logging.
+            return body
+        else:
             try:
                 body = response.json()
-                elements = body.get("Elements") or []
-                if elements and elements[0].get("Status") == "VOIDED":
+                elements = body.get("Elements") or body.get("Invoices") or []
+                if elements:
+                    status = str((elements[0] or {}).get("Status") or "").upper()
+                    if status in {"DELETED", "VOIDED"}:
+                        return body
+                # Fallback idempotency check from latest invoice state.
+                refreshed = self.get_invoice(invoice_id)
+                refreshed_status = str(refreshed.get("Status") or "").upper()
+                if refreshed_status in {"DELETED", "VOIDED"}:
                     return body
             except Exception:
                 pass
             raise RuntimeError(
                 f"Xero invoice void failed: {response.status_code} {response.text}"
             )
-        return response.json()
 
     def authorize_invoice(self, invoice_id: str) -> Dict:
         payload = {"Invoices": [{"InvoiceID": invoice_id, "Status": "AUTHORISED"}]}
