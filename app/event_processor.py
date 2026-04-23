@@ -129,7 +129,7 @@ def ensure_notes_template(description: str | None) -> str:
     )
 
     if not description:
-        return template
+        return _set_entry_status_emoji(template, "orange")
 
     # Ensure notes block exists for freeform job notes that the parser ignores.
     if not _has_notes_block(description):
@@ -149,9 +149,12 @@ def ensure_notes_template(description: str | None) -> str:
             if line.strip().upper() == "DONE":
                 lines[i] = done_repl
                 return _normalize_entry_layout("\n".join(lines))
-        return _normalize_entry_layout(f"{description.rstrip()}\n\n{invoice_block}")
+        return _set_entry_status_emoji(
+            _normalize_entry_layout(f"{description.rstrip()}\n\n{invoice_block}"),
+            "orange",
+        )
 
-    return _normalize_entry_layout(description)
+    return _set_entry_status_emoji(_normalize_entry_layout(description), "orange")
 
 
 def normalize_user_sections(description: str | None) -> str:
@@ -258,6 +261,33 @@ def _normalize_entry_layout(text: str) -> str:
     # Keep exactly one blank line between major blocks.
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip() + "\n"
+
+
+def _set_entry_status_emoji(description: str, status: str) -> str:
+    """
+    Keep exactly one status emoji at the very top of the notes.
+    """
+    status_map = {
+        "orange": "🟠",
+        "yellow": "🟡",
+        "green": "🟢",
+    }
+    emoji = status_map.get((status or "").lower())
+    if not emoji:
+        return description
+
+    text = (description or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if lines and lines[0].strip() in {"🟠", "🟡", "🟢"}:
+        lines.pop(0)
+        while lines and not lines[0].strip():
+            lines.pop(0)
+    body = "\n".join(lines).strip()
+    if body:
+        return f"{emoji}\n{body}\n"
+    return f"{emoji}\n"
 
 
 def parse_customer_fields(description: str | None) -> Dict:
@@ -696,7 +726,7 @@ def upsert_invoice_summary(
     if cleaned:
         summary_lines = [""] + summary_lines
     updated = cleaned + summary_lines
-    return _normalize_entry_layout("\n".join(updated))
+    return _set_entry_status_emoji(_normalize_entry_layout("\n".join(updated)), "yellow")
 
 
 def upsert_send_confirmation(
@@ -731,7 +761,9 @@ def upsert_send_confirmation(
     if cleaned:
         summary_lines = [""] + summary_lines
     updated = cleaned + summary_lines
-    return _normalize_entry_layout("\n".join(updated))
+    pay_mode = payment_choice(description)
+    status = "green" if pay_mode in {"card", "cash"} else "yellow"
+    return _set_entry_status_emoji(_normalize_entry_layout("\n".join(updated)), status)
 
 
 def upsert_cash_confirmation(
@@ -762,7 +794,10 @@ def upsert_cash_confirmation(
         cleaned.pop()
     if cleaned:
         summary_lines = [""] + summary_lines
-    return _normalize_entry_layout("\n".join(cleaned + summary_lines))
+    return _set_entry_status_emoji(
+        _normalize_entry_layout("\n".join(cleaned + summary_lines)),
+        "green",
+    )
 
 
 def upsert_send_failure(
@@ -802,7 +837,10 @@ def upsert_send_failure(
         cleaned.pop()
     if cleaned:
         summary_lines = [""] + summary_lines
-    return _normalize_entry_layout("\n".join(cleaned + summary_lines))
+    return _set_entry_status_emoji(
+        _normalize_entry_layout("\n".join(cleaned + summary_lines)),
+        "yellow",
+    )
 
 
 def _status_base_lines(description: str) -> list[str]:
