@@ -213,13 +213,21 @@ class XeroClient:
         return invoices[0]
 
     def delete_draft_invoice(self, invoice_id: str) -> Dict:
-        """Void a DRAFT invoice so it no longer appears as outstanding."""
+        """Void a DRAFT invoice so it no longer appears as outstanding.
+        Idempotent: if the invoice is already VOIDED this returns without error."""
         payload = {"Invoices": [{"InvoiceID": invoice_id, "Status": "VOIDED"}]}
         if self.dry_run:
             return {"dry_run": True, "payload": payload}
         url = f"{self.base_url}/Invoices"
         response = self._request("POST", url, json=payload)
         if not response.ok:
+            try:
+                body = response.json()
+                elements = body.get("Elements") or []
+                if elements and elements[0].get("Status") == "VOIDED":
+                    return body
+            except Exception:
+                pass
             raise RuntimeError(
                 f"Xero invoice void failed: {response.status_code} {response.text}"
             )
