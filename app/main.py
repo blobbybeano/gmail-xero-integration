@@ -301,10 +301,12 @@ def run() -> None:
             print(f"Sales row skipped for {event_key}: missing submitter email")
             return state
         if not admin_creds or not sales_stats_fields:
+            print(f"Sales row skipped for {event_key}: admin_creds={bool(admin_creds)} sales_stats_fields={len(sales_stats_fields) if sales_stats_fields else 0}", flush=True)
             return state
 
         sales_lines = extract_sales_lines(event.get("description"))
         if not sales_lines:
+            print(f"Sales row skipped for {event_key}: no sales lines parsed from description", flush=True)
             return state
 
         calendar_id = (event.get("_calendar_id") or config.google_calendar_id or "").strip()
@@ -382,6 +384,7 @@ def run() -> None:
             )
 
         if not spreadsheet_id:
+            print(f"Sales row skipped/queued for {event_key}: no sales sheet mapped for calendar '{calendar_id}' (cal_mapping keys={list(cal_mapping.keys())})", flush=True)
             backlog = get_sales_backlog(config.admin_db_file)
             row = {
                 "event_key": event_key,
@@ -409,6 +412,7 @@ def run() -> None:
                 )
             set_sales_backlog(config.admin_db_file, backlog)
             return state
+        print(f"Sales row writing for {event_key}: spreadsheet={spreadsheet_id} sheet={sheet_name} lines={len(sales_lines)}", flush=True)
 
         marker = (
             f"{invoice_id}:{payment_method}:sales:{spreadsheet_id}:{sheet_name}:{len(sales_lines)}:{sales_total_ex:.2f}:{sales_total_inc:.2f}"
@@ -1442,6 +1446,62 @@ def run() -> None:
                                 sales_stats_fields=sales_stats_fields,
                                 state=state,
                             )
+                        elif (
+                            has_send
+                            and invoice_lines
+                            and is_invoice_sent(state, event_key)
+                        ):
+                            # Invoice already sent — retry any missing sheet writes without re-authorising
+                            invoice_id_retry = get_invoice_for_event(state, event_key) or ""
+                            pay_mode_retry = payment_choice(event.get("description")) or ""
+                            print(f"Event {event_id}: invoice already sent, retrying sheet writes (pay={pay_mode_retry})", flush=True)
+                            if pay_mode_retry == "cash":
+                                state = _append_cash_row_or_backlog(
+                                    event=event,
+                                    event_key=event_key,
+                                    invoice_id=invoice_id_retry,
+                                    submitter_email=submitter_email,
+                                    submitter_display=submitter_display,
+                                    admin_creds=admin_creds,
+                                    stats_fields=stats_fields,
+                                    state=state,
+                                )
+                                state = _append_sales_rows_if_enabled(
+                                    event=event,
+                                    event_key=event_key,
+                                    invoice_id=invoice_id_retry,
+                                    payment_method=pay_mode_retry,
+                                    submitter_email=submitter_email,
+                                    submitter_display=submitter_display,
+                                    admin_creds=admin_creds,
+                                    sales_sheet_target=sales_sheet_target,
+                                    sales_stats_fields=sales_stats_fields,
+                                    state=state,
+                                )
+                            elif pay_mode_retry in ("card", "invoice"):
+                                state = _append_sheet_stats_if_enabled(
+                                    event=event,
+                                    event_key=event_key,
+                                    invoice_id=invoice_id_retry,
+                                    payment_method=pay_mode_retry,
+                                    submitter_display=submitter_display,
+                                    admin_creds=admin_creds,
+                                    sheet_target=sheet_target,
+                                    stats_fields=stats_fields,
+                                    state=state,
+                                )
+                                state = _append_sales_rows_if_enabled(
+                                    event=event,
+                                    event_key=event_key,
+                                    invoice_id=invoice_id_retry,
+                                    payment_method=pay_mode_retry,
+                                    submitter_email=submitter_email,
+                                    submitter_display=submitter_display,
+                                    admin_creds=admin_creds,
+                                    sales_sheet_target=sales_sheet_target,
+                                    sales_stats_fields=sales_stats_fields,
+                                    state=state,
+                                )
                         if existing_contact_id:
                             state = set_contact_update_marker(
                                 state, event_key, event_updated

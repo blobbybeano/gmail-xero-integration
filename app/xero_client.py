@@ -212,6 +212,19 @@ class XeroClient:
             raise RuntimeError("Xero invoice fetch returned empty invoice list")
         return invoices[0]
 
+    def delete_draft_invoice(self, invoice_id: str) -> Dict:
+        """Void a DRAFT invoice so it no longer appears as outstanding."""
+        payload = {"Invoices": [{"InvoiceID": invoice_id, "Status": "VOIDED"}]}
+        if self.dry_run:
+            return {"dry_run": True, "payload": payload}
+        url = f"{self.base_url}/Invoices"
+        response = self._request("POST", url, json=payload)
+        if not response.ok:
+            raise RuntimeError(
+                f"Xero invoice void failed: {response.status_code} {response.text}"
+            )
+        return response.json()
+
     def authorize_invoice(self, invoice_id: str) -> Dict:
         payload = {"Invoices": [{"InvoiceID": invoice_id, "Status": "AUTHORISED"}]}
         if self.dry_run:
