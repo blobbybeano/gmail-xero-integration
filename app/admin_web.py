@@ -2140,95 +2140,78 @@ function toggleEnabled() {{
         configured_cal_ids = set(calendar_sales_sheets.keys()) | set(calendar_cash_sheets.keys())
         all_routing_cals = sorted(my_cal_ids | active | configured_cal_ids)
 
-        # Build compact dropdown + per-calendar panel HTML (used inside Sheets accordion)
-        if not all_routing_cals:
-            cal_routing_html = '<p class="text-sm text-gray-500">No calendars found. Connect Google Calendar first.</p>'
-        else:
-            # Pick a sensible default: first calendar that already has routing, else first active, else first
+        # Build per-calendar dropdown HTML — one block for sales, one for cash
+        def _cal_dropdown_html(prefix_select: str, prefix_panel: str, kind: str) -> str:
+            """Return a dropdown + hidden panels for per-calendar sheet routing."""
+            no_cal_msg = '<p class="text-sm text-gray-500">No active calendars found. Tick calendars in Active Calendars and save first.</p>'
+            cals = [c for c in all_routing_cals if c in active or c in configured_cal_ids]
+            if not cals:
+                return no_cal_msg
+            is_sales = kind == "sales"
+            mapping = calendar_sales_sheets if is_sales else calendar_cash_sheets
+            backlog_by_cal = sales_backlog_by_cal if is_sales else cash_backlog_by_cal
+            default_tab = "Sales" if is_sales else "Cash"
             default_cid = next(
-                (c for c in all_routing_cals if c in configured_cal_ids),
-                next((c for c in all_routing_cals if c in active), all_routing_cals[0]),
+                (c for c in cals if c in mapping),
+                next((c for c in cals if c in active), cals[0]),
             )
-            # Dropdown options
-            select_opts = ""
-            for cid in all_routing_cals:
+            # Dropdown
+            opts = ""
+            for cid in cals:
                 label = cal_id_to_name.get(cid, cid)
-                status = " ● " if cid in active else " ○ "
-                select_opts += f'<option value="{escape(cid)}"{" selected" if cid == default_cid else ""}>{escape(status + label)}</option>'
-
-            # Per-calendar panels (all in DOM; JS shows only the selected one)
-            panels_html = ""
-            for cid in all_routing_cals:
-                is_active = cid in active
-                sales_mapped = calendar_sales_sheets.get(cid, {})
-                cash_mapped = calendar_cash_sheets.get(cid, {})
-                s_sid = escape(sales_mapped.get("spreadsheet_id", ""))
-                s_sname = escape(sales_mapped.get("sheet_name", "Sales"))
-                c_sid = escape(cash_mapped.get("spreadsheet_id", ""))
-                c_sname = escape(cash_mapped.get("sheet_name", "Sheet1"))
-                s_pending = sales_backlog_by_cal.get(cid, 0)
-                c_pending = cash_backlog_by_cal.get(cid, 0)
-                s_badge = (
-                    f'<span class="text-xs text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full ml-1">{s_pending} pending</span>'
-                    if s_pending else ""
-                )
-                c_badge = (
-                    f'<span class="text-xs text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full ml-1">{c_pending} pending</span>'
-                    if c_pending else ""
-                )
-                status_badge = (
-                    '<span class="text-xs bg-green-100 text-green-700 px-1.5 py-0.5 rounded font-medium">Monitoring</span>'
-                    if is_active else
-                    '<span class="text-xs bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded font-medium">Paused</span>'
+                status = "● " if cid in active else "○ "
+                opts += f'<option value="{escape(cid)}"{" selected" if cid == default_cid else ""}>{escape(status + label)}</option>'
+            # Panels
+            panels = ""
+            for cid in cals:
+                mapped = mapping.get(cid, {})
+                sid = escape(mapped.get("spreadsheet_id", ""))
+                sname = escape(mapped.get("sheet_name", default_tab))
+                pending = backlog_by_cal.get(cid, 0)
+                pending_badge = (
+                    f'<span class="text-xs text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full ml-2">{pending} pending</span>'
+                    if pending else ""
                 )
                 display = "block" if cid == default_cid else "none"
-                panel_id = f"cal_panel__{escape(cid)}"
-                panels_html += (
-                    f'<div id="{panel_id}" style="display:{display}" class="pt-3 space-y-3">'
-                    f'<div class="flex items-center gap-2 mb-1">{status_badge}</div>'
-                    f'<div>'
-                    f'<p class="text-xs font-medium text-gray-600 mb-1">Sales sheet {s_badge}</p>'
-                    f'<div class="grid grid-cols-1 sm:grid-cols-3 gap-2">'
-                    f'<input name="cal_sales_sheet_id__{escape(cid)}" value="{s_sid}" '
-                    f'placeholder="Spreadsheet URL or ID" '
-                    f'class="sm:col-span-2 px-3 py-1.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">'
-                    f'<input name="cal_sales_sheet_name__{escape(cid)}" value="{s_sname}" '
-                    f'placeholder="Tab (e.g. Sales)" '
-                    f'class="px-3 py-1.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">'
-                    f'</div>'
-                    f'</div>'
-                    f'<div>'
-                    f'<p class="text-xs font-medium text-gray-600 mb-1">Cash sheet {c_badge}</p>'
-                    f'<div class="grid grid-cols-1 sm:grid-cols-3 gap-2">'
-                    f'<input name="cal_cash_sheet_id__{escape(cid)}" value="{c_sid}" '
-                    f'placeholder="Spreadsheet URL or ID" '
-                    f'class="sm:col-span-2 px-3 py-1.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">'
-                    f'<input name="cal_cash_sheet_name__{escape(cid)}" value="{c_sname}" '
-                    f'placeholder="Tab (e.g. Cash)" '
-                    f'class="px-3 py-1.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">'
-                    f'</div>'
-                    f'</div>'
+                panels += (
+                    f'<div id="{prefix_panel}{escape(cid)}" style="display:{display}" class="space-y-3 pt-1">'
+                    f'<p class="text-xs text-gray-500">Spreadsheet URL or ID {pending_badge}</p>'
+                    f'<input name="cal_{kind}_sheet_id__{escape(cid)}" value="{sid}" '
+                    f'placeholder="Paste a Google Sheets URL or spreadsheet ID" '
+                    f'class="w-full px-3 py-1.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">'
+                    f'<p class="text-xs text-gray-500 mt-2">Tab name</p>'
+                    f'<input name="cal_{kind}_sheet_name__{escape(cid)}" value="{sname}" '
+                    f'placeholder="{default_tab}" '
+                    f'class="w-48 px-3 py-1.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">'
                     f'</div>'
                 )
-
-            cal_routing_html = (
-                f'<div>'
-                f'<label class="block text-sm font-medium text-gray-700 mb-1.5">Calendar</label>'
-                f'<select id="cal_routing_select" onchange="showCalRouting(this.value)" '
-                f'class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">'
-                f'{select_opts}'
-                f'</select>'
-                f'</div>'
-                f'<div id="cal_routing_panels">'
-                f'{panels_html}'
-                f'</div>'
+            js = (
                 f'<script>'
-                f'function showCalRouting(cid){{'
-                f'document.querySelectorAll("#cal_routing_panels > div").forEach(function(el){{el.style.display="none";}});'
-                f'if(cid){{var p=document.getElementById("cal_panel__"+cid);if(p)p.style.display="block";}}'
+                f'(function(){{'
+                f'function _show_{kind}(cid){{'
+                f'document.querySelectorAll("[id^=\'{prefix_panel}\']").forEach(function(el){{el.style.display="none";}});'
+                f'var p=document.getElementById("{prefix_panel}"+cid);'
+                f'if(p)p.style.display="block";'
                 f'}}'
+                f'var sel=document.getElementById("{prefix_select}");'
+                f'if(sel)sel.addEventListener("change",function(){{_show_{kind}(this.value);}});'
+                f'}})();'
                 f'</script>'
             )
+            return (
+                f'<div>'
+                f'<label class="block text-sm font-medium text-gray-700 mb-1.5">Calendar / Person</label>'
+                f'<select id="{prefix_select}" '
+                f'class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">'
+                f'{opts}'
+                f'</select>'
+                f'</div>'
+                f'{panels}'
+                f'{js}'
+            )
+
+        cal_sales_routing_html = _cal_dropdown_html("cal_sales_select", "cal_sp__", "sales")
+        cal_cash_routing_html = _cal_dropdown_html("cal_cash_select", "cal_cp__", "cash")
 
         # --- Stats fields ---
         stats_html = ""
@@ -2728,7 +2711,7 @@ function toggleEnabled() {{
                   </div>
                   <div>
                     <h2 class="font-semibold text-gray-900 text-sm">Google Sheets Configuration</h2>
-                    <p class="text-xs text-gray-500">Main invoice sheet + internal sales sheet + cash routing</p>
+                    <p class="text-xs text-gray-500">Invoice sheet · Sales tracking · Cash tracking</p>
                   </div>
                 </div>
                 <div class="flex items-center gap-2">
@@ -2766,66 +2749,30 @@ function toggleEnabled() {{
                 <details class="border border-gray-200 rounded-xl overflow-hidden group/sales" open>
                   <summary class="flex items-center justify-between px-4 py-3 bg-gray-50 cursor-pointer list-none select-none hover:bg-gray-100 transition-colors">
                     <div>
-                      <h3 class="text-sm font-semibold text-gray-900">Sales Tracking (Internal)</h3>
-                      <p class="text-xs text-gray-500">Logs values from lines below <strong>⬇Sales⬇</strong> in [invoice]</p>
+                      <h3 class="text-sm font-semibold text-gray-900">Sales Tracking</h3>
+                      <p class="text-xs text-gray-500">Logs lines below <strong>⬇Sales⬇</strong> in [invoice] — per calendar</p>
                     </div>
                     <svg class="w-4 h-4 text-gray-400 transition-transform duration-200 group-open/sales:rotate-180 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
                     </svg>
                   </summary>
                   <div class="px-4 py-4 border-t border-gray-100 space-y-4">
-                    {"" if not spreadsheets else f"""
-                    <div>
-                      <label class="block text-sm font-medium text-gray-700 mb-1.5">Sales spreadsheet (optional quick pick)</label>
-                      <select name="sales_spreadsheet_pick" class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
-                        {sales_sheet_options}
-                      </select>
-                    </div>
-                    """}
-                    <div>
-                      <label class="block text-sm font-medium text-gray-700 mb-1.5">Sales spreadsheet URL or ID</label>
-                      <input name="sales_spreadsheet_input" value="{escape(sales_sheet_current_id)}"
-                        placeholder="Paste a Google Sheets URL or spreadsheet ID"
-                        class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
-                      {f'<p class="text-xs text-emerald-600 mt-1">&#10003; Saved: <span class="font-medium">{escape(sales_sheet_current_id)}</span></p>' if sales_sheet_current_id else '<p class="text-xs text-gray-400 mt-1">No sales spreadsheet saved yet.</p>'}
-                    </div>
-                    <div>
-                      <label class="block text-sm font-medium text-gray-700 mb-1.5">Sales sheet tab name</label>
-                      <input name="sales_sheet_name" value="{escape(sales_sheet_name_val)}"
-                        placeholder="Sales"
-                        class="w-48 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
-                      {f'<p class="text-xs text-emerald-600 mt-1">&#10003; Saved: <span class="font-medium">{escape(sales_sheet_name_val)}</span></p>' if sales_sheet_current_id else ""}
-                    </div>
-                    <details class="border border-gray-200 rounded-lg overflow-hidden group/sadv">
-                      <summary class="flex items-center justify-between px-3 py-2 bg-gray-50 cursor-pointer list-none select-none hover:bg-gray-100 transition-colors">
-                        <span class="text-sm font-medium text-gray-700">Advanced: Sales fields to post</span>
-                        <svg class="w-4 h-4 text-gray-400 transition-transform duration-200 group-open/sadv:rotate-180 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
-                        </svg>
-                      </summary>
-                      <div class="px-3 py-3 border-t border-gray-100">
-                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-1">
-                          {sales_stats_html}
-                        </div>
-                      </div>
-                    </details>
-
+                    {cal_sales_routing_html}
                   </div>
                 </details>
 
-                <details class="border border-gray-200 rounded-xl overflow-hidden group/calroute">
+                <details class="border border-gray-200 rounded-xl overflow-hidden group/cash">
                   <summary class="flex items-center justify-between px-4 py-3 bg-gray-50 cursor-pointer list-none select-none hover:bg-gray-100 transition-colors">
                     <div>
-                      <h3 class="text-sm font-semibold text-gray-900">Calendar Sheet Routing</h3>
-                      <p class="text-xs text-gray-500">Override which sheet each calendar routes to</p>
+                      <h3 class="text-sm font-semibold text-gray-900">Cash Tracking</h3>
+                      <p class="text-xs text-gray-500">Logs cash payments to a sheet — per calendar</p>
                     </div>
-                    <svg class="w-4 h-4 text-gray-400 transition-transform duration-200 group-open/calroute:rotate-180 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <svg class="w-4 h-4 text-gray-400 transition-transform duration-200 group-open/cash:rotate-180 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
                     </svg>
                   </summary>
-                  <div class="px-4 py-4 border-t border-gray-100 space-y-3">
-                    <p class="text-xs text-gray-500">Pick a calendar from the dropdown to set its sales and cash sheet. Leave blank to fall back to the default sheets above.</p>
-                    {cal_routing_html}
+                  <div class="px-4 py-4 border-t border-gray-100 space-y-4">
+                    {cal_cash_routing_html}
                   </div>
                 </details>
 
