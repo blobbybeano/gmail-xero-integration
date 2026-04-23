@@ -150,3 +150,14 @@ def set_sales_log_marker(state: Dict, event_id: str, marker: str) -> Dict:
     mapping[event_id] = marker
     state["event_sales_log_updates"] = mapping
     return state
+
+
+def get_cash_log_marker(state: Dict, event_id: str) -> str | None:
+    return state.get("event_cash_log_updates", {}).get(event_id)
+
+
+def set_cash_log_marker(state: Dict, event_id: str, marker: str) -> Dict:
+    mapping = state.get("event_cash_log_updates", {})
+    mapping[event_id] = marker
+    state["event_cash_log_updates"] = mapping
+    return state

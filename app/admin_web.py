@@ -2895,8 +2895,13 @@ function toggleEnabled() {{
         cal_sales_routes = _save_calendar_sales_sheets_from_form(config, request.form)
         cal_cash_routes = _save_calendar_cash_sheets_from_form(config, request.form)
         target = {"spreadsheet_id": spreadsheet_id, "sheet_name": sheet_name}
-        creds = load_admin_credentials(config)
-        ok, _ = _sheets_status_data(config, creds, target)
+        creds = None
+        ok = False
+        try:
+            creds = load_admin_credentials(config)
+            ok, _ = _sheets_status_data(config, creds, target)
+        except Exception:
+            ok = False
         if ok:
             msg = "Sheets configuration saved. Connection is ready."
         else:

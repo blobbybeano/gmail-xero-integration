@@ -328,6 +328,25 @@ def set_cash_backlog(db_path: str, rows: list[dict]) -> None:
     set_json_setting(db_path, "cash_backlog", safe_rows)
 
 
+def get_sheet_backlog(db_path: str) -> list[dict]:
+    """
+    Pending universal sheet rows waiting for sheet routing or transient retries.
+    """
+    raw = get_json_setting(db_path, "sheet_backlog", [])
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for row in raw:
+        if isinstance(row, dict):
+            out.append(row)
+    return out
+
+
+def set_sheet_backlog(db_path: str, rows: list[dict]) -> None:
+    safe_rows = [r for r in (rows or []) if isinstance(r, dict)]
+    set_json_setting(db_path, "sheet_backlog", safe_rows)
+
+
 def get_sales_submitter_sheets(db_path: str) -> dict[str, dict[str, str]]:
     """
     Per-submitter sales sheet routing.

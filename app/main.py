@@ -16,6 +16,7 @@ from .admin_store import (
     get_google_watches,
     get_seen_submitters,
     get_sheet_target,
+    get_sheet_backlog,
     get_sales_backlog,
     get_sales_sheet_target,
     get_sales_stats_fields,
@@ -24,6 +25,7 @@ from .admin_store import (
     get_submitter_aliases,
     init_admin_store,
     set_cash_backlog,
+    set_sheet_backlog,
     set_sales_backlog,
     set_google_watch,
     delete_google_watch,
@@ -60,6 +62,7 @@ from .trigger import wait_for_poll, consume_watch_check
 from .google_sheets import append_stats_row, ensure_header
 from .google_admin import load_admin_credentials
 from .state import (
+    get_cash_log_marker,
     get_contact_for_event,
     get_contact_update_marker,
     get_contact_fingerprint,
@@ -83,6 +86,7 @@ from .state import (
     set_invoice_for_event,
     set_invoice_update_marker,
     set_last_sync,
+    set_cash_log_marker,
     set_processed_update_marker,
     set_sheet_log_marker,
     set_sales_log_marker,
@@ -202,24 +206,11 @@ def run() -> None:
         stats_fields: list[str],
         state: dict,
     ) -> dict:
-        if not admin_creds or not stats_fields:
+        if not stats_fields:
             return state
+
         spreadsheet_id = sheet_target.get("spreadsheet_id", "").strip()
         sheet_name = sheet_target.get("sheet_name", "Sheet1").strip() or "Sheet1"
-        if not spreadsheet_id:
-            return state
-
-        marker = f"{invoice_id}:{payment_method}".upper()
-        if get_sheet_log_marker(state, event_key) == marker:
-            return state
-
-        invoice = {}
-        if xero_client:
-            try:
-                invoice = xero_client.get_invoice(invoice_id)
-            except Exception as exc:
-                print(f"Sheets: failed to read invoice {invoice_id}: {exc}")
-                return state
 
         def _fmt_british(iso_str: str) -> str:
             if not iso_str:
@@ -234,13 +225,41 @@ def run() -> None:
             except Exception:
                 return iso_str
 
+        def _fmt_money(value) -> str:
+            if value in (None, ""):
+                return ""
+            try:
+                return f"{float(value):.2f}"
+            except Exception:
+                return str(value)
+
+        invoice = {}
+        if xero_client and invoice_id:
+            try:
+                invoice = xero_client.get_invoice(invoice_id)
+            except Exception as exc:
+                # Keep going with calendar-derived totals so universal sheet still logs.
+                print(f"Sheets: failed to read invoice {invoice_id}, using fallback totals: {exc}")
+
+        subtotal = invoice.get("SubTotal")
+        total = invoice.get("Total")
+        if subtotal in (None, "") or total in (None, ""):
+            fallback_lines = extract_invoice_lines(event.get("description"))
+            if fallback_lines:
+                fb_subtotal, fb_total = compute_invoice_totals(fallback_lines)
+                if subtotal in (None, ""):
+                    subtotal = fb_subtotal
+                if total in (None, ""):
+                    total = fb_total
+
         start = (event.get("start", {}) or {}).get("dateTime") or (event.get("start", {}) or {}).get("date") or ""
         end = (event.get("end", {}) or {}).get("dateTime") or (event.get("end", {}) or {}).get("date") or ""
         start_fmt = _fmt_british(start)
         end_fmt = _fmt_british(end)
         slot_text = f"{start_fmt} – {end_fmt}".strip(" –") if start_fmt != end_fmt else start_fmt
         customer_fields = parse_customer_fields(event.get("description"))
-        is_card = payment_method.lower() == "card"
+        paid_immediately = payment_method.lower() in {"card", "cash"}
+        payload_payment_method = payment_method.upper() if payment_method else "N/A"
         payload = {
             "submitter": submitter_display
             or (event.get("creator", {}) or {}).get("email")
@@ -251,17 +270,54 @@ def run() -> None:
             "receipt_details": "",
             "slot_datetime": slot_text,
             "payment_datetime": _fmt_british(dt.datetime.now(dt.timezone.utc).isoformat())
-            if is_card
+            if paid_immediately
             else "N/A",
-            "payment_method": payment_method.upper() if payment_method else "N/A",
-            "paid_status": "Paid" if is_card else "Outstanding",
-            "job_cost_ex_vat": invoice.get("SubTotal") or "",
-            "job_cost_inc_vat": invoice.get("Total") or "",
+            "payment_method": payload_payment_method,
+            "paid_status": "Paid" if paid_immediately else "Outstanding",
+            "job_cost_ex_vat": _fmt_money(subtotal),
+            "job_cost_inc_vat": _fmt_money(total),
         }
         event_id_raw = event.get("id") or ""
         date_part = start.split("T", 1)[0].replace("-", "")
         suffix = event_id_raw[-4:] if event_id_raw else "0000"
         event_id_display = f"GC-{date_part}-{suffix}" if date_part else (event_id_raw or event_key)
+
+        marker = (
+            f"{invoice_id}:{payload_payment_method}:{spreadsheet_id}:{sheet_name}:"
+            f"{payload.get('job_cost_ex_vat','')}:{payload.get('job_cost_inc_vat','')}"
+        ).upper()
+        if get_sheet_log_marker(state, event_key) == marker:
+            return state
+
+        def _queue_backlog() -> None:
+            backlog = get_sheet_backlog(config.admin_db_file)
+            row = {
+                "event_key": event_key,
+                "invoice_id": invoice_id,
+                "payment_method": payload_payment_method,
+                "stats_fields": stats_fields,
+                "payload": payload,
+                "event_id_display": event_id_display,
+                "marker": marker,
+            }
+            replaced = False
+            for idx, existing in enumerate(backlog):
+                if existing.get("event_key") == event_key:
+                    backlog[idx] = row
+                    replaced = True
+                    break
+            if not replaced:
+                backlog.append(row)
+            set_sheet_backlog(config.admin_db_file, backlog)
+
+        if not admin_creds:
+            _queue_backlog()
+            print(f"Sheets row queued for {event_key}: Google credentials unavailable")
+            return state
+        if not spreadsheet_id:
+            _queue_backlog()
+            print(f"Sheets row queued for {event_key}: universal sheet target not set")
+            return state
         try:
             ensure_header(
                 admin_creds,
@@ -280,10 +336,60 @@ def run() -> None:
             )
             print(f"Sheets row appended for {event_key}")
             _feed.push(f"Sheet row logged: {event_key}", "success")
+            backlog = get_sheet_backlog(config.admin_db_file)
+            backlog = [r for r in backlog if r.get("event_key") != event_key]
+            set_sheet_backlog(config.admin_db_file, backlog)
             return set_sheet_log_marker(state, event_key, marker)
         except Exception as exc:
             print(f"Sheets append failed for {event_key}: {exc}")
+            _queue_backlog()
             return state
+
+    def _flush_sheet_backlog(admin_creds, sheet_target: dict[str, str], state: dict) -> dict:
+        if not admin_creds:
+            return state
+        backlog = get_sheet_backlog(config.admin_db_file)
+        if not backlog:
+            return state
+        spreadsheet_id = (sheet_target.get("spreadsheet_id") or "").strip()
+        sheet_name = (sheet_target.get("sheet_name") or "Sheet1").strip() or "Sheet1"
+        if not spreadsheet_id:
+            return state
+
+        remaining: list[dict] = []
+        for row in backlog:
+            event_key = str(row.get("event_key") or "").strip()
+            payload = row.get("payload") or {}
+            event_id_display = str(row.get("event_id_display") or "").strip()
+            marker = str(row.get("marker") or "").strip()
+            stats = row.get("stats_fields") or []
+            if not event_key or not isinstance(payload, dict):
+                continue
+            try:
+                ensure_header(
+                    admin_creds,
+                    spreadsheet_id=spreadsheet_id,
+                    sheet_name=sheet_name,
+                    stats_fields=[str(s) for s in stats] or DEFAULT_STATS_FIELDS,
+                )
+                append_stats_row(
+                    admin_creds,
+                    spreadsheet_id=spreadsheet_id,
+                    sheet_name=sheet_name,
+                    event_key=event_key,
+                    stats_fields=[str(s) for s in stats] or DEFAULT_STATS_FIELDS,
+                    payload=payload,
+                    event_id_display=event_id_display,
+                )
+                if marker:
+                    state = set_sheet_log_marker(state, event_key, marker)
+                print(f"Universal sheet backlog flushed for {event_key}", flush=True)
+            except Exception as exc:
+                print(f"Universal sheet backlog flush failed for {event_key}: {exc}", flush=True)
+                remaining.append(row)
+        if len(remaining) != len(backlog):
+            set_sheet_backlog(config.admin_db_file, remaining)
+        return state
 
     def _append_sales_rows_if_enabled(
         *,
@@ -298,9 +404,6 @@ def run() -> None:
         sales_stats_fields: list[str],
         state: dict,
     ) -> dict:
-        if not submitter_email:
-            print(f"Sales row skipped for {event_key}: missing submitter email")
-            return state
         if not admin_creds or not sales_stats_fields:
             print(f"Sales row skipped for {event_key}: admin_creds={bool(admin_creds)} sales_stats_fields={len(sales_stats_fields) if sales_stats_fields else 0}", flush=True)
             return state
@@ -563,7 +666,7 @@ def run() -> None:
             return state
 
         marker = f"{invoice_id}:cash:{spreadsheet_id}:{sheet_name}".upper()
-        if get_sheet_log_marker(state, event_key) == marker:
+        if get_cash_log_marker(state, event_key) == marker:
             return state
 
         try:
@@ -584,7 +687,7 @@ def run() -> None:
             )
             print(f"Cash sheet row appended for {event_key} -> calendar {calendar_id}", flush=True)
             _feed.push(f"Cash row logged for {submitter_display or submitter_email}", "success")
-            return set_sheet_log_marker(state, event_key, marker)
+            return set_cash_log_marker(state, event_key, marker)
         except Exception as exc:
             print(f"Cash sheet append failed for {event_key}: {exc}", flush=True)
             backlog = get_cash_backlog(config.admin_db_file)
@@ -929,6 +1032,7 @@ def run() -> None:
                 print(f"Sales sheet header setup failed: {exc}")
                 sales_sheet_enabled = False
 
+        state = _flush_sheet_backlog(admin_creds, sheet_target, state)
         _flush_cash_backlog(admin_creds)
         _flush_sales_backlog(admin_creds)
 
@@ -1307,6 +1411,17 @@ def run() -> None:
                                     stats_fields=stats_fields,
                                     state=state,
                                 )
+                                state = _append_sheet_stats_if_enabled(
+                                    event=event,
+                                    event_key=event_key,
+                                    invoice_id=invoice_id,
+                                    payment_method=pay_mode,
+                                    submitter_display=submitter_display,
+                                    admin_creds=admin_creds,
+                                    sheet_target=sheet_target,
+                                    stats_fields=stats_fields,
+                                    state=state,
+                                )
                                 state = _append_sales_rows_if_enabled(
                                     event=event,
                                     event_key=event_key,
@@ -1486,6 +1601,17 @@ def run() -> None:
                                     submitter_email=submitter_email,
                                     submitter_display=submitter_display,
                                     admin_creds=admin_creds,
+                                    stats_fields=stats_fields,
+                                    state=state,
+                                )
+                                state = _append_sheet_stats_if_enabled(
+                                    event=event,
+                                    event_key=event_key,
+                                    invoice_id=invoice_id_retry,
+                                    payment_method=pay_mode_retry,
+                                    submitter_display=submitter_display,
+                                    admin_creds=admin_creds,
+                                    sheet_target=sheet_target,
                                     stats_fields=stats_fields,
                                     state=state,
                                 )
@@ -1775,6 +1901,17 @@ def run() -> None:
                                     submitter_email=submitter_email,
                                     submitter_display=submitter_display,
                                     admin_creds=admin_creds,
+                                    stats_fields=stats_fields,
+                                    state=state,
+                                )
+                                state = _append_sheet_stats_if_enabled(
+                                    event=event,
+                                    event_key=event_key,
+                                    invoice_id=invoice_id,
+                                    payment_method=pay_mode,
+                                    submitter_display=submitter_display,
+                                    admin_creds=admin_creds,
+                                    sheet_target=sheet_target,
                                     stats_fields=stats_fields,
                                     state=state,
                                 )
