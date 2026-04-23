@@ -442,6 +442,14 @@ def run() -> None:
             2,
         )
 
+        invoice_number_display = ""
+        if xero_client and invoice_id:
+            try:
+                inv = xero_client.get_invoice(invoice_id)
+                invoice_number_display = inv.get("InvoiceNumber") or ""
+            except Exception as _exc:
+                print(f"Sales rows: failed to fetch invoice number for {invoice_id}: {_exc}")
+
         def _fmt_british(iso_str: str) -> str:
             if not iso_str:
                 return ""
@@ -484,12 +492,13 @@ def run() -> None:
                         or (event.get("organizer", {}) or {}).get("email")
                         or "",
                         "customer": customer_fields.get("name") or "",
-                        "invoice_number": "",
+                        "invoice_number": invoice_number_display,
                         "slot_datetime": slot_text,
                         "payment_method": payment_method.upper() if payment_method else "",
                         "sales_item_desc": f"{line.get('Description') or ''} = £{ex_vat:.2f} ex VAT",
                         "sales_item_ex_vat": f"{ex_vat:.2f}",
                         "sales_item_inc_vat": f"{inc_vat:.2f}",
+                        "sales_total_ex_vat": f"{sales_total_ex:.2f}",
                     },
                 }
             )
