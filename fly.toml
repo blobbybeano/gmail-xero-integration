@@ -21,7 +21,7 @@ primary_region = "lhr"
   GOOGLE_CREDENTIALS_FILE = "/data/credentials.json"
 
 [processes]
-  app = "gunicorn -b 0.0.0.0:8080 --workers 1 --threads 4 --timeout 120 run:app"
+  app = "gunicorn -b 0.0.0.0:8080 --workers 1 --threads 2 --timeout 120 run:app"
 
 [http_service]
   internal_port = 8080
