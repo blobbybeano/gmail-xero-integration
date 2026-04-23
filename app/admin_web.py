@@ -2999,6 +2999,22 @@ function toggleEnabled() {{
         sheet_name = (sheet_target.get("sheet_name") or "Sheet1").strip() or "Sheet1"
 
         xero_tok = load_xero_token(config.xero_token_file)
+        if token_is_expired(xero_tok) and xero_tok.get("refresh_token"):
+            try:
+                _cid, _csec = _get_xero_creds(config)
+                if _cid and _csec:
+                    refreshed = refresh_xero_token(
+                        _cid,
+                        _csec,
+                        xero_tok["refresh_token"],
+                    )
+                    xero_tok = {**xero_tok, **refreshed}
+                    save_xero_token(config.xero_token_file, xero_tok)
+            except Exception as exc:
+                print(
+                    f"[webhook] Xero token refresh failed before invoice webhook handling: {exc}",
+                    flush=True,
+                )
         xero_at = (xero_tok or {}).get("access_token", "")
         xero_tenant = (xero_tok or {}).get("tenant_id", "")
 
@@ -3037,6 +3053,8 @@ function toggleEnabled() {{
                                 if updated:
                                     print(f"[webhook] Sheet row updated for {inv_number}", flush=True)
                                     _feed.push(f"Sheet updated: {inv_number} marked as Paid", "paid")
+                                else:
+                                    print(f"[webhook] No matching sheet row found for {inv_number}", flush=True)
                             except Exception as exc:
                                 print(f"[webhook] Sheet update failed: {exc}", flush=True)
                 except Exception as exc:

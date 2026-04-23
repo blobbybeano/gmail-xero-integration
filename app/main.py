@@ -31,6 +31,7 @@ from .admin_store import (
 from .config import load_config
 from .event_processor import (
     apply_validation_hints,
+    compute_invoice_totals,
     done_choice_is_yes,
     ensure_notes_template,
     normalize_user_sections,
@@ -504,6 +505,16 @@ def run() -> None:
                 invoice = xero_client.get_invoice(invoice_id)
             except Exception as exc:
                 print(f"Cash sheet: failed to read invoice {invoice_id}: {exc}")
+        subtotal = invoice.get("SubTotal")
+        total = invoice.get("Total")
+        if subtotal in (None, "") or total in (None, ""):
+            fallback_lines = extract_invoice_lines(event.get("description"))
+            if fallback_lines:
+                fb_subtotal, fb_total = compute_invoice_totals(fallback_lines)
+                if subtotal in (None, ""):
+                    subtotal = fb_subtotal
+                if total in (None, ""):
+                    total = fb_total
 
         start = (event.get("start", {}) or {}).get("dateTime") or (event.get("start", {}) or {}).get("date") or ""
         end = (event.get("end", {}) or {}).get("dateTime") or (event.get("end", {}) or {}).get("date") or ""
@@ -517,8 +528,8 @@ def run() -> None:
             "slot_datetime": slot_text,
             "payment_datetime": dt.datetime.now(dt.timezone.utc).strftime("%d/%m/%Y %H:%M"),
             "payment_method": "CASH",
-            "job_cost_ex_vat": invoice.get("SubTotal") or "",
-            "job_cost_inc_vat": invoice.get("Total") or "",
+            "job_cost_ex_vat": subtotal if subtotal is not None else "",
+            "job_cost_inc_vat": total if total is not None else "",
         }
         event_id_raw = event.get("id") or ""
         date_part = start.split("T", 1)[0].replace("-", "") if start else ""
@@ -1386,7 +1397,7 @@ def run() -> None:
                                     if updated:
                                         event["description"] = failed_description
                                         event_updated = updated.get("updated") or event_updated
-                                    if pay_mode == "card":
+                                    if pay_mode in ("card", "invoice"):
                                         state = _append_sheet_stats_if_enabled(
                                             event=event,
                                             event_key=event_key,
@@ -1396,6 +1407,18 @@ def run() -> None:
                                             admin_creds=admin_creds,
                                             sheet_target=sheet_target,
                                             stats_fields=stats_fields,
+                                            state=state,
+                                        )
+                                        state = _append_sales_rows_if_enabled(
+                                            event=event,
+                                            event_key=event_key,
+                                            invoice_id=invoice_id,
+                                            payment_method=pay_mode,
+                                            submitter_email=submitter_email,
+                                            submitter_display=submitter_display,
+                                            admin_creds=admin_creds,
+                                            sales_sheet_target=sales_sheet_target,
+                                            sales_stats_fields=sales_stats_fields,
                                             state=state,
                                         )
                                     state = set_processed_update_marker(state, event_key, event_updated)
@@ -1845,7 +1868,7 @@ def run() -> None:
                                     if updated:
                                         event["description"] = failed_description
                                         event_updated = updated.get("updated") or event_updated
-                                    if pay_mode == "card":
+                                    if pay_mode in ("card", "invoice"):
                                         state = _append_sheet_stats_if_enabled(
                                             event=event,
                                             event_key=event_key,
@@ -1855,6 +1878,18 @@ def run() -> None:
                                             admin_creds=admin_creds,
                                             sheet_target=sheet_target,
                                             stats_fields=stats_fields,
+                                            state=state,
+                                        )
+                                        state = _append_sales_rows_if_enabled(
+                                            event=event,
+                                            event_key=event_key,
+                                            invoice_id=invoice_id,
+                                            payment_method=pay_mode,
+                                            submitter_email=submitter_email,
+                                            submitter_display=submitter_display,
+                                            admin_creds=admin_creds,
+                                            sales_sheet_target=sales_sheet_target,
+                                            sales_stats_fields=sales_stats_fields,
                                             state=state,
                                         )
                                     state = set_processed_update_marker(state, event_key, event_updated)

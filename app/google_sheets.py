@@ -207,7 +207,9 @@ def update_invoice_paid_in_sheet(
     invoice_number: str,
 ) -> bool:
     """
-    Find the row whose 'Invoice Number' matches and set 'Paid' to 'Paid'.
+    Find rows whose 'Invoice Number' matches and mark payment columns as paid.
+    - If a 'Paid' column exists: set it to 'Paid'
+    - If a 'Payment Date/Time' column exists: set current timestamp
     Returns True if a row was updated.
     """
     if not invoice_number:
@@ -228,21 +230,39 @@ def update_invoice_paid_in_sheet(
     header = rows[0]
     try:
         inv_col = header.index("Invoice Number")
-        paid_col = header.index("Paid")
     except ValueError:
+        return False
+    paid_col = header.index("Paid") if "Paid" in header else None
+    paid_dt_col = (
+        header.index("Payment Date/Time") if "Payment Date/Time" in header else None
+    )
+    if paid_col is None and paid_dt_col is None:
         return False
 
     safe = resolved.replace("'", "''")
     updates = []
+    now_str = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M")
     for row_idx, row in enumerate(rows[1:], start=2):
         cell_val = row[inv_col].strip() if len(row) > inv_col else ""
         if cell_val.upper() == invoice_number.upper():
-            current_paid = row[paid_col].strip() if len(row) > paid_col else ""
-            if current_paid != "Paid":
+            if paid_col is not None:
+                current_paid = row[paid_col].strip() if len(row) > paid_col else ""
+            else:
+                current_paid = "Paid"
+            if current_paid != "Paid" and paid_col is not None:
                 updates.append({
                     "range": f"'{safe}'!{_col_letter(paid_col)}{row_idx}",
                     "values": [["Paid"]],
                 })
+            if paid_dt_col is not None:
+                current_paid_dt = (
+                    row[paid_dt_col].strip() if len(row) > paid_dt_col else ""
+                )
+                if not current_paid_dt or current_paid_dt.upper() == "N/A":
+                    updates.append({
+                        "range": f"'{safe}'!{_col_letter(paid_dt_col)}{row_idx}",
+                        "values": [[now_str]],
+                    })
 
     if not updates:
         return False
