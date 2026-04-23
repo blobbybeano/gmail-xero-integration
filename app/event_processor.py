@@ -265,17 +265,10 @@ def _normalize_entry_layout(text: str) -> str:
 
 def _set_entry_status_emoji(description: str, status: str) -> str:
     """
-    Keep exactly one status emoji at the very top of the notes.
+    Legacy no-op for description status dots.
+    Status dots now live on the event title, not the notes body.
     """
-    status_map = {
-        "orange": "🟠",
-        "yellow": "🟡",
-        "green": "🟢",
-    }
-    emoji = status_map.get((status or "").lower())
-    if not emoji:
-        return description
-
+    _ = status  # kept for backward-compatible call sites
     text = (description or "").replace("\r\n", "\n").replace("\r", "\n")
     lines = text.split("\n")
     while lines and not lines[0].strip():
@@ -284,10 +277,28 @@ def _set_entry_status_emoji(description: str, status: str) -> str:
         lines.pop(0)
         while lines and not lines[0].strip():
             lines.pop(0)
-    body = "\n".join(lines).strip()
-    if body:
-        return f"{emoji}\n{body}\n"
-    return f"{emoji}\n"
+    body = "\n".join(lines)
+    return _normalize_entry_layout(body) if body.strip() else ""
+
+
+def set_title_status_emoji(summary: str | None, status: str) -> str:
+    """
+    Prefix the diary title with the requested status emoji.
+    """
+    status_map = {
+        "orange": "🟠",
+        "yellow": "🟡",
+        "green": "🟢",
+    }
+    emoji = status_map.get((status or "").lower())
+    base = (summary or "").strip()
+    if not emoji:
+        return base
+    while base.startswith(("🟠", "🟡", "🟢")):
+        base = base[1:].lstrip(" -")
+    if base:
+        return f"{emoji} {base}"
+    return emoji
 
 
 def parse_customer_fields(description: str | None) -> Dict:

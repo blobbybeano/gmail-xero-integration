@@ -76,17 +76,21 @@ def update_event_description(
     config: AppConfig,
     event_id: str,
     description: str,
+    summary: str | None = None,
     calendar_id: str | None = None,
 ) -> Dict:
     service = build_calendar_service(config)
     for attempt in range(3):
         try:
+            body = {"description": description}
+            if summary is not None:
+                body["summary"] = summary
             updated = (
                 service.events()
                 .patch(
                     calendarId=calendar_id or config.google_calendar_id,
                     eventId=event_id,
-                    body={"description": description},
+                    body=body,
                 )
                 .execute()
             )
