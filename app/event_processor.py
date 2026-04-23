@@ -122,14 +122,16 @@ def ensure_notes_template(description: str | None) -> str:
         "[/contact]\n"
         "\n"
         "[invoice]\n"
+        "\n"
         "⬇Sales⬇\n"
+        "\n"
         "[/invoice]\n"
         "\n"
         "Y/N =\n"
     )
 
     if not description:
-        return _set_entry_status_emoji(template, "orange")
+        return template
 
     # Ensure notes block exists for freeform job notes that the parser ignores.
     if not _has_notes_block(description):
@@ -252,6 +254,14 @@ def _normalize_entry_layout(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = "\n".join(line.rstrip() for line in text.split("\n"))
 
+    # Collapse all blank lines within [contact] and [invoice] blocks.
+    def _compact_block(m: re.Match) -> str:
+        inner = re.sub(r"\n[ \t]*\n+", "\n", m.group(2))
+        return m.group(1) + inner + m.group(3)
+
+    text = re.sub(r"(\[contact\])(.*?)(\[/contact\])", _compact_block, text, flags=re.I | re.S)
+    text = re.sub(r"(\[invoice\])(.*?)(\[/invoice\])", _compact_block, text, flags=re.I | re.S)
+
     # No blank lines immediately inside contact/invoice tags.
     text = re.sub(r"(\[contact\])\n+", r"\1\n", text, flags=re.I)
     text = re.sub(r"\n+(\[/contact\])", r"\n\1", text, flags=re.I)
@@ -273,7 +283,7 @@ def _set_entry_status_emoji(description: str, status: str) -> str:
     lines = text.split("\n")
     while lines and not lines[0].strip():
         lines.pop(0)
-    if lines and lines[0].strip() in {"🟠", "🟡", "🟢"}:
+    if lines and lines[0].strip() in {"🔵", "🟠", "🟡", "🟢"}:
         lines.pop(0)
         while lines and not lines[0].strip():
             lines.pop(0)
@@ -284,8 +294,13 @@ def _set_entry_status_emoji(description: str, status: str) -> str:
 def set_title_status_emoji(summary: str | None, status: str) -> str:
     """
     Prefix the diary title with the requested status emoji.
+    blue   = event created/formatted (no invoice yet)
+    orange = DONE pressed, invoice in draft
+    yellow = invoice sent, pending payment
+    green  = invoice paid
     """
     status_map = {
+        "blue": "🔵",
         "orange": "🟠",
         "yellow": "🟡",
         "green": "🟢",
@@ -294,7 +309,7 @@ def set_title_status_emoji(summary: str | None, status: str) -> str:
     base = (summary or "").strip()
     if not emoji:
         return base
-    while base.startswith(("🟠", "🟡", "🟢")):
+    while base.startswith(("🔵", "🟠", "🟡", "🟢")):
         base = base[1:].lstrip(" -")
     if base:
         return f"{emoji} {base}"
@@ -737,7 +752,7 @@ def upsert_invoice_summary(
     if cleaned:
         summary_lines = [""] + summary_lines
     updated = cleaned + summary_lines
-    return _set_entry_status_emoji(_normalize_entry_layout("\n".join(updated)), "yellow")
+    return _set_entry_status_emoji(_normalize_entry_layout("\n".join(updated)), "orange")
 
 
 def upsert_send_confirmation(
@@ -850,7 +865,7 @@ def upsert_send_failure(
         summary_lines = [""] + summary_lines
     return _set_entry_status_emoji(
         _normalize_entry_layout("\n".join(cleaned + summary_lines)),
-        "yellow",
+        "orange",
     )
 
 
