@@ -572,7 +572,16 @@ def refresh_xero_token(client_id: str, client_secret: str, refresh_token: str) -
     headers = {"Authorization": f"Basic {basic}"}
     data = {"grant_type": "refresh_token", "refresh_token": refresh_token}
     response = requests.post(TOKEN_URL, headers=headers, data=data, timeout=30)
-    response.raise_for_status()
+    if response.status_code >= 400:
+        detail = ""
+        try:
+            payload = response.json()
+            detail = payload.get("error_description") or payload.get("error") or str(payload)
+        except Exception:
+            detail = response.text[:400]
+        raise RuntimeError(
+            f"Xero token refresh failed ({response.status_code}): {detail}"
+        )
     payload = response.json()
     payload["issued_at"] = int(dt.datetime.now(dt.timezone.utc).timestamp())
     return payload

@@ -1935,6 +1935,15 @@ function toggleEnabled() {{
     @app.get("/settings")
     @require_login
     def index():
+        # Persist the currently used public base URL so the worker can always
+        # register/renew Google watches using the same domain.
+        current_base = _current_base_url()
+        stored_base = str(get_json_setting(config.admin_db_file, "public_base_url", "") or "").strip()
+        if current_base and current_base != stored_base:
+            set_json_setting(config.admin_db_file, "public_base_url", current_base)
+            trigger_watch_check()
+            trigger_poll()
+
         creds = load_admin_credentials(config)
         active = set(get_active_calendars(config.admin_db_file, config.google_calendar_id))
         stats_selected = set(get_stats_fields(config.admin_db_file))

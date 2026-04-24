@@ -14,6 +14,7 @@ from .admin_store import (
     get_active_calendars,
     get_enabled,
     get_google_watches,
+    get_json_setting,
     get_seen_submitters,
     get_sheet_target,
     get_sheet_backlog,
@@ -134,6 +135,7 @@ def run() -> None:
 
     xero_client = _build_xero_client_safe()
     _xero_built_at: float = time.time()
+    _xero_retry_after: float = 0.0
     _XERO_REBUILD_INTERVAL = 3300  # rebuild token ~55 min (Xero tokens last 30 min)
 
     _headers_initialized: set[str] = set()  # sheet keys that have had ensure_header run
@@ -873,6 +875,10 @@ def run() -> None:
         if explicit:
             return explicit
 
+        stored = str(get_json_setting(config.admin_db_file, "public_base_url", "") or "").strip().rstrip("/")
+        if stored and stored.startswith("http"):
+            return stored
+
         fly_app = os.getenv("FLY_APP_NAME", "").strip() or os.getenv("FLY_APP", "").strip()
         if fly_app:
             return f"https://{fly_app}.fly.dev"
@@ -896,9 +902,17 @@ def run() -> None:
     while True:
         now = dt.datetime.now(dt.timezone.utc)
         # Rebuild Xero client only when the cached one is stale or missing.
-        if xero_client is None or (time.time() - _xero_built_at) > _XERO_REBUILD_INTERVAL:
+        _now_ts_for_xero = time.time()
+        if (xero_client is None and _now_ts_for_xero >= _xero_retry_after) or (
+            xero_client is not None and (_now_ts_for_xero - _xero_built_at) > _XERO_REBUILD_INTERVAL
+        ):
             xero_client = _build_xero_client_safe()
-            _xero_built_at = time.time()
+            _xero_built_at = _now_ts_for_xero
+            if xero_client is None:
+                # Avoid hammering Xero token endpoint every poll cycle.
+                _xero_retry_after = _now_ts_for_xero + 120
+            else:
+                _xero_retry_after = 0.0
 
         # Global on/off toggle
         _enabled = get_enabled(config.admin_db_file)
@@ -1009,6 +1023,7 @@ def run() -> None:
                 _feed.push(f"Google webhook manager error: {str(exc).splitlines()[0][:100]}", "error")
 
         events: list[dict] = []
+        calendar_fetch_failed = False
         query_updated_min = last_sync + dt.timedelta(milliseconds=1)
         for calendar_id in active_calendars:
             try:
@@ -1020,6 +1035,7 @@ def run() -> None:
                     calendar_id=calendar_id,
                 )
             except Exception as exc:
+                calendar_fetch_failed = True
                 print(
                     f"[poll] Failed to read calendar {calendar_id}: {exc}",
                     flush=True,
@@ -2194,8 +2210,11 @@ def run() -> None:
             # cause duplicate retries/drafts on restart.
             save_state(config.state_file, state)
 
-        last_sync = now
-        state = set_last_sync(state, now)
+        if not calendar_fetch_failed:
+            last_sync = now
+            state = set_last_sync(state, now)
+        else:
+            print("[poll] Keeping last_sync unchanged because one or more calendars failed this cycle", flush=True)
         state = prune_state(state, keep_recent_events=2000)
         save_state(config.state_file, state)
 
