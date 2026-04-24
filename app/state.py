@@ -10,12 +10,17 @@ def load_state(state_file: str) -> Dict:
     path = Path(state_file)
     if not path.exists():
         return {}
-    return json.loads(path.read_text())
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
 
 
 def save_state(state_file: str, state: Dict) -> None:
     path = Path(state_file)
-    path.write_text(json.dumps(state, indent=2))
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.replace(path)
 
 
 def get_last_sync(state: Dict) -> dt.datetime:
@@ -83,6 +88,8 @@ def set_contact_fingerprint(state: Dict, event_id: str, fingerprint: str) -> Dic
 
 
 def is_processed(state: Dict, event_id: str) -> bool:
+    if event_id in state.get("event_processed_updates", {}):
+        return True
     return event_id in set(state.get("processed_event_ids", []))
 
 
@@ -160,4 +167,54 @@ def set_cash_log_marker(state: Dict, event_id: str, marker: str) -> Dict:
     mapping = state.get("event_cash_log_updates", {})
     mapping[event_id] = marker
     state["event_cash_log_updates"] = mapping
+    return state
+
+
+def prune_state(state: Dict, keep_recent_events: int = 1500) -> Dict:
+    """
+    Keep state bounded so long-running deployments stay reliable.
+    Older event keys are removed from per-event maps/lists.
+    """
+    processed_updates = state.get("event_processed_updates", {})
+    if not isinstance(processed_updates, dict):
+        return state
+
+    if len(processed_updates) <= keep_recent_events:
+        return state
+
+    def _sort_key(item: tuple[str, str]) -> str:
+        return str(item[1] or "")
+
+    recent_items = sorted(processed_updates.items(), key=_sort_key, reverse=True)[
+        :keep_recent_events
+    ]
+    keep_keys = {k for k, _ in recent_items}
+
+    map_fields = [
+        "event_contact_map",
+        "event_contact_updates",
+        "event_contact_fingerprints",
+        "event_processed_updates",
+        "event_invoice_map",
+        "event_invoice_updates",
+        "event_sheet_log_updates",
+        "event_sales_log_updates",
+        "event_cash_log_updates",
+    ]
+    list_fields = [
+        "processed_event_ids",
+        "prefilled_event_ids",
+        "invoice_sent_event_ids",
+    ]
+
+    for field in map_fields:
+        value = state.get(field)
+        if isinstance(value, dict):
+            state[field] = {k: v for k, v in value.items() if k in keep_keys}
+
+    for field in list_fields:
+        value = state.get(field)
+        if isinstance(value, list):
+            state[field] = [k for k in value if k in keep_keys]
+
     return state

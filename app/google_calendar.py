@@ -56,20 +56,28 @@ def list_recent_events(
     calendar_id: str | None = None,
 ) -> List[Dict]:
     service = build_calendar_service(config)
-
-    events_result = (
-        service.events()
-        .list(
-            calendarId=calendar_id or config.google_calendar_id,
-            singleEvents=True,
-            orderBy="startTime",
-            updatedMin=updated_min.isoformat(),
-            timeMin=time_min.isoformat(),
-            timeMax=time_max.isoformat(),
+    items: list[dict] = []
+    page_token: str | None = None
+    while True:
+        events_result = (
+            service.events()
+            .list(
+                calendarId=calendar_id or config.google_calendar_id,
+                singleEvents=True,
+                orderBy="startTime",
+                updatedMin=updated_min.isoformat(),
+                timeMin=time_min.isoformat(),
+                timeMax=time_max.isoformat(),
+                maxResults=2500,
+                pageToken=page_token,
+            )
+            .execute()
         )
-        .execute()
-    )
-    return events_result.get("items", [])
+        items.extend(events_result.get("items", []))
+        page_token = events_result.get("nextPageToken")
+        if not page_token:
+            break
+    return items
 
 
 def update_event_description(
