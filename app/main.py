@@ -899,6 +899,11 @@ def run() -> None:
                 return u[: -len("/xero/callback")]
         return ""
 
+    # Safety overlap to avoid missing edits that land between poll cycles
+    # (or between a fetch and last_sync update). State markers de-duplicate.
+    _poll_overlap_seconds = int(os.getenv("POLL_OVERLAP_SECONDS", "1200") or "1200")
+    _poll_overlap = dt.timedelta(seconds=max(_poll_overlap_seconds, 0))
+
     while True:
         now = dt.datetime.now(dt.timezone.utc)
         # Rebuild Xero client only when the cached one is stale or missing.
@@ -1024,7 +1029,10 @@ def run() -> None:
 
         events: list[dict] = []
         calendar_fetch_failed = False
-        query_updated_min = last_sync + dt.timedelta(milliseconds=1)
+        # Intentionally overlap the updated_min window for reliability.
+        # This prevents races where a calendar change happens right after a fetch
+        # but before last_sync is advanced.
+        query_updated_min = last_sync - _poll_overlap
         for calendar_id in active_calendars:
             try:
                 cal_events = list_recent_events(
