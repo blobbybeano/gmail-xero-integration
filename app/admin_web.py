@@ -1418,35 +1418,8 @@ def create_app() -> Flask:
         # Persist to DB so the callback works even when opened in a separate browser tab
         set_json_setting(config.admin_db_file, "xero_oauth_pending_state", state)
         set_json_setting(config.admin_db_file, "xero_oauth_pending_redirect_uri", dynamic_xero_redirect)
-        safe_url = escape(xero_auth_url)
-        return _page(f"""
-        <div class="min-h-screen flex items-center justify-center bg-gray-50 p-4">
-          <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-8 max-w-xl w-full">
-            <h2 class="text-lg font-semibold text-gray-900 mb-2">Connect to Xero</h2>
-            <p class="text-sm text-gray-600 mb-5">
-              Click the button below to open the Xero authorisation page in a new tab.
-              Once you have approved access, Xero will redirect back and your connection will be saved automatically.
-            </p>
-            <a href="{safe_url}" target="_blank" rel="noopener noreferrer"
-               class="inline-block px-5 py-2.5 text-sm font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors mb-5">
-              Open Xero authorisation &#8599;
-            </a>
-            <p class="text-xs text-gray-400 mb-2">Or copy the URL manually:</p>
-            <div class="flex gap-2 items-center">
-              <input id="xero-url" type="text" readonly value="{safe_url}"
-                class="flex-1 text-xs font-mono border border-gray-200 rounded-lg px-3 py-2 bg-gray-50 focus:outline-none">
-              <button onclick="navigator.clipboard.writeText(document.getElementById('xero-url').value);this.textContent='Copied!';"
-                class="px-3 py-2 text-xs font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors whitespace-nowrap">
-                Copy
-              </button>
-            </div>
-            <p class="text-xs text-gray-400 mt-5">
-              After completing authorisation in Xero, return to
-              <a href="/settings" class="text-indigo-600 hover:underline">Settings</a> to verify the connection.
-            </p>
-          </div>
-        </div>
-        """)
+        import flask as _flask
+        return _flask.jsonify({"url": xero_auth_url})
 
     @app.get("/xero/callback")
     def xero_callback():
@@ -2835,15 +2808,43 @@ function toggleEnabled() {{
                   </div>
                   {xero_pending_auth_url_html}
                   <div class="flex flex-wrap gap-2">
-                    <a href="/connect-xero"
-                      class="inline-block mt-1 px-3 py-1.5 text-xs font-medium text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors {"opacity-50 pointer-events-none" if not xero_has_creds else ""}">
-                      {"Reconnect Xero" if xero_ok else ("New link" if xero_pending_auth_url else "Connect Xero")}
-                    </a>
-                    <a href="/connect-xero?choose_orgs=1"
-                      class="inline-block mt-1 px-3 py-1.5 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 rounded-lg transition-colors {"opacity-50 pointer-events-none" if not xero_has_creds else ""}">
+                    <button type="button" {"disabled" if not xero_has_creds else ""}
+                      onclick="fetchXeroUrl('/connect-xero')"
+                      class="mt-1 px-3 py-1.5 text-xs font-medium text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                      {"Reconnect Xero" if xero_ok else "Connect Xero"}
+                    </button>
+                    <button type="button" {"disabled" if not xero_has_creds else ""}
+                      onclick="fetchXeroUrl('/connect-xero?choose_orgs=1')"
+                      class="mt-1 px-3 py-1.5 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
                       Choose organisations
-                    </a>
+                    </button>
                   </div>
+                  <div id="xero-url-box" class="hidden mt-3">
+                    <p class="text-xs text-gray-500 mb-1">Copy this URL and open it in your browser to authorise:</p>
+                    <div class="flex gap-2 items-center">
+                      <input id="xero-url-input" type="text" readonly
+                        class="flex-1 text-xs font-mono border border-gray-200 rounded-lg px-3 py-2 bg-gray-50 focus:outline-none select-all">
+                      <button type="button"
+                        onclick="navigator.clipboard.writeText(document.getElementById('xero-url-input').value).then(()=>{{this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',2000)}});"
+                        class="px-3 py-2 text-xs font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors whitespace-nowrap">
+                        Copy
+                      </button>
+                    </div>
+                  </div>
+                  <script>
+                  function fetchXeroUrl(endpoint) {{
+                    fetch(endpoint, {{credentials: 'same-origin'}})
+                      .then(r => r.json())
+                      .then(data => {{
+                        var box = document.getElementById('xero-url-box');
+                        var inp = document.getElementById('xero-url-input');
+                        inp.value = data.url;
+                        box.classList.remove('hidden');
+                        inp.select();
+                      }})
+                      .catch(e => alert('Could not generate link: ' + e));
+                  }}
+                  </script>
 
                   <!-- Xero Invoice Payment Webhooks (nested) -->
                   <details class="mt-2 border border-gray-100 rounded-xl overflow-hidden group/xwh">
