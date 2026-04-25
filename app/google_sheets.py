@@ -181,8 +181,17 @@ def append_stats_row(
     _set("Logged At", datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M"))
     _set("Event ID", event_id_display or event_key)
 
-    for field, label in STAT_LABELS.items():
+    # Fill columns based on the configured field list so custom/advanced
+    # fields (e.g. sales_item_desc) are written too.
+    for field in stats_fields:
+        label = STAT_LABELS.get(field, field)
         if field in payload:
+            _set(label, payload[field])
+
+    # Backward-compat fallback: if payload includes known labels not present in
+    # stats_fields, still write them when the column exists.
+    for field, label in STAT_LABELS.items():
+        if field in payload and field not in stats_fields:
             _set(label, payload[field])
 
     safe = resolved.replace("'", "''")
