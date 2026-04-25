@@ -1343,7 +1343,7 @@ def run() -> None:
                                                 event_id=event.get("id"),
                                                 description=updated_description,
                                                 label="Invoice summary",
-                                                summary_status="orange",
+                                                summary_status="yellow",
                                                 current_summary=event.get("summary"),
                                                 calendar_id=calendar_id,
                                             )
@@ -1382,7 +1382,7 @@ def run() -> None:
                                                     event_id=event.get("id"),
                                                     description=updated_description,
                                                     label="Invoice summary",
-                                                    summary_status="orange",
+                                                    summary_status="yellow",
                                                     current_summary=event.get("summary"),
                                                     calendar_id=calendar_id,
                                                 )
@@ -1423,7 +1423,7 @@ def run() -> None:
                                         event_id=event.get("id"),
                                         description=failed_description,
                                         label="Invoice send failed",
-                                        summary_status="orange",
+                                        summary_status="yellow",
                                         current_summary=event.get("summary"),
                                         calendar_id=calendar_id,
                                     )
@@ -1449,7 +1449,7 @@ def run() -> None:
                                             event_id=event.get("id"),
                                             description=failed_description,
                                             label="Cash finalise failed",
-                                            summary_status="orange",
+                                            summary_status="yellow",
                                             current_summary=event.get("summary"),
                                             calendar_id=calendar_id,
                                         )
@@ -1534,7 +1534,7 @@ def run() -> None:
                                             event_id=event.get("id"),
                                             description=failed_description,
                                             label="Invoice send failed",
-                                            summary_status="orange",
+                                            summary_status="yellow",
                                             current_summary=event.get("summary"),
                                             calendar_id=calendar_id,
                                         )
@@ -1566,7 +1566,7 @@ def run() -> None:
                                                 event_id=event.get("id"),
                                                 description=failed_description,
                                                 label="Invoice send failed",
-                                                summary_status="orange",
+                                                summary_status="yellow",
                                                 current_summary=event.get("summary"),
                                                 calendar_id=calendar_id,
                                             )
@@ -1589,7 +1589,7 @@ def run() -> None:
                                             event_id=event.get("id"),
                                             description=failed_description,
                                             label="Invoice send failed",
-                                            summary_status="orange",
+                                            summary_status=("green" if pay_mode == "card" else "yellow"),
                                             current_summary=event.get("summary"),
                                             calendar_id=calendar_id,
                                         )
@@ -1858,7 +1858,7 @@ def run() -> None:
                                                 event_id=event.get("id"),
                                                 description=updated_description,
                                                 label="Invoice summary",
-                                                summary_status="orange",
+                                                summary_status="yellow",
                                                 current_summary=event.get("summary"),
                                                 calendar_id=calendar_id,
                                             )
@@ -1904,7 +1904,7 @@ def run() -> None:
                                                         event_id=event.get("id"),
                                                         description=updated_description,
                                                         label="Invoice summary",
-                                                        summary_status="orange",
+                                                        summary_status="yellow",
                                                         current_summary=event.get("summary"),
                                                         calendar_id=calendar_id,
                                                     )
@@ -1934,7 +1934,7 @@ def run() -> None:
                                         event_id=event.get("id"),
                                         description=failed_description,
                                         label="Invoice send failed",
-                                        summary_status="orange",
+                                        summary_status="yellow",
                                         current_summary=event.get("summary"),
                                         calendar_id=calendar_id,
                                     )
@@ -1960,7 +1960,7 @@ def run() -> None:
                                             event_id=event.get("id"),
                                             description=failed_description,
                                             label="Cash finalise failed",
-                                            summary_status="orange",
+                                            summary_status="yellow",
                                             current_summary=event.get("summary"),
                                             calendar_id=calendar_id,
                                         )
@@ -2045,7 +2045,7 @@ def run() -> None:
                                             event_id=event.get("id"),
                                             description=failed_description,
                                             label="Invoice send failed",
-                                            summary_status="orange",
+                                            summary_status="yellow",
                                             current_summary=event.get("summary"),
                                             calendar_id=calendar_id,
                                         )
@@ -2077,7 +2077,7 @@ def run() -> None:
                                                 event_id=event.get("id"),
                                                 description=failed_description,
                                                 label="Invoice send failed",
-                                                summary_status="orange",
+                                                summary_status="yellow",
                                                 current_summary=event.get("summary"),
                                                 calendar_id=calendar_id,
                                             )
@@ -2100,7 +2100,7 @@ def run() -> None:
                                             event_id=event.get("id"),
                                             description=failed_description,
                                             label="Invoice send failed",
-                                            summary_status="orange",
+                                            summary_status=("green" if pay_mode == "card" else "yellow"),
                                             current_summary=event.get("summary"),
                                             calendar_id=calendar_id,
                                         )

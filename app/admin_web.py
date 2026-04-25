@@ -340,18 +340,27 @@ def _get_xero_creds(config: AppConfig) -> tuple[str, str]:
 
 
 def _xero_authorization_url(
-    config: AppConfig, state: str, redirect_uri: str | None = None
+    config: AppConfig,
+    state: str,
+    redirect_uri: str | None = None,
+    *,
+    force_consent: bool = False,
 ) -> str:
     client_id, _ = _get_xero_creds(config)
     uri = redirect_uri or config.xero_redirect_uri
     # Build manually so spaces in scope are encoded as %20 (not +) — Xero requires %20
     scope_str = _xero_scope_string(config.xero_scopes)
-    base_params = urllib.parse.urlencode({
+    params = {
         "response_type": "code",
         "client_id": client_id,
         "redirect_uri": uri,
         "state": state,
-    })
+    }
+    if force_consent:
+        # Ensures Xero shows the consent/org-selection screen again so users
+        # can add missing organisations to the app connection.
+        params["prompt"] = "consent"
+    base_params = urllib.parse.urlencode(params)
     scope_param = "scope=" + urllib.parse.quote(scope_str, safe="")
     return f"{XERO_AUTH_URL}?{base_params}&{scope_param}"
 
@@ -1299,11 +1308,17 @@ def create_app() -> Flask:
             return redirect(url_for("index"))
         state = secrets.token_urlsafe(24)
         dynamic_xero_redirect = _current_base_url() + "/xero/callback"
-        xero_auth_url = _xero_authorization_url(config, state, redirect_uri=dynamic_xero_redirect)
+        choose_orgs = (request.args.get("choose_orgs") or "").strip().lower() in {"1", "true", "yes", "y"}
+        xero_auth_url = _xero_authorization_url(
+            config,
+            state,
+            redirect_uri=dynamic_xero_redirect,
+            force_consent=choose_orgs,
+        )
         session["xero_oauth_state"] = state
         session["xero_auth_url"] = xero_auth_url
         session["xero_redirect_uri"] = dynamic_xero_redirect
-        return redirect(url_for("index"))
+        return redirect(xero_auth_url)
 
     @app.get("/xero/callback")
     def xero_callback():
@@ -2651,10 +2666,16 @@ function toggleEnabled() {{
                     </button>
                   </div>
                   {xero_pending_auth_url_html}
-                  <a href="/connect-xero"
-                    class="inline-block mt-1 px-3 py-1.5 text-xs font-medium text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors {"opacity-50 pointer-events-none" if not xero_has_creds else ""}">
-                    {"Reconnect Xero" if xero_ok else ("New link" if xero_pending_auth_url else "Connect Xero")}
-                  </a>
+                  <div class="flex flex-wrap gap-2">
+                    <a href="/connect-xero"
+                      class="inline-block mt-1 px-3 py-1.5 text-xs font-medium text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors {"opacity-50 pointer-events-none" if not xero_has_creds else ""}">
+                      {"Reconnect Xero" if xero_ok else ("New link" if xero_pending_auth_url else "Connect Xero")}
+                    </a>
+                    <a href="/connect-xero?choose_orgs=1"
+                      class="inline-block mt-1 px-3 py-1.5 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 rounded-lg transition-colors {"opacity-50 pointer-events-none" if not xero_has_creds else ""}">
+                      Choose organisations
+                    </a>
+                  </div>
 
                   <!-- Xero Invoice Payment Webhooks (nested) -->
                   <details class="mt-2 border border-gray-100 rounded-xl overflow-hidden group/xwh">
@@ -2966,12 +2987,29 @@ function toggleEnabled() {{
         """Receive Google Calendar push notifications and wake the poller."""
         state_header = request.headers.get("X-Goog-Resource-State", "")
         token = request.headers.get("X-Goog-Channel-Token", "")
-        if token != "gcal-bridge":
+        channel_id = request.headers.get("X-Goog-Channel-ID", "")
+
+        # Accept notifications from currently-registered channels.
+        # Some legacy channels may miss our token but still be valid until renewal.
+        known_channels = {
+            str((w or {}).get("channel_id") or "").strip()
+            for w in (get_google_watches(config.admin_db_file) or {}).values()
+        }
+        known_channels.discard("")
+        channel_known = bool(channel_id and channel_id in known_channels)
+
+        if token and token != "gcal-bridge" and not channel_known:
             return "", 200
-        if state_header == "exists":
+        if not token and not channel_known:
+            return "", 200
+
+        if state_header in {"exists", "not_exists", "sync"}:
             _feed.push("Google Calendar change detected — scanning calendars now", "event")
             trigger_poll()
-            print("[webhook] Google Calendar event changed — poll triggered", flush=True)
+            print(
+                f"[webhook] Google Calendar change ({state_header}) — poll triggered",
+                flush=True,
+            )
         return "", 200
 
     @app.post("/webhooks/xero")
