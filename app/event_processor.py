@@ -170,7 +170,7 @@ def normalize_user_sections(description: str | None) -> str:
         return description or ""
     import re
 
-    text = description
+    text = _reconcile_invoice_lines_outside_block(description)
 
     def _norm_contact(block: str) -> str:
         lines = block.splitlines()
@@ -240,6 +240,89 @@ def normalize_user_sections(description: str | None) -> str:
         flags=re.I | re.S,
     )
     return _normalize_entry_layout(text)
+
+
+def _looks_like_invoice_line(line: str) -> bool:
+    import re
+
+    if not line:
+        return False
+    if re.match(r"^.+?\s*[=:\-]\s*£?\s*\d+(?:\.\d+)?(?:\s*\+?\s*vat)?\s*$", line, flags=re.I):
+        return True
+    if re.match(r"^.+?\s+£\s*\d+(?:\.\d+)?(?:\s*\+?\s*vat)?\s*$", line, flags=re.I):
+        return True
+    if re.match(r"^.+?\s+\d+(?:\.\d+)?(?:\s*\+?\s*vat)?\s*$", line, flags=re.I):
+        return True
+    return False
+
+
+def _is_automation_control_line(line: str) -> bool:
+    import re
+
+    low = line.strip().lower()
+    if not low:
+        return False
+    if low in {"[app-status]", "[/app-status]", "[contact]", "[/contact]", "[notes]", "[/notes]", "[invoice]", "[/invoice]"}:
+        return True
+    if low.startswith("payment type"):
+        return True
+    if low.startswith("send"):
+        return True
+    if re.fullmatch(r"(?:done\s+)?y\s*/\s*n\s*(?:=|:)?\s*(?:y|n|yes|no)?\s*", low):
+        return True
+    return False
+
+
+def _reconcile_invoice_lines_outside_block(description: str | None) -> str:
+    """
+    If users type charge lines directly below [/invoice], pull them into the
+    [invoice] block so parsing still works.
+    """
+    if not description:
+        return description or ""
+    import re
+
+    text = description.replace("\r\n", "\n").replace("\r", "\n")
+    m = re.search(r"\[invoice\](.*?)\[/invoice\]", text, flags=re.I | re.S)
+    if not m:
+        return text
+
+    block_inner = (m.group(1) or "").strip()
+    tail = text[m.end() :]
+    consumed = 0
+    moved: list[str] = []
+    started = False
+    for raw in tail.splitlines(keepends=True):
+        line = raw.strip()
+        if not line:
+            if not started:
+                consumed += len(raw)
+                continue
+            consumed += len(raw)
+            continue
+        if _is_automation_control_line(line):
+            break
+        if _looks_like_invoice_line(line):
+            moved.append(line)
+            started = True
+            consumed += len(raw)
+            continue
+        break
+
+    if not moved:
+        return text
+
+    merged = block_inner
+    if merged:
+        merged = f"{merged}\n" + "\n".join(moved)
+    else:
+        merged = "\n".join(moved)
+
+    rebuilt_block = f"[invoice]\n{merged}\n[/invoice]"
+    remaining = tail[consumed:]
+    if remaining and not remaining.startswith("\n"):
+        remaining = "\n" + remaining
+    return text[: m.start()] + rebuilt_block + remaining
 
 
 def _normalize_entry_layout(text: str) -> str:
