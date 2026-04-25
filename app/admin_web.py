@@ -766,7 +766,7 @@ def _xero_tenant_cards(
     tenant_accounts: list of {tenantId, tenantName, enabled, invoiceAccount,
                                paymentAccount, revenueAccounts, bankAccounts}
     """
-    if not xero_ok:
+    if not xero_ok and not tenant_accounts:
         return (
             '<div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6 opacity-50 mt-4">'
             '<h2 class="font-semibold text-gray-900 mb-1">Xero Organisations</h2>'
@@ -872,6 +872,25 @@ def _xero_tenant_cards(
         bank_opts = _opts(bank_accounts, saved_pay)
         rev_badge = _saved_badge(rev_accounts, saved_inv)
         bank_badge = _saved_badge(bank_accounts, saved_pay)
+
+        _input_cls = "w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+        _manual_note = '<p class="text-xs text-amber-600 mt-1">Account list unavailable — enter the Xero account code directly (e.g. 200).</p>'
+        if rev_accounts:
+            rev_field = f'<select name="invoice_account_code" class="{_input_cls}">{rev_opts}</select>'
+        else:
+            rev_field = (
+                f'<input type="text" name="invoice_account_code" value="{escape(saved_inv)}" '
+                f'placeholder="Enter account code (e.g. 200)" class="{_input_cls}">'
+                f'{_manual_note}'
+            )
+        if bank_accounts:
+            bank_field = f'<select name="payment_account_code" class="{_input_cls}">{bank_opts}</select>'
+        else:
+            bank_field = (
+                f'<input type="text" name="payment_account_code" value="{escape(saved_pay)}" '
+                f'placeholder="Enter account code (e.g. 090)" class="{_input_cls}">'
+                f'{_manual_note}'
+            )
         theme_opts = _theme_opts(themes, saved_theme)
         theme_badge = _theme_saved_badge(themes, saved_theme)
 
@@ -921,18 +940,12 @@ def _xero_tenant_cards(
               <!-- Account mapping -->
               <div>
                 <label class="block text-xs font-medium text-gray-700 mb-1">Invoice income account <span class="text-gray-400 font-normal">(revenue / sales)</span></label>
-                <select name="invoice_account_code"
-                  class="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300">
-                  {rev_opts}
-                </select>
+                {rev_field}
                 {rev_badge}
               </div>
               <div>
                 <label class="block text-xs font-medium text-gray-700 mb-1">Payment bank account <span class="text-red-500">*</span> <span class="text-gray-400 font-normal">(where payments land)</span></label>
-                <select name="payment_account_code"
-                  class="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300">
-                  {bank_opts}
-                </select>
+                {bank_field}
                 {bank_badge}
               </div>
 
@@ -2070,7 +2083,8 @@ function toggleEnabled() {{
         # Fetch Xero accounts per tenant for account-mapping UI
         xero_tenant_account_data: list[dict] = []
         xero_tenant_warning = ""
-        if xero_ok:
+        _xero_tok_raw = load_xero_token(config.xero_token_file)
+        if xero_ok or _xero_tok_raw:
             try:
                 _tok = load_xero_token(config.xero_token_file)
                 _granted_scopes = _parse_scope_value(_tok.get("scope"))
