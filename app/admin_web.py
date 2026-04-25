@@ -79,6 +79,13 @@ from .log_feed import feed as _feed
 XERO_AUTH_URL = "https://login.xero.com/identity/connect/authorize"
 XERO_TOKEN_URL = "https://identity.xero.com/connect/token"
 XERO_CONNECTIONS_URL = "https://api.xero.com/connections"
+REQUIRED_XERO_SCOPES = (
+    "offline_access",
+    "accounting.invoices",
+    "accounting.contacts",
+    "accounting.settings",
+    "accounting.payments",
+)
 
 
 STAT_OPTIONS = [
@@ -234,7 +241,7 @@ def _get_tenant_acct_themes(at: str, tid: str) -> "tuple[list, list, list, str]"
             if _ar.status_code == 403:
                 warnings.append("Cannot load account list (missing accounting.settings scope).")
             elif _ar.status_code == 401:
-                warnings.append("Cannot load account list (token expired/unauthorised).")
+                warnings.append("Cannot load account list (token unauthorised: reconnect Xero with accounting.settings scope).")
             else:
                 warnings.append(f"Cannot load account list (HTTP {_ar.status_code}).")
     except Exception:
@@ -255,7 +262,7 @@ def _get_tenant_acct_themes(at: str, tid: str) -> "tuple[list, list, list, str]"
             if _tr.status_code == 403:
                 warnings.append("Cannot load branding themes (missing accounting.settings scope).")
             elif _tr.status_code == 401:
-                warnings.append("Cannot load branding themes (token expired/unauthorised).")
+                warnings.append("Cannot load branding themes (token unauthorised: reconnect Xero with accounting.settings scope).")
             else:
                 warnings.append(f"Cannot load branding themes (HTTP {_tr.status_code}).")
     except Exception:
@@ -349,8 +356,25 @@ def _oauth_client_id(config: AppConfig) -> str:
 
 
 def _xero_scope_string(scopes: list[str]) -> str:
-    parts = [s.strip() for s in scopes if s and s.strip()]
-    return " ".join(parts)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for scope in [*REQUIRED_XERO_SCOPES, *(scopes or [])]:
+        s = str(scope).strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        ordered.append(s)
+    return " ".join(ordered)
+
+
+def _parse_scope_value(value) -> set[str]:
+    if not value:
+        return set()
+    if isinstance(value, list):
+        return {str(v).strip() for v in value if str(v).strip()}
+    if isinstance(value, str):
+        return {v.strip() for v in value.replace(",", " ").split() if v.strip()}
+    return set()
 
 
 def _get_xero_creds(config: AppConfig) -> tuple[str, str]:
@@ -2049,6 +2073,17 @@ function toggleEnabled() {{
         if xero_ok:
             try:
                 _tok = load_xero_token(config.xero_token_file)
+                _granted_scopes = _parse_scope_value(_tok.get("scope"))
+                _missing_scopes = [s for s in REQUIRED_XERO_SCOPES if s not in _granted_scopes]
+                if _missing_scopes:
+                    _miss = " ".join(_missing_scopes)
+                    _warn_scopes = (
+                        f"Xero token missing scopes ({_miss}). "
+                        "Click Reconnect Xero so account/theme lists and card payments can work."
+                    )
+                    xero_tenant_warning = (
+                        f"{xero_tenant_warning} | {_warn_scopes}" if xero_tenant_warning else _warn_scopes
+                    )
                 if token_is_expired(_tok) and _tok.get("refresh_token"):
                     _cid, _csec = _get_xero_creds(config)
                     if _cid and _csec:
