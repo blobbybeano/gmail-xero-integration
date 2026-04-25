@@ -36,7 +36,7 @@ class XeroClient:
         refresh_token: str = "",
         token_file: str = "",
         sales_account_code: str = "",
-        payment_account_code: str = "",
+        payment_account_code: str | None = None,
         branding_theme_id: str = "",
         premium_theme_id: str = "",
         premium_threshold: float | None = None,
@@ -50,7 +50,11 @@ class XeroClient:
         self.refresh_token = refresh_token
         self.token_file = token_file
         self.sales_account_code = sales_account_code or DEFAULT_SALES_ACCOUNT_CODE
-        self.payment_account_code = payment_account_code or DEFAULT_PAYMENT_ACCOUNT_CODE
+        self.payment_account_code = (
+            DEFAULT_PAYMENT_ACCOUNT_CODE
+            if payment_account_code is None
+            else (payment_account_code or "")
+        )
         self.branding_theme_id = branding_theme_id or ""
         self.premium_theme_id = premium_theme_id or ""
         self.premium_threshold = premium_threshold
@@ -305,6 +309,11 @@ class XeroClient:
         account_code = account_code or self.payment_account_code
         if amount <= 0:
             return {"skipped": True, "reason": "No amount due"}
+        if not account_code:
+            raise RuntimeError(
+                "Xero payment account is not configured for the active organisation. "
+                "Set 'Payment bank account' in Xero Organisations settings."
+            )
         payment_date = when or dt.date.today().isoformat()
         payload = {
             "Payments": [
@@ -497,7 +506,9 @@ def build_xero_client(config: AppConfig) -> XeroClient | None:
     if chosen:
         tenant_id = chosen["tenantId"]
         sales_account_code = chosen.get("invoiceAccount", "") or DEFAULT_SALES_ACCOUNT_CODE
-        payment_account_code = chosen.get("paymentAccount", "") or DEFAULT_PAYMENT_ACCOUNT_CODE
+        # When a tenant is explicitly selected, require an explicit payment account
+        # so card payments cannot silently post to an unintended default account.
+        payment_account_code = chosen.get("paymentAccount", "")
         branding_theme_id = chosen.get("brandingThemeId", "") or ""
         premium_theme_id = chosen.get("premiumThemeId", "") or ""
         premium_threshold = chosen.get("premiumThreshold")

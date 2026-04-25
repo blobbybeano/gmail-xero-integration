@@ -790,6 +790,18 @@ def _xero_tenant_cards(
         saved_premium_theme = t.get("premiumThemeId", "")
         saved_threshold = t.get("premiumThreshold")
         threshold_val = f'{saved_threshold:g}' if saved_threshold is not None else ""
+        missing_bits: list[str] = []
+        if enabled and not saved_pay:
+            missing_bits.append("Payment bank account")
+        if enabled and not saved_theme:
+            missing_bits.append("Invoice template")
+        setup_notice = (
+            '<div class="mb-3 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">'
+            f"Action needed: set {escape(', '.join(missing_bits))} before full automation can run."
+            "</div>"
+            if missing_bits
+            else ""
+        )
 
         toggle_color = "bg-emerald-500" if enabled else "bg-gray-300"
         toggle_label = "Active" if enabled else "Paused"
@@ -842,6 +854,7 @@ def _xero_tenant_cards(
           </summary>
           <div class="px-5 pb-5 pt-4 border-t border-gray-100">
             <p class="text-xs text-gray-400 font-mono mb-4">{tid}</p>
+            {setup_notice}
             <form method="post" action="/save-xero-tenant/{tid}" class="space-y-4">
 
               <!-- Account mapping -->
@@ -854,7 +867,7 @@ def _xero_tenant_cards(
                 {rev_badge}
               </div>
               <div>
-                <label class="block text-xs font-medium text-gray-700 mb-1">Payment bank account <span class="text-gray-400 font-normal">(where payments land)</span></label>
+                <label class="block text-xs font-medium text-gray-700 mb-1">Payment bank account <span class="text-red-500">*</span> <span class="text-gray-400 font-normal">(where payments land)</span></label>
                 <select name="payment_account_code"
                   class="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300">
                   {bank_opts}
@@ -864,7 +877,7 @@ def _xero_tenant_cards(
 
               <!-- Invoice template -->
               <div class="pt-1 border-t border-gray-100">
-                <label class="block text-xs font-medium text-gray-700 mb-1">Invoice template <span class="text-gray-400 font-normal">(branding theme)</span></label>
+                <label class="block text-xs font-medium text-gray-700 mb-1">Invoice template <span class="text-red-500">*</span> <span class="text-gray-400 font-normal">(branding theme)</span></label>
                 <select name="branding_theme_id"
                   class="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300 {"opacity-40" if not themes else ""}">
                   {theme_opts}
@@ -1266,7 +1279,17 @@ def create_app() -> Flask:
             premium_theme_id=premium_theme_id if premium_theme_id else None,
             premium_threshold=premium_threshold,
         )
-        session["save_notice"] = "success:Account mapping saved."
+        if not payment_code:
+            session["save_notice"] = (
+                "error:Saved, but Payment bank account is missing. "
+                "Card payments will fail until it is set."
+            )
+        elif not branding_theme_id:
+            session["save_notice"] = (
+                "success:Saved. Invoice template not set; Xero default template will be used."
+            )
+        else:
+            session["save_notice"] = "success:Account mapping and invoice template saved."
         return redirect(url_for("index"))
 
     @app.post("/toggle-xero-tenant/<tenant_id>")
@@ -2009,9 +2032,9 @@ function toggleEnabled() {{
                     _tname = _conn.get("tenantName", _tid)
                     _cfg = _saved_tenants.get(_tid, {})
                     _enabled = _cfg.get("enabled", _tid == xero_tenant)
-                    if _enabled:
+                    try:
                         _rev, _bank, _themes = _get_tenant_acct_themes(_at, _tid)
-                    else:
+                    except Exception:
                         _rev, _bank, _themes = [], [], []
                     xero_tenant_account_data.append({
                         "tenantId": _tid,
@@ -2050,6 +2073,25 @@ function toggleEnabled() {{
                 xero_tenant_warning = (
                     f"Could not refresh organisation list from Xero: {str(exc).splitlines()[0][:240]}"
                 )
+        setup_issues: list[str] = []
+        for _t in xero_tenant_account_data:
+            if not _t.get("enabled", True):
+                continue
+            _missing: list[str] = []
+            if not str(_t.get("paymentAccount", "")).strip():
+                _missing.append("Payment bank account")
+            if not str(_t.get("brandingThemeId", "")).strip():
+                _missing.append("Invoice template")
+            if _missing:
+                _setup_name = str(_t.get("tenantName") or _t.get("tenantId") or "Organisation")
+                setup_issues.append(f"{_setup_name}: missing {', '.join(_missing)}")
+        if setup_issues:
+            setup_msg = "Setup required — " + " | ".join(setup_issues[:4])
+            if len(setup_issues) > 4:
+                setup_msg += f" | +{len(setup_issues) - 4} more"
+            xero_tenant_warning = (
+                f"{xero_tenant_warning} | {setup_msg}" if xero_tenant_warning else setup_msg
+            )
         pending_auth_url = (
             session.get("oauth_auth_url")
             or str(get_json_setting(config.admin_db_file, "oauth_auth_url", "")).strip()
