@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import collections
 import json
+import os
 import threading
 import time
 from typing import Generator, List
@@ -55,4 +56,12 @@ class LogFeed:
         return f"data: {json.dumps(entry)}\n\n"
 
 
-feed = LogFeed()
+def _feed_maxlen() -> int:
+    raw = os.getenv("LIVE_FEED_MAXLEN", "5000").strip()
+    try:
+        return max(500, int(raw))
+    except Exception:
+        return 5000
+
+
+feed = LogFeed(maxlen=_feed_maxlen())

@@ -1375,6 +1375,10 @@ def run() -> None:
                                             line_items=invoice_lines,
                                         )
                                         print(f"Invoice draft updated for event {event['id']}: {_invoice_brief(result)}")
+                                        _feed.push(
+                                            f"Invoice draft updated: {_invoice_brief(result)}",
+                                            "info",
+                                        )
                                         subtotal, total = _extract_totals(result)
                                         if subtotal is not None and total is not None:
                                             updated_description = upsert_invoice_summary(
@@ -1563,6 +1567,10 @@ def run() -> None:
                                                 )
                                         except Exception as exc:
                                             print(f"Event {event_id}: failed to mark invoice paid: {exc}")
+                                            _feed.push(
+                                                f"Card payment failed for \"{event.get('summary', event_id)}\": {str(exc).splitlines()[0][:180]}",
+                                                "error",
+                                            )
                                             fail_reason = str(exc).splitlines()[0][:220]
                                             failed_description = upsert_send_failure(
                                                 event.get("description") or "",
@@ -1612,6 +1620,10 @@ def run() -> None:
                                     emailed = xero_client.email_invoice(invoice_id)
                                     if not emailed:
                                         print(f"Event {event_id}: failed to email invoice {invoice_id}")
+                                        _feed.push(
+                                            f"Invoice email failed for \"{event.get('summary', event_id)}\" ({invoice_id[:8]}…)",
+                                            "warn",
+                                        )
                                         failed_description = upsert_send_failure(
                                             event.get("description") or "",
                                             None,
@@ -1922,6 +1934,10 @@ def run() -> None:
                                                 line_items=invoice_lines,
                                             )
                                             print(f"Invoice draft updated for event {details.get('id')}: {_invoice_brief(result)}")
+                                            _feed.push(
+                                                f"Invoice draft updated: {_invoice_brief(result)}",
+                                                "info",
+                                            )
                                             subtotal, total = _extract_totals(result)
                                             if subtotal is not None and total is not None:
                                                 updated_description = upsert_invoice_summary(
@@ -2099,6 +2115,10 @@ def run() -> None:
                                                 )
                                         except Exception as exc:
                                             print(f"Event {event.get('id')}: failed to mark invoice paid: {exc}")
+                                            _feed.push(
+                                                f"Card payment failed for \"{event.get('summary', event.get('id'))}\": {str(exc).splitlines()[0][:180]}",
+                                                "error",
+                                            )
                                             fail_reason = str(exc).splitlines()[0][:220]
                                             failed_description = upsert_send_failure(
                                                 event.get("description") or "",
@@ -2148,6 +2168,10 @@ def run() -> None:
                                     emailed = xero_client.email_invoice(invoice_id)
                                     if not emailed:
                                         print(f"Event {event.get('id')}: failed to email invoice {invoice_id}")
+                                        _feed.push(
+                                            f"Invoice email failed for \"{event.get('summary', event.get('id'))}\" ({invoice_id[:8]}…)",
+                                            "warn",
+                                        )
                                         failed_description = upsert_send_failure(
                                             event.get("description") or "",
                                             None,

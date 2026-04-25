@@ -193,20 +193,20 @@ def _validate_google_credentials_json(raw: bytes) -> tuple[bool, str]:
     return True, ""
 
 
-_xero_acct_cache: "dict[str, tuple[float, list, list, list]]" = {}
+_xero_acct_cache: "dict[str, tuple[float, list, list, list, str]]" = {}
 _XERO_CACHE_TTL = 300  # seconds (5 min)
 
 
-def _get_tenant_acct_themes(at: str, tid: str) -> "tuple[list, list, list]":
+def _get_tenant_acct_themes(at: str, tid: str) -> "tuple[list, list, list, str]":
     """Return (revenue_accounts, bank_accounts, branding_themes) for a Xero tenant.
     Results are cached for _XERO_CACHE_TTL seconds so the settings page doesn't
     make live API calls on every load."""
     key = f"{at[-12:]}:{tid}" if at else tid
     cached = _xero_acct_cache.get(key)
     if cached:
-        ts, rev, bank, themes = cached
+        ts, rev, bank, themes, warning = cached
         if time.time() - ts < _XERO_CACHE_TTL:
-            return rev, bank, themes
+            return rev, bank, themes, warning
     hdrs = {
         "Authorization": f"Bearer {at}",
         "Xero-tenant-id": tid,
@@ -214,22 +214,31 @@ def _get_tenant_acct_themes(at: str, tid: str) -> "tuple[list, list, list]":
     }
     rev: list = []
     bank: list = []
+    warnings: list[str] = []
     try:
         _ar = requests.get(
             "https://api.xero.com/api.xro/2.0/Accounts",
             headers=hdrs,
             timeout=5,
         )
-        for _a in _ar.json().get("Accounts", []):
-            if _a.get("Status") != "ACTIVE":
-                continue
-            _typ = _a.get("Type", "")
-            if _typ in ("REVENUE", "SALES", "OTHERINCOME"):
-                rev.append(_a)
-            elif _typ == "BANK":
-                bank.append(_a)
+        if _ar.ok:
+            for _a in _ar.json().get("Accounts", []):
+                if _a.get("Status") != "ACTIVE":
+                    continue
+                _typ = _a.get("Type", "")
+                if _typ in ("REVENUE", "SALES", "OTHERINCOME"):
+                    rev.append(_a)
+                elif _typ == "BANK":
+                    bank.append(_a)
+        else:
+            if _ar.status_code == 403:
+                warnings.append("Cannot load account list (missing accounting.settings scope).")
+            elif _ar.status_code == 401:
+                warnings.append("Cannot load account list (token expired/unauthorised).")
+            else:
+                warnings.append(f"Cannot load account list (HTTP {_ar.status_code}).")
     except Exception:
-        pass
+        warnings.append("Cannot load account list (request failed).")
     themes: list = []
     try:
         _tr = requests.get(
@@ -237,14 +246,30 @@ def _get_tenant_acct_themes(at: str, tid: str) -> "tuple[list, list, list]":
             headers=hdrs,
             timeout=5,
         )
-        themes = sorted(
-            _tr.json().get("BrandingThemes", []),
-            key=lambda x: (x.get("SortOrder", 999), x.get("Name", "")),
-        )
+        if _tr.ok:
+            themes = sorted(
+                _tr.json().get("BrandingThemes", []),
+                key=lambda x: (x.get("SortOrder", 999), x.get("Name", "")),
+            )
+        else:
+            if _tr.status_code == 403:
+                warnings.append("Cannot load branding themes (missing accounting.settings scope).")
+            elif _tr.status_code == 401:
+                warnings.append("Cannot load branding themes (token expired/unauthorised).")
+            else:
+                warnings.append(f"Cannot load branding themes (HTTP {_tr.status_code}).")
     except Exception:
-        pass
-    _xero_acct_cache[key] = (time.time(), rev, bank, themes)
-    return rev, bank, themes
+        warnings.append("Cannot load branding themes (request failed).")
+    warning = " ".join(dict.fromkeys([w.strip() for w in warnings if w.strip()]))
+    # Avoid caching empty+failed responses for long periods; this keeps recovery fast
+    # after a reconnect/refresh.
+    if warning and not (rev or bank or themes):
+        _xero_acct_cache[key] = (time.time(), rev, bank, themes, warning)
+        # force short cache for failed empty responses
+        _xero_acct_cache[key] = (time.time() - (_XERO_CACHE_TTL - 20), rev, bank, themes, warning)
+    else:
+        _xero_acct_cache[key] = (time.time(), rev, bank, themes, warning)
+    return rev, bank, themes, warning
 
 
 def _sheets_status_data(
@@ -747,11 +772,16 @@ def _xero_tenant_cards(
 
     def _opts(accounts, saved):
         out = '<option value="">— select account —</option>'
+        found_saved = False
         for a in sorted(accounts, key=lambda x: x.get("Name", "")):
             code = escape(a.get("Code", ""))
             name = escape(a.get("Name", ""))
             sel = ' selected' if a.get("Code", "") == saved else ""
+            if sel:
+                found_saved = True
             out += f'<option value="{code}"{sel}>{name} ({code})</option>'
+        if saved and not found_saved:
+            out += f'<option value="{escape(saved)}" selected>Saved account ({escape(saved)})</option>'
         return out
 
     def _theme_opts(themes, saved, blank_label="— use Xero default —"):
@@ -789,6 +819,7 @@ def _xero_tenant_cards(
         saved_theme = t.get("brandingThemeId", "")
         saved_premium_theme = t.get("premiumThemeId", "")
         saved_threshold = t.get("premiumThreshold")
+        load_warning = str(t.get("loadWarning", "") or "").strip()
         threshold_val = f'{saved_threshold:g}' if saved_threshold is not None else ""
         missing_bits: list[str] = []
         if enabled and not saved_pay:
@@ -800,6 +831,12 @@ def _xero_tenant_cards(
             f"Action needed: set {escape(', '.join(missing_bits))} before full automation can run."
             "</div>"
             if missing_bits
+            else ""
+        )
+        load_warning_html = (
+            '<div class="mb-3 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">'
+            f"{escape(load_warning)}</div>"
+            if load_warning
             else ""
         )
 
@@ -818,12 +855,11 @@ def _xero_tenant_cards(
         premium_theme_badge = _theme_saved_badge(themes, saved_premium_theme)
 
         no_themes_msg = (
-            '' if themes else
+            '' if themes or load_warning else
             '<p class="text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2 mt-1">'
             'No branding themes found — create one in Xero first (Settings → Invoice Settings → New Style).'
             '</p>'
         )
-
         advanced_open = ' open' if (saved_premium_theme or saved_threshold) else ''
 
         cards_html += f"""
@@ -855,6 +891,7 @@ def _xero_tenant_cards(
           <div class="px-5 pb-5 pt-4 border-t border-gray-100">
             <p class="text-xs text-gray-400 font-mono mb-4">{tid}</p>
             {setup_notice}
+            {load_warning_html}
             <form method="post" action="/save-xero-tenant/{tid}" class="space-y-4">
 
               <!-- Account mapping -->
@@ -1595,7 +1632,7 @@ def create_app() -> Flask:
             else ""
         )
 
-        recent_logs = _feed.recent(500)
+        recent_logs = _feed.recent(2000)
         last_seq_val = recent_logs[-1]["seq"] if recent_logs else 0
 
         # Scan feed for meaningful status signals
@@ -1850,13 +1887,7 @@ function toggleScroll() {{
 }}
 
 function onUserScroll() {{
-  const atBottom = term.scrollTop + term.clientHeight >= term.scrollHeight - 40;
-  if (!atBottom && autoScroll) {{
-    autoScroll = false;
-    scrollBtn.textContent = '⏸ Paused';
-    scrollBtn.classList.remove('text-indigo-400');
-    scrollBtn.classList.add('text-neutral-500');
-  }}
+  // Keep auto-scroll sticky unless user explicitly toggles pause.
 }}
 
 const levelColor = {{
@@ -2026,6 +2057,7 @@ function toggleEnabled() {{
                         save_xero_token(config.xero_token_file, _tok)
                 _at = _tok.get("access_token", "")
                 _all_conns = _get_all_xero_connections(_at)
+                _acct_load_warnings: list[str] = []
                 _saved_tenants = {t["tenantId"]: t for t in get_xero_tenants(config.admin_db_file)}
                 for _conn in _all_conns:
                     _tid = _conn["tenantId"]
@@ -2033,9 +2065,11 @@ function toggleEnabled() {{
                     _cfg = _saved_tenants.get(_tid, {})
                     _enabled = _cfg.get("enabled", _tid == xero_tenant)
                     try:
-                        _rev, _bank, _themes = _get_tenant_acct_themes(_at, _tid)
+                        _rev, _bank, _themes, _load_warn = _get_tenant_acct_themes(_at, _tid)
                     except Exception:
-                        _rev, _bank, _themes = [], [], []
+                        _rev, _bank, _themes, _load_warn = [], [], [], "Cannot load Xero account/theme options."
+                    if _load_warn:
+                        _acct_load_warnings.append(f"{_tname}: {_load_warn}")
                     xero_tenant_account_data.append({
                         "tenantId": _tid,
                         "tenantName": _tname,
@@ -2045,10 +2079,18 @@ function toggleEnabled() {{
                         "revenueAccounts": _rev,
                         "bankAccounts": _bank,
                         "brandingThemes": _themes,
+                        "loadWarning": _load_warn,
                         "brandingThemeId": _cfg.get("brandingThemeId", ""),
                         "premiumThemeId": _cfg.get("premiumThemeId", ""),
                         "premiumThreshold": _cfg.get("premiumThreshold"),
                     })
+                if _acct_load_warnings:
+                    _warn = " | ".join(_acct_load_warnings[:3])
+                    if len(_acct_load_warnings) > 3:
+                        _warn += f" | +{len(_acct_load_warnings)-3} more"
+                    xero_tenant_warning = (
+                        f"{xero_tenant_warning} | {_warn}" if xero_tenant_warning else _warn
+                    )
             except Exception as exc:
                 _saved_only = get_xero_tenants(config.admin_db_file)
                 for _cfg in _saved_only:
@@ -2065,6 +2107,7 @@ function toggleEnabled() {{
                             "revenueAccounts": [],
                             "bankAccounts": [],
                             "brandingThemes": [],
+                            "loadWarning": "Reconnect Xero to load live account and branding theme options.",
                             "brandingThemeId": _cfg.get("brandingThemeId", ""),
                             "premiumThemeId": _cfg.get("premiumThemeId", ""),
                             "premiumThreshold": _cfg.get("premiumThreshold"),
