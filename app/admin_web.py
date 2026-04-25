@@ -1415,7 +1415,38 @@ def create_app() -> Flask:
         session["xero_oauth_state"] = state
         session["xero_auth_url"] = xero_auth_url
         session["xero_redirect_uri"] = dynamic_xero_redirect
-        return redirect(xero_auth_url)
+        # Persist to DB so the callback works even when opened in a separate browser tab
+        set_json_setting(config.admin_db_file, "xero_oauth_pending_state", state)
+        set_json_setting(config.admin_db_file, "xero_oauth_pending_redirect_uri", dynamic_xero_redirect)
+        safe_url = escape(xero_auth_url)
+        return _page(f"""
+        <div class="min-h-screen flex items-center justify-center bg-gray-50 p-4">
+          <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-8 max-w-xl w-full">
+            <h2 class="text-lg font-semibold text-gray-900 mb-2">Connect to Xero</h2>
+            <p class="text-sm text-gray-600 mb-5">
+              Click the button below to open the Xero authorisation page in a new tab.
+              Once you have approved access, Xero will redirect back and your connection will be saved automatically.
+            </p>
+            <a href="{safe_url}" target="_blank" rel="noopener noreferrer"
+               class="inline-block px-5 py-2.5 text-sm font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors mb-5">
+              Open Xero authorisation &#8599;
+            </a>
+            <p class="text-xs text-gray-400 mb-2">Or copy the URL manually:</p>
+            <div class="flex gap-2 items-center">
+              <input id="xero-url" type="text" readonly value="{safe_url}"
+                class="flex-1 text-xs font-mono border border-gray-200 rounded-lg px-3 py-2 bg-gray-50 focus:outline-none">
+              <button onclick="navigator.clipboard.writeText(document.getElementById('xero-url').value);this.textContent='Copied!';"
+                class="px-3 py-2 text-xs font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors whitespace-nowrap">
+                Copy
+              </button>
+            </div>
+            <p class="text-xs text-gray-400 mt-5">
+              After completing authorisation in Xero, return to
+              <a href="/settings" class="text-indigo-600 hover:underline">Settings</a> to verify the connection.
+            </p>
+          </div>
+        </div>
+        """)
 
     @app.get("/xero/callback")
     def xero_callback():
@@ -1449,6 +1480,7 @@ def create_app() -> Flask:
         try:
             dynamic_xero_redirect = (
                 session.get("xero_redirect_uri")
+                or str(get_json_setting(config.admin_db_file, "xero_oauth_pending_redirect_uri", "")).strip()
                 or _current_base_url() + "/xero/callback"
             )
             token = _exchange_xero_code(config, code, redirect_uri=dynamic_xero_redirect)
@@ -1502,7 +1534,9 @@ def create_app() -> Flask:
         session["logged_in"] = True
         session.pop("xero_oauth_state", None)
         session.pop("xero_auth_url", None)
+        session.pop("xero_redirect_uri", None)
         set_json_setting(config.admin_db_file, "xero_oauth_pending_state", "")
+        set_json_setting(config.admin_db_file, "xero_oauth_pending_redirect_uri", "")
         set_json_setting(config.admin_db_file, "xero_auth_url", "")
         session["save_notice"] = "success:Xero connected successfully."
         return redirect(url_for("index"))
