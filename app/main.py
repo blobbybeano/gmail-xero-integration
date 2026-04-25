@@ -230,6 +230,7 @@ def run() -> None:
         event_key: str,
         invoice_id: str,
         payment_method: str,
+        paid_override: bool | None = None,
         submitter_display: str,
         admin_creds,
         sheet_target: dict[str, str],
@@ -288,7 +289,7 @@ def run() -> None:
         end_fmt = _fmt_british(end)
         slot_text = f"{start_fmt} – {end_fmt}".strip(" –") if start_fmt != end_fmt else start_fmt
         customer_fields = parse_customer_fields(event.get("description"))
-        paid_immediately = payment_method.lower() in {"card", "cash"}
+        paid_immediately = paid_override if paid_override is not None else (payment_method.lower() in {"card", "cash"})
         payload_payment_method = payment_method.upper() if payment_method else "N/A"
         payload = {
             "submitter": submitter_display
@@ -1581,6 +1582,31 @@ def run() -> None:
                                             if updated:
                                                 event["description"] = failed_description
                                                 event_updated = updated.get("updated") or event_updated
+                                            # Still log to sheets as outstanding so submissions are never dropped.
+                                            state = _append_sheet_stats_if_enabled(
+                                                event=event,
+                                                event_key=event_key,
+                                                invoice_id=invoice_id,
+                                                payment_method=pay_mode,
+                                                paid_override=False,
+                                                submitter_display=submitter_display,
+                                                admin_creds=admin_creds,
+                                                sheet_target=sheet_target,
+                                                stats_fields=stats_fields,
+                                                state=state,
+                                            )
+                                            state = _append_sales_rows_if_enabled(
+                                                event=event,
+                                                event_key=event_key,
+                                                invoice_id=invoice_id,
+                                                payment_method=pay_mode,
+                                                submitter_email=submitter_email,
+                                                submitter_display=submitter_display,
+                                                admin_creds=admin_creds,
+                                                sales_sheet_target=sales_sheet_target,
+                                                sales_stats_fields=sales_stats_fields,
+                                                state=state,
+                                            )
                                             state = set_processed_update_marker(state, event_key, event_updated)
                                             continue
                                     emailed = xero_client.email_invoice(invoice_id)
@@ -2092,6 +2118,31 @@ def run() -> None:
                                             if updated:
                                                 event["description"] = failed_description
                                                 event_updated = updated.get("updated") or event_updated
+                                            # Still log to sheets as outstanding so submissions are never dropped.
+                                            state = _append_sheet_stats_if_enabled(
+                                                event=event,
+                                                event_key=event_key,
+                                                invoice_id=invoice_id,
+                                                payment_method=pay_mode,
+                                                paid_override=False,
+                                                submitter_display=submitter_display,
+                                                admin_creds=admin_creds,
+                                                sheet_target=sheet_target,
+                                                stats_fields=stats_fields,
+                                                state=state,
+                                            )
+                                            state = _append_sales_rows_if_enabled(
+                                                event=event,
+                                                event_key=event_key,
+                                                invoice_id=invoice_id,
+                                                payment_method=pay_mode,
+                                                submitter_email=submitter_email,
+                                                submitter_display=submitter_display,
+                                                admin_creds=admin_creds,
+                                                sales_sheet_target=sales_sheet_target,
+                                                sales_stats_fields=sales_stats_fields,
+                                                state=state,
+                                            )
                                             state = set_processed_update_marker(state, event_key, event_updated)
                                             continue
                                     emailed = xero_client.email_invoice(invoice_id)
