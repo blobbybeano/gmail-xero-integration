@@ -1572,9 +1572,6 @@ def run() -> None:
                                         if updated:
                                             event["description"] = updated_description
                                             event_updated = updated.get("updated") or event_updated
-                                    state = mark_invoice_sent(state, event_key)
-                                    state = set_invoice_for_event(state, event_key, "")
-                                    state = set_invoice_update_marker(state, event_key, event_updated)
                                     state = _append_cash_row_or_backlog(
                                         event=event,
                                         event_key=event_key,
@@ -1597,6 +1594,9 @@ def run() -> None:
                                         stats_fields=stats_fields,
                                         state=state,
                                     )
+                                    state = mark_invoice_sent(state, event_key)
+                                    state = set_invoice_for_event(state, event_key, "")
+                                    state = set_invoice_update_marker(state, event_key, event_updated)
                                     print(f"Cash payment finalised for event {event_id}: draft {invoice_id} deleted")
                                     _feed.push(f"Cash payment logged for \"{event.get('summary', event_id)}\"", "success")
                                     state = set_processed_update_marker(state, event_key, event_updated)
@@ -2114,9 +2114,6 @@ def run() -> None:
                                         if updated:
                                             event["description"] = updated_description
                                             event_updated = updated.get("updated") or event_updated
-                                    state = mark_invoice_sent(state, event_key)
-                                    state = set_invoice_for_event(state, event_key, "")
-                                    state = set_invoice_update_marker(state, event_key, event_updated)
                                     state = _append_cash_row_or_backlog(
                                         event=event,
                                         event_key=event_key,
@@ -2139,6 +2136,9 @@ def run() -> None:
                                         stats_fields=stats_fields,
                                         state=state,
                                     )
+                                    state = mark_invoice_sent(state, event_key)
+                                    state = set_invoice_for_event(state, event_key, "")
+                                    state = set_invoice_update_marker(state, event_key, event_updated)
                                     print(f"Cash payment finalised for event {event.get('id')}: draft {invoice_id} deleted")
                                     _feed.push(f"Cash payment logged for \"{event.get('summary', event.get('id'))}\"", "success")
                                     state = set_processed_update_marker(state, event_key, event_updated)
