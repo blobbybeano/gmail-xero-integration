@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import base64
 import json
+import threading
 from typing import Dict
 
 import requests
@@ -13,6 +14,7 @@ from .admin_store import get_json_setting, get_xero_tenants
 TOKEN_URL = "https://identity.xero.com/connect/token"
 DEFAULT_SALES_ACCOUNT_CODE = "200"
 DEFAULT_PAYMENT_ACCOUNT_CODE = "090"
+_TOKEN_REFRESH_LOCK = threading.Lock()
 
 
 def _short_reference(event: Dict) -> str:
@@ -68,22 +70,48 @@ class XeroClient:
         }
 
     def _refresh_access_token(self) -> bool:
-        if not self.refresh_token:
-            return False
-        try:
-            refreshed = refresh_xero_token(
-                client_id=self.client_id,
-                client_secret=self.client_secret,
-                refresh_token=self.refresh_token,
-            )
-        except Exception as exc:
-            print(f"[xero] token refresh failed: {exc}", flush=True)
-            return False
-        refreshed["tenant_id"] = self.tenant_id
-        save_xero_token(self.token_file, refreshed)
-        self.access_token = refreshed.get("access_token", self.access_token)
-        self.refresh_token = refreshed.get("refresh_token", self.refresh_token)
-        return True
+        with _TOKEN_REFRESH_LOCK:
+            latest = load_xero_token(self.token_file) if self.token_file else {}
+            latest_access = latest.get("access_token", "")
+            latest_refresh = latest.get("refresh_token", "")
+            if latest_access and latest_refresh:
+                # Another thread/worker may have already refreshed and rotated tokens.
+                self.access_token = latest_access
+                self.refresh_token = latest_refresh
+                if not token_is_expired(latest):
+                    return True
+
+            refresh_token_value = self.refresh_token or latest_refresh
+            if not refresh_token_value:
+                return False
+
+            try:
+                refreshed = refresh_xero_token(
+                    client_id=self.client_id,
+                    client_secret=self.client_secret,
+                    refresh_token=refresh_token_value,
+                )
+            except Exception as exc:
+                # Xero refresh tokens are one-time use; if another thread rotated it,
+                # recover by adopting the newest saved token from disk.
+                newest = load_xero_token(self.token_file) if self.token_file else {}
+                newest_access = newest.get("access_token", "")
+                newest_refresh = newest.get("refresh_token", "")
+                if newest_access and newest_refresh and (
+                    newest_access != self.access_token or newest_refresh != self.refresh_token
+                ):
+                    self.access_token = newest_access
+                    self.refresh_token = newest_refresh
+                    if not token_is_expired(newest):
+                        return True
+                print(f"[xero] token refresh failed: {exc}", flush=True)
+                return False
+
+            refreshed["tenant_id"] = self.tenant_id
+            save_xero_token(self.token_file, refreshed)
+            self.access_token = refreshed.get("access_token", self.access_token)
+            self.refresh_token = refreshed.get("refresh_token", self.refresh_token)
+            return True
 
     def _request(self, method: str, url: str, **kwargs):
         response = requests.request(method, url, headers=self._headers(), timeout=30, **kwargs)
