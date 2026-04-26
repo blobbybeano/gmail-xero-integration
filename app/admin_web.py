@@ -46,6 +46,7 @@ from .admin_store import (
     set_stats_fields,
 )
 from .config import load_config
+from .event_processor import set_title_status_emoji
 from .google_admin import (
     build_calendar_service_from_creds,
     build_sheets_service_from_creds,
@@ -56,6 +57,7 @@ from .google_admin import (
     oauth_exchange_code,
     save_admin_credentials,
 )
+from .google_calendar import update_event_description
 from .config import AppConfig
 from .xero_client import load_xero_token, save_xero_token, token_is_expired, refresh_xero_token
 from .google_sheets import backfill_submitter_in_sheet, update_invoice_paid_in_sheet
@@ -3244,7 +3246,7 @@ function toggleEnabled() {{
 
     @app.post("/webhooks/xero")
     def webhook_xero():
-        """Receive Xero webhooks (invoice paid etc.) and update the sheet."""
+        """Receive Xero webhooks (invoice paid etc.) and update sheets + calendar status."""
         import hmac as _hmac
         import hashlib as _hashlib
         import base64 as _base64
@@ -3301,6 +3303,34 @@ function toggleEnabled() {{
         xero_at = (xero_tok or {}).get("access_token", "")
         xero_tenant = (xero_tok or {}).get("tenant_id", "")
 
+        def _fetch_invoice(invoice_id: str):
+            nonlocal xero_at, xero_tok
+            if not (xero_at and xero_tenant):
+                return None
+            url = f"https://api.xero.com/api.xro/2.0/Invoices/{invoice_id}"
+            headers = {
+                "Authorization": f"Bearer {xero_at}",
+                "Xero-tenant-id": xero_tenant,
+                "Accept": "application/json",
+            }
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 401 and xero_tok.get("refresh_token"):
+                try:
+                    _cid, _csec = _get_xero_creds(config)
+                    if _cid and _csec:
+                        refreshed = refresh_xero_token(_cid, _csec, xero_tok["refresh_token"])
+                        xero_tok = {**xero_tok, **refreshed}
+                        save_xero_token(config.xero_token_file, xero_tok)
+                        xero_at = (xero_tok or {}).get("access_token", "")
+                        headers["Authorization"] = f"Bearer {xero_at}"
+                        resp = requests.get(url, headers=headers, timeout=10)
+                except Exception as exc:
+                    print(f"[webhook] Xero token refresh failed while fetching invoice: {exc}", flush=True)
+            if not resp.ok:
+                return None
+            invoices = resp.json().get("Invoices", [])
+            return invoices[0] if invoices else None
+
         for ev in events:
             if ev.get("eventCategory") != "INVOICE":
                 continue
@@ -3309,39 +3339,51 @@ function toggleEnabled() {{
                 continue
             print(f"[webhook] Xero invoice event: {ev.get('eventType')} {invoice_id}", flush=True)
 
-            if xero_at and xero_tenant:
-                try:
-                    resp = requests.get(
-                        f"https://api.xero.com/api.xro/2.0/Invoices/{invoice_id}",
-                        headers={
-                            "Authorization": f"Bearer {xero_at}",
-                            "Xero-tenant-id": xero_tenant,
-                            "Accept": "application/json",
-                        },
-                        timeout=10,
-                    )
-                    invoices = resp.json().get("Invoices", [])
-                    if invoices and invoices[0].get("Status") == "PAID":
-                        inv_number = invoices[0].get("InvoiceNumber", "")
-                        print(f"[webhook] Invoice {inv_number} is PAID — updating sheet", flush=True)
-                        _feed.push(f"Invoice {inv_number} paid — marking sheet row as Paid", "paid")
-                        if creds and spreadsheet_id and inv_number:
-                            try:
-                                updated = update_invoice_paid_in_sheet(
-                                    creds,
-                                    spreadsheet_id=spreadsheet_id,
-                                    sheet_name=sheet_name,
-                                    invoice_number=inv_number,
-                                )
-                                if updated:
-                                    print(f"[webhook] Sheet row updated for {inv_number}", flush=True)
-                                    _feed.push(f"Sheet updated: {inv_number} marked as Paid", "paid")
-                                else:
-                                    print(f"[webhook] No matching sheet row found for {inv_number}", flush=True)
-                            except Exception as exc:
-                                print(f"[webhook] Sheet update failed: {exc}", flush=True)
-                except Exception as exc:
-                    print(f"[webhook] Xero invoice fetch failed: {exc}", flush=True)
+            try:
+                invoice = _fetch_invoice(invoice_id)
+                if invoice and invoice.get("Status") == "PAID":
+                    inv_number = invoice.get("InvoiceNumber", "")
+                    print(f"[webhook] Invoice {inv_number} is PAID — updating sheet + calendar", flush=True)
+                    _feed.push(f"Invoice {inv_number} paid — marking sheet row as Paid", "paid")
+                    if creds and spreadsheet_id and inv_number:
+                        try:
+                            updated = update_invoice_paid_in_sheet(
+                                creds,
+                                spreadsheet_id=spreadsheet_id,
+                                sheet_name=sheet_name,
+                                invoice_number=inv_number,
+                            )
+                            if updated:
+                                print(f"[webhook] Sheet row updated for {inv_number}", flush=True)
+                                _feed.push(f"Sheet updated: {inv_number} marked as Paid", "paid")
+                            else:
+                                print(f"[webhook] No matching sheet row found for {inv_number}", flush=True)
+                        except Exception as exc:
+                            print(f"[webhook] Sheet update failed: {exc}", flush=True)
+
+                    event_key = inv_id_to_key.get(invoice_id, "")
+                    if event_key and ":" in event_key:
+                        cal_id, event_id = event_key.split(":", 1)
+                        try:
+                            gsvc = build_calendar_service_from_creds(creds) if creds else None
+                            if gsvc:
+                                ge = gsvc.events().get(calendarId=cal_id, eventId=event_id).execute()
+                                cur_summary = ge.get("summary")
+                                updated_summary = set_title_status_emoji(cur_summary, "green")
+                                if updated_summary != cur_summary:
+                                    update_event_description(
+                                        config,
+                                        event_id=event_id,
+                                        description=ge.get("description") or "",
+                                        summary=updated_summary,
+                                        calendar_id=cal_id,
+                                    )
+                                    print(f"[webhook] Calendar title set to green for {event_key}", flush=True)
+                                    _feed.push(f"Calendar updated to paid (green): {inv_number or event_id}", "paid")
+                        except Exception as exc:
+                            print(f"[webhook] Calendar status update failed for {event_key}: {exc}", flush=True)
+            except Exception as exc:
+                print(f"[webhook] Xero invoice fetch failed: {exc}", flush=True)
 
         trigger_poll()
         return "", 200
