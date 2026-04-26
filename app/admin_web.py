@@ -20,6 +20,7 @@ from .admin_store import (
     DEFAULT_STATS_FIELDS,
     get_active_calendars,
     get_calendar_cash_sheets,
+    get_cash_sheet_target,
     get_calendar_sales_sheets,
     get_cash_backlog,
     get_cash_submitter_sheets,
@@ -34,6 +35,7 @@ from .admin_store import (
     get_submitter_aliases,
     init_admin_store,
     set_calendar_cash_sheets,
+    set_cash_sheet_target,
     set_calendar_sales_sheets,
     set_submitter_aliases,
     set_active_calendars,
@@ -2556,6 +2558,9 @@ function toggleEnabled() {{
         sheet_name_val = target.get("sheet_name", "Sheet1")
         sales_sheet_current_id = sales_target.get("spreadsheet_id", "")
         sales_sheet_name_val = sales_target.get("sheet_name", "Sales")
+        cash_target = get_cash_sheet_target(config.admin_db_file)
+        cash_sheet_current_id = cash_target.get("spreadsheet_id", "")
+        cash_sheet_name_val = cash_target.get("sheet_name", "Cash")
         for s in spreadsheets:
             sel = 'selected' if s.get("id") == sheet_current_id else ""
             sheet_options += f'<option value="{escape(s["id"])}" {sel}>{escape(s["name"])}</option>'
@@ -2567,6 +2572,12 @@ function toggleEnabled() {{
             sales_sheet_options += f'<option value="{escape(s["id"])}" {sel}>{escape(s["name"])}</option>'
         if sales_sheet_current_id and all(s.get("id") != sales_sheet_current_id for s in spreadsheets):
             sales_sheet_options += f'<option value="{escape(sales_sheet_current_id)}" selected>Current saved ({escape(sales_sheet_current_id)})</option>'
+        cash_sheet_options = '<option value="">-- Select a spreadsheet --</option>'
+        for s in spreadsheets:
+            sel = 'selected' if s.get("id") == cash_sheet_current_id else ""
+            cash_sheet_options += f'<option value="{escape(s["id"])}" {sel}>{escape(s["name"])}</option>'
+        if cash_sheet_current_id and all(s.get("id") != cash_sheet_current_id for s in spreadsheets):
+            cash_sheet_options += f'<option value="{escape(cash_sheet_current_id)}" selected>Current saved ({escape(cash_sheet_current_id)})</option>'
 
         # --- Webhook state ---
         watches = get_google_watches(config.admin_db_file)
@@ -2996,28 +3007,76 @@ function toggleEnabled() {{
               </summary>
               <div class="px-5 pb-5 pt-4 border-t border-gray-100 space-y-4">
                 <p class="text-sm text-gray-500">{escape(sheets_msg)}</p>
-                {"" if not spreadsheets else f"""
-                <div>
-                  <label class="block text-sm font-medium text-gray-700 mb-1.5">Pick from your spreadsheets</label>
-                  <select name="spreadsheet_pick" class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
-                    {sheet_options}
-                  </select>
-                </div>
-                """}
-                <div>
-                  <label class="block text-sm font-medium text-gray-700 mb-1.5">Spreadsheet URL or ID</label>
-                  <input name="spreadsheet_input" value="{escape(sheet_current_id)}"
-                    placeholder="Paste a Google Sheets URL or spreadsheet ID"
-                    class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
-                  {f'<p class="text-xs text-emerald-600 mt-1">&#10003; Saved: <span class="font-medium">{escape(sheet_current_id)}</span></p>' if sheet_current_id else '<p class="text-xs text-gray-400 mt-1">No spreadsheet saved yet.</p>'}
-                </div>
-                <div>
-                  <label class="block text-sm font-medium text-gray-700 mb-1.5">Sheet tab name</label>
-                  <input name="sheet_name" value="{escape(sheet_name_val)}"
-                    placeholder="Sheet1"
-                    class="w-48 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
-                  {f'<p class="text-xs text-emerald-600 mt-1">&#10003; Saved: <span class="font-medium">{escape(sheet_name_val)}</span></p>' if sheet_current_id else ""}
-                </div>
+                <details class="border border-gray-200 rounded-xl overflow-hidden group/master" open>
+                  <summary class="flex items-center justify-between px-4 py-3 bg-gray-50 cursor-pointer list-none select-none hover:bg-gray-100 transition-colors">
+                    <div>
+                      <h3 class="text-sm font-semibold text-gray-900">Master Sheet</h3>
+                      <p class="text-xs text-gray-500">All invoice/payment rows (universal)</p>
+                    </div>
+                    <svg class="w-4 h-4 text-gray-400 transition-transform duration-200 group-open/master:rotate-180 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+                    </svg>
+                  </summary>
+                  <div class="px-4 py-4 border-t border-gray-100 space-y-3">
+                    {"" if not spreadsheets else f"""
+                    <div>
+                      <label class="block text-sm font-medium text-gray-700 mb-1.5">Pick from your spreadsheets</label>
+                      <select name="spreadsheet_pick" class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                        {sheet_options}
+                      </select>
+                    </div>
+                    """}
+                    <div>
+                      <label class="block text-sm font-medium text-gray-700 mb-1.5">Spreadsheet URL or ID</label>
+                      <input name="spreadsheet_input" value="{escape(sheet_current_id)}"
+                        placeholder="Paste a Google Sheets URL or spreadsheet ID"
+                        class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                      {f'<p class="text-xs text-emerald-600 mt-1">&#10003; Saved: <span class="font-medium">{escape(sheet_current_id)}</span></p>' if sheet_current_id else '<p class="text-xs text-gray-400 mt-1">No spreadsheet saved yet.</p>'}
+                    </div>
+                    <div>
+                      <label class="block text-sm font-medium text-gray-700 mb-1.5">Sheet tab name</label>
+                      <input name="sheet_name" value="{escape(sheet_name_val)}"
+                        placeholder="Sheet1"
+                        class="w-48 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                      {f'<p class="text-xs text-emerald-600 mt-1">&#10003; Saved: <span class="font-medium">{escape(sheet_name_val)}</span></p>' if sheet_current_id else ""}
+                    </div>
+                  </div>
+                </details>
+
+                <details class="border border-gray-200 rounded-xl overflow-hidden group/cashall">
+                  <summary class="flex items-center justify-between px-4 py-3 bg-gray-50 cursor-pointer list-none select-none hover:bg-gray-100 transition-colors">
+                    <div>
+                      <h3 class="text-sm font-semibold text-gray-900">Cash (All)</h3>
+                      <p class="text-xs text-gray-500">All cash payments in one sheet</p>
+                    </div>
+                    <svg class="w-4 h-4 text-gray-400 transition-transform duration-200 group-open/cashall:rotate-180 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+                    </svg>
+                  </summary>
+                  <div class="px-4 py-4 border-t border-gray-100 space-y-3">
+                    {"" if not spreadsheets else f"""
+                    <div>
+                      <label class="block text-sm font-medium text-gray-700 mb-1.5">Pick from your spreadsheets</label>
+                      <select name="cash_spreadsheet_pick" class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                        {cash_sheet_options}
+                      </select>
+                    </div>
+                    """}
+                    <div>
+                      <label class="block text-sm font-medium text-gray-700 mb-1.5">Spreadsheet URL or ID</label>
+                      <input name="cash_spreadsheet_input" value="{escape(cash_sheet_current_id)}"
+                        placeholder="Paste a Google Sheets URL or spreadsheet ID"
+                        class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                    </div>
+                    <div>
+                      <label class="block text-sm font-medium text-gray-700 mb-1.5">Sheet tab name</label>
+                      <input name="cash_sheet_name" value="{escape(cash_sheet_name_val)}"
+                        placeholder="Cash"
+                        class="w-48 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                      {f'<p class="text-xs text-emerald-600 mt-1">&#10003; Saved: <span class="font-medium">{escape(cash_sheet_current_id)} / {escape(cash_sheet_name_val)}</span></p>' if cash_sheet_current_id else '<p class="text-xs text-gray-400 mt-1">No global cash sheet saved yet.</p>'}
+                    </div>
+                  </div>
+                </details>
 
                 <details class="border border-gray-200 rounded-xl overflow-hidden group/sales" open>
                   <summary class="flex items-center justify-between px-4 py-3 bg-gray-50 cursor-pointer list-none select-none hover:bg-gray-100 transition-colors">
@@ -3157,6 +3216,15 @@ function toggleEnabled() {{
             spreadsheet_id=sales_spreadsheet_id,
             sheet_name=sales_sheet_name,
         )
+        cash_picked = (request.form.get("cash_spreadsheet_pick") or "").strip()
+        cash_entered = (request.form.get("cash_spreadsheet_input") or "").strip()
+        cash_spreadsheet_id = _extract_spreadsheet_id(cash_picked or cash_entered)
+        cash_sheet_name = (request.form.get("cash_sheet_name") or "Cash").strip() or "Cash"
+        set_cash_sheet_target(
+            config.admin_db_file,
+            spreadsheet_id=cash_spreadsheet_id,
+            sheet_name=cash_sheet_name,
+        )
         sales_fields = request.form.getlist("sales_stats_fields")
         valid_sales = [k for k in sales_fields if k in {k for k, _ in SALES_STAT_OPTIONS}]
         if not valid_sales:
@@ -3183,6 +3251,8 @@ function toggleEnabled() {{
             msg += " Calendar routing updated."
         if sales_spreadsheet_id:
             msg += " Sales sheet updated."
+        if cash_spreadsheet_id:
+            msg += " Global cash sheet updated."
         session["save_notice"] = f"success:{msg}"
         trigger_poll()
         return redirect(url_for("index"))

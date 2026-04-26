@@ -170,6 +170,17 @@ def set_cash_log_marker(state: Dict, event_id: str, marker: str) -> Dict:
     return state
 
 
+def get_cash_global_log_marker(state: Dict, event_id: str) -> str | None:
+    return state.get("event_cash_global_log_updates", {}).get(event_id)
+
+
+def set_cash_global_log_marker(state: Dict, event_id: str, marker: str) -> Dict:
+    mapping = state.get("event_cash_global_log_updates", {})
+    mapping[event_id] = marker
+    state["event_cash_global_log_updates"] = mapping
+    return state
+
+
 def prune_state(state: Dict, keep_recent_events: int = 1500) -> Dict:
     """
     Keep state bounded so long-running deployments stay reliable.
@@ -200,6 +211,7 @@ def prune_state(state: Dict, keep_recent_events: int = 1500) -> Dict:
         "event_sheet_log_updates",
         "event_sales_log_updates",
         "event_cash_log_updates",
+        "event_cash_global_log_updates",
     ]
     list_fields = [
         "processed_event_ids",

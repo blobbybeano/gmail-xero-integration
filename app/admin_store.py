@@ -142,6 +142,18 @@ def get_sales_sheet_target(db_path: str) -> dict[str, str]:
     }
 
 
+def get_cash_sheet_target(db_path: str) -> dict[str, str]:
+    target = get_json_setting(
+        db_path,
+        "cash_sheet_target",
+        {"spreadsheet_id": "", "sheet_name": "Cash"},
+    )
+    return {
+        "spreadsheet_id": str(target.get("spreadsheet_id", "")).strip(),
+        "sheet_name": str(target.get("sheet_name", "Cash")).strip() or "Cash",
+    }
+
+
 def set_sales_sheet_target(db_path: str, spreadsheet_id: str, sheet_name: str) -> None:
     set_json_setting(
         db_path,
@@ -149,6 +161,17 @@ def set_sales_sheet_target(db_path: str, spreadsheet_id: str, sheet_name: str) -
         {
             "spreadsheet_id": spreadsheet_id.strip(),
             "sheet_name": sheet_name.strip() or "Sales",
+        },
+    )
+
+
+def set_cash_sheet_target(db_path: str, spreadsheet_id: str, sheet_name: str) -> None:
+    set_json_setting(
+        db_path,
+        "cash_sheet_target",
+        {
+            "spreadsheet_id": spreadsheet_id.strip(),
+            "sheet_name": sheet_name.strip() or "Cash",
         },
     )
 

@@ -12,6 +12,7 @@ from .admin_store import (
     get_calendar_cash_sheets,
     get_calendar_sales_sheets,
     get_active_calendars,
+    get_cash_sheet_target,
     get_enabled,
     get_google_watches,
     get_json_setting,
@@ -72,6 +73,7 @@ from .state import (
     get_invoice_update_marker,
     get_last_sync,
     get_processed_update_marker,
+    get_cash_global_log_marker,
     get_sheet_log_marker,
     get_sales_log_marker,
     is_prefilled,
@@ -90,6 +92,7 @@ from .state import (
     set_invoice_update_marker,
     set_last_sync,
     set_cash_log_marker,
+    set_cash_global_log_marker,
     set_processed_update_marker,
     set_sheet_log_marker,
     set_sales_log_marker,
@@ -622,6 +625,7 @@ def run() -> None:
         submitter_display: str,
         admin_creds,
         stats_fields: list[str],
+        cash_sheet_target: dict[str, str],
         state: dict,
     ) -> dict:
         """
@@ -707,49 +711,79 @@ def run() -> None:
 
         marker = f"{invoice_id}:cash:{spreadsheet_id}:{sheet_name}".upper()
         if get_cash_log_marker(state, event_key) == marker:
-            return state
+            # still attempt global cash sheet routing below
+            pass
 
-        try:
-            ensure_header(
-                admin_creds,
-                spreadsheet_id=spreadsheet_id,
-                sheet_name=sheet_name,
-                stats_fields=cash_stats_fields,
-            )
-            append_stats_row(
-                admin_creds,
-                spreadsheet_id=spreadsheet_id,
-                sheet_name=sheet_name,
-                event_key=event_key,
-                stats_fields=cash_stats_fields,
-                payload=payload,
-                event_id_display=event_id_display,
-            )
-            print(f"Cash sheet row appended for {event_key} -> calendar {calendar_id}", flush=True)
-            _feed.push(f"Cash row logged for {submitter_display or submitter_email}", "success")
-            return set_cash_log_marker(state, event_key, marker)
-        except Exception as exc:
-            print(f"Cash sheet append failed for {event_key}: {exc}", flush=True)
-            backlog = get_cash_backlog(config.admin_db_file)
-            row = {
-                "event_key": event_key,
-                "calendar_id": calendar_id,
-                "submitter_email": submitter_email.lower(),
-                "stats_fields": cash_stats_fields,
-                "payload": payload,
-                "event_id_display": event_id_display,
-                "invoice_id": invoice_id,
-            }
-            replaced = False
-            for idx, existing in enumerate(backlog):
-                if existing.get("event_key") == event_key:
-                    backlog[idx] = row
-                    replaced = True
-                    break
-            if not replaced:
-                backlog.append(row)
-            set_cash_backlog(config.admin_db_file, backlog)
-            return state
+        if get_cash_log_marker(state, event_key) != marker:
+            try:
+                ensure_header(
+                    admin_creds,
+                    spreadsheet_id=spreadsheet_id,
+                    sheet_name=sheet_name,
+                    stats_fields=cash_stats_fields,
+                )
+                append_stats_row(
+                    admin_creds,
+                    spreadsheet_id=spreadsheet_id,
+                    sheet_name=sheet_name,
+                    event_key=event_key,
+                    stats_fields=cash_stats_fields,
+                    payload=payload,
+                    event_id_display=event_id_display,
+                )
+                print(f"Cash sheet row appended for {event_key} -> calendar {calendar_id}", flush=True)
+                _feed.push(f"Cash row logged for {submitter_display or submitter_email}", "success")
+                state = set_cash_log_marker(state, event_key, marker)
+            except Exception as exc:
+                print(f"Cash sheet append failed for {event_key}: {exc}", flush=True)
+                backlog = get_cash_backlog(config.admin_db_file)
+                row = {
+                    "event_key": event_key,
+                    "calendar_id": calendar_id,
+                    "submitter_email": submitter_email.lower(),
+                    "stats_fields": cash_stats_fields,
+                    "payload": payload,
+                    "event_id_display": event_id_display,
+                    "invoice_id": invoice_id,
+                }
+                replaced = False
+                for idx, existing in enumerate(backlog):
+                    if existing.get("event_key") == event_key:
+                        backlog[idx] = row
+                        replaced = True
+                        break
+                if not replaced:
+                    backlog.append(row)
+                set_cash_backlog(config.admin_db_file, backlog)
+                return state
+
+        # Optional global cash sheet (all cash payments irrespective of calendar/person)
+        global_spreadsheet_id = (cash_sheet_target.get("spreadsheet_id") or "").strip()
+        global_sheet_name = (cash_sheet_target.get("sheet_name") or "Cash").strip() or "Cash"
+        if global_spreadsheet_id:
+            global_marker = f"{invoice_id}:cash_global:{global_spreadsheet_id}:{global_sheet_name}".upper()
+            if get_cash_global_log_marker(state, event_key) != global_marker:
+                try:
+                    ensure_header(
+                        admin_creds,
+                        spreadsheet_id=global_spreadsheet_id,
+                        sheet_name=global_sheet_name,
+                        stats_fields=cash_stats_fields,
+                    )
+                    append_stats_row(
+                        admin_creds,
+                        spreadsheet_id=global_spreadsheet_id,
+                        sheet_name=global_sheet_name,
+                        event_key=f"{event_key}:cash-global",
+                        stats_fields=cash_stats_fields,
+                        payload=payload,
+                        event_id_display=event_id_display,
+                    )
+                    state = set_cash_global_log_marker(state, event_key, global_marker)
+                except Exception as exc:
+                    print(f"Global cash sheet append failed for {event_key}: {exc}", flush=True)
+
+        return state
 
     def _flush_cash_backlog(admin_creds) -> None:
         if not admin_creds:
@@ -1063,6 +1097,7 @@ def run() -> None:
         sheet_target = get_sheet_target(config.admin_db_file)
         stats_fields = get_stats_fields(config.admin_db_file)
         sales_sheet_target = get_sales_sheet_target(config.admin_db_file)
+        cash_sheet_target = get_cash_sheet_target(config.admin_db_file)
         sales_stats_fields = get_sales_stats_fields(config.admin_db_file)
         submitter_aliases = get_submitter_aliases(config.admin_db_file)
         sheet_enabled = bool(
@@ -1533,6 +1568,7 @@ def run() -> None:
                                         submitter_display=submitter_display,
                                         admin_creds=admin_creds,
                                         stats_fields=stats_fields,
+                                        cash_sheet_target=cash_sheet_target,
                                         state=state,
                                     )
                                     state = _append_sheet_stats_if_enabled(
@@ -1756,6 +1792,7 @@ def run() -> None:
                                         submitter_display=submitter_display,
                                         admin_creds=admin_creds,
                                         stats_fields=stats_fields,
+                                        cash_sheet_target=cash_sheet_target,
                                         state=state,
                                     )
                                     state = _append_sheet_stats_if_enabled(
@@ -2070,6 +2107,7 @@ def run() -> None:
                                         submitter_display=submitter_display,
                                         admin_creds=admin_creds,
                                         stats_fields=stats_fields,
+                                        cash_sheet_target=cash_sheet_target,
                                         state=state,
                                     )
                                     state = _append_sheet_stats_if_enabled(
