@@ -1540,6 +1540,21 @@ def run() -> None:
                                         state = set_processed_update_marker(state, event_key, event_updated)
                                         continue
 
+                                    # Log sales rows from the original invoice block before
+                                    # we rewrite notes for cash completion.
+                                    state = _append_sales_rows_if_enabled(
+                                        event=event,
+                                        event_key=event_key,
+                                        invoice_id=invoice_id,
+                                        payment_method=pay_mode,
+                                        submitter_email=submitter_email,
+                                        submitter_display=submitter_display,
+                                        admin_creds=admin_creds,
+                                        sales_sheet_target=sales_sheet_target,
+                                        sales_stats_fields=sales_stats_fields,
+                                        state=state,
+                                    )
+
                                     updated_description = upsert_cash_confirmation(
                                         event.get("description") or "",
                                         submitter=submitter_display,
@@ -1580,18 +1595,6 @@ def run() -> None:
                                         admin_creds=admin_creds,
                                         sheet_target=sheet_target,
                                         stats_fields=stats_fields,
-                                        state=state,
-                                    )
-                                    state = _append_sales_rows_if_enabled(
-                                        event=event,
-                                        event_key=event_key,
-                                        invoice_id=invoice_id,
-                                        payment_method=pay_mode,
-                                        submitter_email=submitter_email,
-                                        submitter_display=submitter_display,
-                                        admin_creds=admin_creds,
-                                        sales_sheet_target=sales_sheet_target,
-                                        sales_stats_fields=sales_stats_fields,
                                         state=state,
                                     )
                                     print(f"Cash payment finalised for event {event_id}: draft {invoice_id} deleted")
@@ -2079,6 +2082,21 @@ def run() -> None:
                                         state = set_processed_update_marker(state, event_key, event_updated)
                                         continue
 
+                                    # Log sales rows from the original invoice block before
+                                    # we rewrite notes for cash completion.
+                                    state = _append_sales_rows_if_enabled(
+                                        event=event,
+                                        event_key=event_key,
+                                        invoice_id=invoice_id,
+                                        payment_method=pay_mode,
+                                        submitter_email=submitter_email,
+                                        submitter_display=submitter_display,
+                                        admin_creds=admin_creds,
+                                        sales_sheet_target=sales_sheet_target,
+                                        sales_stats_fields=sales_stats_fields,
+                                        state=state,
+                                    )
+
                                     updated_description = upsert_cash_confirmation(
                                         event.get("description") or "",
                                         submitter=submitter_display,
@@ -2119,18 +2137,6 @@ def run() -> None:
                                         admin_creds=admin_creds,
                                         sheet_target=sheet_target,
                                         stats_fields=stats_fields,
-                                        state=state,
-                                    )
-                                    state = _append_sales_rows_if_enabled(
-                                        event=event,
-                                        event_key=event_key,
-                                        invoice_id=invoice_id,
-                                        payment_method=pay_mode,
-                                        submitter_email=submitter_email,
-                                        submitter_display=submitter_display,
-                                        admin_creds=admin_creds,
-                                        sales_sheet_target=sales_sheet_target,
-                                        sales_stats_fields=sales_stats_fields,
                                         state=state,
                                     )
                                     print(f"Cash payment finalised for event {event.get('id')}: draft {invoice_id} deleted")

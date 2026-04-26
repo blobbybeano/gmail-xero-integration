@@ -366,6 +366,20 @@ def _normalize_entry_layout(text: str) -> str:
     text = re.sub(r"\[invoice\](.*?)\[/invoice\]", _compact_invoice, text, flags=re.I | re.S)
     text = re.sub(r"\[app-status\](.*?)\[/app-status\]", _compact_status, text, flags=re.I | re.S)
 
+    # Never keep multiple blank lines immediately inside compact blocks.
+    text = re.sub(
+        r"(\[(?:contact|app-status)\])\n{2,}",
+        r"\1\n",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"\n{2,}(\[/(?:contact|app-status)\])",
+        r"\n\1",
+        text,
+        flags=re.I,
+    )
+
     # Exactly one blank line before app-status.
     text = re.sub(r"\n*\[app-status\]", r"\n\n[app-status]", text, flags=re.I)
 
