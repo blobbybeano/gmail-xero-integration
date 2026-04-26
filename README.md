@@ -96,6 +96,47 @@ python scripts/test_xero.py
 - When `DONE` is present, it creates/updates a Xero Contact from the customer fields.
 - If an `<invoice>...</invoice>` block is present, it creates a draft invoice from those lines.
 
+## Current Production Flow (Do Not Change)
+- Trigger: event is processed when `Y/N =Y` is present in the notes body.
+- Event title dots:
+  - `🔵` newly formatted template
+  - `🟠` edited/processing
+  - `🟡` invoice sent, pending payment
+  - `🟢` paid/complete
+- Sheet routing rules:
+  - `Master Sheet`: logs non-cash invoice/card flows (cash excluded)
+  - `Cash (All)`: logs every cash payment
+  - `Sales Tracking`: logs sales lines (`⬇sales⬇`) per calendar mapping
+  - `Cash Tracking`: logs cash payments per calendar mapping
+
+### Expected compact calendar format
+```text
+[notes]
+
+[/notes]
+
+[contact]
+Customer name:
+Customer email address:
+Customer contact number:
+[/contact]
+
+[invoice]
+
+⬇sales⬇
+example = £35+VAT
+
+[/invoice]
+
+Y/N =Y
+
+[app-status]
+Invoice total (ex VAT): £35.00
+Invoice total (inc VAT): £42.00
+Entry complete ✅
+[/app-status]
+```
+
 ## Fly.io
 This repo includes:
 - `Dockerfile`

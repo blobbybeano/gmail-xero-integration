@@ -1583,17 +1583,6 @@ def run() -> None:
                                         cash_sheet_target=cash_sheet_target,
                                         state=state,
                                     )
-                                    state = _append_sheet_stats_if_enabled(
-                                        event=event,
-                                        event_key=event_key,
-                                        invoice_id=invoice_id,
-                                        payment_method=pay_mode,
-                                        submitter_display=submitter_display,
-                                        admin_creds=admin_creds,
-                                        sheet_target=sheet_target,
-                                        stats_fields=stats_fields,
-                                        state=state,
-                                    )
                                     state = mark_invoice_sent(state, event_key)
                                     state = set_invoice_for_event(state, event_key, "")
                                     state = set_invoice_update_marker(state, event_key, event_updated)
@@ -2123,17 +2112,6 @@ def run() -> None:
                                         admin_creds=admin_creds,
                                         stats_fields=stats_fields,
                                         cash_sheet_target=cash_sheet_target,
-                                        state=state,
-                                    )
-                                    state = _append_sheet_stats_if_enabled(
-                                        event=event,
-                                        event_key=event_key,
-                                        invoice_id=invoice_id,
-                                        payment_method=pay_mode,
-                                        submitter_display=submitter_display,
-                                        admin_creds=admin_creds,
-                                        sheet_target=sheet_target,
-                                        stats_fields=stats_fields,
                                         state=state,
                                     )
                                     state = mark_invoice_sent(state, event_key)

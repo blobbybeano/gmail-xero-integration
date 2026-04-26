@@ -353,7 +353,8 @@ def _normalize_entry_layout(text: str) -> str:
         inner = m.group(1).strip("\n")
         if not inner.strip():
             return "[invoice]\n\n[/invoice]"
-        inner = re.sub(r"\n{3,}", "\n\n", inner)
+        # Keep invoice body tight (no cascading empty lines).
+        inner = re.sub(r"\n{2,}", "\n", inner)
         return f"[invoice]\n\n{inner}\n\n[/invoice]"
 
     def _compact_status(m: re.Match) -> str:
