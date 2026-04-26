@@ -337,19 +337,37 @@ def _normalize_entry_layout(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = "\n".join(line.rstrip() for line in text.split("\n"))
 
-    # Collapse all blank lines within [contact] and [invoice] blocks.
-    def _compact_block(m: re.Match) -> str:
-        inner = re.sub(r"\n[ \t]*\n+", "\n", m.group(2))
-        return m.group(1) + inner + m.group(3)
+    def _compact_contact(m: re.Match) -> str:
+        inner_lines = [ln.strip() for ln in m.group(1).splitlines() if ln.strip()]
+        inner = "\n".join(inner_lines)
+        return f"[contact]\n{inner}\n[/contact]" if inner else "[contact]\n[/contact]"
 
-    text = re.sub(r"(\[contact\])(.*?)(\[/contact\])", _compact_block, text, flags=re.I | re.S)
-    text = re.sub(r"(\[invoice\])(.*?)(\[/invoice\])", _compact_block, text, flags=re.I | re.S)
+    def _compact_notes(m: re.Match) -> str:
+        inner = m.group(1).strip("\n")
+        if not inner.strip():
+            return "[notes]\n\n[/notes]"
+        inner = re.sub(r"\n{3,}", "\n\n", inner)
+        return f"[notes]\n{inner}\n[/notes]"
 
-    # No blank lines immediately inside contact/invoice tags.
-    text = re.sub(r"(\[contact\])\n+", r"\1\n", text, flags=re.I)
-    text = re.sub(r"\n+(\[/contact\])", r"\n\1", text, flags=re.I)
-    text = re.sub(r"(\[invoice\])\n+", r"\1\n", text, flags=re.I)
-    text = re.sub(r"\n+(\[/invoice\])", r"\n\1", text, flags=re.I)
+    def _compact_invoice(m: re.Match) -> str:
+        inner = m.group(1).strip("\n")
+        if not inner.strip():
+            return "[invoice]\n\n[/invoice]"
+        inner = re.sub(r"\n{3,}", "\n\n", inner)
+        return f"[invoice]\n\n{inner}\n\n[/invoice]"
+
+    def _compact_status(m: re.Match) -> str:
+        inner_lines = [ln.rstrip() for ln in m.group(1).splitlines() if ln.strip()]
+        inner = "\n".join(inner_lines)
+        return f"[app-status]\n{inner}\n[/app-status]" if inner else "[app-status]\n[/app-status]"
+
+    text = re.sub(r"\[notes\](.*?)\[/notes\]", _compact_notes, text, flags=re.I | re.S)
+    text = re.sub(r"\[contact\](.*?)\[/contact\]", _compact_contact, text, flags=re.I | re.S)
+    text = re.sub(r"\[invoice\](.*?)\[/invoice\]", _compact_invoice, text, flags=re.I | re.S)
+    text = re.sub(r"\[app-status\](.*?)\[/app-status\]", _compact_status, text, flags=re.I | re.S)
+
+    # Exactly one blank line before app-status.
+    text = re.sub(r"\n*\[app-status\]", r"\n\n[app-status]", text, flags=re.I)
 
     # Keep exactly one blank line between major blocks.
     text = re.sub(r"\n{3,}", "\n\n", text)
