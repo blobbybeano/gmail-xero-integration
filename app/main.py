@@ -1170,7 +1170,7 @@ def run() -> None:
                                 event_id=event.get("id"),
                                 description=new_description,
                                 label="Prefill",
-                                summary_status="orange",
+                                summary_status="blue",
                                 current_summary=event.get("summary"),
                                 calendar_id=calendar_id,
                             )
@@ -1178,12 +1178,45 @@ def run() -> None:
                                 print(f"Prefilled notes for new event {updated.get('id')}")
                                 event["description"] = updated.get("description", new_description)
                                 event["updated"] = updated.get("updated", event.get("updated"))
+                        # Remember the prefill update marker so we can detect first
+                        # user edit and flip blue -> orange.
+                        state = set_processed_update_marker(
+                            state,
+                            event_key,
+                            event.get("updated") or "",
+                        )
                         state = mark_prefilled(state, event_key)
 
                 # Process any event with DONE/SEND, regardless of when it was created.
                 has_done = done_choice_is_yes(event.get("description"))
                 # Only send when user explicitly answers Y/YES.
                 has_send = send_choice_is_yes(event.get("description"))
+                # If user edited a prefilled entry (before submit), switch title dot
+                # from blue to orange once.
+                if (
+                    event.get("id")
+                    and is_prefilled(state, event_key)
+                    and not has_done
+                    and not has_send
+                ):
+                    prefill_marker = get_processed_update_marker(state, event_key) or ""
+                    event_updated_now = event.get("updated") or ""
+                    if prefill_marker and event_updated_now and event_updated_now != prefill_marker:
+                        updated = safe_update(
+                            event_id=event.get("id"),
+                            description=event.get("description") or "",
+                            label="Status updated",
+                            summary_status="orange",
+                            current_summary=event.get("summary"),
+                            calendar_id=calendar_id,
+                        )
+                        if updated:
+                            event["updated"] = updated.get("updated", event_updated_now)
+                            state = set_processed_update_marker(
+                                state,
+                                event_key,
+                                event["updated"] or event_updated_now,
+                            )
                 if (has_done or has_send) and event.get("id"):
                     event_updated = event.get("updated") or ""
                     normalized_description = normalize_user_sections(
