@@ -3280,6 +3280,11 @@ function toggleEnabled() {{
         sheet_target = get_sheet_target(config.admin_db_file)
         spreadsheet_id = (sheet_target.get("spreadsheet_id") or "").strip()
         sheet_name = (sheet_target.get("sheet_name") or "Sheet1").strip() or "Sheet1"
+        # Needed for invoice-paid webhook sales logging path
+        sales_sheet_target = get_sales_sheet_target(config.admin_db_file)
+        calendar_sales_sheets = get_calendar_sales_sheets(config.admin_db_file)
+        sales_stats_fields = get_sales_stats_fields(config.admin_db_file)
+        submitter_aliases = get_submitter_aliases(config.admin_db_file)
         sheet_updated = 0
         if creds and spreadsheet_id:
             try:

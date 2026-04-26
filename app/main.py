@@ -1236,6 +1236,16 @@ def run() -> None:
                 has_done = done_choice_is_yes(event.get("description"))
                 # Only send when user explicitly answers Y/YES.
                 has_send = send_choice_is_yes(event.get("description"))
+                # Finalised entries (green title) are immutable: do nothing else.
+                # This prevents any follow-up pass from re-touching completed jobs.
+                current_summary = (event.get("summary") or "").strip()
+                if current_summary.startswith("🟢"):
+                    state = set_processed_update_marker(
+                        state,
+                        event_key,
+                        event.get("updated") or "",
+                    )
+                    continue
                 # If user edited a prefilled entry (before submit), switch title dot
                 # from blue to orange once.
                 if (
