@@ -304,7 +304,7 @@ def run() -> None:
             if paid_immediately
             else "N/A",
             "payment_method": payload_payment_method,
-            "paid_status": "Paid" if paid_immediately else "Outstanding",
+            "paid_status": "Paid" if paid_immediately else "Pending",
             "job_cost_ex_vat": _fmt_money(subtotal),
             "job_cost_inc_vat": _fmt_money(total),
         }
@@ -1636,18 +1636,6 @@ def run() -> None:
                                                 stats_fields=stats_fields,
                                                 state=state,
                                             )
-                                            state = _append_sales_rows_if_enabled(
-                                                event=event,
-                                                event_key=event_key,
-                                                invoice_id=invoice_id,
-                                                payment_method=pay_mode,
-                                                submitter_email=submitter_email,
-                                                submitter_display=submitter_display,
-                                                admin_creds=admin_creds,
-                                                sales_sheet_target=sales_sheet_target,
-                                                sales_stats_fields=sales_stats_fields,
-                                                state=state,
-                                            )
                                             state = set_processed_update_marker(state, event_key, event_updated)
                                             continue
                                     emailed = xero_client.email_invoice(invoice_id)
@@ -1675,7 +1663,7 @@ def run() -> None:
                                         if updated:
                                             event["description"] = failed_description
                                             event_updated = updated.get("updated") or event_updated
-                                        if pay_mode in ("card", "invoice"):
+                                        if pay_mode == "card":
                                             state = _append_sheet_stats_if_enabled(
                                                 event=event,
                                                 event_key=event_key,
@@ -1737,18 +1725,19 @@ def run() -> None:
                                     stats_fields=stats_fields,
                                     state=state,
                                 )
-                                state = _append_sales_rows_if_enabled(
-                                    event=event,
-                                    event_key=event_key,
-                                    invoice_id=invoice_id,
-                                    payment_method=pay_mode,
-                                    submitter_email=submitter_email,
-                                    submitter_display=submitter_display,
-                                    admin_creds=admin_creds,
-                                    sales_sheet_target=sales_sheet_target,
-                                    sales_stats_fields=sales_stats_fields,
-                                    state=state,
-                                )
+                                if pay_mode == "card":
+                                    state = _append_sales_rows_if_enabled(
+                                        event=event,
+                                        event_key=event_key,
+                                        invoice_id=invoice_id,
+                                        payment_method=pay_mode,
+                                        submitter_email=submitter_email,
+                                        submitter_display=submitter_display,
+                                        admin_creds=admin_creds,
+                                        sales_sheet_target=sales_sheet_target,
+                                        sales_stats_fields=sales_stats_fields,
+                                        state=state,
+                                    )
                             elif (
                                 has_send
                                 and invoice_lines
@@ -1792,7 +1781,7 @@ def run() -> None:
                                         sales_stats_fields=sales_stats_fields,
                                         state=state,
                                     )
-                                elif pay_mode_retry in ("card", "invoice"):
+                                elif pay_mode_retry == "card":
                                     state = _append_sheet_stats_if_enabled(
                                         event=event,
                                         event_key=event_key,
@@ -2184,18 +2173,6 @@ def run() -> None:
                                                 stats_fields=stats_fields,
                                                 state=state,
                                             )
-                                            state = _append_sales_rows_if_enabled(
-                                                event=event,
-                                                event_key=event_key,
-                                                invoice_id=invoice_id,
-                                                payment_method=pay_mode,
-                                                submitter_email=submitter_email,
-                                                submitter_display=submitter_display,
-                                                admin_creds=admin_creds,
-                                                sales_sheet_target=sales_sheet_target,
-                                                sales_stats_fields=sales_stats_fields,
-                                                state=state,
-                                            )
                                             state = set_processed_update_marker(state, event_key, event_updated)
                                             continue
                                     emailed = xero_client.email_invoice(invoice_id)
@@ -2223,7 +2200,7 @@ def run() -> None:
                                         if updated:
                                             event["description"] = failed_description
                                             event_updated = updated.get("updated") or event_updated
-                                        if pay_mode in ("card", "invoice"):
+                                        if pay_mode == "card":
                                             state = _append_sheet_stats_if_enabled(
                                                 event=event,
                                                 event_key=event_key,
@@ -2285,18 +2262,19 @@ def run() -> None:
                                     stats_fields=stats_fields,
                                     state=state,
                                 )
-                                state = _append_sales_rows_if_enabled(
-                                    event=event,
-                                    event_key=event_key,
-                                    invoice_id=invoice_id,
-                                    payment_method=pay_mode,
-                                    submitter_email=submitter_email,
-                                    submitter_display=submitter_display,
-                                    admin_creds=admin_creds,
-                                    sales_sheet_target=sales_sheet_target,
-                                    sales_stats_fields=sales_stats_fields,
-                                    state=state,
-                                )
+                                if pay_mode == "card":
+                                    state = _append_sales_rows_if_enabled(
+                                        event=event,
+                                        event_key=event_key,
+                                        invoice_id=invoice_id,
+                                        payment_method=pay_mode,
+                                        submitter_email=submitter_email,
+                                        submitter_display=submitter_display,
+                                        admin_creds=admin_creds,
+                                        sales_sheet_target=sales_sheet_target,
+                                        sales_stats_fields=sales_stats_fields,
+                                        state=state,
+                                    )
                             else:
                                 if contact and contact.get("Name"):
                                     print(

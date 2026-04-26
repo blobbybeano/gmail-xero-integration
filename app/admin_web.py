@@ -61,6 +61,8 @@ from .google_calendar import update_event_description
 from .config import AppConfig
 from .xero_client import load_xero_token, save_xero_token, token_is_expired, refresh_xero_token
 from .google_sheets import backfill_submitter_in_sheet, update_invoice_paid_in_sheet
+from .google_sheets import ensure_header, append_stats_row
+from .event_processor import extract_sales_lines, parse_customer_fields, payment_choice
 from .admin_store import (
     get_enabled,
     set_enabled,
@@ -74,7 +76,13 @@ from .admin_store import (
     upsert_xero_tenant,
 )
 from .trigger import trigger_poll, trigger_watch_check
-from .state import load_state, get_last_sync
+from .state import (
+    load_state,
+    save_state,
+    get_last_sync,
+    get_sales_log_marker,
+    set_sales_log_marker,
+)
 from .log_feed import feed as _feed
 
 
@@ -92,11 +100,13 @@ REQUIRED_XERO_SCOPES = (
 
 STAT_OPTIONS = [
     ("submitter", "Person who submitted invoice"),
+    ("customer", "Customer name"),
     ("invoice_number", "Invoice number"),
     ("receipt_details", "Receipt details (when implemented)"),
     ("slot_datetime", "Diary slot date/time"),
     ("payment_datetime", "Payment date/time"),
     ("payment_method", "Payment method"),
+    ("paid_status", "Payment status (Paid/Pending)"),
     ("job_cost_ex_vat", "Job cost (ex VAT)"),
     ("job_cost_inc_vat", "Job cost (inc VAT)"),
 ]
@@ -3380,6 +3390,112 @@ function toggleEnabled() {{
                                     )
                                     print(f"[webhook] Calendar title set to green for {event_key}", flush=True)
                                     _feed.push(f"Calendar updated to paid (green): {inv_number or event_id}", "paid")
+
+                                # Invoice-mode sales logging happens only after payment is actually made.
+                                if payment_choice(ge.get("description")) == "invoice":
+                                    sales_lines = extract_sales_lines(ge.get("description"))
+                                    if sales_lines and sales_stats_fields:
+                                        route = calendar_sales_sheets.get(cal_id) or {}
+                                        sales_spreadsheet_id = (
+                                            str(route.get("spreadsheet_id") or "").strip()
+                                            or str(sales_sheet_target.get("spreadsheet_id") or "").strip()
+                                        )
+                                        sales_sheet_name = (
+                                            str(route.get("sheet_name") or "").strip()
+                                            or str(sales_sheet_target.get("sheet_name") or "Sales").strip()
+                                            or "Sales"
+                                        )
+                                        if sales_spreadsheet_id:
+                                            sales_total_ex = round(
+                                                sum(
+                                                    float(li.get("UnitAmount") or 0.0)
+                                                    * float(li.get("Quantity") or 1.0)
+                                                    for li in sales_lines
+                                                ),
+                                                2,
+                                            )
+                                            sales_total_inc = round(
+                                                sum(
+                                                    (float(li.get("UnitAmount") or 0.0)
+                                                    * float(li.get("Quantity") or 1.0))
+                                                    * (
+                                                        1.2
+                                                        if (li.get("TaxType") or "").upper() == "OUTPUT2"
+                                                        else 1.0
+                                                    )
+                                                    for li in sales_lines
+                                                ),
+                                                2,
+                                            )
+                                            sales_marker = (
+                                                f"{invoice_id}:invoice:sales:{sales_spreadsheet_id}:"
+                                                f"{sales_sheet_name}:{len(sales_lines)}:"
+                                                f"{sales_total_ex:.2f}:{sales_total_inc:.2f}"
+                                            ).upper()
+                                            if get_sales_log_marker(app_state, event_key) != sales_marker:
+                                                start = (ge.get("start", {}) or {}).get("dateTime") or (ge.get("start", {}) or {}).get("date") or ""
+                                                end = (ge.get("end", {}) or {}).get("dateTime") or (ge.get("end", {}) or {}).get("date") or ""
+                                                slot_text = f"{start} – {end}".strip(" –") if start != end else start
+                                                customer_fields = parse_customer_fields(ge.get("description"))
+                                                submitter_email = (
+                                                    ((ge.get("creator", {}) or {}).get("email"))
+                                                    or ((ge.get("organizer", {}) or {}).get("email"))
+                                                    or ""
+                                                ).strip().lower()
+                                                submitter_name = submitter_aliases.get(submitter_email, submitter_email)
+                                                event_id_raw = ge.get("id") or ""
+                                                date_part = start.split("T", 1)[0].replace("-", "") if start else ""
+                                                suffix = event_id_raw[-4:] if event_id_raw else "0000"
+                                                event_id_display = (
+                                                    f"GC-{date_part}-{suffix}" if date_part else (event_id_raw or event_key)
+                                                )
+                                                ensure_header(
+                                                    creds,
+                                                    spreadsheet_id=sales_spreadsheet_id,
+                                                    sheet_name=sales_sheet_name,
+                                                    stats_fields=sales_stats_fields,
+                                                )
+                                                for idx, line in enumerate(sales_lines, start=1):
+                                                    ex_vat = round(
+                                                        float(line.get("UnitAmount") or 0.0)
+                                                        * float(line.get("Quantity") or 1.0),
+                                                        2,
+                                                    )
+                                                    inc_vat = round(
+                                                        ex_vat
+                                                        * (
+                                                            1.2
+                                                            if (line.get("TaxType") or "").upper() == "OUTPUT2"
+                                                            else 1.0
+                                                        ),
+                                                        2,
+                                                    )
+                                                    append_stats_row(
+                                                        creds,
+                                                        spreadsheet_id=sales_spreadsheet_id,
+                                                        sheet_name=sales_sheet_name,
+                                                        event_key=f"{event_key}:sales:{idx}",
+                                                        stats_fields=sales_stats_fields,
+                                                        payload={
+                                                            "submitter": submitter_name,
+                                                            "customer": customer_fields.get("name") or "",
+                                                            "invoice_number": inv_number,
+                                                            "slot_datetime": slot_text,
+                                                            "payment_method": "INVOICE",
+                                                            "sales_item_desc": f"{line.get('Description') or ''} = £{ex_vat:.2f} ex VAT",
+                                                            "sales_item_ex_vat": f"{ex_vat:.2f}",
+                                                            "sales_item_inc_vat": f"{inc_vat:.2f}",
+                                                            "sales_total_ex_vat": f"{sales_total_ex:.2f}",
+                                                        },
+                                                        event_id_display=event_id_display,
+                                                    )
+                                                app_state = set_sales_log_marker(app_state, event_key, sales_marker)
+                                                save_state(config.state_file, app_state)
+                                                print(f"[webhook] Sales rows appended for paid invoice {inv_number}", flush=True)
+                                                _feed.push(
+                                                    f"Sales logged after payment: {inv_number or event_id}",
+                                                    "success",
+                                                )
                         except Exception as exc:
                             print(f"[webhook] Calendar status update failed for {event_key}: {exc}", flush=True)
             except Exception as exc:
