@@ -2972,10 +2972,16 @@ function toggleEnabled() {{
                           placeholder="{"••••••••  (saved)" if xero_wh_key else "Paste the signing key from Xero"}"
                           class="w-full px-3 py-1.5 border border-gray-300 rounded-lg text-xs font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500">
                       </div>
-                      <button type="submit" formaction="/save-xero-webhook-key"
-                        class="px-3 py-1.5 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors">
-                        Save Webhook Key
-                      </button>
+                      <div class="flex flex-wrap gap-2">
+                        <button type="submit" formaction="/save-xero-webhook-key"
+                          class="px-3 py-1.5 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors">
+                          Save Webhook Key
+                        </button>
+                        <button type="submit" formaction="/test-xero-webhook"
+                          class="px-3 py-1.5 text-xs font-medium text-indigo-700 bg-indigo-50 hover:bg-indigo-100 rounded-lg transition-colors">
+                          Test Webhook
+                        </button>
+                      </div>
                     </div>
                   </details>
                 </div>
@@ -3421,7 +3427,17 @@ function toggleEnabled() {{
 
             try:
                 invoice = _fetch_invoice(invoice_id)
-                if invoice and invoice.get("Status") == "PAID":
+                if invoice:
+                    status_raw = str(invoice.get("Status") or "").upper()
+                    try:
+                        amount_due = float(invoice.get("AmountDue") or 0.0)
+                    except Exception:
+                        amount_due = 0.0
+                    # Treat fully settled invoices as paid even if status lags.
+                    is_paid_or_settled = status_raw == "PAID" or amount_due <= 0.0001
+                else:
+                    is_paid_or_settled = False
+                if is_paid_or_settled:
                     inv_number = invoice.get("InvoiceNumber", "")
                     print(f"[webhook] Invoice {inv_number} is PAID — updating sheet + calendar", flush=True)
                     _feed.push(f"Invoice {inv_number} paid — marking sheet row as Paid", "paid")
@@ -3600,6 +3616,69 @@ function toggleEnabled() {{
         set_xero_webhook_key(config.admin_db_file, key)
         set_xero_webhook_verified(config.admin_db_file, False)
         session["save_notice"] = "success:Xero webhook key saved. Now click \"Send intent to receive\" in the Xero Developer portal to verify."
+        return redirect(url_for("index"))
+
+    @app.post("/test-xero-webhook")
+    @require_login
+    def test_xero_webhook():
+        """
+        Manual test for Xero webhook handling from settings page.
+        1) Sends an intent-style ping (events=[]) to verify route/signature path.
+        2) Sends one sample INVOICE event using a known mapped invoice id (if available).
+        """
+        import hmac as _hmac
+        import hashlib as _hashlib
+
+        webhook_key = get_xero_webhook_key(config.admin_db_file)
+        base_url = request.host_url.rstrip("/")  # keep local http for localhost dev
+        webhook_url = f"{base_url}/webhooks/xero"
+
+        def _post_payload(payload: dict) -> requests.Response:
+            raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+            if webhook_key:
+                sig = base64.b64encode(
+                    _hmac.new(webhook_key.encode("utf-8"), raw, _hashlib.sha256).digest()
+                ).decode("utf-8")
+                headers["x-xero-signature"] = sig
+            return requests.post(webhook_url, data=raw, headers=headers, timeout=12)
+
+        try:
+            ping_resp = _post_payload({"events": []})
+            if ping_resp.status_code != 200:
+                session["save_notice"] = (
+                    f"error:Webhook test failed (intent ping HTTP {ping_resp.status_code})."
+                )
+                return redirect(url_for("index"))
+
+            # Optional sample invoice event to exercise paid/settled path.
+            app_state = load_state(config.state_file)
+            inv_map = app_state.get("event_invoice_map", {}) or {}
+            sample_invoice_id = next(
+                (v for v in reversed(list(inv_map.values())) if str(v).strip()),
+                "",
+            )
+            if sample_invoice_id:
+                _post_payload(
+                    {
+                        "events": [
+                            {
+                                "resourceId": sample_invoice_id,
+                                "eventCategory": "INVOICE",
+                                "eventType": "UPDATE",
+                            }
+                        ]
+                    }
+                )
+                session["save_notice"] = (
+                    "success:Xero webhook test passed. Intent ping accepted and sample invoice event submitted."
+                )
+            else:
+                session["save_notice"] = (
+                    "success:Xero webhook test passed. Intent ping accepted."
+                )
+        except Exception as exc:
+            session["save_notice"] = f"error:Xero webhook test failed: {str(exc)[:220]}"
         return redirect(url_for("index"))
 
     return app
