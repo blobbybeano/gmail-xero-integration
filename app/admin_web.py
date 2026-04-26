@@ -201,14 +201,18 @@ def _validate_google_credentials_json(raw: bytes) -> tuple[bool, str]:
 
 
 _xero_acct_cache: "dict[str, tuple[float, list, list, list, str]]" = {}
+_xero_conn_cache: "dict[str, tuple[float, list[dict]]]" = {}
 _XERO_CACHE_TTL = 300  # seconds (5 min)
+_XERO_CONN_CACHE_TTL = 45  # seconds
 
 
 def _get_tenant_acct_themes(at: str, tid: str) -> "tuple[list, list, list, str]":
     """Return (revenue_accounts, bank_accounts, branding_themes) for a Xero tenant.
     Results are cached for _XERO_CACHE_TTL seconds so the settings page doesn't
     make live API calls on every load."""
-    key = f"{at[-12:]}:{tid}" if at else tid
+    # Cache by tenant only (not access token) so the settings page stays fast
+    # across normal token refreshes.
+    key = tid
     cached = _xero_acct_cache.get(key)
     if cached:
         ts, rev, bank, themes, warning = cached
@@ -226,7 +230,7 @@ def _get_tenant_acct_themes(at: str, tid: str) -> "tuple[list, list, list, str]"
         _ar = requests.get(
             "https://api.xero.com/api.xro/2.0/Accounts",
             headers=hdrs,
-            timeout=5,
+            timeout=3,
         )
         if _ar.ok:
             for _a in _ar.json().get("Accounts", []):
@@ -251,7 +255,7 @@ def _get_tenant_acct_themes(at: str, tid: str) -> "tuple[list, list, list, str]"
         _tr = requests.get(
             "https://api.xero.com/api.xro/2.0/BrandingThemes",
             headers=hdrs,
-            timeout=5,
+            timeout=3,
         )
         if _tr.ok:
             themes = sorted(
@@ -268,14 +272,32 @@ def _get_tenant_acct_themes(at: str, tid: str) -> "tuple[list, list, list, str]"
     except Exception:
         warnings.append("Cannot load branding themes (request failed).")
     warning = " ".join(dict.fromkeys([w.strip() for w in warnings if w.strip()]))
+    # If live fetch fails but we have stale cache, use stale data immediately so
+    # Settings remains responsive instead of blocking on repeated API failures.
+    if warning and cached:
+        _, c_rev, c_bank, c_themes, c_warning = cached
+        if c_rev or c_bank or c_themes:
+            _warn = warning
+            if c_warning and c_warning not in _warn:
+                _warn = f"{_warn} Using cached options."
+            return c_rev, c_bank, c_themes, _warn
+
     # Avoid caching empty+failed responses for long periods; this keeps recovery fast
     # after a reconnect/refresh.
     if warning and not (rev or bank or themes):
-        _xero_acct_cache[key] = (time.time(), rev, bank, themes, warning)
-        # force short cache for failed empty responses
+        # short-lived cache for failed empty responses, so UI recovers quickly
         _xero_acct_cache[key] = (time.time() - (_XERO_CACHE_TTL - 20), rev, bank, themes, warning)
     else:
         _xero_acct_cache[key] = (time.time(), rev, bank, themes, warning)
+    return rev, bank, themes, warning
+
+
+def _get_tenant_cached_only(tid: str) -> "tuple[list, list, list, str]":
+    """Return cached tenant options only (never perform network I/O)."""
+    cached = _xero_acct_cache.get(tid)
+    if not cached:
+        return [], [], [], ""
+    _, rev, bank, themes, warning = cached
     return rev, bank, themes, warning
 
 
@@ -449,14 +471,22 @@ def _get_all_xero_connections(access_token: str) -> list[dict]:
     """Return all authorised Xero connections as [{tenantId, tenantName}]."""
     if not access_token:
         return []
+    cache_key = access_token[-24:]
+    cached = _xero_conn_cache.get(cache_key)
+    if cached:
+        ts, rows = cached
+        if time.time() - ts < _XERO_CONN_CACHE_TTL:
+            return rows
     headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
     response = requests.get(XERO_CONNECTIONS_URL, headers=headers, timeout=10)
     response.raise_for_status()
-    return [
+    rows = [
         {"tenantId": c.get("tenantId", ""), "tenantName": c.get("tenantName", c.get("tenantId", ""))}
         for c in response.json()
         if c.get("tenantId")
     ]
+    _xero_conn_cache[cache_key] = (time.time(), rows)
+    return rows
 
 
 def _xero_status_data(config: AppConfig) -> tuple[bool, str, str]:
@@ -2129,7 +2159,17 @@ function toggleEnabled() {{
                     _cfg = _saved_tenants.get(_tid, {})
                     _enabled = _cfg.get("enabled", _tid == xero_tenant)
                     try:
-                        _rev, _bank, _themes, _load_warn = _get_tenant_acct_themes(_at, _tid)
+                        # Keep settings snappy: fetch live options for the active tenant,
+                        # use cached options only for inactive tenants.
+                        if _enabled:
+                            _rev, _bank, _themes, _load_warn = _get_tenant_acct_themes(_at, _tid)
+                        else:
+                            _rev, _bank, _themes, _load_warn = _get_tenant_cached_only(_tid)
+                            if not (_rev or _bank or _themes):
+                                _load_warn = (
+                                    "Options load for the active organisation to keep settings fast. "
+                                    "Set this organisation Active to load its account/theme lists."
+                                )
                     except Exception:
                         _rev, _bank, _themes, _load_warn = [], [], [], "Cannot load Xero account/theme options."
                     if _load_warn:
