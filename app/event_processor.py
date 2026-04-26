@@ -867,7 +867,6 @@ def upsert_send_confirmation(
     STATUS_END = "[/app-status]"
     cleaned = _status_base_lines(description)
     totals = _extract_existing_totals(description)
-    payment = _extract_existing_payment_type(description)
 
     summary_lines: list[str] = []
     summary_lines.append(STATUS_START)
@@ -911,10 +910,9 @@ def upsert_cash_confirmation(
         summary_lines.append(totals[0])
     if totals[1]:
         summary_lines.append(totals[1])
-    if payment:
-        summary_lines.append(payment)
-    summary_lines.append("<b>Cash payment recorded ✅</b>")
-    summary_lines.append("Draft invoice removed from Xero.")
+    summary_lines.append("")
+    summary_lines.append("<b>Entry complete ✅</b>")
+    summary_lines.append("")
     summary_lines.append(STATUS_END)
 
     while cleaned and not cleaned[-1].strip():
