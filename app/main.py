@@ -157,8 +157,18 @@ def run() -> None:
         current_summary: str | None = None,
         calendar_id: str | None = None,
     ):
+        import re
+
         summary = None
         if summary_status:
+            # Never downgrade a paid/green title back to yellow/orange.
+            # This avoids regressions when delayed poll paths run after a paid webhook update.
+            if (
+                summary_status in {"yellow", "orange"}
+                and current_summary
+                and re.match(r"^\s*🟢\b", current_summary)
+            ):
+                summary_status = "green"
             summary = set_title_status_emoji(current_summary, summary_status)
         try:
             return update_event_description(
