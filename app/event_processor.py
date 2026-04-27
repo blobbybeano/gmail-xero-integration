@@ -384,18 +384,29 @@ def _normalize_entry_layout(text: str) -> str:
     # Exactly one blank line before app-status.
     text = re.sub(r"\n*\[app-status\]", r"\n\n[app-status]", text, flags=re.I)
 
-    # Keep exactly one blank line between major blocks.
-    text = re.sub(r"\n{3,}", "\n\n", text)
-
     # Enforce stable section spacing for final diary layout.
     text = re.sub(r"\[/notes\]\n+\[contact\]", "[/notes]\n\n[contact]", text, flags=re.I)
     text = re.sub(r"\[/contact\]\n+\[invoice\]", "[/contact]\n\n[invoice]", text, flags=re.I)
+
+    # Contact block should be tight: no empty lines immediately inside.
+    text = re.sub(r"(?is)\[contact\]\n(?:[ \t]*\n)+", "[contact]\n", text)
+    text = re.sub(r"(?is)\n(?:[ \t]*\n)+\[/contact\]", "\n[/contact]", text)
+
+    # Invoice block should have exactly one blank line after open and before close.
+    text = re.sub(r"(?is)\[invoice\]\n(?:[ \t]*\n)*", "[invoice]\n\n", text)
+    text = re.sub(r"(?is)\n(?:[ \t]*\n)*\[/invoice\]", "\n\n[/invoice]", text)
+
+    # Keep one blank line below [/invoice] before Y/N.
     text = re.sub(r"\[/invoice\]\n+(?=(?:DONE\\s+)?Y\\s*/\\s*N\\s*=)", "[/invoice]\n\n", text, flags=re.I)
+
+    # Keep one blank line below Y/N line before app-status.
     text = re.sub(
         r"(?im)^\\s*(?!SEND\\b)((?:DONE\\s+)?Y\\s*/\\s*N\\s*=\\s*(?:Y|N|YES|NO)?)\\s*$\\n*",
         r"\\1\n\n",
         text,
     )
+
+    # Never keep giant gaps anywhere.
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip() + "\n"
 
