@@ -386,6 +386,17 @@ def _normalize_entry_layout(text: str) -> str:
 
     # Keep exactly one blank line between major blocks.
     text = re.sub(r"\n{3,}", "\n\n", text)
+
+    # Enforce stable section spacing for final diary layout.
+    text = re.sub(r"\[/notes\]\n+\[contact\]", "[/notes]\n\n[contact]", text, flags=re.I)
+    text = re.sub(r"\[/contact\]\n+\[invoice\]", "[/contact]\n\n[invoice]", text, flags=re.I)
+    text = re.sub(r"\[/invoice\]\n+(?=(?:DONE\\s+)?Y\\s*/\\s*N\\s*=)", "[/invoice]\n\n", text, flags=re.I)
+    text = re.sub(
+        r"(?im)^\\s*(?!SEND\\b)((?:DONE\\s+)?Y\\s*/\\s*N\\s*=\\s*(?:Y|N|YES|NO)?)\\s*$\\n*",
+        r"\\1\n\n",
+        text,
+    )
+    text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip() + "\n"
 
 
