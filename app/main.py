@@ -1453,6 +1453,19 @@ def run() -> None:
                                         print(
                                             f"Event {event_id}: skip invoice update, status={status}"
                                         )
+                                        if (status or "").upper() == "PAID":
+                                            if not (event.get("summary") or "").strip().startswith("🟢"):
+                                                updated = safe_update(
+                                                    event_id=event.get("id"),
+                                                    description=event.get("description") or "",
+                                                    label="Invoice paid",
+                                                    summary_status="green",
+                                                    current_summary=event.get("summary"),
+                                                    calendar_id=calendar_id,
+                                                )
+                                                if updated:
+                                                    event_updated = updated.get("updated") or event_updated
+                                            state = mark_invoice_sent(state, event_key)
                                         state = set_invoice_update_marker(
                                             state, event_key, event_updated
                                         )
@@ -1995,6 +2008,19 @@ def run() -> None:
                                             print(
                                                 f"Event {event.get('id')}: skip invoice update, status={status}"
                                             )
+                                            if (status or "").upper() == "PAID":
+                                                if not (event.get("summary") or "").strip().startswith("🟢"):
+                                                    updated = safe_update(
+                                                        event_id=event.get("id"),
+                                                        description=event.get("description") or "",
+                                                        label="Invoice paid",
+                                                        summary_status="green",
+                                                        current_summary=event.get("summary"),
+                                                        calendar_id=calendar_id,
+                                                    )
+                                                    if updated:
+                                                        event_updated = updated.get("updated") or event_updated
+                                                state = mark_invoice_sent(state, event_key)
                                             state = set_invoice_update_marker(
                                                 state, event_key, event_updated
                                             )
