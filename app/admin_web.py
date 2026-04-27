@@ -217,7 +217,7 @@ def _validate_google_credentials_json(raw: bytes) -> tuple[bool, str]:
 _xero_acct_cache: "dict[str, tuple[float, list, list, list, str]]" = {}
 _xero_conn_cache: "dict[str, tuple[float, list[dict]]]" = {}
 _XERO_CACHE_TTL = 300  # seconds (5 min)
-_XERO_CONN_CACHE_TTL = 45  # seconds
+_XERO_CONN_CACHE_TTL = 300  # seconds
 
 
 def _get_tenant_acct_themes(at: str, tid: str) -> "tuple[list, list, list, str]":
@@ -492,7 +492,7 @@ def _get_all_xero_connections(access_token: str) -> list[dict]:
         if time.time() - ts < _XERO_CONN_CACHE_TTL:
             return rows
     headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
-    response = requests.get(XERO_CONNECTIONS_URL, headers=headers, timeout=10)
+    response = requests.get(XERO_CONNECTIONS_URL, headers=headers, timeout=4)
     response.raise_for_status()
     rows = [
         {"tenantId": c.get("tenantId", ""), "tenantName": c.get("tenantName", c.get("tenantId", ""))}
@@ -1728,7 +1728,8 @@ def create_app() -> Flask:
             else ""
         )
 
-        recent_logs = _feed.recent(2000)
+        # Keep dashboard rendering snappy even when the ring buffer is large.
+        recent_logs = _feed.recent(400)
         last_seq_val = recent_logs[-1]["seq"] if recent_logs else 0
 
         # Scan feed for meaningful status signals
@@ -3280,16 +3281,6 @@ function toggleEnabled() {{
         sheet_target = get_sheet_target(config.admin_db_file)
         spreadsheet_id = (sheet_target.get("spreadsheet_id") or "").strip()
         sheet_name = (sheet_target.get("sheet_name") or "Sheet1").strip() or "Sheet1"
-        # Context used by the optional "log sales after INVOICE is paid" path.
-        sales_sheet_target = get_sales_sheet_target(config.admin_db_file)
-        calendar_sales_sheets = get_calendar_sales_sheets(config.admin_db_file)
-        sales_stats_fields = get_sales_stats_fields(config.admin_db_file)
-        submitter_aliases = get_submitter_aliases(config.admin_db_file)
-        # Needed for invoice-paid webhook sales logging path
-        sales_sheet_target = get_sales_sheet_target(config.admin_db_file)
-        calendar_sales_sheets = get_calendar_sales_sheets(config.admin_db_file)
-        sales_stats_fields = get_sales_stats_fields(config.admin_db_file)
-        submitter_aliases = get_submitter_aliases(config.admin_db_file)
         sheet_updated = 0
         if creds and spreadsheet_id:
             try:
@@ -3376,6 +3367,10 @@ function toggleEnabled() {{
 
         creds = load_admin_credentials(config)
         sheet_target = get_sheet_target(config.admin_db_file)
+        sales_sheet_target = get_sales_sheet_target(config.admin_db_file)
+        calendar_sales_sheets = get_calendar_sales_sheets(config.admin_db_file)
+        sales_stats_fields = get_sales_stats_fields(config.admin_db_file)
+        submitter_aliases = get_submitter_aliases(config.admin_db_file)
         spreadsheet_id = (sheet_target.get("spreadsheet_id") or "").strip()
         sheet_name = (sheet_target.get("sheet_name") or "Sheet1").strip() or "Sheet1"
 
