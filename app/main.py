@@ -3,8 +3,10 @@ from __future__ import annotations
 import datetime as dt
 import os
 import time
+from zoneinfo import ZoneInfo
 
 from .admin_store import (
+    DEFAULT_SALES_STATS_FIELDS,
     DEFAULT_STATS_FIELDS,
     add_seen_submitter,
     get_cash_backlog,
@@ -43,6 +45,7 @@ from .event_processor import (
     extract_event_details,
     extract_invoice_lines,
     extract_sales_lines,
+    invoice_has_cash_marker,
     parse_customer_fields,
     parse_event_address,
     parse_event_address_debug,
@@ -62,7 +65,7 @@ from .google_calendar import (
     RateLimitError,
 )
 from .trigger import wait_for_poll, consume_watch_check
-from .google_sheets import append_stats_row, ensure_header
+from .google_sheets import append_stats_row, ensure_header, update_invoice_paid_in_sheet
 from .google_admin import load_admin_credentials
 from .state import (
     get_cash_log_marker,
@@ -99,6 +102,8 @@ from .state import (
 )
 from .xero_client import XeroClient, build_xero_client
 from .log_feed import feed as _feed
+
+LONDON_TZ = ZoneInfo("Europe/London")
 
 
 def run() -> None:
@@ -232,10 +237,12 @@ def run() -> None:
         if raw:
             try:
                 ts = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
-                return ts.astimezone().strftime("%d/%m/%Y %H:%M")
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=dt.timezone.utc)
+                return ts.astimezone(LONDON_TZ).strftime("%d/%m/%Y %H:%M")
             except ValueError:
                 pass
-        return dt.datetime.now().astimezone().strftime("%d/%m/%Y %H:%M")
+        return dt.datetime.now(dt.timezone.utc).astimezone(LONDON_TZ).strftime("%d/%m/%Y %H:%M")
 
     def _append_sheet_stats_if_enabled(
         *,
@@ -261,8 +268,10 @@ def run() -> None:
                 return ""
             try:
                 if "T" in iso_str:
-                    obj = dt.datetime.fromisoformat(iso_str)
-                    return obj.strftime("%d/%m/%Y %H:%M")
+                    obj = dt.datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+                    if obj.tzinfo is None:
+                        obj = obj.replace(tzinfo=dt.timezone.utc)
+                    return obj.astimezone(LONDON_TZ).strftime("%d/%m/%Y %H:%M")
                 else:
                     obj = dt.date.fromisoformat(iso_str)
                     return obj.strftime("%d/%m/%Y")
@@ -313,9 +322,9 @@ def run() -> None:
             "invoice_number": invoice.get("InvoiceNumber") or "",
             "receipt_details": "",
             "slot_datetime": slot_text,
-            "payment_datetime": _fmt_british(dt.datetime.now(dt.timezone.utc).isoformat())
+            "payment_datetime": dt.datetime.now(dt.timezone.utc).astimezone(LONDON_TZ).strftime("%d/%m/%Y %H:%M")
             if paid_immediately
-            else "N/A",
+            else "🔴 N/A",
             "payment_method": payload_payment_method,
             "paid_status": "Paid" if paid_immediately else "Pending",
             "job_cost_ex_vat": _fmt_money(subtotal),
@@ -448,9 +457,15 @@ def run() -> None:
         sales_stats_fields: list[str],
         state: dict,
     ) -> dict:
-        if not admin_creds or not sales_stats_fields:
-            print(f"Sales row skipped for {event_key}: admin_creds={bool(admin_creds)} sales_stats_fields={len(sales_stats_fields) if sales_stats_fields else 0}", flush=True)
+        if not admin_creds:
+            print(
+                f"Sales row skipped for {event_key}: admin_creds={bool(admin_creds)}",
+                flush=True,
+            )
             return state
+        effective_sales_stats_fields = [
+            str(s) for s in (sales_stats_fields or DEFAULT_SALES_STATS_FIELDS)
+        ]
 
         sales_lines = extract_sales_lines(event.get("description"))
         if not sales_lines:
@@ -492,8 +507,10 @@ def run() -> None:
                 return ""
             try:
                 if "T" in iso_str:
-                    obj = dt.datetime.fromisoformat(iso_str)
-                    return obj.strftime("%d/%m/%Y %H:%M")
+                    obj = dt.datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+                    if obj.tzinfo is None:
+                        obj = obj.replace(tzinfo=dt.timezone.utc)
+                    return obj.astimezone(LONDON_TZ).strftime("%d/%m/%Y %H:%M")
                 obj = dt.date.fromisoformat(iso_str)
                 return obj.strftime("%d/%m/%Y")
             except Exception:
@@ -516,10 +533,6 @@ def run() -> None:
                 float(line.get("UnitAmount") or 0.0) * float(line.get("Quantity") or 1.0),
                 2,
             )
-            inc_vat = round(
-                ex_vat * (1.2 if (line.get("TaxType") or "").upper() == "OUTPUT2" else 1.0),
-                2,
-            )
             payload_rows.append(
                 {
                     "event_key": f"{event_key}:sales:{idx}",
@@ -532,9 +545,7 @@ def run() -> None:
                         "invoice_number": invoice_number_display,
                         "slot_datetime": slot_text,
                         "payment_method": payment_method.upper() if payment_method else "",
-                        "sales_item_desc": f"{line.get('Description') or ''} = £{ex_vat:.2f} ex VAT",
-                        "sales_item_ex_vat": f"{ex_vat:.2f}",
-                        "sales_item_inc_vat": f"{inc_vat:.2f}",
+                        "sales_item_desc": f"{line.get('Description') or ''} = £{ex_vat:.2f}",
                         "sales_total_ex_vat": f"{sales_total_ex:.2f}",
                     },
                 }
@@ -547,7 +558,7 @@ def run() -> None:
                 "event_key": event_key,
                 "calendar_id": calendar_id,
                 "submitter_email": submitter_email.lower(),
-                "stats_fields": sales_stats_fields,
+                "stats_fields": effective_sales_stats_fields,
                 "rows": payload_rows,
                 "event_id_display": event_id_display,
                 "invoice_id": invoice_id,
@@ -582,7 +593,7 @@ def run() -> None:
                 admin_creds,
                 spreadsheet_id=spreadsheet_id,
                 sheet_name=sheet_name,
-                stats_fields=sales_stats_fields,
+                stats_fields=effective_sales_stats_fields,
             )
             for row in payload_rows:
                 append_stats_row(
@@ -590,7 +601,7 @@ def run() -> None:
                     spreadsheet_id=spreadsheet_id,
                     sheet_name=sheet_name,
                     event_key=row["event_key"],
-                    stats_fields=sales_stats_fields,
+                    stats_fields=effective_sales_stats_fields,
                     payload=row["payload"],
                     event_id_display=event_id_display,
                 )
@@ -607,7 +618,7 @@ def run() -> None:
                 "event_key": event_key,
                 "calendar_id": calendar_id,
                 "submitter_email": submitter_email.lower(),
-                "stats_fields": sales_stats_fields,
+                "stats_fields": effective_sales_stats_fields,
                 "rows": payload_rows,
                 "event_id_display": event_id_display,
                 "invoice_id": invoice_id,
@@ -646,9 +657,19 @@ def run() -> None:
             print(f"Cash row deferred for {event_key}: Google credentials unavailable")
             return state
 
-        cash_stats_fields = [f for f in stats_fields if f != "paid_status"]
+        cash_stats_fields = [
+            f
+            for f in stats_fields
+            if f not in {"paid_status", "job_cost_ex_vat"}
+        ]
         if not cash_stats_fields:
-            cash_stats_fields = [f for f in DEFAULT_STATS_FIELDS if f != "paid_status"]
+            cash_stats_fields = [
+                f
+                for f in DEFAULT_STATS_FIELDS
+                if f not in {"paid_status", "job_cost_ex_vat"}
+            ]
+        if "job_cost_inc_vat" not in cash_stats_fields:
+            cash_stats_fields.append("job_cost_inc_vat")
 
         calendar_id = (event.get("_calendar_id") or config.google_calendar_id or "").strip()
         cal_mapping = get_calendar_cash_sheets(config.admin_db_file)
@@ -672,10 +693,42 @@ def run() -> None:
                     subtotal = fb_subtotal
                 if total in (None, ""):
                     total = fb_total
+        cash_marker_mode = invoice_has_cash_marker(event.get("description"))
+
+        def _as_float(value):
+            try:
+                return float(value)
+            except Exception:
+                return None
+
+        subtotal_f = _as_float(subtotal)
+        total_f = _as_float(total)
+        if cash_marker_mode:
+            # Explicit *cash* marker means treat invoice amounts as no-VAT.
+            cash_amount = subtotal_f if subtotal_f is not None else total_f
+        else:
+            # Normal cash flow: if VAT exists, use the higher (inc VAT) value.
+            cash_amount = total_f if total_f is not None else subtotal_f
 
         start = (event.get("start", {}) or {}).get("dateTime") or (event.get("start", {}) or {}).get("date") or ""
         end = (event.get("end", {}) or {}).get("dateTime") or (event.get("end", {}) or {}).get("date") or ""
-        slot_text = f"{start} – {end}".strip(" –") if start != end else start
+        def _fmt_british(iso_str: str) -> str:
+            if not iso_str:
+                return ""
+            try:
+                if "T" in iso_str:
+                    obj = dt.datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+                    if obj.tzinfo is None:
+                        obj = obj.replace(tzinfo=dt.timezone.utc)
+                    return obj.astimezone(LONDON_TZ).strftime("%d/%m/%Y %H:%M")
+                obj = dt.date.fromisoformat(iso_str)
+                return obj.strftime("%d/%m/%Y")
+            except Exception:
+                return iso_str
+
+        start_fmt = _fmt_british(start)
+        end_fmt = _fmt_british(end)
+        slot_text = f"{start_fmt} – {end_fmt}".strip(" –") if start_fmt != end_fmt else start_fmt
         customer_fields = parse_customer_fields(event.get("description"))
         payload = {
             "submitter": submitter_display or submitter_email,
@@ -683,10 +736,9 @@ def run() -> None:
             "invoice_number": invoice.get("InvoiceNumber") or "",
             "receipt_details": "",
             "slot_datetime": slot_text,
-            "payment_datetime": dt.datetime.now(dt.timezone.utc).strftime("%d/%m/%Y %H:%M"),
+            "payment_datetime": dt.datetime.now(dt.timezone.utc).astimezone(LONDON_TZ).strftime("%d/%m/%Y %H:%M"),
             "payment_method": "CASH",
-            "job_cost_ex_vat": subtotal if subtotal is not None else "",
-            "job_cost_inc_vat": total if total is not None else "",
+            "job_cost_inc_vat": f"{cash_amount:.2f}" if cash_amount is not None else "",
         }
         event_id_raw = event.get("id") or ""
         date_part = start.split("T", 1)[0].replace("-", "") if start else ""
@@ -1296,12 +1348,25 @@ def run() -> None:
                     # keep retrying until draft creation succeeds.
                     pending_draft = bool(has_done and invoice_lines and not existing_invoice_id)
                     # Skip reprocessing only when unchanged and nothing is pending.
-                    if (
+                    # Normally skip unchanged events. Exception: sent INVOICE-mode
+                    # events must still be rechecked so paid-state can be synced
+                    # (master sheet Paid columns + invoice sales rows + green dot).
+                    skip_unchanged = bool(
                         last_processed_update
                         and event_updated == last_processed_update
                         and not pending_draft
-                    ):
-                        continue
+                    )
+                    if skip_unchanged:
+                        pay_mode_hint = payment_choice(event.get("description")) or ""
+                        needs_invoice_paid_sync = bool(
+                            has_send
+                            and is_invoice_sent(state, event_key)
+                            and pay_mode_hint == "invoice"
+                            and xero_client
+                            and get_invoice_for_event(state, event_key)
+                        )
+                        if not needs_invoice_paid_sync:
+                            continue
                     if has_done and not invoice_lines:
                         print(f"Event {event_id}: no invoice lines found, skipping invoice")
                         _feed.push(f"No job details in \"{event.get('summary', event_id)}\" — awaiting line items", "warn")
@@ -1648,6 +1713,20 @@ def run() -> None:
                                         if updated:
                                             event["description"] = failed_description
                                             event_updated = updated.get("updated") or event_updated
+                                        # Master sheet should still receive pending invoice rows.
+                                        if pay_mode in {"invoice", "card"}:
+                                            state = _append_sheet_stats_if_enabled(
+                                                event=event,
+                                                event_key=event_key,
+                                                invoice_id=invoice_id,
+                                                payment_method=pay_mode,
+                                                paid_override=False,
+                                                submitter_display=submitter_display,
+                                                admin_creds=admin_creds,
+                                                sheet_target=sheet_target,
+                                                stats_fields=stats_fields,
+                                                state=state,
+                                            )
                                         state = set_processed_update_marker(state, event_key, event_updated)
                                         continue
                                     if pay_mode == "card":
@@ -1724,18 +1803,20 @@ def run() -> None:
                                         if updated:
                                             event["description"] = failed_description
                                             event_updated = updated.get("updated") or event_updated
-                                        if pay_mode == "card":
+                                        if pay_mode in {"invoice", "card"}:
                                             state = _append_sheet_stats_if_enabled(
                                                 event=event,
                                                 event_key=event_key,
                                                 invoice_id=invoice_id,
                                                 payment_method=pay_mode,
+                                                paid_override=False if pay_mode == "invoice" else None,
                                                 submitter_display=submitter_display,
                                                 admin_creds=admin_creds,
                                                 sheet_target=sheet_target,
                                                 stats_fields=stats_fields,
                                                 state=state,
                                             )
+                                        if pay_mode == "card":
                                             state = _append_sales_rows_if_enabled(
                                                 event=event,
                                                 event_key=event_key,
@@ -1867,6 +1948,53 @@ def run() -> None:
                                         sales_stats_fields=sales_stats_fields,
                                         state=state,
                                     )
+                                elif pay_mode_retry == "invoice" and invoice_id_retry and xero_client:
+                                    try:
+                                        invoice_data = xero_client.get_invoice(invoice_id_retry)
+                                        status = str(invoice_data.get("Status") or "").upper()
+                                        amount_due = float(invoice_data.get("AmountDue") or 0.0)
+                                        is_paid = status == "PAID" or amount_due <= 0.0001
+                                    except Exception as exc:
+                                        print(f"Event {event_id}: failed to fetch invoice status for retry: {exc}", flush=True)
+                                        is_paid = False
+                                        invoice_data = {}
+                                    if is_paid:
+                                        inv_number = str(invoice_data.get("InvoiceNumber") or "").strip()
+                                        # Update master sheet paid columns as a poll fallback (webhook is primary).
+                                        if admin_creds and sheet_target.get("spreadsheet_id", "").strip() and inv_number:
+                                            try:
+                                                if update_invoice_paid_in_sheet(
+                                                    admin_creds,
+                                                    spreadsheet_id=sheet_target.get("spreadsheet_id", "").strip(),
+                                                    sheet_name=sheet_target.get("sheet_name", "Sheet1").strip() or "Sheet1",
+                                                    invoice_number=inv_number,
+                                                ):
+                                                    print(f"Master sheet marked Paid for {inv_number}", flush=True)
+                                            except Exception as exc:
+                                                print(f"Master sheet paid update failed for {inv_number}: {exc}", flush=True)
+                                        state = _append_sales_rows_if_enabled(
+                                            event=event,
+                                            event_key=event_key,
+                                            invoice_id=invoice_id_retry,
+                                            payment_method=pay_mode_retry,
+                                            submitter_email=submitter_email,
+                                            submitter_display=submitter_display,
+                                            admin_creds=admin_creds,
+                                            sales_sheet_target=sales_sheet_target,
+                                            sales_stats_fields=sales_stats_fields,
+                                            state=state,
+                                        )
+                                        if not (event.get("summary") or "").strip().startswith("🟢"):
+                                            updated = safe_update(
+                                                event_id=event.get("id"),
+                                                description=event.get("description") or "",
+                                                label="Invoice paid",
+                                                summary_status="green",
+                                                current_summary=event.get("summary"),
+                                                calendar_id=calendar_id,
+                                            )
+                                            if updated:
+                                                event_updated = updated.get("updated") or event_updated
                             if existing_contact_id:
                                 state = set_contact_update_marker(
                                     state, event_key, event_updated
@@ -2192,6 +2320,20 @@ def run() -> None:
                                         if updated:
                                             event["description"] = failed_description
                                             event_updated = updated.get("updated") or event_updated
+                                        # Master sheet should still receive pending invoice rows.
+                                        if pay_mode in {"invoice", "card"}:
+                                            state = _append_sheet_stats_if_enabled(
+                                                event=event,
+                                                event_key=event_key,
+                                                invoice_id=invoice_id,
+                                                payment_method=pay_mode,
+                                                paid_override=False,
+                                                submitter_display=submitter_display,
+                                                admin_creds=admin_creds,
+                                                sheet_target=sheet_target,
+                                                stats_fields=stats_fields,
+                                                state=state,
+                                            )
                                         state = set_processed_update_marker(state, event_key, event_updated)
                                         continue
                                     if pay_mode == "card":
@@ -2268,18 +2410,20 @@ def run() -> None:
                                         if updated:
                                             event["description"] = failed_description
                                             event_updated = updated.get("updated") or event_updated
-                                        if pay_mode == "card":
+                                        if pay_mode in {"invoice", "card"}:
                                             state = _append_sheet_stats_if_enabled(
                                                 event=event,
                                                 event_key=event_key,
                                                 invoice_id=invoice_id,
                                                 payment_method=pay_mode,
+                                                paid_override=False if pay_mode == "invoice" else None,
                                                 submitter_display=submitter_display,
                                                 admin_creds=admin_creds,
                                                 sheet_target=sheet_target,
                                                 stats_fields=stats_fields,
                                                 state=state,
                                             )
+                                        if pay_mode == "card":
                                             state = _append_sales_rows_if_enabled(
                                                 event=event,
                                                 event_key=event_key,

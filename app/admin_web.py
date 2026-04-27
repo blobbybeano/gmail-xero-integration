@@ -119,10 +119,8 @@ SALES_STAT_OPTIONS = [
     ("slot_datetime", "Diary slot date/time"),
     ("payment_method", "Payment method"),
     ("invoice_number", "Invoice number"),
-    ("sales_item_desc", "Sales item"),
-    ("sales_item_ex_vat", "Sales value (ex VAT)"),
-    ("sales_item_inc_vat", "Sales value (inc VAT)"),
-    ("sales_total_ex_vat", "Sales total (ex VAT)"),
+    ("sales_item_desc", "Sales item + value"),
+    ("sales_total_ex_vat", "Sales total"),
 ]
 
 _BASE_HTML = """<!DOCTYPE html>
@@ -3485,7 +3483,10 @@ function toggleEnabled() {{
                                 # Invoice-mode sales logging happens only after payment is actually made.
                                 if payment_choice(ge.get("description")) == "invoice":
                                     sales_lines = extract_sales_lines(ge.get("description"))
-                                    if sales_lines and sales_stats_fields:
+                                    effective_sales_stats_fields = [
+                                        str(s) for s in (sales_stats_fields or DEFAULT_SALES_STATS_FIELDS)
+                                    ]
+                                    if sales_lines:
                                         route = calendar_sales_sheets.get(cal_id) or {}
                                         sales_spreadsheet_id = (
                                             str(route.get("spreadsheet_id") or "").strip()
@@ -3524,9 +3525,29 @@ function toggleEnabled() {{
                                                 f"{sales_total_ex:.2f}:{sales_total_inc:.2f}"
                                             ).upper()
                                             if get_sales_log_marker(app_state, event_key) != sales_marker:
+                                                from zoneinfo import ZoneInfo
+
+                                                london_tz = ZoneInfo("Europe/London")
+
+                                                def _fmt_london(iso_str: str) -> str:
+                                                    if not iso_str:
+                                                        return ""
+                                                    try:
+                                                        if "T" in iso_str:
+                                                            obj = dt.datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+                                                            if obj.tzinfo is None:
+                                                                obj = obj.replace(tzinfo=dt.timezone.utc)
+                                                            return obj.astimezone(london_tz).strftime("%d/%m/%Y %H:%M")
+                                                        obj = dt.date.fromisoformat(iso_str)
+                                                        return obj.strftime("%d/%m/%Y")
+                                                    except Exception:
+                                                        return iso_str
+
                                                 start = (ge.get("start", {}) or {}).get("dateTime") or (ge.get("start", {}) or {}).get("date") or ""
                                                 end = (ge.get("end", {}) or {}).get("dateTime") or (ge.get("end", {}) or {}).get("date") or ""
-                                                slot_text = f"{start} – {end}".strip(" –") if start != end else start
+                                                start_fmt = _fmt_london(start)
+                                                end_fmt = _fmt_london(end)
+                                                slot_text = f"{start_fmt} – {end_fmt}".strip(" –") if start_fmt != end_fmt else start_fmt
                                                 customer_fields = parse_customer_fields(ge.get("description"))
                                                 submitter_email = (
                                                     ((ge.get("creator", {}) or {}).get("email"))
@@ -3544,7 +3565,7 @@ function toggleEnabled() {{
                                                     creds,
                                                     spreadsheet_id=sales_spreadsheet_id,
                                                     sheet_name=sales_sheet_name,
-                                                    stats_fields=sales_stats_fields,
+                                                    stats_fields=effective_sales_stats_fields,
                                                 )
                                                 for idx, line in enumerate(sales_lines, start=1):
                                                     ex_vat = round(
@@ -3552,30 +3573,19 @@ function toggleEnabled() {{
                                                         * float(line.get("Quantity") or 1.0),
                                                         2,
                                                     )
-                                                    inc_vat = round(
-                                                        ex_vat
-                                                        * (
-                                                            1.2
-                                                            if (line.get("TaxType") or "").upper() == "OUTPUT2"
-                                                            else 1.0
-                                                        ),
-                                                        2,
-                                                    )
                                                     append_stats_row(
                                                         creds,
                                                         spreadsheet_id=sales_spreadsheet_id,
                                                         sheet_name=sales_sheet_name,
                                                         event_key=f"{event_key}:sales:{idx}",
-                                                        stats_fields=sales_stats_fields,
+                                                        stats_fields=effective_sales_stats_fields,
                                                         payload={
                                                             "submitter": submitter_name,
                                                             "customer": customer_fields.get("name") or "",
                                                             "invoice_number": inv_number,
                                                             "slot_datetime": slot_text,
                                                             "payment_method": "INVOICE",
-                                                            "sales_item_desc": f"{line.get('Description') or ''} = £{ex_vat:.2f} ex VAT",
-                                                            "sales_item_ex_vat": f"{ex_vat:.2f}",
-                                                            "sales_item_inc_vat": f"{inc_vat:.2f}",
+                                                            "sales_item_desc": f"{line.get('Description') or ''} = £{ex_vat:.2f}",
                                                             "sales_total_ex_vat": f"{sales_total_ex:.2f}",
                                                         },
                                                         event_id_display=event_id_display,

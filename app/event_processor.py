@@ -126,12 +126,11 @@ def ensure_notes_template(description: str | None) -> str:
         "⬇Sales⬇\n"
         "\n"
         "[/invoice]\n"
-        "\n"
         "Y/N =\n"
     )
 
     if not description:
-        return template
+        return _normalize_entry_layout(template)
 
     # Ensure notes block exists for freeform job notes that the parser ignores.
     if not _has_notes_block(description):
@@ -140,19 +139,18 @@ def ensure_notes_template(description: str | None) -> str:
 
     # Ensure core customer fields exist; if not, append full template.
     if "Customer name:" not in description or "Customer email address:" not in description:
-        return f"{description.rstrip()}\n\n{template}"
+        return _normalize_entry_layout(f"{description.rstrip()}\n\n{template}")
 
-    # Ensure invoice block exists. If missing, insert before DONE if present.
+    # Ensure invoice block exists. If missing, insert before DONE/Y/N if present.
     if not _has_invoice_block(description):
-        invoice_block = "[invoice]\n⬇Sales⬇\n[/invoice]\n"
-        done_repl = f"{invoice_block}DONE"
+        invoice_block = "[invoice]\n\n⬇Sales⬇\n\n[/invoice]\n"
         lines = description.splitlines()
         for i, line in enumerate(lines):
-            if line.strip().upper() == "DONE":
-                lines[i] = done_repl
-                return _normalize_entry_layout("\n".join(lines))
+            if line.strip().upper() == "DONE" or line.strip().upper().startswith("Y/N"):
+                lines[i] = invoice_block + line.strip()
+                return _set_entry_status_emoji(_normalize_entry_layout("\n".join(lines)), "orange")
         return _set_entry_status_emoji(
-            _normalize_entry_layout(f"{description.rstrip()}\n\n{invoice_block}"),
+            _normalize_entry_layout(f"{description.rstrip()}\n\n{invoice_block}Y/N ="),
             "orange",
         )
 
@@ -180,13 +178,13 @@ def normalize_user_sections(description: str | None) -> str:
             low = line.lower()
             if low.startswith("customer name:"):
                 val = line.split(":", 1)[1].strip() if ":" in line else ""
-                out.append(f"Customer name: {val}")
+                out.append(f"Customer name: {val}".rstrip())
             elif low.startswith("customer email address:") or low.startswith("customer email:"):
                 val = line.split(":", 1)[1].strip() if ":" in line else ""
-                out.append(f"Customer email address: {val}")
+                out.append(f"Customer email address: {val}".rstrip())
             elif low.startswith("customer contact number:"):
                 val = line.split(":", 1)[1].strip() if ":" in line else ""
-                out.append(f"Customer contact number: {val}")
+                out.append(f"Customer contact number: {val}".rstrip())
             else:
                 out.append(raw.rstrip())
         return "\n".join(out)
@@ -295,9 +293,6 @@ def _reconcile_invoice_lines_outside_block(description: str | None) -> str:
     for raw in tail.splitlines(keepends=True):
         line = raw.strip()
         if not line:
-            if not started:
-                consumed += len(raw)
-                continue
             consumed += len(raw)
             continue
         if _is_automation_control_line(line):
@@ -307,6 +302,8 @@ def _reconcile_invoice_lines_outside_block(description: str | None) -> str:
             started = True
             consumed += len(raw)
             continue
+        if started:
+            break
         break
 
     if not moved:
@@ -327,7 +324,13 @@ def _reconcile_invoice_lines_outside_block(description: str | None) -> str:
 
 def _normalize_entry_layout(text: str) -> str:
     """
-    Keep notes/contact/invoice blocks compact and predictable.
+    Keep calendar description neat:
+    - [notes] has one blank line inside if empty
+    - [contact] is tight
+    - [invoice] has one blank line after open and before close
+    - no blank line between [/invoice] and Y/N
+    - one blank line between Y/N and [app-status]
+    - [app-status] is tight
     """
     import re
 
@@ -337,77 +340,55 @@ def _normalize_entry_layout(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = "\n".join(line.rstrip() for line in text.split("\n"))
 
-    def _compact_contact(m: re.Match) -> str:
-        inner_lines = [ln.strip() for ln in m.group(1).splitlines() if ln.strip()]
-        inner = "\n".join(inner_lines)
-        return f"[contact]\n{inner}\n[/contact]" if inner else "[contact]\n[/contact]"
-
-    def _compact_notes(m: re.Match) -> str:
-        inner = m.group(1).strip("\n")
-        if not inner.strip():
+    def compact_notes(m: re.Match) -> str:
+        inner = m.group(1).strip()
+        if not inner:
             return "[notes]\n\n[/notes]"
         inner = re.sub(r"\n{3,}", "\n\n", inner)
         return f"[notes]\n{inner}\n[/notes]"
 
-    def _compact_invoice(m: re.Match) -> str:
-        inner = m.group(1).strip("\n")
-        if not inner.strip():
+    def compact_contact(m: re.Match) -> str:
+        lines = [ln.strip() for ln in m.group(1).splitlines() if ln.strip()]
+        inner = "\n".join(lines)
+        return f"[contact]\n{inner}\n[/contact]" if inner else "[contact]\n[/contact]"
+
+    def compact_invoice(m: re.Match) -> str:
+        inner = m.group(1).strip()
+        if not inner:
             return "[invoice]\n\n[/invoice]"
-        # Keep invoice body tight (no cascading empty lines).
         inner = re.sub(r"\n{2,}", "\n", inner)
         return f"[invoice]\n\n{inner}\n\n[/invoice]"
 
-    def _compact_status(m: re.Match) -> str:
-        inner_lines = [ln.rstrip() for ln in m.group(1).splitlines() if ln.strip()]
-        inner = "\n".join(inner_lines)
+    def compact_status(m: re.Match) -> str:
+        lines = [ln.strip() for ln in m.group(1).splitlines() if ln.strip()]
+        inner = "\n".join(lines)
         return f"[app-status]\n{inner}\n[/app-status]" if inner else "[app-status]\n[/app-status]"
 
-    text = re.sub(r"\[notes\](.*?)\[/notes\]", _compact_notes, text, flags=re.I | re.S)
-    text = re.sub(r"\[contact\](.*?)\[/contact\]", _compact_contact, text, flags=re.I | re.S)
-    text = re.sub(r"\[invoice\](.*?)\[/invoice\]", _compact_invoice, text, flags=re.I | re.S)
-    text = re.sub(r"\[app-status\](.*?)\[/app-status\]", _compact_status, text, flags=re.I | re.S)
+    text = re.sub(r"\[notes\](.*?)\[/notes\]", compact_notes, text, flags=re.I | re.S)
+    text = re.sub(r"\[contact\](.*?)\[/contact\]", compact_contact, text, flags=re.I | re.S)
+    text = re.sub(r"\[invoice\](.*?)\[/invoice\]", compact_invoice, text, flags=re.I | re.S)
+    text = re.sub(r"\[app-status\](.*?)\[/app-status\]", compact_status, text, flags=re.I | re.S)
 
-    # Never keep multiple blank lines immediately inside compact blocks.
+    # Stable spacing between blocks.
+    text = re.sub(r"\[/notes\]\n*\[contact\]", "[/notes]\n\n[contact]", text, flags=re.I)
+    text = re.sub(r"\[/contact\]\n*\[invoice\]", "[/contact]\n\n[invoice]", text, flags=re.I)
+
+    # No blank line between [/invoice] and Y/N.
+    text = re.sub(r"\[/invoice\]\n*(?=(?:DONE\s+)?Y\s*/\s*N\s*=)", "[/invoice]\n", text, flags=re.I)
+
+    # One blank line below Y/N before app-status or anything else.
     text = re.sub(
-        r"(\[(?:contact|app-status)\])\n{2,}",
-        r"\1\n",
-        text,
-        flags=re.I,
-    )
-    text = re.sub(
-        r"\n{2,}(\[/(?:contact|app-status)\])",
-        r"\n\1",
-        text,
-        flags=re.I,
-    )
-
-    # Exactly one blank line before app-status.
-    text = re.sub(r"\n*\[app-status\]", r"\n\n[app-status]", text, flags=re.I)
-
-    # Enforce stable section spacing for final diary layout.
-    text = re.sub(r"\[/notes\]\n+\[contact\]", "[/notes]\n\n[contact]", text, flags=re.I)
-    text = re.sub(r"\[/contact\]\n+\[invoice\]", "[/contact]\n\n[invoice]", text, flags=re.I)
-
-    # Contact block should be tight: no empty lines immediately inside.
-    text = re.sub(r"(?is)\[contact\]\n(?:[ \t]*\n)+", "[contact]\n", text)
-    text = re.sub(r"(?is)\n(?:[ \t]*\n)+\[/contact\]", "\n[/contact]", text)
-
-    # Invoice block should have exactly one blank line after open and before close.
-    text = re.sub(r"(?is)\[invoice\]\n(?:[ \t]*\n)*", "[invoice]\n\n", text)
-    text = re.sub(r"(?is)\n(?:[ \t]*\n)*\[/invoice\]", "\n\n[/invoice]", text)
-
-    # Keep one blank line below [/invoice] before Y/N.
-    text = re.sub(r"\[/invoice\]\n+(?=(?:DONE\\s+)?Y\\s*/\\s*N\\s*=)", "[/invoice]\n\n", text, flags=re.I)
-
-    # Keep one blank line below Y/N line before app-status.
-    text = re.sub(
-        r"(?im)^\\s*(?!SEND\\b)((?:DONE\\s+)?Y\\s*/\\s*N\\s*=\\s*(?:Y|N|YES|NO)?)\\s*$\\n*",
-        r"\\1\n\n",
+        r"(?im)^((?:DONE\s+)?Y\s*/\s*N\s*=\s*(?:Y|N|YES|NO)?)\s*$\n*",
+        r"\1\n\n",
         text,
     )
 
-    # Never keep giant gaps anywhere.
+    # One blank line before app-status, unless it is the first thing in the body.
+    text = re.sub(r"\n*\[app-status\]", "\n\n[app-status]", text, flags=re.I)
+
+    # Prevent giant gaps anywhere.
     text = re.sub(r"\n{3,}", "\n\n", text)
+
     return text.strip() + "\n"
 
 
@@ -606,6 +587,7 @@ def parse_event_address_debug(location: str | None) -> Dict:
         "address": address,
     }
 
+
 def _extract_email(value: str) -> str:
     # Handle cases where Google inserts mailto links or HTML.
     import re
@@ -676,7 +658,6 @@ def validate_customer_fields(fields: Dict) -> Dict[str, str]:
     errors: Dict[str, str] = {}
     name = (fields.get("name") or "").strip()
     email = (fields.get("email") or "").strip()
-    phone = (fields.get("phone") or "").strip()
 
     if not name:
         errors["name"] = "Type a full name"
@@ -684,8 +665,7 @@ def validate_customer_fields(fields: Dict) -> Dict[str, str]:
     if email and not _is_valid_email(email):
         errors["email"] = "Type a valid email"
 
-    # Phone is optional and never blocks or warns (per user request).
-
+    # Phone is optional and never blocks or warns.
     return errors
 
 
@@ -701,23 +681,51 @@ def extract_invoice_lines(description: str | None) -> list[dict]:
     block = _extract_invoice_block(description)
     if not block:
         return []
+    cash_mode = _invoice_block_has_cash_marker(block)
     invoice_part, sales_part = _split_invoice_sales(block)
     combined = "\n".join(
         part for part in (invoice_part, sales_part) if (part or "").strip()
     ).strip()
-    return _parse_line_items(combined)
+    return _parse_line_items(combined, force_no_vat=cash_mode)
 
 
 def extract_sales_lines(description: str | None) -> list[dict]:
     """
     Extract internal sales lines from the [invoice] block section below the
     "⬇Sales⬇" marker.
+
+    Fallback: if a sales marker exists but no lines are below it, parse lines
+    above the marker instead. This handles entries where users accidentally
+    type the sales line before the marker.
     """
     block = _extract_invoice_block(description)
     if not block:
         return []
-    _, sales_part = _split_invoice_sales(block)
-    return _parse_line_items(sales_part)
+    import re
+
+    marker_present = bool(
+        re.search(r"^\s*[⬇↓]?\s*sales\s*[⬇↓]?\s*$", block, flags=re.I | re.M)
+    )
+    if not marker_present:
+        return []
+
+    invoice_part, sales_part = _split_invoice_sales(block)
+    sales_lines = _parse_line_items(sales_part)
+    if sales_lines:
+        return sales_lines
+    return _parse_line_items(invoice_part)
+
+
+def invoice_has_cash_marker(description: str | None) -> bool:
+    """
+    Returns True when [invoice] block contains a dedicated cash marker line,
+    e.g. '*cash*' / 'cash'. This indicates invoice lines should be treated
+    as no-VAT.
+    """
+    block = _extract_invoice_block(description)
+    if not block:
+        return False
+    return _invoice_block_has_cash_marker(block)
 
 
 def _extract_invoice_block(description: str | None) -> str:
@@ -743,8 +751,8 @@ def _extract_invoice_block(description: str | None) -> str:
 def _split_invoice_sales(block: str) -> tuple[str, str]:
     """
     Split invoice block into:
-    - customer-facing invoice lines (before sales marker)
-    - internal sales lines (after sales marker)
+    - customer-facing invoice lines before sales marker
+    - internal sales lines after sales marker
     """
     import re
 
@@ -756,7 +764,19 @@ def _split_invoice_sales(block: str) -> tuple[str, str]:
     return before, after
 
 
-def _parse_line_items(block: str) -> list[dict]:
+def _invoice_block_has_cash_marker(block: str) -> bool:
+    import re
+
+    for raw_line in (block or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if re.fullmatch(r"[\*\s]*cash[\*\s]*", line, flags=re.I):
+            return True
+    return False
+
+
+def _parse_line_items(block: str, *, force_no_vat: bool = False) -> list[dict]:
     import re
 
     if not block:
@@ -766,6 +786,9 @@ def _parse_line_items(block: str) -> list[dict]:
     for raw_line in block.splitlines():
         line = raw_line.strip()
         if not line:
+            continue
+        # Ignore dedicated marker lines.
+        if re.fullmatch(r"[\*\s]*cash[\*\s]*", line, flags=re.I):
             continue
 
         desc = ""
@@ -806,7 +829,7 @@ def _parse_line_items(block: str) -> list[dict]:
             "Quantity": 1,
             "UnitAmount": amount,
         }
-        if vat_flag:
+        if vat_flag and not force_no_vat:
             line_item["TaxType"] = "OUTPUT2"
         lines.append(line_item)
 
@@ -874,13 +897,13 @@ def upsert_invoice_summary(
 
     summary_lines: list[str] = []
     summary_lines.append(STATUS_START)
-    summary_lines.append(f"<b>Invoice total (ex VAT): £{subtotal:.2f}</b>")
-    summary_lines.append(f"<b>Invoice total (inc VAT): £{total:.2f}</b>")
+    summary_lines.append(f"Invoice total (ex VAT): £{subtotal:.2f}")
+    summary_lines.append(f"Invoice total (inc VAT): £{total:.2f}")
     summary_lines.append(f"PAYMENT TYPE (CARD/INVOICE) = {current_payment}")
     if sent:
-        summary_lines.append("<b>Invoice sent ✅</b>")
+        summary_lines.append("Invoice sent ✅")
         if invoice_url:
-            summary_lines.append(f'Invoice link: <a href="{invoice_url}">{invoice_url}</a>')
+            summary_lines.append(f"Invoice link: {invoice_url}")
     elif include_prompt:
         summary_lines.append("SEND Y/N =")
     summary_lines.append(STATUS_END)
@@ -904,6 +927,7 @@ def upsert_send_confirmation(
     STATUS_END = "[/app-status]"
     cleaned = _status_base_lines(description)
     totals = _extract_existing_totals(description)
+    payment = _extract_existing_payment_type(description)
 
     summary_lines: list[str] = []
     summary_lines.append(STATUS_START)
@@ -913,9 +937,9 @@ def upsert_send_confirmation(
         summary_lines.append(totals[1])
     if payment:
         summary_lines.append(payment)
-    summary_lines.append("<b>Invoice sent ✅</b>")
+    summary_lines.append("Invoice sent ✅")
     if invoice_url:
-        summary_lines.append(f'Invoice link: <a href="{invoice_url}">{invoice_url}</a>')
+        summary_lines.append(f"Invoice link: {invoice_url}")
     summary_lines.append(STATUS_END)
 
     # Keep all existing notes/details and append confirmation neatly at the end.
@@ -939,7 +963,6 @@ def upsert_cash_confirmation(
     STATUS_END = "[/app-status]"
     cleaned = _status_base_lines(description)
     totals = _extract_existing_totals(description)
-    payment = _extract_existing_payment_type(description)
 
     summary_lines: list[str] = []
     summary_lines.append(STATUS_START)
@@ -947,9 +970,7 @@ def upsert_cash_confirmation(
         summary_lines.append(totals[0])
     if totals[1]:
         summary_lines.append(totals[1])
-    summary_lines.append("")
-    summary_lines.append("<b>Entry complete ✅</b>")
-    summary_lines.append("")
+    summary_lines.append("Entry complete ✅")
     summary_lines.append(STATUS_END)
 
     while cleaned and not cleaned[-1].strip():
@@ -983,16 +1004,14 @@ def upsert_send_failure(
         summary_lines.append(totals[1])
     if payment:
         summary_lines.append(payment)
-    summary_lines.append("<b>Invoice send failed ❌</b>")
+    summary_lines.append("Invoice send failed ❌")
     if reason:
         summary_lines.append(f"Reason: {reason}")
     if invoice_url:
-        summary_lines.append(f'Invoice link: <a href="{invoice_url}">{invoice_url}</a>')
+        summary_lines.append(f"Invoice link: {invoice_url}")
     else:
         summary_lines.append("Invoice link: unavailable (retry in a moment).")
-    summary_lines.append(
-        "Check customer e-mail, Update if needed then retry below:"
-    )
+    summary_lines.append("Check customer e-mail, Update if needed then retry below:")
     summary_lines.append("SEND Y/N =")
     summary_lines.append(STATUS_END)
     while cleaned and not cleaned[-1].strip():
@@ -1054,10 +1073,6 @@ def _extract_existing_totals(description: str) -> tuple[str, str]:
             ex_line = line
         elif "invoice total (inc vat)" in low:
             inc_line = line
-    if ex_line and not ex_line.lower().startswith("<b>"):
-        ex_line = f"<b>{ex_line}</b>"
-    if inc_line and not inc_line.lower().startswith("<b>"):
-        inc_line = f"<b>{inc_line}</b>"
     return ex_line, inc_line
 
 
@@ -1141,7 +1156,7 @@ def _is_valid_email(value: str) -> bool:
 def _is_valid_phone(value: str) -> bool:
     import re
 
-    digits = re.sub(r"\\D", "", value)
+    digits = re.sub(r"\D", "", value)
     return len(digits) >= 7
 
 
@@ -1149,7 +1164,7 @@ def _normalize_phone(value: str) -> str:
     import re
 
     value = value.strip().strip("'\"")
-    digits = re.sub(r"\\D", "", value)
+    digits = re.sub(r"\D", "", value)
     return digits
 
 

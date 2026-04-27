@@ -26,8 +26,6 @@ DEFAULT_SALES_STATS_FIELDS = [
     "payment_method",
     "invoice_number",
     "sales_item_desc",
-    "sales_item_ex_vat",
-    "sales_item_inc_vat",
     "sales_total_ex_vat",
 ]
 

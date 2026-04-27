@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
+import re
 
 from google.oauth2.credentials import Credentials
 
@@ -19,9 +21,16 @@ STAT_LABELS = {
     "paid_status": "Paid",
     "job_cost_ex_vat": "Job Cost Ex VAT",
     "job_cost_inc_vat": "Job Cost Inc VAT",
+    "sales_item_desc": "Sales Item",
+    "sales_total_ex_vat": "Sales Total",
 }
 
 _FIXED_HEADERS = ["Logged At", "Event ID"]
+LONDON_TZ = ZoneInfo("Europe/London")
+
+
+def _now_london_str() -> str:
+    return datetime.now(timezone.utc).astimezone(LONDON_TZ).strftime("%d/%m/%Y %H:%M")
 
 
 def _col_letter(idx: int) -> str:
@@ -42,6 +51,42 @@ def _sheet_range(sheet_name: str) -> str:
 def _header_range(sheet_name: str) -> str:
     safe = sheet_name.replace("'", "''")
     return f"'{safe}'!A1:Z1"
+
+
+def _sheet_id_by_title(service, spreadsheet_id: str, sheet_title: str) -> int | None:
+    meta = (
+        service.spreadsheets()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            fields="sheets.properties.sheetId,sheets.properties.title",
+        )
+        .execute()
+    )
+    for sheet in (meta.get("sheets") or []):
+        props = sheet.get("properties", {}) or {}
+        title = str(props.get("title") or "")
+        if title == sheet_title:
+            try:
+                return int(props.get("sheetId"))
+            except Exception:
+                return None
+    return None
+
+
+def _extract_row_number_from_updated_range(updated_range: str) -> int | None:
+    """
+    Parse row number from A1 ranges like:
+      'Sheet1'!A12:J12
+    """
+    if not updated_range:
+        return None
+    m = re.search(r"![A-Z]+(\d+)(?::[A-Z]+(\d+))?$", updated_range)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
 
 
 def _resolve_existing_sheet_name(
@@ -178,7 +223,7 @@ def append_stats_row(
         if idx is not None:
             row[idx] = "" if value is None else str(value)
 
-    _set("Logged At", datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M"))
+    _set("Logged At", _now_london_str())
     _set("Event ID", event_id_display or event_key)
 
     # Fill columns based on the configured field list so custom/advanced
@@ -195,7 +240,7 @@ def append_stats_row(
             _set(label, payload[field])
 
     safe = resolved.replace("'", "''")
-    (
+    append_result = (
         service.spreadsheets()
         .values()
         .append(
@@ -207,6 +252,62 @@ def append_stats_row(
         )
         .execute()
     )
+
+    # Make unpaid marker visually clear on master sheet:
+    # when Payment Date/Time is N/A, render it red.
+    payment_col = col_index.get("Payment Date/Time")
+    if payment_col is not None:
+        payment_raw = str(row[payment_col] if payment_col < len(row) else "").strip()
+        payment_norm = payment_raw.upper().replace("🔴", "").strip()
+        if payment_norm == "N/A":
+            updated_range = ((append_result.get("updates") or {}).get("updatedRange") or "")
+            row_num = _extract_row_number_from_updated_range(updated_range)
+            if row_num:
+                col_letter = _col_letter(payment_col)
+                # Keep visible value clean as plain "N/A".
+                (
+                    service.spreadsheets()
+                    .values()
+                    .update(
+                        spreadsheetId=spreadsheet_id,
+                        range=f"'{safe}'!{col_letter}{row_num}",
+                        valueInputOption="USER_ENTERED",
+                        body={"values": [["N/A"]]},
+                    )
+                    .execute()
+                )
+                sheet_id = _sheet_id_by_title(service, spreadsheet_id, resolved)
+                if sheet_id is not None:
+                    service.spreadsheets().batchUpdate(
+                        spreadsheetId=spreadsheet_id,
+                        body={
+                            "requests": [
+                                {
+                                    "repeatCell": {
+                                        "range": {
+                                            "sheetId": sheet_id,
+                                            "startRowIndex": row_num - 1,
+                                            "endRowIndex": row_num,
+                                            "startColumnIndex": payment_col,
+                                            "endColumnIndex": payment_col + 1,
+                                        },
+                                        "cell": {
+                                            "userEnteredFormat": {
+                                                "textFormat": {
+                                                    "foregroundColor": {
+                                                        "red": 0.84,
+                                                        "green": 0.15,
+                                                        "blue": 0.16,
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        "fields": "userEnteredFormat.textFormat.foregroundColor",
+                                    }
+                                }
+                            ]
+                        },
+                    ).execute()
 
 
 def update_invoice_paid_in_sheet(
@@ -250,7 +351,8 @@ def update_invoice_paid_in_sheet(
 
     safe = resolved.replace("'", "''")
     updates = []
-    now_str = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M")
+    payment_dt_rows_to_black: list[int] = []
+    now_str = _now_london_str()
     for row_idx, row in enumerate(rows[1:], start=2):
         cell_val = row[inv_col].strip() if len(row) > inv_col else ""
         if cell_val.upper() == invoice_number.upper():
@@ -267,11 +369,13 @@ def update_invoice_paid_in_sheet(
                 current_paid_dt = (
                     row[paid_dt_col].strip() if len(row) > paid_dt_col else ""
                 )
-                if not current_paid_dt or current_paid_dt.upper() == "N/A":
+                normalized_paid_dt = current_paid_dt.upper().replace("🔴", "").strip()
+                if not current_paid_dt or normalized_paid_dt == "N/A":
                     updates.append({
                         "range": f"'{safe}'!{_col_letter(paid_dt_col)}{row_idx}",
                         "values": [[now_str]],
                     })
+                    payment_dt_rows_to_black.append(row_idx)
 
     if not updates:
         return False
@@ -280,6 +384,43 @@ def update_invoice_paid_in_sheet(
         spreadsheetId=spreadsheet_id,
         body={"valueInputOption": "USER_ENTERED", "data": updates},
     ).execute()
+
+    # If we replaced an unpaid N/A marker, reset text color back to neutral.
+    if paid_dt_col is not None and payment_dt_rows_to_black:
+        sheet_id = _sheet_id_by_title(service, spreadsheet_id, resolved)
+        if sheet_id is not None:
+            requests = []
+            for row_idx in payment_dt_rows_to_black:
+                requests.append(
+                    {
+                        "repeatCell": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "startRowIndex": row_idx - 1,
+                                "endRowIndex": row_idx,
+                                "startColumnIndex": paid_dt_col,
+                                "endColumnIndex": paid_dt_col + 1,
+                            },
+                            "cell": {
+                                "userEnteredFormat": {
+                                    "textFormat": {
+                                        "foregroundColor": {
+                                            "red": 0.0,
+                                            "green": 0.0,
+                                            "blue": 0.0,
+                                        }
+                                    }
+                                }
+                            },
+                            "fields": "userEnteredFormat.textFormat.foregroundColor",
+                        }
+                    }
+                )
+            if requests:
+                service.spreadsheets().batchUpdate(
+                    spreadsheetId=spreadsheet_id,
+                    body={"requests": requests},
+                ).execute()
     return True
 
 
