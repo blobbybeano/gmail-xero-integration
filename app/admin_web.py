@@ -1727,7 +1727,7 @@ def create_app() -> Flask:
         )
 
         # Keep dashboard rendering snappy even when the ring buffer is large.
-        recent_logs = _feed.recent(400)
+        recent_logs = _feed.recent(30)
         last_seq_val = recent_logs[-1]["seq"] if recent_logs else 0
 
         # Scan feed for meaningful status signals
@@ -1821,13 +1821,6 @@ def create_app() -> Flask:
         # On/Off toggle state
         enabled_js = "true" if enabled else "false"
         toggle_label = "Running" if enabled else "Paused"
-        toggle_cls = (
-            "flex items-center gap-2 px-4 py-1.5 rounded-full text-sm font-semibold border transition-all "
-            + ("bg-emerald-900/50 text-emerald-300 border-emerald-600/60 hover:bg-emerald-800/60"
-               if enabled else
-               "bg-neutral-800 text-neutral-400 border-neutral-600 hover:bg-neutral-700")
-        )
-        dot_cls = "w-2 h-2 rounded-full " + ("bg-emerald-400 animate-pulse" if enabled else "bg-neutral-500")
 
         def _render_line(entry):
             ts = dt.datetime.fromtimestamp(entry["ts"], tz=dt.timezone.utc).strftime("%H:%M:%S")
@@ -1899,11 +1892,14 @@ def create_app() -> Flask:
       {google_badge}
       {xero_badge}
       <div class="w-px h-5 bg-neutral-700 mx-1"></div>
-      <!-- On/Off Toggle -->
-      <button id="toggle-btn" onclick="toggleEnabled()" class="{toggle_cls}">
-        <span id="toggle-dot" class="{dot_cls}"></span>
-        <span id="toggle-label">{toggle_label}</span>
-      </button>
+      <!-- On/Off Toggle Switch -->
+      <label for="toggle-switch" class="flex items-center gap-2 px-2 py-1 rounded-lg border border-neutral-700 bg-neutral-800/70">
+        <span id="toggle-label" class="text-xs font-semibold {'text-emerald-300' if enabled else 'text-neutral-400'}">{toggle_label}</span>
+        <input id="toggle-switch" type="checkbox" class="sr-only" {'checked' if enabled else ''} onchange="toggleEnabled(this.checked)">
+        <span id="toggle-track" class="relative inline-flex h-5 w-9 items-center rounded-full transition-colors {'bg-emerald-500' if enabled else 'bg-neutral-600'}">
+          <span id="toggle-knob" class="inline-block h-4 w-4 transform rounded-full bg-white transition-transform {'translate-x-4' if enabled else 'translate-x-1'}"></span>
+        </span>
+      </label>
       <div class="w-px h-5 bg-neutral-700 mx-1"></div>
       <a href="/settings" class="px-3 py-1.5 text-xs font-medium text-neutral-300 hover:text-white bg-neutral-800 hover:bg-neutral-700 rounded-lg border border-neutral-700 transition-colors">
         Settings
@@ -1966,6 +1962,7 @@ const term = document.getElementById('terminal');
 const connDot = document.getElementById('conn-dot');
 const connLabel = document.getElementById('conn-label');
 const scrollBtn = document.getElementById('scroll-btn');
+const MAX_TERM_LINES = 30;
 let autoScroll = true;
 
 function scrollToBottom() {{
@@ -2008,6 +2005,9 @@ function appendLine(entry) {{
     + `<span class="${{col}} shrink-0 select-none">${{pre}}</span>`
     + `<span class="${{col}}">${{escHtml(entry.msg)}}</span>`;
   term.appendChild(div);
+  while (term.children.length > MAX_TERM_LINES) {{
+    term.removeChild(term.firstElementChild);
+  }}
   if (autoScroll) scrollToBottom();
 }}
 
@@ -2037,28 +2037,41 @@ es.onerror = () => {{
 
 // On/Off toggle
 let _enabled = {enabled_js};
-const toggleBtn = document.getElementById('toggle-btn');
-const toggleDot = document.getElementById('toggle-dot');
+const toggleSwitch = document.getElementById('toggle-switch');
+const toggleTrack = document.getElementById('toggle-track');
+const toggleKnob = document.getElementById('toggle-knob');
 const toggleLbl = document.getElementById('toggle-label');
 
 function applyToggleState(on) {{
   _enabled = on;
+  toggleSwitch.checked = !!on;
   toggleLbl.textContent = on ? 'Running' : 'Paused';
   if (on) {{
-    toggleBtn.className = 'flex items-center gap-2 px-4 py-1.5 rounded-full text-sm font-semibold border transition-all bg-emerald-900/50 text-emerald-300 border-emerald-600/60 hover:bg-emerald-800/60';
-    toggleDot.className = 'w-2 h-2 rounded-full bg-emerald-400 animate-pulse';
+    toggleLbl.className = 'text-xs font-semibold text-emerald-300';
+    toggleTrack.className = 'relative inline-flex h-5 w-9 items-center rounded-full transition-colors bg-emerald-500';
+    toggleKnob.className = 'inline-block h-4 w-4 transform rounded-full bg-white transition-transform translate-x-4';
   }} else {{
-    toggleBtn.className = 'flex items-center gap-2 px-4 py-1.5 rounded-full text-sm font-semibold border transition-all bg-neutral-800 text-neutral-400 border-neutral-600 hover:bg-neutral-700';
-    toggleDot.className = 'w-2 h-2 rounded-full bg-neutral-500';
+    toggleLbl.className = 'text-xs font-semibold text-neutral-400';
+    toggleTrack.className = 'relative inline-flex h-5 w-9 items-center rounded-full transition-colors bg-neutral-600';
+    toggleKnob.className = 'inline-block h-4 w-4 transform rounded-full bg-white transition-transform translate-x-1';
   }}
 }}
 
-function toggleEnabled() {{
-  toggleBtn.disabled = true;
+function toggleEnabled(requested) {{
+  toggleSwitch.disabled = true;
+  const previous = _enabled;
+  applyToggleState(!!requested);
   fetch('/toggle-enabled', {{method: 'POST'}})
-    .then(r => r.json())
-    .then(d => {{ applyToggleState(d.enabled); toggleBtn.disabled = false; }})
-    .catch(() => {{ toggleBtn.disabled = false; }});
+    .then(r => {{
+      if (!r.ok) throw new Error('toggle failed');
+      return r.json();
+    }})
+    .then(d => {{ applyToggleState(!!d.enabled); toggleSwitch.disabled = false; }})
+    .catch(() => {{
+      applyToggleState(previous);
+      toggleSwitch.disabled = false;
+      alert('Toggle failed. Please refresh and try again.');
+    }});
 }}
 </script>
 
@@ -2091,8 +2104,15 @@ function toggleEnabled() {{
     @require_login
     def toggle_enabled():
         current = get_enabled(config.admin_db_file)
-        set_enabled(config.admin_db_file, not current)
         new_state = not current
+        set_enabled(config.admin_db_file, new_state)
+        # Wake worker immediately so pause/resume takes effect now, not after
+        # the next poll timeout.
+        trigger_poll()
+        if new_state:
+            _feed.push("System resumed from Live View toggle", "system")
+        else:
+            _feed.push("System paused from Live View toggle", "system")
         import flask as _flask
         return _flask.jsonify({"enabled": new_state})
 

@@ -57,11 +57,11 @@ class LogFeed:
 
 
 def _feed_maxlen() -> int:
-    raw = os.getenv("LIVE_FEED_MAXLEN", "5000").strip()
+    raw = os.getenv("LIVE_FEED_MAXLEN", "30").strip()
     try:
-        return max(500, int(raw))
+        return max(30, int(raw))
     except Exception:
-        return 5000
+        return 30
 
 
 feed = LogFeed(maxlen=_feed_maxlen())

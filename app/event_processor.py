@@ -767,13 +767,10 @@ def _split_invoice_sales(block: str) -> tuple[str, str]:
 def _invoice_block_has_cash_marker(block: str) -> bool:
     import re
 
-    for raw_line in (block or "").splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if re.fullmatch(r"[\*\s]*cash[\*\s]*", line, flags=re.I):
-            return True
-    return False
+    # Recognise marker anywhere inside [invoice], case-insensitive:
+    # examples: "*cash*", "CASH", "payment type: cash"
+    normalized = re.sub(r"[\*]+", " ", block or "")
+    return bool(re.search(r"\bcash\b", normalized, flags=re.I))
 
 
 def _parse_line_items(block: str, *, force_no_vat: bool = False) -> list[dict]:

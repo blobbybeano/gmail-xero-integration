@@ -551,34 +551,38 @@ def run() -> None:
                 }
             )
 
-        if not spreadsheet_id:
-            print(f"Sales row skipped/queued for {event_key}: no sales sheet mapped for calendar '{calendar_id}' (cal_mapping keys={list(cal_mapping.keys())})", flush=True)
+        backlog_row = {
+            "event_key": event_key,
+            "calendar_id": calendar_id,
+            "submitter_email": submitter_email.lower(),
+            "stats_fields": effective_sales_stats_fields,
+            "rows": payload_rows,
+            "event_id_display": event_id_display,
+            "invoice_id": invoice_id,
+            "payment_method": payment_method,
+            "sales_total_ex": sales_total_ex,
+            "sales_total_inc": sales_total_inc,
+        }
+
+        def _upsert_sales_backlog_row() -> None:
             backlog = get_sales_backlog(config.admin_db_file)
-            row = {
-                "event_key": event_key,
-                "calendar_id": calendar_id,
-                "submitter_email": submitter_email.lower(),
-                "stats_fields": effective_sales_stats_fields,
-                "rows": payload_rows,
-                "event_id_display": event_id_display,
-                "invoice_id": invoice_id,
-                "payment_method": payment_method,
-                "sales_total_ex": sales_total_ex,
-                "sales_total_inc": sales_total_inc,
-            }
             replaced = False
             for idx, existing in enumerate(backlog):
                 if existing.get("event_key") == event_key:
-                    backlog[idx] = row
+                    backlog[idx] = backlog_row
                     replaced = True
                     break
             if not replaced:
-                backlog.append(row)
-                print(
-                    f"Sales row queued for {event_key}: no sales sheet mapped for calendar {calendar_id}",
-                    flush=True,
-                )
+                backlog.append(backlog_row)
             set_sales_backlog(config.admin_db_file, backlog)
+
+        if not spreadsheet_id:
+            print(f"Sales row skipped/queued for {event_key}: no sales sheet mapped for calendar '{calendar_id}' (cal_mapping keys={list(cal_mapping.keys())})", flush=True)
+            _upsert_sales_backlog_row()
+            print(
+                f"Sales row queued for {event_key}: no sales sheet mapped for calendar {calendar_id}",
+                flush=True,
+            )
             return state
         print(f"Sales row writing for {event_key}: spreadsheet={spreadsheet_id} sheet={sheet_name} lines={len(sales_lines)}", flush=True)
 
@@ -587,6 +591,10 @@ def run() -> None:
         ).upper()
         if get_sales_log_marker(state, event_key) == marker:
             return state
+
+        # Persist backlog *before* remote write so unexpected restarts/OOM
+        # still replay this sales payload on next cycle.
+        _upsert_sales_backlog_row()
 
         try:
             ensure_header(
@@ -613,28 +621,7 @@ def run() -> None:
             return set_sales_log_marker(state, event_key, marker)
         except Exception as exc:
             print(f"Sales sheet append failed for {event_key}: {exc}")
-            backlog = get_sales_backlog(config.admin_db_file)
-            row = {
-                "event_key": event_key,
-                "calendar_id": calendar_id,
-                "submitter_email": submitter_email.lower(),
-                "stats_fields": effective_sales_stats_fields,
-                "rows": payload_rows,
-                "event_id_display": event_id_display,
-                "invoice_id": invoice_id,
-                "payment_method": payment_method,
-                "sales_total_ex": sales_total_ex,
-                "sales_total_inc": sales_total_inc,
-            }
-            replaced = False
-            for idx, existing in enumerate(backlog):
-                if existing.get("event_key") == event_key:
-                    backlog[idx] = row
-                    replaced = True
-                    break
-            if not replaced:
-                backlog.append(row)
-            set_sales_backlog(config.admin_db_file, backlog)
+            _upsert_sales_backlog_row()
             return state
 
     def _append_cash_row_or_backlog(
@@ -657,19 +644,19 @@ def run() -> None:
             print(f"Cash row deferred for {event_key}: Google credentials unavailable")
             return state
 
-        cash_stats_fields = [
-            f
-            for f in stats_fields
-            if f not in {"paid_status", "job_cost_ex_vat"}
-        ]
-        if not cash_stats_fields:
-            cash_stats_fields = [
-                f
-                for f in DEFAULT_STATS_FIELDS
-                if f not in {"paid_status", "job_cost_ex_vat"}
-            ]
-        if "job_cost_inc_vat" not in cash_stats_fields:
-            cash_stats_fields.append("job_cost_inc_vat")
+        def _normalize_cash_stats_fields(raw_fields: list[str]) -> list[str]:
+            normalized: list[str] = []
+            for field in raw_fields:
+                key = str(field).strip()
+                if not key or key in {"paid_status", "job_cost_ex_vat", "job_cost_inc_vat"}:
+                    continue
+                if key not in normalized:
+                    normalized.append(key)
+            if "job_cost" not in normalized:
+                normalized.append("job_cost")
+            return normalized
+
+        cash_stats_fields = _normalize_cash_stats_fields(stats_fields or DEFAULT_STATS_FIELDS)
 
         calendar_id = (event.get("_calendar_id") or config.google_calendar_id or "").strip()
         cal_mapping = get_calendar_cash_sheets(config.admin_db_file)
@@ -738,7 +725,7 @@ def run() -> None:
             "slot_datetime": slot_text,
             "payment_datetime": dt.datetime.now(dt.timezone.utc).astimezone(LONDON_TZ).strftime("%d/%m/%Y %H:%M"),
             "payment_method": "CASH",
-            "job_cost_inc_vat": f"{cash_amount:.2f}" if cash_amount is not None else "",
+            "job_cost": f"{cash_amount:.2f}" if cash_amount is not None else "",
         }
         event_id_raw = event.get("id") or ""
         date_part = start.split("T", 1)[0].replace("-", "") if start else ""
@@ -864,7 +851,22 @@ def run() -> None:
                 remaining.append(row)
                 continue
             stats = row.get("stats_fields") or []
+            normalized_stats: list[str] = []
+            for field in stats:
+                key = str(field).strip()
+                if not key or key in {"paid_status", "job_cost_ex_vat", "job_cost_inc_vat"}:
+                    continue
+                if key not in normalized_stats:
+                    normalized_stats.append(key)
+            if "job_cost" not in normalized_stats:
+                normalized_stats.append("job_cost")
             payload = row.get("payload") or {}
+            if isinstance(payload, dict):
+                if "job_cost" not in payload:
+                    old = payload.get("job_cost_inc_vat")
+                    if old in (None, ""):
+                        old = payload.get("job_cost_ex_vat", "")
+                    payload["job_cost"] = old
             event_key = str(row.get("event_key", "")).strip()
             event_id_display = str(row.get("event_id_display", "")).strip()
             if not event_key or not isinstance(payload, dict):
@@ -874,14 +876,14 @@ def run() -> None:
                     admin_creds,
                     spreadsheet_id=spreadsheet_id,
                     sheet_name=sheet_name,
-                    stats_fields=[str(s) for s in stats] or [f for f in DEFAULT_STATS_FIELDS if f != "paid_status"],
+                    stats_fields=normalized_stats,
                 )
                 append_stats_row(
                     admin_creds,
                     spreadsheet_id=spreadsheet_id,
                     sheet_name=sheet_name,
                     event_key=event_key,
-                    stats_fields=[str(s) for s in stats] or [f for f in DEFAULT_STATS_FIELDS if f != "paid_status"],
+                    stats_fields=normalized_stats,
                     payload=payload,
                     event_id_display=event_id_display,
                 )

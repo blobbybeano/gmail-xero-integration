@@ -21,6 +21,7 @@ STAT_LABELS = {
     "paid_status": "Paid",
     "job_cost_ex_vat": "Job Cost Ex VAT",
     "job_cost_inc_vat": "Job Cost Inc VAT",
+    "job_cost": "Job Cost",
     "sales_item_desc": "Sales Item",
     "sales_total_ex_vat": "Sales Total",
 }

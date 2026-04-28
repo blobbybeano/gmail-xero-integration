@@ -29,6 +29,16 @@ DEFAULT_SALES_STATS_FIELDS = [
     "sales_total_ex_vat",
 ]
 
+_ALLOWED_SALES_STATS_FIELDS = {
+    "submitter",
+    "customer",
+    "slot_datetime",
+    "payment_method",
+    "invoice_number",
+    "sales_item_desc",
+    "sales_total_ex_vat",
+}
+
 
 def _clean_email(value: str) -> str:
     return (value or "").strip().lower()
@@ -178,11 +188,23 @@ def get_sales_stats_fields(db_path: str) -> list[str]:
     value = get_json_setting(db_path, "sales_stats_fields", DEFAULT_SALES_STATS_FIELDS)
     if not value:
         return []
-    return [str(v) for v in value]
+    cleaned: list[str] = []
+    for v in value:
+        key = str(v)
+        if key in _ALLOWED_SALES_STATS_FIELDS and key not in cleaned:
+            cleaned.append(key)
+    return cleaned
 
 
 def set_sales_stats_fields(db_path: str, fields: list[str]) -> None:
-    set_json_setting(db_path, "sales_stats_fields", fields)
+    cleaned: list[str] = []
+    for field in fields:
+        key = str(field)
+        if key in _ALLOWED_SALES_STATS_FIELDS and key not in cleaned:
+            cleaned.append(key)
+    if not cleaned:
+        cleaned = list(DEFAULT_SALES_STATS_FIELDS)
+    set_json_setting(db_path, "sales_stats_fields", cleaned)
 
 
 def get_submitter_aliases(db_path: str) -> dict[str, str]:
