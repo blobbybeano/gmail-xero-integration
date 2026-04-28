@@ -831,22 +831,36 @@ def _xero_tenant_cards(
             '</div>'
         )
 
-    def _find_name(accounts, code):
+    def _account_value(account: dict, *, allow_id_fallback: bool = False) -> str:
+        code = str(account.get("Code") or "").strip()
+        if code:
+            return code
+        if allow_id_fallback:
+            aid = str(account.get("AccountID") or "").strip()
+            if aid:
+                return f"id:{aid}"
+        return ""
+
+    def _find_name(accounts, saved_value, *, allow_id_fallback: bool = False):
         for a in accounts:
-            if a.get("Code", "") == code:
-                return a.get("Name", code)
+            if _account_value(a, allow_id_fallback=allow_id_fallback) == str(saved_value or "").strip():
+                return a.get("Name", saved_value)
         return None
 
-    def _opts(accounts, saved):
+    def _opts(accounts, saved, *, allow_id_fallback: bool = False):
         out = '<option value="">— select account —</option>'
         found_saved = False
         for a in sorted(accounts, key=lambda x: x.get("Name", "")):
-            code = escape(a.get("Code", ""))
+            raw_value = _account_value(a, allow_id_fallback=allow_id_fallback)
+            if not raw_value:
+                continue
+            code = escape(raw_value)
             name = escape(a.get("Name", ""))
-            sel = ' selected' if a.get("Code", "") == saved else ""
+            code_display = escape(str(a.get("Code") or "").strip() or "no-code")
+            sel = ' selected' if raw_value == saved else ""
             if sel:
                 found_saved = True
-            out += f'<option value="{code}"{sel}>{name} ({code})</option>'
+            out += f'<option value="{code}"{sel}>{name} ({code_display})</option>'
         if saved and not found_saved:
             out += f'<option value="{escape(saved)}" selected>Saved account ({escape(saved)})</option>'
         return out
@@ -860,11 +874,11 @@ def _xero_tenant_cards(
             out += f'<option value="{tid_val}"{sel}>{tname_val}</option>'
         return out
 
-    def _saved_badge(accounts, code):
-        if not code:
+    def _saved_badge(accounts, saved_value, *, allow_id_fallback: bool = False):
+        if not saved_value:
             return '<p class="text-xs text-gray-400 mt-1">No account saved yet.</p>'
-        name = _find_name(accounts, code)
-        label = escape(f"{name} ({code})") if name else escape(code)
+        name = _find_name(accounts, saved_value, allow_id_fallback=allow_id_fallback)
+        label = escape(f"{name} ({saved_value})") if name else escape(saved_value)
         return f'<p class="text-xs text-emerald-600 mt-1">&#10003; Saved: <span class="font-medium">{label}</span></p>'
 
     def _theme_saved_badge(themes, theme_id):
@@ -912,9 +926,9 @@ def _xero_tenant_cards(
         border_cls = "border-emerald-200" if enabled else "border-gray-200"
 
         rev_opts = _opts(rev_accounts, saved_inv)
-        bank_opts = _opts(bank_accounts, saved_pay)
+        bank_opts = _opts(bank_accounts, saved_pay, allow_id_fallback=True)
         rev_badge = _saved_badge(rev_accounts, saved_inv)
-        bank_badge = _saved_badge(bank_accounts, saved_pay)
+        bank_badge = _saved_badge(bank_accounts, saved_pay, allow_id_fallback=True)
 
         _input_cls = "w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300"
         _manual_note = '<p class="text-xs text-amber-600 mt-1">Account list unavailable — enter the Xero account code directly (e.g. 200).</p>'

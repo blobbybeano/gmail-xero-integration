@@ -348,12 +348,24 @@ class XeroClient:
                 "Xero payment account is not configured for the active organisation. "
                 "Set 'Payment bank account' in Xero Organisations settings."
             )
+        account_ref: Dict[str, str]
+        account_value = str(account_code or "").strip()
+        if account_value.lower().startswith("id:"):
+            account_ref = {"AccountID": account_value[3:].strip()}
+        elif (
+            len(account_value) == 36
+            and account_value.count("-") == 4
+        ):
+            # Backward-compatible support if an AccountID was saved directly.
+            account_ref = {"AccountID": account_value}
+        else:
+            account_ref = {"Code": account_value}
         payment_date = when or dt.date.today().isoformat()
         payload = {
             "Payments": [
                 {
                     "Invoice": {"InvoiceID": invoice_id},
-                    "Account": {"Code": account_code},
+                    "Account": account_ref,
                     "Date": payment_date,
                     "Amount": float(amount),
                 }
