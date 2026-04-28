@@ -7,26 +7,26 @@ from typing import Any
 
 
 DEFAULT_STATS_FIELDS = [
-    "submitter",
+    "slot_datetime",
     "customer",
     "invoice_number",
-    "receipt_details",
-    "slot_datetime",
-    "payment_datetime",
     "payment_method",
+    "receipt_details",
     "paid_status",
+    "payment_datetime",
     "job_cost_ex_vat",
     "job_cost_inc_vat",
+    "submitter",
 ]
 
 DEFAULT_SALES_STATS_FIELDS = [
-    "submitter",
-    "customer",
     "slot_datetime",
-    "payment_method",
+    "customer",
     "invoice_number",
+    "payment_method",
     "sales_item_desc",
     "sales_total_ex_vat",
+    "submitter",
 ]
 
 _ALLOWED_SALES_STATS_FIELDS = {
