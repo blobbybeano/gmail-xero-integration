@@ -435,7 +435,7 @@ def _set_entry_status_emoji(description: str, status: str) -> str:
     return _normalize_entry_layout(body) if body.strip() else ""
 
 
-def set_title_status_emoji(summary: str | None, status: str) -> str:
+def set_title_status_emoji(summary: str | None, status: str, draft: bool = False) -> str:
     """
     Prefix the diary title with the requested status emoji.
     blue   = event created/formatted (no invoice yet)
@@ -453,11 +453,13 @@ def set_title_status_emoji(summary: str | None, status: str) -> str:
     }
     emoji = status_map.get((status or "").lower())
     base = _strip_title_prefix_markers(summary)
+    draft_emoji = "📝" if draft and (status or "").lower() == "yellow" else ""
     if not emoji:
         return base
+    prefix = " ".join([part for part in (emoji, draft_emoji) if part])
     if base:
-        return f"{emoji} {base}"
-    return emoji
+        return f"{prefix} {base}"
+    return prefix
 
 
 def set_title_mail_emoji(summary: str | None, email_send_failed: bool) -> str:
@@ -467,11 +469,14 @@ def set_title_mail_emoji(summary: str | None, email_send_failed: bool) -> str:
     """
     base = _strip_title_prefix_markers(summary)
     status_emoji = _extract_title_status_emoji(summary)
+    draft_emoji = _extract_title_draft_emoji(summary)
     mail_emoji = "✉️" if email_send_failed else ""
 
     parts: list[str] = []
     if status_emoji:
         parts.append(status_emoji)
+    if draft_emoji:
+        parts.append(draft_emoji)
     if mail_emoji:
         parts.append(mail_emoji)
     if base:
@@ -487,9 +492,24 @@ def _extract_title_status_emoji(summary: str | None) -> str:
     return ""
 
 
+def _extract_title_draft_emoji(summary: str | None) -> str:
+    text = (summary or "").strip()
+    status = _extract_title_status_emoji(text)
+    if status and text.startswith(status):
+        text = text[len(status):].lstrip(" -")
+    for em in ("📝",):
+        if text.startswith(em):
+            return em
+    return ""
+
+
 def _strip_title_prefix_markers(summary: str | None) -> str:
     text = (summary or "").strip()
     for em in ("🔵", "🟠", "🟡", "🟢", "🔴"):
+        if text.startswith(em):
+            text = text[len(em):].lstrip(" -")
+            break
+    for em in ("📝",):
         if text.startswith(em):
             text = text[len(em):].lstrip(" -")
             break

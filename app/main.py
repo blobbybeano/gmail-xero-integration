@@ -177,7 +177,18 @@ def run() -> None:
                 and re.match(r"^\s*🟢\b", current_summary)
             ):
                 summary_status = "green"
-            summary = set_title_status_emoji(current_summary, summary_status)
+            desc_lower = (description or "").lower()
+            is_draft_yellow = (
+                summary_status == "yellow"
+                and ("invoice sent ✅".lower() not in desc_lower)
+                and ("invoice send failed ❌".lower() not in desc_lower)
+                and ("entry complete ✅".lower() not in desc_lower)
+            )
+            summary = set_title_status_emoji(
+                current_summary,
+                summary_status,
+                draft=is_draft_yellow,
+            )
             mail_failed = "invoice send failed" in (description or "").lower()
             summary = set_title_mail_emoji(summary, mail_failed)
         try:
