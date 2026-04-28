@@ -60,6 +60,7 @@ from .event_processor import (
     validate_customer_fields,
 )
 from .google_calendar import (
+    build_calendar_service,
     list_recent_events,
     update_event_description,
     register_calendar_watch,
@@ -248,9 +249,58 @@ def run() -> None:
                 pass
         return dt.datetime.now(dt.timezone.utc).astimezone(LONDON_TZ).strftime("%d/%m/%Y %H:%M")
 
+    _calendar_name_cache: dict[str, str] = {}
+    _calendar_name_cache_ts: float = 0.0
+
+    def _refresh_calendar_name_cache(active_calendar_ids: list[str]) -> None:
+        nonlocal _calendar_name_cache, _calendar_name_cache_ts
+        now_ts = time.time()
+        # Refresh at most every 10 minutes.
+        if _calendar_name_cache and (now_ts - _calendar_name_cache_ts) < 600:
+            return
+        try:
+            service = build_calendar_service(config)
+        except Exception:
+            return
+        mapping: dict[str, str] = {}
+        page_token = None
+        try:
+            while True:
+                resp = (
+                    service.calendarList()
+                    .list(pageToken=page_token, maxResults=250)
+                    .execute()
+                )
+                for item in resp.get("items", []) or []:
+                    cid = str(item.get("id") or "").strip()
+                    if not cid:
+                        continue
+                    label = str(
+                        item.get("summaryOverride")
+                        or item.get("summary")
+                        or item.get("id")
+                        or ""
+                    ).strip()
+                    if label:
+                        mapping[cid] = label
+                page_token = resp.get("nextPageToken")
+                if not page_token:
+                    break
+        except Exception:
+            # Keep old cache on transient API failures.
+            if _calendar_name_cache:
+                return
+        for cid in active_calendar_ids:
+            mapping.setdefault(cid, cid)
+        _calendar_name_cache = mapping
+        _calendar_name_cache_ts = now_ts
+
     def _diary_entry_name(event: dict) -> str:
         import re
 
+        cal_id = str(event.get("_calendar_id") or "").strip()
+        if cal_id and cal_id in _calendar_name_cache:
+            return _calendar_name_cache[cal_id]
         organizer = (event.get("organizer") or {})
         calendar_name = str(organizer.get("displayName") or "").strip()
         if calendar_name:
@@ -1122,6 +1172,7 @@ def run() -> None:
         active_calendars = get_active_calendars(
             config.admin_db_file, config.google_calendar_id
         )
+        _refresh_calendar_name_cache(active_calendars)
 
         # Auto-manage Google Calendar watches — run at most once per hour,
         # or immediately when calendar settings change (triggered by the settings page).

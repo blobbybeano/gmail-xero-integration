@@ -222,6 +222,7 @@ class XeroClient:
     def get_online_invoice_url(self, invoice_id: str) -> str | None:
         """
         Return the public Online Invoice URL if available.
+        Do not fall back to internal portal URLs that may require Xero login.
         """
         url = f"{self.base_url}/Invoices/{invoice_id}/OnlineInvoice"
         response = self._request("GET", url)
@@ -229,7 +230,12 @@ class XeroClient:
             return None
         data = response.json()
         online = data.get("OnlineInvoices", [{}])[0]
-        return online.get("OnlineInvoiceUrl") or online.get("Url")
+        public_url = str(online.get("OnlineInvoiceUrl") or "").strip()
+        if not public_url:
+            return None
+        if public_url.startswith("http://") or public_url.startswith("https://"):
+            return public_url
+        return None
 
     def get_invoice(self, invoice_id: str) -> Dict:
         url = f"{self.base_url}/Invoices/{invoice_id}"
