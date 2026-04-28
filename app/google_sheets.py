@@ -203,6 +203,7 @@ def append_stats_row(
     stats_fields: list[str],
     payload: dict[str, Any],
     event_id_display: str = "",
+    dedupe_signature: dict[str, Any] | None = None,
 ) -> None:
     """
     Append a data row to the sheet, placing each value under its correct column
@@ -240,6 +241,32 @@ def append_stats_row(
     for field, label in STAT_LABELS.items():
         if field in payload and field not in stats_fields:
             _set(label, payload[field])
+
+    # Optional idempotency guard: if a row already exists with the same
+    # signature columns, skip append to prevent duplicate submissions.
+    if dedupe_signature:
+        safe = resolved.replace("'", "''")
+        existing_values = (
+            service.spreadsheets()
+            .values()
+            .get(spreadsheetId=spreadsheet_id, range=f"'{safe}'!A:Z")
+            .execute()
+            .get("values", [])
+        )
+        if existing_values:
+            for existing_row in existing_values[1:]:
+                matched = True
+                for label, expected in dedupe_signature.items():
+                    idx = col_index.get(label)
+                    if idx is None:
+                        matched = False
+                        break
+                    actual_val = existing_row[idx] if idx < len(existing_row) else ""
+                    if str(actual_val).strip() != str(expected).strip():
+                        matched = False
+                        break
+                if matched:
+                    return
 
     safe = resolved.replace("'", "''")
     append_result = (

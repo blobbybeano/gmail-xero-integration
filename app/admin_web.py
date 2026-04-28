@@ -3598,6 +3598,7 @@ function toggleEnabled(requested) {{
                                                         * float(line.get("Quantity") or 1.0),
                                                         2,
                                                     )
+                                                    sales_row_event_id = f"{event_id_display}-S{idx}"
                                                     append_stats_row(
                                                         creds,
                                                         spreadsheet_id=sales_spreadsheet_id,
@@ -3613,7 +3614,8 @@ function toggleEnabled(requested) {{
                                                             "sales_item_desc": f"{line.get('Description') or ''} = £{ex_vat:.2f}",
                                                             "sales_total_ex_vat": f"{sales_total_ex:.2f}",
                                                         },
-                                                        event_id_display=event_id_display,
+                                                        event_id_display=sales_row_event_id,
+                                                        dedupe_signature={"Event ID": sales_row_event_id},
                                                     )
                                                 app_state = set_sales_log_marker(app_state, event_key, sales_marker)
                                                 save_state(config.state_file, app_state)

@@ -670,9 +670,11 @@ def run() -> None:
                 float(line.get("UnitAmount") or 0.0) * float(line.get("Quantity") or 1.0),
                 2,
             )
+            sales_row_event_id = f"{event_id_display}-S{idx}"
             payload_rows.append(
                 {
                     "event_key": f"{event_key}:sales:{idx}",
+                    "event_id_display": sales_row_event_id,
                     "payload": {
                         "submitter": submitter_display
                         or (event.get("creator", {}) or {}).get("email")
@@ -748,7 +750,10 @@ def run() -> None:
                     event_key=row["event_key"],
                     stats_fields=effective_sales_stats_fields,
                     payload=row["payload"],
-                    event_id_display=event_id_display,
+                    event_id_display=str(row.get("event_id_display") or event_id_display),
+                    dedupe_signature={
+                        "Event ID": str(row.get("event_id_display") or event_id_display),
+                    },
                 )
             print(f"Sales rows appended for {event_key}: {len(sales_lines)} item(s)")
             _feed.push(f"Sales logged ({len(sales_lines)} item(s)) for \"{event.get('summary', event_key)}\"", "success")
@@ -1076,6 +1081,7 @@ def run() -> None:
                         continue
                     event_key_row = str(item.get("event_key", "")).strip()
                     payload = item.get("payload") or {}
+                    row_event_id_display = str(item.get("event_id_display") or event_id_display)
                     if not event_key_row or not isinstance(payload, dict):
                         continue
                     append_stats_row(
@@ -1085,7 +1091,8 @@ def run() -> None:
                         event_key=event_key_row,
                         stats_fields=[str(s) for s in stats] or DEFAULT_SALES_STATS_FIELDS,
                         payload=payload,
-                        event_id_display=event_id_display,
+                        event_id_display=row_event_id_display,
+                        dedupe_signature={"Event ID": row_event_id_display},
                     )
                 print(
                     f"Sales backlog flushed for calendar {calendar_id}: {row.get('event_key', '')}",
