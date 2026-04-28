@@ -545,6 +545,15 @@ def run() -> None:
             print(f"Sales row skipped for {event_key}: no sales lines parsed from description", flush=True)
             return state
 
+        # Exclude "Materials" lines from the sales sheet (Xero invoice is unaffected).
+        sales_lines = [
+            li for li in sales_lines
+            if "material" not in (li.get("Description") or "").lower()
+        ]
+        if not sales_lines:
+            print(f"Sales row skipped for {event_key}: only materials lines, nothing to write", flush=True)
+            return state
+
         calendar_id = (event.get("_calendar_id") or config.google_calendar_id or "").strip()
         cal_mapping = get_calendar_sales_sheets(config.admin_db_file)
         route = cal_mapping.get(calendar_id) or {}
