@@ -52,13 +52,24 @@ def send_choice_is_yes(description: str | None) -> bool:
     import re
 
     text = _normalize_description(description)
-    text = _strip_bracket_blocks(text).lower()
-    # Accept tolerant variants:
-    # SEND Y/N =Y
-    # SEND Y/N = Y
-    # SEND =Y
-    # SEND YES
-    return bool(re.search(r"\bsend\b[^\n]*?(?:=|:)?\s*(y|yes)\b", text, re.I))
+    text = _strip_bracket_blocks(text)
+    # Accept tolerant variants, but only when SEND is explicitly answered Y/YES.
+    # Avoid false positives from placeholder lines like "SEND Y/N =".
+    # Valid examples:
+    #   SEND Y/N =Y
+    #   SEND Y/N = YES
+    #   SEND =Y
+    #   SEND: YES
+    #   SEND YES
+    for raw in text.splitlines():
+        line = raw.strip().lower()
+        if not line.startswith("send"):
+            continue
+        if re.fullmatch(r"send\s*(?:y\s*/\s*n)?\s*(?:=|:)\s*(y|yes)\s*", line):
+            return True
+        if re.fullmatch(r"send\s+(y|yes)\s*", line):
+            return True
+    return False
 
 
 def payment_choice(description: str | None) -> str:
