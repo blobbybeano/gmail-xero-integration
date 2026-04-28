@@ -47,14 +47,15 @@ from .event_processor import (
     extract_sales_lines,
     invoice_has_cash_marker,
     parse_customer_fields,
+    parse_invoice_contact_overrides,
     parse_event_address,
-    parse_event_address_debug,
     payment_choice,
     upsert_send_failure,
     upsert_invoice_summary,
     upsert_cash_confirmation,
     upsert_send_confirmation,
     set_title_status_emoji,
+    set_title_mail_emoji,
     validate_customer_fields,
 )
 from .google_calendar import (
@@ -175,6 +176,8 @@ def run() -> None:
             ):
                 summary_status = "green"
             summary = set_title_status_emoji(current_summary, summary_status)
+            mail_failed = "invoice send failed" in (description or "").lower()
+            summary = set_title_mail_emoji(summary, mail_failed)
         try:
             return update_event_description(
                 config=config,
@@ -243,6 +246,75 @@ def run() -> None:
             except ValueError:
                 pass
         return dt.datetime.now(dt.timezone.utc).astimezone(LONDON_TZ).strftime("%d/%m/%Y %H:%M")
+
+    def _diary_entry_name(summary: str | None) -> str:
+        import re
+
+        text = (summary or "").strip()
+        text = re.sub(r"^\s*[🔵🟠🟡🟢🔴]\s*", "", text)
+        text = re.sub(r"^\s*✉️?\s*", "", text)
+        return text.strip()
+
+    def _invoice_address_from_overrides(overrides: dict, fallback: dict | None) -> dict:
+        addr1 = str(overrides.get("invoice_address_line_1", "") or "").strip()
+        addr2 = str(overrides.get("invoice_address_line_2", "") or "").strip()
+        city = str(overrides.get("invoice_city", "") or "").strip()
+        postcode = str(overrides.get("invoice_postcode", "") or "").strip()
+        country = str(overrides.get("invoice_country", "") or "").strip()
+        if not any([addr1, addr2, city, postcode, country]):
+            return fallback or {}
+        out = {
+            "AddressType": "POBOX",
+            "AddressLine1": addr1 or (fallback or {}).get("AddressLine1", ""),
+        }
+        if addr2:
+            out["AddressLine2"] = addr2
+        if city:
+            out["City"] = city
+        if postcode:
+            out["PostalCode"] = postcode
+        if country:
+            out["Country"] = country
+        return out
+
+    def _resolve_invoice_contact(
+        *,
+        event: dict,
+        customer: dict,
+        location: str | None,
+    ) -> tuple[dict | None, dict, str, str | None]:
+        """
+        Returns: (contact, address_payload, contact_name_for_logs, error_code)
+        error_code:
+          - 'PROFILE_NOT_FOUND' when Invoice profile is set but no match exists.
+          - None on success / non-blocking no-op.
+        """
+        overrides = parse_invoice_contact_overrides(event.get("description"))
+        fallback_address = parse_event_address(location)
+        address_payload = _invoice_address_from_overrides(overrides, fallback_address)
+        invoice_name = str(overrides.get("invoice_name", "") or "").strip() or str(customer.get("name", "") or "").strip()
+        invoice_profile = str(overrides.get("invoice_profile", "") or "").strip()
+
+        if not xero_client:
+            return None, address_payload, invoice_name or invoice_profile or "", None
+
+        if invoice_profile:
+            matched = xero_client.find_contact_by_name(invoice_profile)
+            if not matched or not matched.get("ContactID"):
+                return None, address_payload, invoice_name or invoice_profile, "PROFILE_NOT_FOUND"
+            return matched, address_payload, str(matched.get("Name") or invoice_profile), None
+
+        if not invoice_name:
+            return None, address_payload, "", None
+
+        contact_result = xero_client.ensure_contact(
+            name=invoice_name,
+            email=customer.get("email", ""),
+            phone=customer.get("phone", ""),
+            address=address_payload if address_payload else None,
+        )
+        contact = contact_result.get("contact")
+        return contact, address_payload, invoice_name, None
 
     def _append_sheet_stats_if_enabled(
         *,
@@ -314,6 +386,7 @@ def run() -> None:
         paid_immediately = paid_override if paid_override is not None else (payment_method.lower() in {"card", "cash"})
         payload_payment_method = payment_method.upper() if payment_method else "N/A"
         payload = {
+            "diary_entry_name": _diary_entry_name(event.get("summary")),
             "submitter": submitter_display
             or (event.get("creator", {}) or {}).get("email")
             or (event.get("organizer", {}) or {}).get("email")
@@ -718,6 +791,7 @@ def run() -> None:
         slot_text = f"{start_fmt} – {end_fmt}".strip(" –") if start_fmt != end_fmt else start_fmt
         customer_fields = parse_customer_fields(event.get("description"))
         payload = {
+            "diary_entry_name": _diary_entry_name(event.get("summary")),
             "submitter": submitter_display or submitter_email,
             "customer": customer_fields.get("name") or "",
             "invoice_number": invoice.get("InvoiceNumber") or "",
@@ -1205,6 +1279,44 @@ def run() -> None:
                 print(f"Sales sheet header setup failed: {exc}")
                 sales_sheet_enabled = False
 
+        # Integration health used to mark titles red when processing is blocked.
+        integration_issues: list[str] = []
+        if not xero_client:
+            integration_issues.append("xero_disconnected")
+        if not admin_creds:
+            integration_issues.append("google_disconnected")
+        if calendar_fetch_failed:
+            integration_issues.append("calendar_read_failed")
+        if sheet_target.get("spreadsheet_id", "").strip() and not sheet_enabled:
+            integration_issues.append("master_sheet_disconnected")
+        if sales_sheet_target.get("spreadsheet_id", "").strip() and not sales_sheet_enabled:
+            integration_issues.append("sales_sheet_disconnected")
+        if active_calendars:
+            watches = get_google_watches(config.admin_db_file)
+            now_ms = int(now.timestamp() * 1000)
+            base_url = _webhook_base_url().rstrip("/")
+            expected_webhook_url = f"{base_url}/webhooks/google-calendar" if base_url else ""
+            if not expected_webhook_url:
+                integration_issues.append("webhook_base_url_missing")
+            else:
+                bad_watch = False
+                for cal_id in active_calendars:
+                    winfo = watches.get(cal_id) or {}
+                    exp_ms = int(winfo.get("expiration_ms") or 0)
+                    if (
+                        not winfo.get("channel_id")
+                        or not winfo.get("resource_id")
+                        or exp_ms <= now_ms
+                    ):
+                        bad_watch = True
+                        break
+                    saved_url = str(winfo.get("webhook_url") or "").strip()
+                    if saved_url and saved_url != expected_webhook_url:
+                        bad_watch = True
+                        break
+                if bad_watch:
+                    integration_issues.append("google_webhook_not_attached")
+
         state = _flush_sheet_backlog(admin_creds, sheet_target, state)
         _flush_cash_backlog(admin_creds)
         _flush_sales_backlog(admin_creds)
@@ -1300,6 +1412,29 @@ def run() -> None:
                         event.get("updated") or "",
                     )
                     continue
+                # If integrations are down, mark actionable entries red so staff can
+                # immediately see they need intervention before retrying.
+                if integration_issues and (has_done or has_send):
+                    if not current_summary.startswith("🔴"):
+                        updated = safe_update(
+                            event_id=event.get("id"),
+                            description=event.get("description") or "",
+                            label="Integration issue",
+                            summary_status="red",
+                            current_summary=event.get("summary"),
+                            calendar_id=calendar_id,
+                        )
+                        if updated:
+                            event["updated"] = updated.get("updated", event.get("updated"))
+                    print(
+                        f"Event {event_id}: blocked due to integration issues: {', '.join(integration_issues)}",
+                        flush=True,
+                    )
+                    _feed.push(
+                        f"Blocked \"{event.get('summary', event_id)}\": {', '.join(integration_issues)}",
+                        "error",
+                    )
+                    continue
                 # If user edited a prefilled entry (before submit), switch title dot
                 # from blue to orange once.
                 if (
@@ -1381,19 +1516,40 @@ def run() -> None:
                         # If the event was processed before but has no contact recorded, retry contact creation.
                         if not existing_contact_id and xero_client and has_done:
                             customer = parse_customer_fields(event.get("description"))
-                            address = parse_event_address(event.get("location"))
+                            overrides = parse_invoice_contact_overrides(event.get("description"))
+                            profile_mode = bool((overrides.get("invoice_profile") or "").strip())
+                            address = _invoice_address_from_overrides(
+                                overrides,
+                                parse_event_address(event.get("location")),
+                            )
                             errors = validate_customer_fields(customer)
                             blocking_errors = {
                                 k: v for k, v in errors.items() if k != "phone"
                             }
-                            if not blocking_errors and customer.get("name"):
-                                contact_result = xero_client.ensure_contact(
-                                    name=customer.get("name", ""),
-                                    email=customer.get("email", ""),
-                                    phone=customer.get("phone", ""),
-                                    address=address if address else None,
+                            if profile_mode:
+                                blocking_errors = {}
+                            invoice_name_for_fp = (overrides.get("invoice_name") or customer.get("name") or "").strip()
+                            if not blocking_errors and (customer.get("name") or profile_mode or invoice_name_for_fp):
+                                contact, _resolved_address, resolved_name, resolve_err = _resolve_invoice_contact(
+                                    event=event,
+                                    customer=customer,
+                                    location=event.get("location"),
                                 )
-                                contact = contact_result.get("contact")
+                                if resolve_err == "PROFILE_NOT_FOUND":
+                                    safe_update(
+                                        event_id=event.get("id"),
+                                        description=event.get("description") or "",
+                                        label="Invoice profile missing",
+                                        summary_status="blue",
+                                        current_summary=event.get("summary"),
+                                        calendar_id=calendar_id,
+                                    )
+                                    _feed.push(
+                                        f"Invoice profile not found for \"{event.get('summary', event_id)}\"",
+                                        "warn",
+                                    )
+                                    state = set_processed_update_marker(state, event_key, event_updated)
+                                    continue
                                 if contact and contact.get("ContactID"):
                                     existing_contact_id = contact.get("ContactID")
                                     state = set_contact_for_event(
@@ -1402,13 +1558,13 @@ def run() -> None:
                                     state = set_contact_fingerprint(
                                         state,
                                         event_key,
-                                        f"{customer.get('name','')}|{customer.get('email','')}|{customer.get('phone','')}|{address or {}}",
+                                        f"{resolved_name}|{customer.get('email','')}|{customer.get('phone','')}|{address or {}}",
                                     )
                                     print(
                                         f"Contact processed for event {event['id']}: {existing_contact_id}"
                                     )
                                     _feed.push(
-                                        f"Customer saved to Xero: {customer.get('name', '')}",
+                                        f"Customer saved to Xero: {resolved_name or customer.get('name', '')}",
                                         "success",
                                     )
                                 else:
@@ -1418,14 +1574,21 @@ def run() -> None:
                         if existing_contact_id and xero_client:
                             if event_updated and event_updated != last_contact_update:
                                 customer = parse_customer_fields(event.get("description"))
-                                address = parse_event_address(event.get("location"))
+                                overrides = parse_invoice_contact_overrides(event.get("description"))
+                                profile_mode = bool((overrides.get("invoice_profile") or "").strip())
+                                address = _invoice_address_from_overrides(
+                                    overrides,
+                                    parse_event_address(event.get("location")),
+                                )
                                 errors = validate_customer_fields(customer)
                                 blocking_errors = {
                                     k: v for k, v in errors.items() if k != "phone"
                                 }
-                                if not blocking_errors:
+                                if profile_mode:
+                                    blocking_errors = {}
+                                if not blocking_errors and not profile_mode:
                                     fingerprint = (
-                                        f"{customer.get('name','')}"
+                                        f"{(overrides.get('invoice_name') or customer.get('name') or '').strip()}"
                                         f"|{customer.get('email','')}"
                                         f"|{customer.get('phone','')}"
                                         f"|{address or {}}"
@@ -2011,10 +2174,16 @@ def run() -> None:
                         details = extract_event_details(event)
                         _feed.push(f"DONE event detected: \"{event.get('summary', event_id)}\"", "event")
                         customer = parse_customer_fields(event.get("description"))
-                        address_debug = parse_event_address_debug(event.get("location"))
-                        address = address_debug.get("address")
+                        overrides = parse_invoice_contact_overrides(event.get("description"))
+                        profile_mode = bool((overrides.get("invoice_profile") or "").strip())
+                        address = _invoice_address_from_overrides(
+                            overrides,
+                            parse_event_address(event.get("location")),
+                        )
                         errors = validate_customer_fields(customer)
                         blocking_errors = {k: v for k, v in errors.items() if k != "phone"}
+                        if profile_mode:
+                            blocking_errors = {}
                         if errors:
                             hinted = apply_validation_hints(
                                 event.get("description") or "", errors
@@ -2040,31 +2209,33 @@ def run() -> None:
                             print(details)
                         else:
                             contact = None
-                            if customer.get("name"):
-                                contact_result = xero_client.ensure_contact(
-                                    name=customer.get("name", ""),
-                                    email=customer.get("email", ""),
-                                    phone=customer.get("phone", ""),
-                                    address=address if address else None,
+                            if customer.get("name") or profile_mode or (overrides.get("invoice_name") or "").strip():
+                                contact, _resolved_address, resolved_name, resolve_err = _resolve_invoice_contact(
+                                    event=event,
+                                    customer=customer,
+                                    location=event.get("location"),
                                 )
-                                contact = contact_result.get("contact")
-                                _cname = customer.get("name", "")
-                                if contact_result.get("address_split"):
-                                    _feed.push(
-                                        f"New address for {_cname} — archived as \"{contact_result.get('orig_name', '')}\" and created \"{contact_result.get('new_name', '')}\"",
-                                        "info",
+                                if resolve_err == "PROFILE_NOT_FOUND":
+                                    safe_update(
+                                        event_id=event.get("id"),
+                                        description=event.get("description") or "",
+                                        label="Invoice profile missing",
+                                        summary_status="blue",
+                                        current_summary=event.get("summary"),
+                                        calendar_id=calendar_id,
                                     )
-                                elif contact_result.get("created"):
                                     _feed.push(
-                                        f"New customer saved to Xero: {_cname}",
+                                        f"Invoice profile not found for \"{event.get('summary', event_id)}\"",
+                                        "warn",
+                                    )
+                                    state = set_processed_update_marker(state, event_key, event.get("updated") or "")
+                                    continue
+                                if contact and contact.get("ContactID"):
+                                    _cname = resolved_name or customer.get("name", "")
+                                    _feed.push(
+                                        f"Customer ready in Xero: {_cname}",
                                         "success",
                                     )
-                                else:
-                                    _feed.push(
-                                        f"Customer matched in Xero: {_cname}",
-                                        "info",
-                                    )
-                                if contact and contact.get("ContactID"):
                                     state = set_contact_for_event(
                                         state, event_key, contact["ContactID"]
                                     )

@@ -370,6 +370,22 @@ class XeroClient:
         response.raise_for_status()
         return response.json()
 
+    def find_contact_by_name(self, name: str) -> Dict | None:
+        """
+        Return a single contact for a business/profile name lookup.
+        Prefers exact case-insensitive name match; falls back to first result.
+        """
+        if not (name or "").strip():
+            return None
+        contacts = (self.find_contacts_by_name(name.strip()).get("Contacts") or [])
+        if not contacts:
+            return None
+        wanted = name.strip().lower()
+        for contact in contacts:
+            if str(contact.get("Name") or "").strip().lower() == wanted:
+                return contact
+        return contacts[0]
+
     def create_contact(self, name: str, email: str, phone: str, address: Dict | None) -> Dict:
         payload = {
             "Contacts": [

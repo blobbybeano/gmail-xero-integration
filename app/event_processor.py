@@ -185,6 +185,27 @@ def normalize_user_sections(description: str | None) -> str:
             elif low.startswith("customer contact number:"):
                 val = line.split(":", 1)[1].strip() if ":" in line else ""
                 out.append(f"Customer contact number: {val}".rstrip())
+            elif low.startswith("invoice profile:"):
+                val = line.split(":", 1)[1].strip() if ":" in line else ""
+                out.append(f"Invoice profile: {val}".rstrip())
+            elif low.startswith("invoice name:"):
+                val = line.split(":", 1)[1].strip() if ":" in line else ""
+                out.append(f"Invoice name: {val}".rstrip())
+            elif low.startswith("invoice address line 1:"):
+                val = line.split(":", 1)[1].strip() if ":" in line else ""
+                out.append(f"Invoice address line 1: {val}".rstrip())
+            elif low.startswith("invoice address line 2:"):
+                val = line.split(":", 1)[1].strip() if ":" in line else ""
+                out.append(f"Invoice address line 2: {val}".rstrip())
+            elif low.startswith("invoice city:"):
+                val = line.split(":", 1)[1].strip() if ":" in line else ""
+                out.append(f"Invoice city: {val}".rstrip())
+            elif low.startswith("invoice postcode:"):
+                val = line.split(":", 1)[1].strip() if ":" in line else ""
+                out.append(f"Invoice postcode: {val}".rstrip())
+            elif low.startswith("invoice country:"):
+                val = line.split(":", 1)[1].strip() if ":" in line else ""
+                out.append(f"Invoice country: {val}".rstrip())
             else:
                 out.append(raw.rstrip())
         return "\n".join(out)
@@ -406,7 +427,7 @@ def _set_entry_status_emoji(description: str, status: str) -> str:
     lines = text.split("\n")
     while lines and not lines[0].strip():
         lines.pop(0)
-    if lines and lines[0].strip() in {"🔵", "🟠", "🟡", "🟢"}:
+    if lines and lines[0].strip() in {"🔵", "🟠", "🟡", "🟢", "🔴"}:
         lines.pop(0)
         while lines and not lines[0].strip():
             lines.pop(0)
@@ -421,12 +442,14 @@ def set_title_status_emoji(summary: str | None, status: str) -> str:
     orange = DONE pressed, invoice in draft
     yellow = invoice sent, pending payment
     green  = invoice paid
+    red    = integration error / action blocked
     """
     status_map = {
         "blue": "🔵",
         "orange": "🟠",
         "yellow": "🟡",
         "green": "🟢",
+        "red": "🔴",
     }
     emoji = status_map.get((status or "").lower())
     base = _strip_title_prefix_markers(summary)
@@ -458,7 +481,7 @@ def set_title_mail_emoji(summary: str | None, email_send_failed: bool) -> str:
 
 def _extract_title_status_emoji(summary: str | None) -> str:
     text = (summary or "").strip()
-    for em in ("🔵", "🟠", "🟡", "🟢"):
+    for em in ("🔵", "🟠", "🟡", "🟢", "🔴"):
         if text.startswith(em):
             return em
     return ""
@@ -466,7 +489,7 @@ def _extract_title_status_emoji(summary: str | None) -> str:
 
 def _strip_title_prefix_markers(summary: str | None) -> str:
     text = (summary or "").strip()
-    for em in ("🔵", "🟠", "🟡", "🟢"):
+    for em in ("🔵", "🟠", "🟡", "🟢", "🔴"):
         if text.startswith(em):
             text = text[len(em):].lstrip(" -")
             break
@@ -520,6 +543,62 @@ def parse_customer_fields(description: str | None) -> Dict:
         result["email"] = _normalize_email(_extract_email(_strip_error_hint(email_val)))
     if phone_val:
         result["phone"] = _normalize_phone(_strip_error_hint(phone_val))
+
+    return result
+
+
+def parse_invoice_contact_overrides(description: str | None) -> Dict:
+    """
+    Optional invoice-only contact overrides inside [contact] block.
+    Supported lines (case-insensitive):
+      Invoice profile: Jo&Co Ltd
+      Invoice name: Jo&Co Ltd
+      Invoice address line 1: ...
+      Invoice address line 2: ...
+      Invoice city: ...
+      Invoice postcode: ...
+      Invoice country: ...
+    """
+    result = {
+        "invoice_profile": "",
+        "invoice_name": "",
+        "invoice_address_line_1": "",
+        "invoice_address_line_2": "",
+        "invoice_city": "",
+        "invoice_postcode": "",
+        "invoice_country": "",
+    }
+    if not description:
+        return result
+
+    text = _normalize_description(description)
+
+    import re
+
+    contact_match = re.search(r"\[contact\](.*?)\[/contact\]", text, re.I | re.S)
+    if contact_match:
+        text = contact_match.group(1)
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        lower = line.lower()
+        if ":" not in line:
+            continue
+        value = line.split(":", 1)[1].strip()
+        if lower.startswith("invoice profile:"):
+            result["invoice_profile"] = _strip_error_hint(value).strip()
+        elif lower.startswith("invoice name:"):
+            result["invoice_name"] = _strip_error_hint(value).strip()
+        elif lower.startswith("invoice address line 1:"):
+            result["invoice_address_line_1"] = _strip_error_hint(value)
+        elif lower.startswith("invoice address line 2:"):
+            result["invoice_address_line_2"] = _strip_error_hint(value)
+        elif lower.startswith("invoice city:"):
+            result["invoice_city"] = _strip_error_hint(value)
+        elif lower.startswith("invoice postcode:"):
+            result["invoice_postcode"] = _strip_error_hint(value)
+        elif lower.startswith("invoice country:"):
+            result["invoice_country"] = _strip_error_hint(value)
 
     return result
 
