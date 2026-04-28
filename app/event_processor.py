@@ -603,6 +603,56 @@ def parse_invoice_contact_overrides(description: str | None) -> Dict:
     return result
 
 
+def collapse_invoice_override_section(description: str | None) -> str:
+    """
+    Reduce verbose invoice-only contact override lines to a compact marker:
+      Alternate Invoice Address ✅
+    Keeps core customer lines untouched.
+    """
+    if not description:
+        return description or ""
+    import re
+
+    text = _normalize_description(description)
+    m = re.search(r"\[contact\](.*?)\[/contact\]", text, re.I | re.S)
+    if not m:
+        return description or ""
+
+    block = m.group(1)
+    raw_lines = block.splitlines()
+    kept: list[str] = []
+    had_override = False
+    for raw in raw_lines:
+        line = raw.strip()
+        low = line.lower()
+        if (
+            low.startswith("invoice profile:")
+            or low.startswith("invoice name:")
+            or low.startswith("invoice address line 1:")
+            or low.startswith("invoice address line 2:")
+            or low.startswith("invoice city:")
+            or low.startswith("invoice postcode:")
+            or low.startswith("invoice country:")
+            or low.startswith("alternate invoice address")
+        ):
+            had_override = True
+            continue
+        kept.append(raw.rstrip())
+
+    if had_override:
+        while kept and not kept[-1].strip():
+            kept.pop()
+        if kept:
+            kept.append("Alternate Invoice Address ✅")
+        else:
+            kept = ["Alternate Invoice Address ✅"]
+
+    new_block = "\n".join(kept).strip("\n")
+    replacement = f"[contact]\n{new_block}\n[/contact]" if new_block else "[contact]\n[/contact]"
+    text = text[: m.start()] + replacement + text[m.end() :]
+    return _normalize_entry_layout(text)
+
+
 def parse_event_address(location: str | None) -> Dict:
     debug = parse_event_address_debug(location)
     return debug.get("address", {})
@@ -1017,6 +1067,8 @@ def upsert_invoice_summary(
     summary_lines.append(STATUS_START)
     summary_lines.append(_format_status_total_line(f"Invoice total (ex VAT): £{subtotal:.2f}"))
     summary_lines.append(_format_status_total_line(f"Invoice total (inc VAT): £{total:.2f}"))
+    if invoice_url:
+        summary_lines.append(f"Invoice link: {invoice_url}")
     summary_lines.append(f"PAYMENT TYPE (CARD/INVOICE) = {current_payment}")
     if sent:
         summary_lines.append("Invoice sent ✅")

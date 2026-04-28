@@ -48,6 +48,7 @@ from .event_processor import (
     invoice_has_cash_marker,
     parse_customer_fields,
     parse_invoice_contact_overrides,
+    collapse_invoice_override_section,
     parse_event_address,
     payment_choice,
     upsert_send_failure,
@@ -247,10 +248,14 @@ def run() -> None:
                 pass
         return dt.datetime.now(dt.timezone.utc).astimezone(LONDON_TZ).strftime("%d/%m/%Y %H:%M")
 
-    def _diary_entry_name(summary: str | None) -> str:
+    def _diary_entry_name(event: dict) -> str:
         import re
 
-        text = (summary or "").strip()
+        organizer = (event.get("organizer") or {})
+        calendar_name = str(organizer.get("displayName") or "").strip()
+        if calendar_name:
+            return calendar_name
+        text = (event.get("summary") or "").strip()
         text = re.sub(r"^\s*[🔵🟠🟡🟢🔴]\s*", "", text)
         text = re.sub(r"^\s*✉️?\s*", "", text)
         return text.strip()
@@ -386,7 +391,7 @@ def run() -> None:
         paid_immediately = paid_override if paid_override is not None else (payment_method.lower() in {"card", "cash"})
         payload_payment_method = payment_method.upper() if payment_method else "N/A"
         payload = {
-            "diary_entry_name": _diary_entry_name(event.get("summary")),
+            "diary_entry_name": _diary_entry_name(event),
             "submitter": submitter_display
             or (event.get("creator", {}) or {}).get("email")
             or (event.get("organizer", {}) or {}).get("email")
@@ -800,7 +805,7 @@ def run() -> None:
         slot_text = f"{start_fmt} – {end_fmt}".strip(" –") if start_fmt != end_fmt else start_fmt
         customer_fields = parse_customer_fields(event.get("description"))
         payload = {
-            "diary_entry_name": _diary_entry_name(event.get("summary")),
+            "diary_entry_name": _diary_entry_name(event),
             "submitter": submitter_display or submitter_email,
             "customer": customer_fields.get("name") or "",
             "invoice_number": invoice.get("InvoiceNumber") or "",
@@ -1687,10 +1692,15 @@ def run() -> None:
                                     subtotal, total = _extract_totals(result)
                                     if subtotal is not None and total is not None:
                                         updated_description = upsert_invoice_summary(
-                                            event.get("description") or "",
+                                            collapse_invoice_override_section(event.get("description") or ""),
                                             subtotal,
                                             total,
                                             sent=False,
+                                            invoice_url=(
+                                                xero_client.get_online_invoice_url(invoice_id)
+                                                if xero_client and invoice_id
+                                                else None
+                                            ),
                                             include_prompt=True,
                                             submitter=submitter_display,
                                             submitted_at=submitted_at_display,
@@ -1743,10 +1753,15 @@ def run() -> None:
                                         subtotal, total = _extract_totals(result)
                                         if subtotal is not None and total is not None:
                                             updated_description = upsert_invoice_summary(
-                                                event.get("description") or "",
+                                                collapse_invoice_override_section(event.get("description") or ""),
                                                 subtotal,
                                                 total,
                                                 sent=False,
+                                                invoice_url=(
+                                                    xero_client.get_online_invoice_url(invoice_id)
+                                                    if xero_client and invoice_id
+                                                    else None
+                                                ),
                                                 include_prompt=True,
                                                 submitter=submitter_display,
                                                 submitted_at=submitted_at_display,
@@ -2306,10 +2321,15 @@ def run() -> None:
                                     subtotal, total = _extract_totals(result)
                                     if subtotal is not None and total is not None:
                                         updated_description = upsert_invoice_summary(
-                                            event.get("description") or "",
+                                            collapse_invoice_override_section(event.get("description") or ""),
                                             subtotal,
                                             total,
                                             sent=False,
+                                            invoice_url=(
+                                                xero_client.get_online_invoice_url(invoice_id)
+                                                if xero_client and invoice_id
+                                                else None
+                                            ),
                                             include_prompt=True,
                                             submitter=submitter_display,
                                             submitted_at=submitted_at_display,
@@ -2369,10 +2389,15 @@ def run() -> None:
                                             subtotal, total = _extract_totals(result)
                                             if subtotal is not None and total is not None:
                                                 updated_description = upsert_invoice_summary(
-                                                    event.get("description") or "",
+                                                    collapse_invoice_override_section(event.get("description") or ""),
                                                     subtotal,
                                                     total,
                                                     sent=False,
+                                                    invoice_url=(
+                                                        xero_client.get_online_invoice_url(invoice_id)
+                                                        if xero_client and invoice_id
+                                                        else None
+                                                    ),
                                                     include_prompt=True,
                                                     submitter=submitter_display,
                                                     submitted_at=submitted_at_display,
