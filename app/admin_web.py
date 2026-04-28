@@ -48,7 +48,7 @@ from .admin_store import (
     set_stats_fields,
 )
 from .config import load_config
-from .event_processor import set_title_status_emoji
+from .event_processor import set_title_status_emoji, set_title_mail_emoji
 from .google_admin import (
     build_calendar_service_from_creds,
     build_sheets_service_from_creds,
@@ -101,6 +101,7 @@ REQUIRED_XERO_SCOPES = (
 
 
 STAT_OPTIONS = [
+    ("diary_entry_name", "Diary entry name"),
     ("submitter", "Person who submitted invoice"),
     ("customer", "Customer name"),
     ("invoice_number", "Invoice number"),
@@ -3489,6 +3490,10 @@ function toggleEnabled(requested) {{
                                 ge = gsvc.events().get(calendarId=cal_id, eventId=event_id).execute()
                                 cur_summary = ge.get("summary")
                                 updated_summary = set_title_status_emoji(cur_summary, "green")
+                                updated_summary = set_title_mail_emoji(
+                                    updated_summary,
+                                    "invoice send failed" in (ge.get("description") or "").lower(),
+                                )
                                 if updated_summary != cur_summary:
                                     update_event_description(
                                         config,

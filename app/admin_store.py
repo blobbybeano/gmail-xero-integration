@@ -8,6 +8,7 @@ from typing import Any
 
 DEFAULT_STATS_FIELDS = [
     "slot_datetime",
+    "diary_entry_name",
     "customer",
     "invoice_number",
     "payment_method",
@@ -108,7 +109,11 @@ def get_stats_fields(db_path: str) -> list[str]:
     value = get_json_setting(db_path, "stats_fields", DEFAULT_STATS_FIELDS)
     if not value:
         return []
-    return [str(v) for v in value]
+    fields = [str(v) for v in value]
+    if "diary_entry_name" not in fields:
+        insert_at = 1 if "slot_datetime" in fields else 0
+        fields.insert(insert_at, "diary_entry_name")
+    return fields
 
 
 def set_stats_fields(db_path: str, fields: list[str]) -> None:

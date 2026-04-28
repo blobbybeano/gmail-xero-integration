@@ -11,6 +11,7 @@ from .google_admin import build_sheets_service_from_creds
 
 
 STAT_LABELS = {
+    "diary_entry_name": "Diary Entry",
     "submitter": "Submitted By",
     "customer": "Customer",
     "invoice_number": "Invoice Number",
