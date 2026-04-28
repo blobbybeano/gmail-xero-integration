@@ -197,6 +197,10 @@ def normalize_user_sections(description: str | None) -> str:
 
     def _norm_rhs(rhs: str) -> str:
         v = " ".join(rhs.strip().split())
+        # Normalize thousand separators in numeric values.
+        v = re.sub(r"(?<=\d),(?=\d)", "", v)
+        # Ensure a £ sign is present before the first numeric value.
+        v = re.sub(r"^\s*£?\s*(\d+(?:\.\d+)?)", r"£\1", v)
         v = re.sub(r"\+?\s*vat\b", "+VAT", v, flags=re.I)
         return v
 
@@ -425,14 +429,52 @@ def set_title_status_emoji(summary: str | None, status: str) -> str:
         "green": "🟢",
     }
     emoji = status_map.get((status or "").lower())
-    base = (summary or "").strip()
+    base = _strip_title_prefix_markers(summary)
     if not emoji:
         return base
-    while base.startswith(("🔵", "🟠", "🟡", "🟢")):
-        base = base[1:].lstrip(" -")
     if base:
         return f"{emoji} {base}"
     return emoji
+
+
+def set_title_mail_emoji(summary: str | None, email_send_failed: bool) -> str:
+    """
+    Add/remove a letter marker next to the status dot in the title.
+    Example: "🟡 ✉️ My Event"
+    """
+    base = _strip_title_prefix_markers(summary)
+    status_emoji = _extract_title_status_emoji(summary)
+    mail_emoji = "✉️" if email_send_failed else ""
+
+    parts: list[str] = []
+    if status_emoji:
+        parts.append(status_emoji)
+    if mail_emoji:
+        parts.append(mail_emoji)
+    if base:
+        parts.append(base)
+    return " ".join(parts).strip()
+
+
+def _extract_title_status_emoji(summary: str | None) -> str:
+    text = (summary or "").strip()
+    for em in ("🔵", "🟠", "🟡", "🟢"):
+        if text.startswith(em):
+            return em
+    return ""
+
+
+def _strip_title_prefix_markers(summary: str | None) -> str:
+    text = (summary or "").strip()
+    for em in ("🔵", "🟠", "🟡", "🟢"):
+        if text.startswith(em):
+            text = text[len(em):].lstrip(" -")
+            break
+    for em in ("✉️", "✉"):
+        if text.startswith(em):
+            text = text[len(em):].lstrip(" -")
+            break
+    return text.strip()
 
 
 def parse_customer_fields(description: str | None) -> Dict:
@@ -894,8 +936,8 @@ def upsert_invoice_summary(
 
     summary_lines: list[str] = []
     summary_lines.append(STATUS_START)
-    summary_lines.append(f"Invoice total (ex VAT): £{subtotal:.2f}")
-    summary_lines.append(f"Invoice total (inc VAT): £{total:.2f}")
+    summary_lines.append(_format_status_total_line(f"Invoice total (ex VAT): £{subtotal:.2f}"))
+    summary_lines.append(_format_status_total_line(f"Invoice total (inc VAT): £{total:.2f}"))
     summary_lines.append(f"PAYMENT TYPE (CARD/INVOICE) = {current_payment}")
     if sent:
         summary_lines.append("Invoice sent ✅")
@@ -929,9 +971,9 @@ def upsert_send_confirmation(
     summary_lines: list[str] = []
     summary_lines.append(STATUS_START)
     if totals[0]:
-        summary_lines.append(totals[0])
+        summary_lines.append(_format_status_total_line(totals[0]))
     if totals[1]:
-        summary_lines.append(totals[1])
+        summary_lines.append(_format_status_total_line(totals[1]))
     if payment:
         summary_lines.append(payment)
     summary_lines.append("Invoice sent ✅")
@@ -964,9 +1006,9 @@ def upsert_cash_confirmation(
     summary_lines: list[str] = []
     summary_lines.append(STATUS_START)
     if totals[0]:
-        summary_lines.append(totals[0])
+        summary_lines.append(_format_status_total_line(totals[0]))
     if totals[1]:
-        summary_lines.append(totals[1])
+        summary_lines.append(_format_status_total_line(totals[1]))
     summary_lines.append("Entry complete ✅")
     summary_lines.append(STATUS_END)
 
@@ -996,9 +1038,9 @@ def upsert_send_failure(
     summary_lines: list[str] = []
     summary_lines.append(STATUS_START)
     if totals[0]:
-        summary_lines.append(totals[0])
+        summary_lines.append(_format_status_total_line(totals[0]))
     if totals[1]:
-        summary_lines.append(totals[1])
+        summary_lines.append(_format_status_total_line(totals[1]))
     if payment:
         summary_lines.append(payment)
     summary_lines.append("Invoice send failed ❌")
@@ -1071,6 +1113,21 @@ def _extract_existing_totals(description: str) -> tuple[str, str]:
         elif "invoice total (inc vat)" in low:
             inc_line = line
     return ex_line, inc_line
+
+
+def _format_status_total_line(line: str) -> str:
+    import re
+
+    plain = re.sub(r"<[^>]+>", "", line or "").strip()
+    if not plain:
+        return ""
+    if plain.lower().startswith("invoice total (ex vat)") or plain.lower().startswith(
+        "invoice total (inc vat)"
+    ):
+        return f"<b>{plain}</b>"
+    return plain
+
+
 
 
 def _extract_existing_payment_type(description: str) -> str:
