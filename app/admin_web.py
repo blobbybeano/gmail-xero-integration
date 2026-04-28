@@ -3592,31 +3592,35 @@ function toggleEnabled(requested) {{
                                                     sheet_name=sales_sheet_name,
                                                     stats_fields=effective_sales_stats_fields,
                                                 )
-                                                for idx, line in enumerate(sales_lines, start=1):
+                                                sales_lines_text: list[str] = []
+                                                for line in sales_lines:
                                                     ex_vat = round(
                                                         float(line.get("UnitAmount") or 0.0)
                                                         * float(line.get("Quantity") or 1.0),
                                                         2,
                                                     )
-                                                    sales_row_event_id = f"{event_id_display}-S{idx}"
-                                                    append_stats_row(
-                                                        creds,
-                                                        spreadsheet_id=sales_spreadsheet_id,
-                                                        sheet_name=sales_sheet_name,
-                                                        event_key=f"{event_key}:sales:{idx}",
-                                                        stats_fields=effective_sales_stats_fields,
-                                                        payload={
-                                                            "submitter": submitter_name,
-                                                            "customer": customer_fields.get("name") or "",
-                                                            "invoice_number": inv_number,
-                                                            "slot_datetime": slot_text,
-                                                            "payment_method": "INVOICE",
-                                                            "sales_item_desc": f"{line.get('Description') or ''} = £{ex_vat:.2f}",
-                                                            "sales_total_ex_vat": f"{sales_total_ex:.2f}",
-                                                        },
-                                                        event_id_display=sales_row_event_id,
-                                                        dedupe_signature={"Event ID": sales_row_event_id},
+                                                    sales_lines_text.append(
+                                                        f"{line.get('Description') or ''} = £{ex_vat:.2f}"
                                                     )
+                                                sales_row_event_id = f"{event_id_display}-S"
+                                                append_stats_row(
+                                                    creds,
+                                                    spreadsheet_id=sales_spreadsheet_id,
+                                                    sheet_name=sales_sheet_name,
+                                                    event_key=f"{event_key}:sales",
+                                                    stats_fields=effective_sales_stats_fields,
+                                                    payload={
+                                                        "submitter": submitter_name,
+                                                        "customer": customer_fields.get("name") or "",
+                                                        "invoice_number": inv_number,
+                                                        "slot_datetime": slot_text,
+                                                        "payment_method": "INVOICE",
+                                                        "sales_item_desc": "\n".join(sales_lines_text),
+                                                        "sales_total_ex_vat": f"{sales_total_ex:.2f}",
+                                                    },
+                                                    event_id_display=sales_row_event_id,
+                                                    dedupe_signature={"Event ID": sales_row_event_id},
+                                                )
                                                 app_state = set_sales_log_marker(app_state, event_key, sales_marker)
                                                 save_state(config.state_file, app_state)
                                                 print(f"[webhook] Sales rows appended for paid invoice {inv_number}", flush=True)

@@ -664,31 +664,32 @@ def run() -> None:
         suffix = event_id_raw[-4:] if event_id_raw else "0000"
         event_id_display = f"GC-{date_part}-{suffix}" if date_part else (event_id_raw or event_key)
 
-        payload_rows: list[dict] = []
-        for idx, line in enumerate(sales_lines, start=1):
+        sales_lines_text: list[str] = []
+        for line in sales_lines:
             ex_vat = round(
                 float(line.get("UnitAmount") or 0.0) * float(line.get("Quantity") or 1.0),
                 2,
             )
-            sales_row_event_id = f"{event_id_display}-S{idx}"
-            payload_rows.append(
-                {
-                    "event_key": f"{event_key}:sales:{idx}",
-                    "event_id_display": sales_row_event_id,
-                    "payload": {
-                        "submitter": submitter_display
-                        or (event.get("creator", {}) or {}).get("email")
-                        or (event.get("organizer", {}) or {}).get("email")
-                        or "",
-                        "customer": customer_fields.get("name") or "",
-                        "invoice_number": invoice_number_display,
-                        "slot_datetime": slot_text,
-                        "payment_method": payment_method.upper() if payment_method else "",
-                        "sales_item_desc": f"{line.get('Description') or ''} = £{ex_vat:.2f}",
-                        "sales_total_ex_vat": f"{sales_total_ex:.2f}",
-                    },
-                }
-            )
+            sales_lines_text.append(f"{line.get('Description') or ''} = £{ex_vat:.2f}")
+
+        payload_rows: list[dict] = [
+            {
+                "event_key": f"{event_key}:sales",
+                "event_id_display": f"{event_id_display}-S",
+                "payload": {
+                    "submitter": submitter_display
+                    or (event.get("creator", {}) or {}).get("email")
+                    or (event.get("organizer", {}) or {}).get("email")
+                    or "",
+                    "customer": customer_fields.get("name") or "",
+                    "invoice_number": invoice_number_display,
+                    "slot_datetime": slot_text,
+                    "payment_method": payment_method.upper() if payment_method else "",
+                    "sales_item_desc": "\n".join(sales_lines_text),
+                    "sales_total_ex_vat": f"{sales_total_ex:.2f}",
+                },
+            }
+        ]
 
         backlog_row = {
             "event_key": event_key,
@@ -755,8 +756,11 @@ def run() -> None:
                         "Event ID": str(row.get("event_id_display") or event_id_display),
                     },
                 )
-            print(f"Sales rows appended for {event_key}: {len(sales_lines)} item(s)")
-            _feed.push(f"Sales logged ({len(sales_lines)} item(s)) for \"{event.get('summary', event_key)}\"", "success")
+            print(f"Sales row appended for {event_key}: {len(sales_lines)} item(s)")
+            _feed.push(
+                f"Sales logged ({len(sales_lines)} item(s)) for \"{event.get('summary', event_key)}\"",
+                "success",
+            )
             backlog = get_sales_backlog(config.admin_db_file)
             backlog = [r for r in backlog if r.get("event_key") != event_key]
             set_sales_backlog(config.admin_db_file, backlog)
