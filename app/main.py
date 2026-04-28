@@ -1501,9 +1501,30 @@ def run() -> None:
                             and pay_mode_hint == "invoice"
                             and xero_client
                             and get_invoice_for_event(state, event_key)
+                            and not (event.get("summary") or "").strip().startswith("🟢")
                         )
                         if not needs_invoice_paid_sync:
                             continue
+                        # Poll Xero for payment status on unchanged INVOICE-mode events.
+                        _sync_inv_id = get_invoice_for_event(state, event_key)
+                        try:
+                            _sync_inv = xero_client.get_invoice(_sync_inv_id)
+                            if (_sync_inv.get("Status") or "").upper() == "PAID":
+                                safe_update(
+                                    event_id=event.get("id"),
+                                    description=event.get("description") or "",
+                                    label="Invoice paid",
+                                    summary_status="green",
+                                    current_summary=event.get("summary"),
+                                    calendar_id=calendar_id,
+                                )
+                                _feed.push(
+                                    f"Invoice paid — marked green: \"{event.get('summary', event_id)}\"",
+                                    "success",
+                                )
+                        except Exception as _exc:
+                            print(f"Event {event_id}: paid-sync check failed: {_exc}")
+                        continue
                     if has_done and not invoice_lines:
                         print(f"Event {event_id}: no invoice lines found, skipping invoice")
                         _feed.push(f"No job details in \"{event.get('summary', event_id)}\" — awaiting line items", "warn")
