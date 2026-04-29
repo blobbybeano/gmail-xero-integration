@@ -165,7 +165,7 @@ def run() -> None:
         summary_status: str | None = None,
         current_summary: str | None = None,
         calendar_id: str | None = None,
-        yellow_draft_increment: bool = False,
+        draft_progress_increment: bool = False,
     ):
         import re
 
@@ -180,29 +180,29 @@ def run() -> None:
             ):
                 summary_status = "green"
             desc_lower = (description or "").lower()
-            is_draft_yellow = (
-                summary_status == "yellow"
+            is_draft_orange = (
+                summary_status == "orange"
                 and ("invoice sent ✅".lower() not in desc_lower)
                 and ("invoice send failed ❌".lower() not in desc_lower)
                 and ("entry complete ✅".lower() not in desc_lower)
             )
             draft_dots = 0
-            if summary_status == "yellow":
-                if is_draft_yellow:
+            if summary_status == "orange":
+                if is_draft_orange:
                     existing_dots = get_title_progress_dots(current_summary)
-                    # First draft save from non-yellow => plain yellow.
-                    # Subsequent draft edits while already yellow => +1 dot each save.
-                    if yellow_draft_increment and (current_summary or "").strip().startswith("🟡"):
+                    # First draft save from non-orange => plain orange.
+                    # Subsequent draft edits while already orange => +1 dot each save.
+                    if draft_progress_increment and (current_summary or "").strip().startswith("🟠"):
                         draft_dots = existing_dots + 1
                     else:
                         draft_dots = existing_dots
                 else:
-                    # Sent/failed/complete states keep yellow without progress dots.
+                    # Non-draft states keep orange without progress dots.
                     draft_dots = 0
             summary = set_title_status_emoji(
                 current_summary,
                 summary_status,
-                draft_dots=(draft_dots if summary_status == "yellow" else None),
+                draft_dots=(draft_dots if summary_status == "orange" else None),
             )
             mail_failed = "invoice send failed" in (description or "").lower()
             summary = set_title_mail_emoji(summary, mail_failed)
@@ -1537,32 +1537,7 @@ def run() -> None:
                         "error",
                     )
                     continue
-                # If user edited a prefilled entry (before submit), switch title dot
-                # from blue to orange once.
-                if (
-                    event.get("id")
-                    and is_prefilled(state, event_key)
-                    and not has_done
-                    and not has_send
-                ):
-                    prefill_marker = get_processed_update_marker(state, event_key) or ""
-                    event_updated_now = event.get("updated") or ""
-                    if prefill_marker and event_updated_now and event_updated_now != prefill_marker:
-                        updated = safe_update(
-                            event_id=event.get("id"),
-                            description=event.get("description") or "",
-                            label="Status updated",
-                            summary_status="orange",
-                            current_summary=event.get("summary"),
-                            calendar_id=calendar_id,
-                        )
-                        if updated:
-                            event["updated"] = updated.get("updated", event_updated_now)
-                            state = set_processed_update_marker(
-                                state,
-                                event_key,
-                                event["updated"] or event_updated_now,
-                            )
+                # Keep blue until staff explicitly confirms PROCESS DRAFT = Y.
                 if (has_done or has_send) and event.get("id"):
                     event_updated = event.get("updated") or ""
                     normalized_description = normalize_user_sections(
@@ -1798,10 +1773,10 @@ def run() -> None:
                                                 event_id=event.get("id"),
                                                 description=updated_description,
                                                 label="Invoice summary",
-                                                summary_status="yellow",
+                                                summary_status="orange",
                                                 current_summary=event.get("summary"),
                                                 calendar_id=calendar_id,
-                                                yellow_draft_increment=True,
+                                                draft_progress_increment=True,
                                             )
                                             if updated:
                                                 event["description"] = updated_description
@@ -1860,10 +1835,10 @@ def run() -> None:
                                                     event_id=event.get("id"),
                                                     description=updated_description,
                                                     label="Invoice summary",
-                                                    summary_status="yellow",
+                                                    summary_status="orange",
                                                     current_summary=event.get("summary"),
                                                     calendar_id=calendar_id,
-                                                    yellow_draft_increment=True,
+                                                    draft_progress_increment=True,
                                                 )
                                                 if updated:
                                                     event["description"] = updated_description
@@ -2429,10 +2404,10 @@ def run() -> None:
                                                 event_id=event.get("id"),
                                                 description=updated_description,
                                                 label="Invoice summary",
-                                                summary_status="yellow",
+                                                summary_status="orange",
                                                 current_summary=event.get("summary"),
                                                 calendar_id=calendar_id,
-                                                yellow_draft_increment=True,
+                                                draft_progress_increment=True,
                                             )
                                             if updated:
                                                 event["description"] = updated_description
@@ -2498,10 +2473,10 @@ def run() -> None:
                                                         event_id=event.get("id"),
                                                         description=updated_description,
                                                         label="Invoice summary",
-                                                        summary_status="yellow",
+                                                        summary_status="orange",
                                                         current_summary=event.get("summary"),
                                                         calendar_id=calendar_id,
-                                                        yellow_draft_increment=True,
+                                                        draft_progress_increment=True,
                                                     )
                                                     if updated:
                                                         event["description"] = updated_description

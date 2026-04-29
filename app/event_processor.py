@@ -505,7 +505,7 @@ def set_title_status_emoji(
     """
     Prefix the diary title with the requested status emoji.
     blue   = event created/formatted (no invoice yet)
-    orange = DONE pressed, invoice in draft
+    orange = draft stage (created/edited)
     yellow = invoice sent, pending payment
     green  = invoice paid
     red    = integration error / action blocked
@@ -520,7 +520,7 @@ def set_title_status_emoji(
     emoji = status_map.get((status or "").lower())
     base = _strip_title_prefix_markers(summary)
     dots = 0
-    if (status or "").lower() == "yellow":
+    if (status or "").lower() == "orange":
         dots = (
             max(int(draft_dots), 0)
             if draft_dots is not None
@@ -1193,7 +1193,7 @@ def upsert_invoice_summary(
     cleaned_joined = _set_notes_error_alert("\n".join(cleaned), None)
     cleaned = cleaned_joined.splitlines()
     cleaned_text = _bold_invoice_amounts("\n".join(cleaned))
-    cleaned = cleaned_text.splitlines()
+    cleaned = [_format_process_prompt_line(l) for l in cleaned_text.splitlines()]
     current_payment = payment_choice(description).upper()
 
     summary_lines: list[str] = []
@@ -1230,6 +1230,7 @@ def upsert_send_confirmation(
     STATUS_END = "[/app-status]"
     cleaned = _status_base_lines(description)
     cleaned = _set_notes_error_alert("\n".join(cleaned), None).splitlines()
+    cleaned = [_format_process_prompt_line(l) for l in cleaned]
     totals = _extract_existing_totals(description)
     payment = _extract_existing_payment_type(description)
 
@@ -1267,6 +1268,7 @@ def upsert_cash_confirmation(
     STATUS_END = "[/app-status]"
     cleaned = _status_base_lines(description)
     cleaned = _set_notes_error_alert("\n".join(cleaned), None).splitlines()
+    cleaned = [_format_process_prompt_line(l) for l in cleaned]
     totals = _extract_existing_totals(description)
 
     summary_lines: list[str] = []
@@ -1302,6 +1304,7 @@ def upsert_send_failure(
     payment_type_missing = bool(reason and "payment type" in reason.lower())
     alert = "!!! PAYMENT TYPE EMPTY !!!!" if payment_type_missing else None
     cleaned = _set_notes_error_alert("\n".join(cleaned), alert).splitlines()
+    cleaned = [_format_process_prompt_line(l) for l in cleaned]
     totals = _extract_existing_totals(description)
     payment = _extract_existing_payment_type(description)
     summary_lines: list[str] = []
@@ -1405,6 +1408,21 @@ def _format_status_prompt_line(line: str) -> str:
     if not plain:
         return ""
     return f"<b>{plain}</b>"
+
+
+def _format_process_prompt_line(line: str) -> str:
+    import re
+
+    plain = re.sub(r"<[^>]+>", "", line or "").strip()
+    if not plain:
+        return line
+    if re.fullmatch(
+        r"(?:process\s*draft\s*\(\s*y\s*/\s*n\s*\)|(?:done\s+)?y\s*/\s*n)\s*(?:=|:)\s*(?:y|n|yes|no)?\s*",
+        plain,
+        flags=re.I,
+    ):
+        return f"<b>{plain}</b>"
+    return line
 
 
 
