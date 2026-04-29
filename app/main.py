@@ -55,6 +55,7 @@ from .event_processor import (
     upsert_invoice_summary,
     upsert_cash_confirmation,
     upsert_send_confirmation,
+    get_title_progress_dots,
     set_title_status_emoji,
     set_title_mail_emoji,
     validate_customer_fields,
@@ -164,6 +165,7 @@ def run() -> None:
         summary_status: str | None = None,
         current_summary: str | None = None,
         calendar_id: str | None = None,
+        yellow_draft_increment: bool = False,
     ):
         import re
 
@@ -184,10 +186,23 @@ def run() -> None:
                 and ("invoice send failed ❌".lower() not in desc_lower)
                 and ("entry complete ✅".lower() not in desc_lower)
             )
+            draft_dots = 0
+            if summary_status == "yellow":
+                if is_draft_yellow:
+                    existing_dots = get_title_progress_dots(current_summary)
+                    # First draft save from non-yellow => plain yellow.
+                    # Subsequent draft edits while already yellow => +1 dot each save.
+                    if yellow_draft_increment and (current_summary or "").strip().startswith("🟡"):
+                        draft_dots = existing_dots + 1
+                    else:
+                        draft_dots = existing_dots
+                else:
+                    # Sent/failed/complete states keep yellow without progress dots.
+                    draft_dots = 0
             summary = set_title_status_emoji(
                 current_summary,
                 summary_status,
-                draft=is_draft_yellow,
+                draft_dots=(draft_dots if summary_status == "yellow" else None),
             )
             mail_failed = "invoice send failed" in (description or "").lower()
             summary = set_title_mail_emoji(summary, mail_failed)
@@ -1786,6 +1801,7 @@ def run() -> None:
                                                 summary_status="yellow",
                                                 current_summary=event.get("summary"),
                                                 calendar_id=calendar_id,
+                                                yellow_draft_increment=True,
                                             )
                                             if updated:
                                                 event["description"] = updated_description
@@ -1847,6 +1863,7 @@ def run() -> None:
                                                     summary_status="yellow",
                                                     current_summary=event.get("summary"),
                                                     calendar_id=calendar_id,
+                                                    yellow_draft_increment=True,
                                                 )
                                                 if updated:
                                                     event["description"] = updated_description
@@ -2415,6 +2432,7 @@ def run() -> None:
                                                 summary_status="yellow",
                                                 current_summary=event.get("summary"),
                                                 calendar_id=calendar_id,
+                                                yellow_draft_increment=True,
                                             )
                                             if updated:
                                                 event["description"] = updated_description
@@ -2483,6 +2501,7 @@ def run() -> None:
                                                         summary_status="yellow",
                                                         current_summary=event.get("summary"),
                                                         calendar_id=calendar_id,
+                                                        yellow_draft_increment=True,
                                                     )
                                                     if updated:
                                                         event["description"] = updated_description

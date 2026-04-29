@@ -446,7 +446,11 @@ def _set_entry_status_emoji(description: str, status: str) -> str:
     return _normalize_entry_layout(body) if body.strip() else ""
 
 
-def set_title_status_emoji(summary: str | None, status: str, draft: bool = False) -> str:
+def set_title_status_emoji(
+    summary: str | None,
+    status: str,
+    draft_dots: int | None = None,
+) -> str:
     """
     Prefix the diary title with the requested status emoji.
     blue   = event created/formatted (no invoice yet)
@@ -464,10 +468,16 @@ def set_title_status_emoji(summary: str | None, status: str, draft: bool = False
     }
     emoji = status_map.get((status or "").lower())
     base = _strip_title_prefix_markers(summary)
-    draft_emoji = "📝" if draft and (status or "").lower() == "yellow" else ""
+    dots = 0
+    if (status or "").lower() == "yellow":
+        dots = (
+            max(int(draft_dots), 0)
+            if draft_dots is not None
+            else _extract_title_progress_dots(summary)
+        )
     if not emoji:
         return base
-    prefix = " ".join([part for part in (emoji, draft_emoji) if part])
+    prefix = emoji + ("." * dots if dots else "")
     if base:
         return f"{prefix} {base}"
     return prefix
@@ -480,14 +490,12 @@ def set_title_mail_emoji(summary: str | None, email_send_failed: bool) -> str:
     """
     base = _strip_title_prefix_markers(summary)
     status_emoji = _extract_title_status_emoji(summary)
-    draft_emoji = _extract_title_draft_emoji(summary)
+    dots = _extract_title_progress_dots(summary)
     mail_emoji = "✉️" if email_send_failed else ""
 
     parts: list[str] = []
     if status_emoji:
-        parts.append(status_emoji)
-    if draft_emoji:
-        parts.append(draft_emoji)
+        parts.append(status_emoji + ("." * dots if dots else ""))
     if mail_emoji:
         parts.append(mail_emoji)
     if base:
@@ -503,15 +511,21 @@ def _extract_title_status_emoji(summary: str | None) -> str:
     return ""
 
 
-def _extract_title_draft_emoji(summary: str | None) -> str:
+def _extract_title_progress_dots(summary: str | None) -> int:
     text = (summary or "").strip()
     status = _extract_title_status_emoji(text)
     if status and text.startswith(status):
         text = text[len(status):].lstrip(" -")
-    for em in ("📝",):
-        if text.startswith(em):
-            return em
-    return ""
+    import re
+
+    m = re.match(r"^(\.+)", text)
+    if m:
+        return len(m.group(1))
+    return 0
+
+
+def get_title_progress_dots(summary: str | None) -> int:
+    return _extract_title_progress_dots(summary)
 
 
 def _strip_title_prefix_markers(summary: str | None) -> str:
@@ -520,15 +534,48 @@ def _strip_title_prefix_markers(summary: str | None) -> str:
         if text.startswith(em):
             text = text[len(em):].lstrip(" -")
             break
-    for em in ("📝",):
-        if text.startswith(em):
-            text = text[len(em):].lstrip(" -")
-            break
+    text = text.lstrip(". ").lstrip(" -")
     for em in ("✉️", "✉"):
         if text.startswith(em):
             text = text[len(em):].lstrip(" -")
             break
     return text.strip()
+
+
+def _bold_invoice_amounts(description: str | None) -> str:
+    """
+    Inside [invoice]..[/invoice], bold currency tokens like:
+      £20
+      £20.50
+      £20+VAT
+    """
+    if not description:
+        return ""
+    import re
+
+    text = _normalize_description(description)
+
+    def _apply(block: str) -> str:
+        out_lines: list[str] = []
+        for raw in block.splitlines():
+            line = raw
+            line = re.sub(r"</?b>", "", line, flags=re.I)
+            line = re.sub(
+                r"(£\s*\d+(?:\.\d+)?(?:\s*\+\s*vat)?)",
+                r"<b>\1</b>",
+                line,
+                flags=re.I,
+            )
+            out_lines.append(line)
+        return "\n".join(out_lines)
+
+    text = re.sub(
+        r"(\[invoice\])(.*?)(\[/invoice\])",
+        lambda m: f"{m.group(1)}{_apply(m.group(2))}{m.group(3)}",
+        text,
+        flags=re.I | re.S,
+    )
+    return text
 
 
 def parse_customer_fields(description: str | None) -> Dict:
@@ -1092,6 +1139,8 @@ def upsert_invoice_summary(
         )
 
     cleaned = [line for line in lines if not is_summary_line(line)]
+    cleaned_text = _bold_invoice_amounts("\n".join(cleaned))
+    cleaned = cleaned_text.splitlines()
     current_payment = payment_choice(description).upper()
 
     summary_lines: list[str] = []
