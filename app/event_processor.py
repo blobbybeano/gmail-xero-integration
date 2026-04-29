@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from typing import Dict
 
+PROCESS_DRAFT_PROMPT = "PROCESS DRAFT (Y/N) ="
+PAYMENT_TYPE_PROMPT = "PAYMENT TYPE (CARD/INVOICE) ="
+SEND_PROMPT = "SEND NOW (Y/N) ="
+
 
 def event_contains_keyword(event: Dict, keyword: str) -> bool:
     """
@@ -18,10 +22,11 @@ def event_contains_keyword(event: Dict, keyword: str) -> bool:
 def done_choice_is_yes(description: str | None, keyword: str = "DONE") -> bool:
     """
     Submit gate for draft processing.
-    Accepts Y/N prompt styles such as:
-      Y/N =Y
-      Y/N = YES
-      done y/n = y
+    Accepts prompt styles such as:
+      PROCESS DRAFT (Y/N) =Y
+      PROCESS DRAFT (Y/N) = YES
+      Y/N =Y  (legacy)
+      done y/n = y (legacy)
 
     Notes:
     - A plain `DONE` line no longer triggers processing.
@@ -41,7 +46,10 @@ def done_choice_is_yes(description: str | None, keyword: str = "DONE") -> bool:
         lower = line.lower()
         if "send" in lower:
             continue
-        if re.fullmatch(r"(?:done\s+)?y\s*/\s*n\s*(?:=|:)?\s*(y|yes)\b", lower):
+        if re.fullmatch(
+            r"(?:process\s*draft\s*\(\s*y\s*/\s*n\s*\)|(?:done\s+)?y\s*/\s*n)\s*(?:=|:)?\s*(y|yes)\b",
+            lower,
+        ):
             return True
     return False
 
@@ -56,8 +64,9 @@ def send_choice_is_yes(description: str | None) -> bool:
     # Accept tolerant variants, but only when SEND is explicitly answered Y/YES.
     # Avoid false positives from placeholder lines like "SEND Y/N =".
     # Valid examples:
+    #   SEND NOW (Y/N) =Y
+    #   SEND NOW (Y/N) = YES
     #   SEND Y/N =Y
-    #   SEND Y/N = YES
     #   SEND =Y
     #   SEND: YES
     #   SEND YES
@@ -65,7 +74,7 @@ def send_choice_is_yes(description: str | None) -> bool:
         line = raw.strip().lower()
         if not line.startswith("send"):
             continue
-        if re.fullmatch(r"send\s*(?:y\s*/\s*n)?\s*(?:=|:)\s*(y|yes)\s*", line):
+        if re.fullmatch(r"send(?:\s+now)?\s*(?:\(\s*y\s*/\s*n\s*\)|y\s*/\s*n)?\s*(?:=|:)\s*(y|yes)\s*", line):
             return True
         if re.fullmatch(r"send\s+(y|yes)\s*", line):
             return True
@@ -137,7 +146,7 @@ def ensure_notes_template(description: str | None) -> str:
         "⬇Sales⬇\n"
         "\n"
         "[/invoice]\n"
-        "Y/N =\n"
+        f"{PROCESS_DRAFT_PROMPT}\n"
     )
 
     if not description:
@@ -157,11 +166,12 @@ def ensure_notes_template(description: str | None) -> str:
         invoice_block = "[invoice]\n\n⬇Sales⬇\n\n[/invoice]\n"
         lines = description.splitlines()
         for i, line in enumerate(lines):
-            if line.strip().upper() == "DONE" or line.strip().upper().startswith("Y/N"):
+            low = line.strip().lower()
+            if line.strip().upper() == "DONE" or low.startswith("y/n") or low.startswith("process draft"):
                 lines[i] = invoice_block + line.strip()
                 return _set_entry_status_emoji(_normalize_entry_layout("\n".join(lines)), "orange")
         return _set_entry_status_emoji(
-            _normalize_entry_layout(f"{description.rstrip()}\n\n{invoice_block}Y/N ="),
+            _normalize_entry_layout(f"{description.rstrip()}\n\n{invoice_block}{PROCESS_DRAFT_PROMPT}"),
             "orange",
         )
 
@@ -276,6 +286,39 @@ def normalize_user_sections(description: str | None) -> str:
     return _normalize_entry_layout(text)
 
 
+def _set_notes_error_alert(description: str, alert: str | None) -> str:
+    """
+    Add or remove a single alert line at the top of [notes]..[/notes].
+    """
+    import re
+
+    text = _normalize_description(description or "")
+    match = re.search(r"(\[notes\])(.*?)(\[/notes\])", text, flags=re.I | re.S)
+    if not match:
+        return text
+
+    inner = match.group(2) or ""
+    lines = inner.splitlines()
+    filtered: list[str] = []
+    for raw in lines:
+        if raw.strip().startswith("!!! ") and raw.strip().endswith(" !!!!"):
+            continue
+        filtered.append(raw)
+
+    # Trim leading blanks so alert sits at top of [notes].
+    while filtered and not filtered[0].strip():
+        filtered.pop(0)
+
+    new_lines: list[str] = []
+    if alert:
+        new_lines.append(alert.strip())
+    new_lines.extend(filtered)
+
+    new_inner = "\n".join(new_lines).strip()
+    rebuilt = f"{match.group(1)}\n{new_inner}\n{match.group(3)}" if new_inner else f"{match.group(1)}\n\n{match.group(3)}"
+    return text[: match.start()] + rebuilt + text[match.end() :]
+
+
 def _looks_like_invoice_line(line: str) -> bool:
     import re
 
@@ -293,7 +336,7 @@ def _looks_like_invoice_line(line: str) -> bool:
 def _is_automation_control_line(line: str) -> bool:
     import re
 
-    low = line.strip().lower()
+    low = re.sub(r"<[^>]+>", "", line.strip()).lower()
     if not low:
         return False
     if low in {"[app-status]", "[/app-status]", "[contact]", "[/contact]", "[notes]", "[/notes]", "[invoice]", "[/invoice]"}:
@@ -302,7 +345,10 @@ def _is_automation_control_line(line: str) -> bool:
         return True
     if low.startswith("send"):
         return True
-    if re.fullmatch(r"(?:done\s+)?y\s*/\s*n\s*(?:=|:)?\s*(?:y|n|yes|no)?\s*", low):
+    if re.fullmatch(
+        r"(?:process\s*draft\s*\(\s*y\s*/\s*n\s*\)|(?:done\s+)?y\s*/\s*n)\s*(?:=|:)?\s*(?:y|n|yes|no)?\s*",
+        low,
+    ):
         return True
     return False
 
@@ -409,12 +455,17 @@ def _normalize_entry_layout(text: str) -> str:
     text = re.sub(r"\[/notes\]\n*\[contact\]", "[/notes]\n\n[contact]", text, flags=re.I)
     text = re.sub(r"\[/contact\]\n*\[invoice\]", "[/contact]\n\n[invoice]", text, flags=re.I)
 
-    # No blank line between [/invoice] and Y/N.
-    text = re.sub(r"\[/invoice\]\n*(?=(?:DONE\s+)?Y\s*/\s*N\s*=)", "[/invoice]\n", text, flags=re.I)
-
-    # One blank line below Y/N before app-status or anything else.
+    # No blank line between [/invoice] and PROCESS DRAFT / legacy Y/N.
     text = re.sub(
-        r"(?im)^((?:DONE\s+)?Y\s*/\s*N\s*=\s*(?:Y|N|YES|NO)?)\s*$\n*",
+        r"\[/invoice\]\n*(?=(?:PROCESS\s+DRAFT\s*\(\s*Y\s*/\s*N\s*\)|(?:DONE\s+)?Y\s*/\s*N)\s*=)",
+        "[/invoice]\n",
+        text,
+        flags=re.I,
+    )
+
+    # One blank line below PROCESS DRAFT/legacy Y/N before app-status or anything else.
+    text = re.sub(
+        r"(?im)^((?:PROCESS\s*DRAFT\s*\(\s*Y\s*/\s*N\s*\)|(?:DONE\s+)?Y\s*/\s*N)\s*=\s*(?:Y|N|YES|NO)?)\s*$\n*",
         r"\1\n\n",
         text,
     )
@@ -1139,6 +1190,8 @@ def upsert_invoice_summary(
         )
 
     cleaned = [line for line in lines if not is_summary_line(line)]
+    cleaned_joined = _set_notes_error_alert("\n".join(cleaned), None)
+    cleaned = cleaned_joined.splitlines()
     cleaned_text = _bold_invoice_amounts("\n".join(cleaned))
     cleaned = cleaned_text.splitlines()
     current_payment = payment_choice(description).upper()
@@ -1149,13 +1202,13 @@ def upsert_invoice_summary(
     summary_lines.append(_format_status_total_line(f"Invoice total (inc VAT): £{total:.2f}"))
     if invoice_url:
         summary_lines.append(f"Invoice link: {invoice_url}")
-    summary_lines.append(f"PAYMENT TYPE (CARD/INVOICE) = {current_payment}")
+    summary_lines.append(_format_status_prompt_line(f"{PAYMENT_TYPE_PROMPT} {current_payment}".rstrip()))
     if sent:
         summary_lines.append("Invoice sent ✅")
         if invoice_url:
             summary_lines.append(f"Invoice link: {invoice_url}")
     elif include_prompt:
-        summary_lines.append("SEND Y/N =")
+        summary_lines.append(_format_status_prompt_line(SEND_PROMPT))
     summary_lines.append(STATUS_END)
 
     while cleaned and not cleaned[-1].strip():
@@ -1176,6 +1229,7 @@ def upsert_send_confirmation(
     STATUS_START = "[app-status]"
     STATUS_END = "[/app-status]"
     cleaned = _status_base_lines(description)
+    cleaned = _set_notes_error_alert("\n".join(cleaned), None).splitlines()
     totals = _extract_existing_totals(description)
     payment = _extract_existing_payment_type(description)
 
@@ -1186,7 +1240,7 @@ def upsert_send_confirmation(
     if totals[1]:
         summary_lines.append(_format_status_total_line(totals[1]))
     if payment:
-        summary_lines.append(payment)
+        summary_lines.append(_format_status_prompt_line(payment))
     summary_lines.append("Invoice sent ✅")
     if invoice_url:
         summary_lines.append(f"Invoice link: {invoice_url}")
@@ -1212,6 +1266,7 @@ def upsert_cash_confirmation(
     STATUS_START = "[app-status]"
     STATUS_END = "[/app-status]"
     cleaned = _status_base_lines(description)
+    cleaned = _set_notes_error_alert("\n".join(cleaned), None).splitlines()
     totals = _extract_existing_totals(description)
 
     summary_lines: list[str] = []
@@ -1244,6 +1299,9 @@ def upsert_send_failure(
     STATUS_START = "[app-status]"
     STATUS_END = "[/app-status]"
     cleaned = _status_base_lines(description)
+    payment_type_missing = bool(reason and "payment type" in reason.lower())
+    alert = "!!! PAYMENT TYPE EMPTY !!!!" if payment_type_missing else None
+    cleaned = _set_notes_error_alert("\n".join(cleaned), alert).splitlines()
     totals = _extract_existing_totals(description)
     payment = _extract_existing_payment_type(description)
     summary_lines: list[str] = []
@@ -1253,7 +1311,7 @@ def upsert_send_failure(
     if totals[1]:
         summary_lines.append(_format_status_total_line(totals[1]))
     if payment:
-        summary_lines.append(payment)
+        summary_lines.append(_format_status_prompt_line(payment))
     summary_lines.append("Invoice send failed ❌")
     if reason:
         summary_lines.append(f"Reason: {reason}")
@@ -1262,7 +1320,7 @@ def upsert_send_failure(
     else:
         summary_lines.append("Invoice link: unavailable (retry in a moment).")
     summary_lines.append("Check customer e-mail, Update if needed then retry below:")
-    summary_lines.append("SEND Y/N =")
+    summary_lines.append(_format_status_prompt_line(SEND_PROMPT))
     summary_lines.append(STATUS_END)
     while cleaned and not cleaned[-1].strip():
         cleaned.pop()
@@ -1295,6 +1353,7 @@ def _status_base_lines(description: str) -> list[str]:
         if (
             "invoice total" in plain
             or "send y/n" in plain
+            or "send now (y/n)" in plain
             or "invoice sent" in plain
             or "invoice link" in plain
             or "payment type" in plain
@@ -1337,6 +1396,15 @@ def _format_status_total_line(line: str) -> str:
     ):
         return f"<b>{plain}</b>"
     return plain
+
+
+def _format_status_prompt_line(line: str) -> str:
+    import re
+
+    plain = re.sub(r"<[^>]+>", "", line or "").strip()
+    if not plain:
+        return ""
+    return f"<b>{plain}</b>"
 
 
 
