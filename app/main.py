@@ -1833,6 +1833,7 @@ def run() -> None:
                                 and xero_client
                                 and existing_contact_id
                                 and not is_invoice_sent(state, event_key)
+                                and not has_send
                             ):
                                 invoice_id = get_invoice_for_event(state, event_key)
                                 last_invoice_update = get_invoice_update_marker(
@@ -1961,9 +1962,9 @@ def run() -> None:
                                         state = set_invoice_update_marker(
                                             state, event_key, event_updated
                                         )
-                            elif has_done and not existing_contact_id:
+                            elif has_done and not has_send and not existing_contact_id:
                                 print(f"Event {event_id}: skipping invoice (no contact_id)")
-                            elif has_done and not xero_client:
+                            elif has_done and not has_send and not xero_client:
                                 print(f"Event {event_id}: skipping invoice (xero not configured)")
 
                             # If SEND keyword is present, mark as sent in notes.
@@ -2516,6 +2517,7 @@ def run() -> None:
                                 and contact
                                 and contact.get("ContactID")
                                 and not is_invoice_sent(state, event_key)
+                                and not has_send
                             ):
                                 event_updated = event.get("updated") or ""
                                 invoice_id = get_invoice_for_event(state, event_key)
