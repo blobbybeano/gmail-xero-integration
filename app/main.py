@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import json
 import os
 import time
 from zoneinfo import ZoneInfo
@@ -68,7 +70,12 @@ from .google_calendar import (
     stop_calendar_watch,
     RateLimitError,
 )
-from .trigger import wait_for_poll, consume_watch_check
+from .trigger import (
+    wait_for_poll,
+    consume_watch_check,
+    consume_calendar_targets,
+    consume_event_targets,
+)
 from .google_sheets import append_stats_row, ensure_header, update_invoice_paid_in_sheet
 from .google_admin import load_admin_credentials
 from .state import (
@@ -76,6 +83,8 @@ from .state import (
     get_contact_for_event,
     get_contact_update_marker,
     get_contact_fingerprint,
+    get_draft_sync_attempted_at,
+    get_draft_sync_fingerprint,
     get_invoice_for_event,
     get_invoice_update_marker,
     get_last_sync,
@@ -97,6 +106,8 @@ from .state import (
     set_contact_update_marker,
     set_contact_for_event,
     set_contact_fingerprint,
+    set_draft_sync_attempted_at,
+    set_draft_sync_fingerprint,
     set_invoice_for_event,
     set_invoice_update_marker,
     set_last_sync,
@@ -119,6 +130,14 @@ def run() -> None:
     run_started_at = dt.datetime.now(dt.timezone.utc)
     state = load_state(config.state_file)
     state["run_started_at"] = run_started_at.isoformat()
+    if not state.get("xero_retry_queue_reset_at"):
+        _retry_after_map = state.get("event_xero_retry_after") or {}
+        _retry_backoff_map = state.get("event_xero_retry_backoff") or {}
+        if _retry_after_map or _retry_backoff_map:
+            state["event_xero_retry_after"] = {}
+            state["event_xero_retry_backoff"] = {}
+            _feed.push("Xero retry queue reset on startup", "system")
+        state["xero_retry_queue_reset_at"] = run_started_at.isoformat()
     save_state(config.state_file, state)
 
     has_saved_sync = "last_sync" in state
@@ -161,6 +180,31 @@ def run() -> None:
 
     _last_watch_check: float = 0.0
     _WATCH_CHECK_INTERVAL = 3600  # re-check watches at most once per hour
+
+    # Scan strategy:
+    # - Webhook-targeted cycles scan only touched calendars/events.
+    # - Every poll cycle does a lightweight "recent saves" Google-only safety scan.
+    # - Hourly reconcile scans past entries for paid status, in controlled Xero batches.
+    _last_hourly_reconcile_ts: float = 0.0
+    _HOURLY_RECONCILE_SECONDS = max(
+        int(os.getenv("HOURLY_RECONCILE_SECONDS", "3600") or "3600"), 300
+    )
+    _HOURLY_RECONCILE_PAST_DAYS = max(
+        int(os.getenv("HOURLY_RECONCILE_PAST_DAYS", "45") or "45"), 1
+    )
+    _DRAFT_CLEANUP_PER_HOURLY = max(
+        int(os.getenv("DRAFT_CLEANUP_PER_HOURLY", "1") or "1"), 1
+    )
+    _DRAFT_CLEANUP_MIN_BACKOFF = max(
+        int(os.getenv("DRAFT_CLEANUP_MIN_BACKOFF", "3600") or "3600"), 300
+    )
+    _DRAFT_CLEANUP_MAX_BACKOFF = max(
+        int(os.getenv("DRAFT_CLEANUP_MAX_BACKOFF", "86400") or "86400"),
+        _DRAFT_CLEANUP_MIN_BACKOFF,
+    )
+    _DRAFT_SYNC_COOLDOWN_SECONDS = max(
+        int(os.getenv("DRAFT_SYNC_COOLDOWN_SECONDS", "120") or "120"), 10
+    )
 
     backoff_seconds = max(config.poll_seconds, 5)
     max_backoff = max(backoff_seconds, 60)
@@ -371,7 +415,9 @@ def run() -> None:
         # Once paid is confirmed (webhook or poll), always keep green regardless of mode.
         if paid_state:
             return "green"
-        if has_send or sent_state:
+        # Only show "yellow/pending" after send was actually confirmed.
+        # If staff sets SEND=Y but Xero send/authorise fails, keep orange.
+        if sent_state:
             pay_mode = payment_choice(description) or ""
             # Card/cash are immediate payment flows once send is confirmed.
             if sent_state and pay_mode in {"card", "cash"}:
@@ -383,6 +429,8 @@ def run() -> None:
                 if (current_summary or "").strip().startswith("🟢"):
                     return "green"
             return "yellow"
+        if has_send and not sent_state:
+            return "orange"
         if has_done:
             return "orange"
         return "blue"
@@ -1246,6 +1294,64 @@ def run() -> None:
         text = str(exc or "")
         return "429" in text or "Too Many Requests" in text
 
+    def _event_end_utc(event: dict) -> dt.datetime | None:
+        end_obj = (event.get("end") or {}) if isinstance(event, dict) else {}
+        raw_dt = str(end_obj.get("dateTime") or "").strip()
+        if raw_dt:
+            try:
+                out = dt.datetime.fromisoformat(raw_dt.replace("Z", "+00:00"))
+                if out.tzinfo is None:
+                    out = out.replace(tzinfo=dt.timezone.utc)
+                return out.astimezone(dt.timezone.utc)
+            except Exception:
+                return None
+        raw_date = str(end_obj.get("date") or "").strip()
+        if raw_date:
+            try:
+                d = dt.date.fromisoformat(raw_date)
+                # all-day end date is exclusive in Google Calendar;
+                # treat it as end-of-previous-day local time for "past" checks.
+                local = dt.datetime.combine(
+                    d, dt.time.min, tzinfo=LONDON_TZ
+                ) - dt.timedelta(seconds=1)
+                return local.astimezone(dt.timezone.utc)
+            except Exception:
+                return None
+        return None
+
+    def _clear_draft_cleanup_warning(description: str) -> str:
+        lines = (description or "").splitlines()
+        kept = [
+            ln
+            for ln in lines
+            if "draft cleanup pending" not in ln.lower()
+        ]
+        return "\n".join(kept)
+
+    def _draft_sync_fingerprint(
+        *,
+        invoice_lines: list[dict],
+        contact_id: str,
+        payment_mode: str,
+        force_no_vat: bool,
+    ) -> str:
+        payload = {
+            "contact_id": str(contact_id or ""),
+            "payment_mode": str(payment_mode or "").lower(),
+            "force_no_vat": bool(force_no_vat),
+            "invoice_lines": [
+                {
+                    "Description": str((line or {}).get("Description") or "").strip(),
+                    "Quantity": float((line or {}).get("Quantity") or 0),
+                    "UnitAmount": float((line or {}).get("UnitAmount") or 0),
+                    "TaxType": str((line or {}).get("TaxType") or "").strip().upper(),
+                }
+                for line in (invoice_lines or [])
+            ],
+        }
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
     while True:
         now = dt.datetime.now(dt.timezone.utc)
         # Rebuild Xero client only when the cached one is stale or missing.
@@ -1272,19 +1378,37 @@ def run() -> None:
         if not _was_enabled:
             _feed.push("System resumed — watching for events", "system")
         _was_enabled = True
-        # Keep poll scope realistic; avoids dragging legacy/test history into each cycle.
-        _scan_past_days = max(int(os.getenv("EVENT_SCAN_PAST_DAYS", "45") or "45"), 1)
-        _scan_future_days = max(int(os.getenv("EVENT_SCAN_FUTURE_DAYS", "120") or "120"), 1)
-        time_min = now - dt.timedelta(days=_scan_past_days)
-        time_max = now + dt.timedelta(days=_scan_future_days)
         active_calendars = get_active_calendars(
             config.admin_db_file, config.google_calendar_id
         )
         _refresh_calendar_name_cache(active_calendars)
 
+        _queued_calendar_targets = {
+            c for c in consume_calendar_targets() if c in set(active_calendars)
+        }
+        _queued_event_targets = [e for e in consume_event_targets() if ":" in e]
+        _target_event_ids_by_calendar: dict[str, set[str]] = {}
+        for _key in _queued_event_targets:
+            _cal_id, _ev_id = _key.split(":", 1)
+            if _cal_id not in active_calendars or not _ev_id:
+                continue
+            _target_event_ids_by_calendar.setdefault(_cal_id, set()).add(_ev_id)
+        _target_calendar_ids = set(_queued_calendar_targets) | set(
+            _target_event_ids_by_calendar.keys()
+        )
+        _target_event_keys = {
+            k
+            for k in _queued_event_targets
+            if (k.split(":", 1)[0] in set(active_calendars))
+        }
+        _now_ts = time.time()
+        _is_targeted_cycle = bool(_target_calendar_ids)
+        _is_hourly_reconcile_cycle = (_now_ts - _last_hourly_reconcile_ts) >= _HOURLY_RECONCILE_SECONDS
+        if _is_hourly_reconcile_cycle:
+            _last_hourly_reconcile_ts = _now_ts
+
         # Auto-manage Google Calendar watches — run at most once per hour,
         # or immediately when calendar settings change (triggered by the settings page).
-        _now_ts = time.time()
         if consume_watch_check() or (_now_ts - _last_watch_check) >= _WATCH_CHECK_INTERVAL:
             _last_watch_check = _now_ts
             _run_watch_check = True
@@ -1374,20 +1498,90 @@ def run() -> None:
                 _feed.push(f"Google webhook manager error: {str(exc).splitlines()[0][:100]}", "error")
 
         events: list[dict] = []
+        seen_event_keys: set[str] = set()
+
+        def _push_unique_event(calendar_id: str, event: dict) -> None:
+            event_id = str((event or {}).get("id") or "").strip()
+            if not event_id:
+                return
+            dedupe_key = f"{calendar_id}:{event_id}"
+            if dedupe_key in seen_event_keys:
+                return
+            seen_event_keys.add(dedupe_key)
+            event["_calendar_id"] = calendar_id
+            events.append(event)
+
         calendar_fetch_failed = False
         # Intentionally overlap the updated_min window for reliability.
         # This prevents races where a calendar change happens right after a fetch
         # but before last_sync is advanced.
         query_updated_min = last_sync - _poll_overlap
-        for calendar_id in active_calendars:
+        _service = None
+        if _target_event_ids_by_calendar:
             try:
-                cal_events = list_recent_events(
-                    config=config,
-                    updated_min=query_updated_min,
-                    time_min=time_min,
-                    time_max=time_max,
-                    calendar_id=calendar_id,
+                _service = build_calendar_service(config)
+            except Exception as exc:
+                print(f"[poll] Failed to build calendar service for targeted events: {exc}", flush=True)
+                _feed.push(
+                    f"Targeted event read failed: {str(exc).splitlines()[0][:100]}",
+                    "error",
                 )
+
+        # Directly read webhook-targeted event ids first, avoiding full-cycle scans.
+        if _service:
+            for _cal_id, _event_ids in _target_event_ids_by_calendar.items():
+                for _event_id in sorted(_event_ids):
+                    try:
+                        _ev = _service.events().get(calendarId=_cal_id, eventId=_event_id).execute()
+                        _push_unique_event(_cal_id, _ev)
+                    except Exception as exc:
+                        print(f"[poll] Targeted event read failed for {_cal_id}:{_event_id}: {exc}", flush=True)
+
+        # Build scan windows:
+        # - Targeted cycles: focused scan around touched calendars/events.
+        # - Every cycle: lightweight recent-saves scan only (Google safety net).
+        # - Hourly: add a past-only sweep for payment reconciliation candidates.
+        _scan_windows: list[tuple[dt.datetime, dt.datetime]] = []
+        if _is_targeted_cycle:
+            _scan_windows.append(
+                (
+                    now - dt.timedelta(days=2),
+                    now + dt.timedelta(days=30),
+                )
+            )
+            calendars_to_scan = [c for c in active_calendars if c in _target_calendar_ids]
+        else:
+            calendars_to_scan = list(active_calendars)
+            _start_of_today = now.astimezone(LONDON_TZ).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).astimezone(dt.timezone.utc)
+            _scan_windows.append(
+                (
+                    _start_of_today - dt.timedelta(hours=1),
+                    _start_of_today + dt.timedelta(days=1, hours=1),
+                )
+            )
+            if _is_hourly_reconcile_cycle:
+                _scan_windows.append(
+                    (
+                        now - dt.timedelta(days=_HOURLY_RECONCILE_PAST_DAYS),
+                        now + dt.timedelta(hours=1),
+                    )
+                )
+
+        for calendar_id in calendars_to_scan:
+            try:
+                cal_events: list[dict] = []
+                for _time_min, _time_max in _scan_windows:
+                    cal_events.extend(
+                        list_recent_events(
+                            config=config,
+                            updated_min=query_updated_min,
+                            time_min=_time_min,
+                            time_max=_time_max,
+                            calendar_id=calendar_id,
+                        )
+                    )
             except Exception as exc:
                 calendar_fetch_failed = True
                 print(
@@ -1400,11 +1594,89 @@ def run() -> None:
                 )
                 continue
             for e in cal_events:
-                e["_calendar_id"] = calendar_id
-                events.append(e)
+                _push_unique_event(calendar_id, e)
         # Process newest changes first so current operations are not starved by backlog.
         events.sort(key=lambda e: str(e.get("updated") or ""), reverse=True)
         had_changes = bool(events)
+        events_by_key = {
+            f"{str(e.get('_calendar_id') or '')}:{str(e.get('id') or '')}": e
+            for e in events
+            if e.get("id") and e.get("_calendar_id")
+        }
+
+        # Retry deferred Xero draft cleanup for cash-completed entries.
+        # Keep this low-frequency and low-volume (hourly, capped) to avoid extra load.
+        if _is_hourly_reconcile_cycle and xero_client:
+            _cleanup_queue = dict(state.get("draft_cleanup_queue", {}) or {})
+            if _cleanup_queue:
+                _cleanup_now = time.time()
+                _cleanup_done = 0
+                _cleanup_service = None
+                for _ev_key, _row in sorted(
+                    _cleanup_queue.items(),
+                    key=lambda kv: float(((kv[1] or {}).get("next_retry_at") or 0.0)),
+                ):
+                    if _cleanup_done >= _DRAFT_CLEANUP_PER_HOURLY:
+                        break
+                    _row = dict(_row or {})
+                    _inv_id = str(_row.get("invoice_id") or "").strip()
+                    if not _inv_id:
+                        _cleanup_queue.pop(_ev_key, None)
+                        continue
+                    _next_retry_at = float(_row.get("next_retry_at") or 0.0)
+                    if _next_retry_at and _next_retry_at > _cleanup_now:
+                        continue
+                    try:
+                        xero_client.delete_draft_invoice(_inv_id)
+                        _cleanup_queue.pop(_ev_key, None)
+                        if ":" in _ev_key:
+                            _cal_id, _eid = _ev_key.split(":", 1)
+                            _ev = events_by_key.get(_ev_key)
+                            if _ev is None:
+                                try:
+                                    if _cleanup_service is None:
+                                        _cleanup_service = build_calendar_service(config)
+                                    _ev = (
+                                        _cleanup_service.events()
+                                        .get(calendarId=_cal_id, eventId=_eid)
+                                        .execute()
+                                    )
+                                except Exception:
+                                    _ev = None
+                            if _ev:
+                                _desc = str(_ev.get("description") or "")
+                                _new_desc = _clear_draft_cleanup_warning(_desc)
+                                if _new_desc != _desc:
+                                    _upd = safe_update(
+                                        event_id=_eid,
+                                        description=_new_desc,
+                                        label="Draft cleanup complete",
+                                        summary_status="green",
+                                        current_summary=_ev.get("summary"),
+                                        calendar_id=_cal_id,
+                                    )
+                                    if _upd:
+                                        _ev["description"] = _new_desc
+                                        _ev["updated"] = _upd.get("updated", _ev.get("updated"))
+                        _feed.push(
+                            f"Draft cleanup completed for {_inv_id[:8]}…",
+                            "success",
+                        )
+                    except Exception as _exc:
+                        _prev_backoff = int(_row.get("backoff_seconds") or 0)
+                        _next_backoff = max(
+                            _DRAFT_CLEANUP_MIN_BACKOFF,
+                            (_prev_backoff * 2) if _prev_backoff else _DRAFT_CLEANUP_MIN_BACKOFF,
+                        )
+                        _next_backoff = min(_next_backoff, _DRAFT_CLEANUP_MAX_BACKOFF)
+                        _cleanup_queue[_ev_key] = {
+                            "invoice_id": _inv_id,
+                            "next_retry_at": _cleanup_now + _next_backoff,
+                            "backoff_seconds": _next_backoff,
+                            "last_error": str(_exc).splitlines()[0][:220],
+                        }
+                    _cleanup_done += 1
+                state["draft_cleanup_queue"] = _cleanup_queue
 
         admin_creds = load_admin_credentials(config)
         sheet_target = get_sheet_target(config.admin_db_file)
@@ -1592,6 +1864,15 @@ def run() -> None:
                 sent_state = is_invoice_sent(state, event_key)
                 paid_state = is_invoice_paid(state, event_key)
                 pay_mode_hint = payment_choice(event.get("description")) or ""
+                _event_end = _event_end_utc(event)
+                _event_is_past = bool(_event_end and _event_end <= now)
+                _event_targeted = (
+                    (event_key in _target_event_keys)
+                    or (calendar_id in _target_calendar_ids)
+                )
+                _allow_paid_reconcile = bool(
+                    _event_is_past and (_is_hourly_reconcile_cycle or _event_targeted)
+                )
                 _needs_xero_event_work = bool(
                     (
                         (has_done or has_send)
@@ -1601,6 +1882,7 @@ def run() -> None:
                         sent_state
                         and not paid_state
                         and pay_mode_hint in {"invoice", "card"}
+                        and _allow_paid_reconcile
                     )
                 )
                 if _needs_xero_event_work:
@@ -1641,9 +1923,61 @@ def run() -> None:
                             event["summary"] = updated.get("summary", event.get("summary"))
                             event["updated"] = updated.get("updated", event.get("updated"))
                             current_summary = (event.get("summary") or "").strip()
-                # Finalised entries (green title) are immutable: do nothing else.
-                # This prevents any follow-up pass from re-touching completed jobs.
+                # Finalised entries (green title) are normally immutable.
+                # Exception: if staff explicitly requests SEND NOW on a green+mail-failed
+                # entry, allow a safe email-only retry without changing invoice/payment data.
                 if current_summary.startswith("🟢"):
+                    _desc_now = event.get("description") or ""
+                    _mail_retry_requested = bool(
+                        has_send and ("invoice send failed" in _desc_now.lower())
+                    )
+                    _mail_retry_invoice_id = get_invoice_for_event(state, event_key) or ""
+                    if _mail_retry_requested and _mail_retry_invoice_id and xero_client:
+                        try:
+                            _emailed = xero_client.email_invoice(_mail_retry_invoice_id)
+                            if _emailed:
+                                _invoice_url = xero_client.get_online_invoice_url(
+                                    _mail_retry_invoice_id
+                                )
+                                _updated_desc = upsert_send_confirmation(
+                                    _desc_now,
+                                    invoice_url=_invoice_url,
+                                    submitter=submitter_display,
+                                    submitted_at=submitted_at_display,
+                                )
+                                _updated_event = safe_update(
+                                    event_id=event.get("id"),
+                                    description=_updated_desc,
+                                    label="Invoice email retry",
+                                    summary_status="green",
+                                    current_summary=event.get("summary"),
+                                    calendar_id=calendar_id,
+                                )
+                                if _updated_event:
+                                    event["description"] = _updated_desc
+                                    event["updated"] = _updated_event.get(
+                                        "updated", event.get("updated")
+                                    )
+                                state = mark_invoice_sent(state, event_key)
+                                state = mark_invoice_paid(state, event_key)
+                                _feed.push(
+                                    f"Invoice email sent on retry for \"{event.get('summary', event_id)}\"",
+                                    "success",
+                                )
+                            else:
+                                _feed.push(
+                                    f"Invoice email retry failed for \"{event.get('summary', event_id)}\"",
+                                    "warn",
+                                )
+                        except Exception as _exc:
+                            print(
+                                f"Event {event_id}: email-only retry failed: {_exc}",
+                                flush=True,
+                            )
+                            _feed.push(
+                                f"Invoice email retry failed for \"{event.get('summary', event_id)}\": {str(_exc).splitlines()[0][:100]}",
+                                "error",
+                            )
                     state = set_processed_update_marker(
                         state,
                         event_key,
@@ -1707,18 +2041,19 @@ def run() -> None:
                         and not pending_draft
                     )
                     if skip_unchanged:
+                        _sync_invoice_id = get_invoice_for_event(state, event_key)
                         needs_invoice_paid_sync = bool(
-                            (has_send or sent_state)
-                            and is_invoice_sent(state, event_key)
-                            and pay_mode_hint in {"invoice", "card"}
+                            has_done
+                            and _allow_paid_reconcile
                             and xero_client
-                            and get_invoice_for_event(state, event_key)
+                            and _sync_invoice_id
+                            and pay_mode_hint in {"invoice", "card"}
                             and not (event.get("summary") or "").strip().startswith("🟢")
                         )
                         if not needs_invoice_paid_sync:
                             continue
                         # Poll Xero for payment status on unchanged INVOICE-mode events.
-                        _sync_inv_id = get_invoice_for_event(state, event_key)
+                        _sync_inv_id = _sync_invoice_id
                         try:
                             _sync_inv = xero_client.get_invoice(_sync_inv_id)
                             if (_sync_inv.get("Status") or "").upper() == "PAID":
@@ -1734,6 +2069,7 @@ def run() -> None:
                                     f"Invoice paid — marked green: \"{event.get('summary', event_id)}\"",
                                     "success",
                                 )
+                                state = mark_invoice_sent(state, event_key)
                                 state = mark_invoice_paid(state, event_key)
                         except Exception as _exc:
                             print(f"Event {event_id}: paid-sync check failed: {_exc}")
@@ -1866,10 +2202,31 @@ def run() -> None:
                                     if existing_contact_id
                                     else None
                                 )
+                                draft_fp = _draft_sync_fingerprint(
+                                    invoice_lines=invoice_lines,
+                                    contact_id=existing_contact_id,
+                                    payment_mode=payment_choice(event.get("description")) or "",
+                                    force_no_vat=invoice_has_cash_marker(event.get("description")),
+                                )
+                                last_draft_fp = get_draft_sync_fingerprint(state, event_key)
+                                last_draft_attempt = (
+                                    get_draft_sync_attempted_at(state, event_key) or 0.0
+                                )
+                                now_ts = time.time()
+                                in_cooldown = (
+                                    (now_ts - last_draft_attempt) < _DRAFT_SYNC_COOLDOWN_SECONDS
+                                )
                                 if not invoice_id:
+                                    if in_cooldown and draft_fp == last_draft_fp:
+                                        if event_updated:
+                                            state = set_invoice_update_marker(
+                                                state, event_key, event_updated
+                                            )
+                                        continue
                                     print(f"Event {event_id}: creating draft invoice")
                                     _feed.push(f"Creating invoice in Xero for \"{event.get('summary', event_id)}\"…", "info")
                                     details = extract_event_details(event)
+                                    state = set_draft_sync_attempted_at(state, event_key, now_ts)
                                     result = xero_client.create_invoice_from_event(
                                         details, contact=contact_ref, line_items=invoice_lines
                                     )
@@ -1880,6 +2237,9 @@ def run() -> None:
                                         if invoice_id:
                                             state = set_invoice_for_event(
                                                 state, event_key, invoice_id
+                                            )
+                                            state = set_draft_sync_fingerprint(
+                                                state, event_key, draft_fp
                                             )
                                             state = set_invoice_update_marker(
                                                 state, event_key, event_updated
@@ -1918,72 +2278,90 @@ def run() -> None:
                                             if updated:
                                                 event["description"] = updated_description
                                                 event_updated = updated.get("updated") or event_updated
-                                elif event_updated and event_updated != last_invoice_update:
-                                    mutable, status = _is_invoice_mutable(invoice_id)
-                                    if not mutable:
-                                        print(
-                                            f"Event {event_id}: skip invoice update, status={status}"
-                                        )
-                                        if (status or "").upper() == "PAID":
-                                            if not (event.get("summary") or "").strip().startswith("🟢"):
-                                                updated = safe_update(
-                                                    event_id=event.get("id"),
-                                                    description=event.get("description") or "",
-                                                    label="Invoice paid",
-                                                    summary_status="green",
-                                                    current_summary=event.get("summary"),
-                                                    calendar_id=calendar_id,
-                                                )
-                                                if updated:
-                                                    event_updated = updated.get("updated") or event_updated
-                                            state = mark_invoice_sent(state, event_key)
-                                            state = mark_invoice_paid(state, event_key)
-                                        state = set_invoice_update_marker(
-                                            state, event_key, event_updated
-                                        )
-                                    else:
-                                        result = xero_client.update_invoice(
-                                            invoice_id=invoice_id,
-                                            contact=contact_ref,
-                                            line_items=invoice_lines,
-                                        )
-                                        print(f"Invoice draft updated for event {event['id']}: {_invoice_brief(result)}")
-                                        _feed.push(
-                                            f"Invoice draft updated: {_invoice_brief(result)}",
-                                            "info",
-                                        )
-                                        subtotal, total = _extract_totals(result)
-                                        if subtotal is not None and total is not None:
-                                            updated_description = upsert_invoice_summary(
-                                                collapse_invoice_override_section(event.get("description") or ""),
-                                                subtotal,
-                                                total,
-                                                sent=False,
-                                                invoice_url=(
-                                                    xero_client.get_online_invoice_url(invoice_id)
-                                                    if xero_client and invoice_id
-                                                    else None
-                                                ),
-                                                include_prompt=True,
-                                                submitter=submitter_display,
-                                                submitted_at=submitted_at_display,
+                                else:
+                                    should_try_update = bool(
+                                        (event_updated and event_updated != last_invoice_update)
+                                        or (draft_fp != last_draft_fp)
+                                    )
+                                    if not should_try_update:
+                                        pass
+                                    elif in_cooldown and draft_fp == last_draft_fp:
+                                        if event_updated:
+                                            state = set_invoice_update_marker(
+                                                state, event_key, event_updated
                                             )
-                                            if updated_description != (event.get("description") or ""):
-                                                updated = safe_update(
-                                                    event_id=event.get("id"),
-                                                    description=updated_description,
-                                                    label="Invoice summary",
-                                                    summary_status="orange",
-                                                    current_summary=event.get("summary"),
-                                                    calendar_id=calendar_id,
-                                                    draft_progress_increment=True,
-                                                )
-                                                if updated:
-                                                    event["description"] = updated_description
-                                                    event_updated = updated.get("updated") or event_updated
-                                        state = set_invoice_update_marker(
-                                            state, event_key, event_updated
+                                    else:
+                                        state = set_draft_sync_attempted_at(
+                                            state, event_key, now_ts
                                         )
+                                        mutable, status = _is_invoice_mutable(invoice_id)
+                                        if not mutable:
+                                            print(
+                                                f"Event {event_id}: skip invoice update, status={status}"
+                                            )
+                                            if (status or "").upper() == "PAID":
+                                                if not (event.get("summary") or "").strip().startswith("🟢"):
+                                                    updated = safe_update(
+                                                        event_id=event.get("id"),
+                                                        description=event.get("description") or "",
+                                                        label="Invoice paid",
+                                                        summary_status="green",
+                                                        current_summary=event.get("summary"),
+                                                        calendar_id=calendar_id,
+                                                    )
+                                                    if updated:
+                                                        event_updated = updated.get("updated") or event_updated
+                                                state = mark_invoice_sent(state, event_key)
+                                                state = mark_invoice_paid(state, event_key)
+                                            state = set_invoice_update_marker(
+                                                state, event_key, event_updated
+                                            )
+                                        else:
+                                            result = xero_client.update_invoice(
+                                                invoice_id=invoice_id,
+                                                contact=contact_ref,
+                                                line_items=invoice_lines,
+                                            )
+                                            print(f"Invoice draft updated for event {event['id']}: {_invoice_brief(result)}")
+                                            _feed.push(
+                                                f"Invoice draft updated: {_invoice_brief(result)}",
+                                                "info",
+                                            )
+                                            subtotal, total = _extract_totals(result)
+                                            if subtotal is not None and total is not None:
+                                                updated_description = upsert_invoice_summary(
+                                                    collapse_invoice_override_section(event.get("description") or ""),
+                                                    subtotal,
+                                                    total,
+                                                    sent=False,
+                                                    invoice_url=(
+                                                        xero_client.get_online_invoice_url(invoice_id)
+                                                        if xero_client and invoice_id
+                                                        else None
+                                                    ),
+                                                    include_prompt=True,
+                                                    submitter=submitter_display,
+                                                    submitted_at=submitted_at_display,
+                                                )
+                                                if updated_description != (event.get("description") or ""):
+                                                    updated = safe_update(
+                                                        event_id=event.get("id"),
+                                                        description=updated_description,
+                                                        label="Invoice summary",
+                                                        summary_status="orange",
+                                                        current_summary=event.get("summary"),
+                                                        calendar_id=calendar_id,
+                                                        draft_progress_increment=True,
+                                                    )
+                                                    if updated:
+                                                        event["description"] = updated_description
+                                                        event_updated = updated.get("updated") or event_updated
+                                            state = set_draft_sync_fingerprint(
+                                                state, event_key, draft_fp
+                                            )
+                                            state = set_invoice_update_marker(
+                                                state, event_key, event_updated
+                                            )
                             elif has_done and not has_send and not existing_contact_id:
                                 print(f"Event {event_id}: skipping invoice (no contact_id)")
                             elif has_done and not has_send and not xero_client:
@@ -2031,16 +2409,25 @@ def run() -> None:
                                     continue
                                 if pay_mode == "cash":
                                     cash_cleanup_warning = None
+                                    _cleanup_queue = dict(state.get("draft_cleanup_queue", {}) or {})
                                     if invoice_id and xero_client:
                                         try:
                                             xero_client.delete_draft_invoice(invoice_id)
+                                            _cleanup_queue.pop(event_key, None)
                                         except Exception as exc:
                                             print(f"Event {event_id}: failed to remove draft for cash flow: {exc}")
                                             cash_cleanup_warning = str(exc).splitlines()[0][:140]
+                                            _cleanup_queue[event_key] = {
+                                                "invoice_id": invoice_id,
+                                                "next_retry_at": 0.0,
+                                                "backoff_seconds": _DRAFT_CLEANUP_MIN_BACKOFF,
+                                                "last_error": cash_cleanup_warning,
+                                            }
                                             _feed.push(
                                                 f"Cash marked complete but draft cleanup will retry: {cash_cleanup_warning}",
                                                 "warn",
                                             )
+                                    state["draft_cleanup_queue"] = _cleanup_queue
 
                                     # Log sales rows from the original invoice block before
                                     # we rewrite notes for cash completion.
@@ -2548,7 +2935,28 @@ def run() -> None:
                                     if contact and contact.get("ContactID")
                                     else None
                                 )
+                                draft_fp = _draft_sync_fingerprint(
+                                    invoice_lines=invoice_lines,
+                                    contact_id=(contact.get("ContactID") if contact else ""),
+                                    payment_mode=payment_choice(event.get("description")) or "",
+                                    force_no_vat=invoice_has_cash_marker(event.get("description")),
+                                )
+                                last_draft_fp = get_draft_sync_fingerprint(state, event_key)
+                                last_draft_attempt = (
+                                    get_draft_sync_attempted_at(state, event_key) or 0.0
+                                )
+                                now_ts = time.time()
+                                in_cooldown = (
+                                    (now_ts - last_draft_attempt) < _DRAFT_SYNC_COOLDOWN_SECONDS
+                                )
                                 if not invoice_id:
+                                    if in_cooldown and draft_fp == last_draft_fp:
+                                        if event_updated:
+                                            state = set_invoice_update_marker(
+                                                state, event_key, event_updated
+                                            )
+                                        continue
+                                    state = set_draft_sync_attempted_at(state, event_key, now_ts)
                                     result = xero_client.create_invoice_from_event(
                                         details, contact=contact_ref, line_items=invoice_lines
                                     )
@@ -2561,6 +2969,9 @@ def run() -> None:
                                         if invoice_id:
                                             state = set_invoice_for_event(
                                                 state, event_key, invoice_id
+                                            )
+                                            state = set_draft_sync_fingerprint(
+                                                state, event_key, draft_fp
                                             )
                                             state = set_invoice_update_marker(
                                                 state, event_key, event_updated
@@ -2602,7 +3013,21 @@ def run() -> None:
                                     last_invoice_update = get_invoice_update_marker(
                                         state, event_key
                                     )
-                                    if event_updated and event_updated != last_invoice_update:
+                                    should_try_update = bool(
+                                        (event_updated and event_updated != last_invoice_update)
+                                        or (draft_fp != last_draft_fp)
+                                    )
+                                    if not should_try_update:
+                                        pass
+                                    elif in_cooldown and draft_fp == last_draft_fp:
+                                        if event_updated:
+                                            state = set_invoice_update_marker(
+                                                state, event_key, event_updated
+                                            )
+                                    else:
+                                        state = set_draft_sync_attempted_at(
+                                            state, event_key, now_ts
+                                        )
                                         mutable, status = _is_invoice_mutable(invoice_id)
                                         if not mutable:
                                             print(
@@ -2665,6 +3090,9 @@ def run() -> None:
                                                     if updated:
                                                         event["description"] = updated_description
                                                         event_updated = updated.get("updated") or event_updated
+                                            state = set_draft_sync_fingerprint(
+                                                state, event_key, draft_fp
+                                            )
                                             state = set_invoice_update_marker(
                                                 state, event_key, event_updated
                                             )
@@ -2710,16 +3138,25 @@ def run() -> None:
                                     continue
                                 if pay_mode == "cash":
                                     cash_cleanup_warning = None
+                                    _cleanup_queue = dict(state.get("draft_cleanup_queue", {}) or {})
                                     if invoice_id and xero_client:
                                         try:
                                             xero_client.delete_draft_invoice(invoice_id)
+                                            _cleanup_queue.pop(event_key, None)
                                         except Exception as exc:
                                             print(f"Event {event.get('id')}: failed to remove draft for cash flow: {exc}")
                                             cash_cleanup_warning = str(exc).splitlines()[0][:140]
+                                            _cleanup_queue[event_key] = {
+                                                "invoice_id": invoice_id,
+                                                "next_retry_at": 0.0,
+                                                "backoff_seconds": _DRAFT_CLEANUP_MIN_BACKOFF,
+                                                "last_error": cash_cleanup_warning,
+                                            }
                                             _feed.push(
                                                 f"Cash marked complete but draft cleanup will retry: {cash_cleanup_warning}",
                                                 "warn",
                                             )
+                                    state["draft_cleanup_queue"] = _cleanup_queue
 
                                     # Log sales rows from the original invoice block before
                                     # we rewrite notes for cash completion.

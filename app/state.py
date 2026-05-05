@@ -148,6 +148,32 @@ def set_invoice_update_marker(state: Dict, event_id: str, updated_at: str) -> Di
     return state
 
 
+def get_draft_sync_fingerprint(state: Dict, event_id: str) -> str | None:
+    return state.get("event_draft_sync_fingerprints", {}).get(event_id)
+
+
+def set_draft_sync_fingerprint(state: Dict, event_id: str, fingerprint: str) -> Dict:
+    mapping = state.get("event_draft_sync_fingerprints", {})
+    mapping[event_id] = fingerprint
+    state["event_draft_sync_fingerprints"] = mapping
+    return state
+
+
+def get_draft_sync_attempted_at(state: Dict, event_id: str) -> float | None:
+    raw = (state.get("event_draft_sync_attempted_at", {}) or {}).get(event_id)
+    try:
+        return float(raw)
+    except Exception:
+        return None
+
+
+def set_draft_sync_attempted_at(state: Dict, event_id: str, when_ts: float) -> Dict:
+    mapping = state.get("event_draft_sync_attempted_at", {})
+    mapping[event_id] = float(when_ts)
+    state["event_draft_sync_attempted_at"] = mapping
+    return state
+
+
 def get_sheet_log_marker(state: Dict, event_id: str) -> str | None:
     return state.get("event_sheet_log_updates", {}).get(event_id)
 
@@ -219,8 +245,11 @@ def prune_state(state: Dict, keep_recent_events: int = 1500) -> Dict:
         "event_processed_updates",
         "event_invoice_map",
         "event_invoice_updates",
+        "event_draft_sync_fingerprints",
+        "event_draft_sync_attempted_at",
         "event_xero_retry_after",
         "event_xero_retry_backoff",
+        "draft_cleanup_queue",
         "event_sheet_log_updates",
         "event_sales_log_updates",
         "event_cash_log_updates",
