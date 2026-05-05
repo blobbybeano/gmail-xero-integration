@@ -20,6 +20,11 @@ _XERO_RATE_LIMIT_LOCK = threading.Lock()
 _XERO_RATE_LIMIT_UNTIL_TS = 0.0
 
 
+def get_xero_rate_limit_until_ts() -> float:
+    with _XERO_RATE_LIMIT_LOCK:
+        return float(_XERO_RATE_LIMIT_UNTIL_TS or 0.0)
+
+
 def _short_reference(event: Dict) -> str:
     event_id = (event.get("id") or "").strip()
     date_raw = (event.get("start") or "").split("T", 1)[0].replace("-", "")

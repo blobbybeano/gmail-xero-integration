@@ -117,7 +117,7 @@ from .state import (
     set_sheet_log_marker,
     set_sales_log_marker,
 )
-from .xero_client import XeroClient, build_xero_client
+from .xero_client import XeroClient, build_xero_client, get_xero_rate_limit_until_ts
 from .log_feed import feed as _feed
 
 LONDON_TZ = ZoneInfo("Europe/London")
@@ -168,13 +168,17 @@ def run() -> None:
 
     xero_client = _build_xero_client_safe()
     _xero_built_at: float = time.time()
-    _xero_retry_after: float = 0.0
+    _xero_retry_after: float = float(state.get("xero_lockout_until_ts") or 0.0)
+    _xero_lock_notice_ts: float = 0.0
     _XERO_REBUILD_INTERVAL = 3300  # rebuild token ~55 min (Xero tokens last 30 min)
     _XERO_429_COOLDOWN_SECONDS = 180
     _XERO_EVENT_429_COOLDOWN_SECONDS = 900
     _XERO_EVENT_429_MAX_COOLDOWN_SECONDS = max(
         int(os.getenv("XERO_EVENT_429_MAX_COOLDOWN_SECONDS", "90000") or "90000"),
         _XERO_EVENT_429_COOLDOWN_SECONDS,
+    )
+    _XERO_LOCK_PROBE_SECONDS = max(
+        int(os.getenv("XERO_LOCK_PROBE_SECONDS", "1800") or "1800"), 300
     )
     _XERO_EVENTS_PER_CYCLE = max(int(os.getenv("XERO_EVENTS_PER_CYCLE", "4") or "4"), 1)
     _last_xero_429_notice_at: float = 0.0
@@ -1369,8 +1373,47 @@ def run() -> None:
 
     while True:
         now = dt.datetime.now(dt.timezone.utc)
-        # Rebuild Xero client only when the cached one is stale or missing.
         _now_ts_for_xero = time.time()
+        _persisted_lock_until = float(state.get("xero_lockout_until_ts") or 0.0)
+        _global_lock_until = float(get_xero_rate_limit_until_ts() or 0.0)
+        _effective_lock_until = max(_xero_retry_after, _persisted_lock_until, _global_lock_until)
+        if _effective_lock_until > _now_ts_for_xero:
+            _xero_retry_after = _effective_lock_until
+            state["xero_lockout_until_ts"] = _effective_lock_until
+            state["xero_lockout_reason"] = "Xero API day/minute rate limit (429)"
+            state["xero_lockout_updated_at_ts"] = _now_ts_for_xero
+            if xero_client is not None:
+                xero_client = None
+            _last_probe = float(state.get("xero_lockout_last_probe_ts") or 0.0)
+            if (_now_ts_for_xero - _last_probe) >= _XERO_LOCK_PROBE_SECONDS:
+                state["xero_lockout_last_probe_ts"] = _now_ts_for_xero
+                try:
+                    _probe_client = _build_xero_client_safe()
+                    if _probe_client:
+                        _probe_client.get_organisation()
+                        state["xero_lockout_until_ts"] = 0.0
+                        state["xero_lockout_reason"] = ""
+                        state["xero_lockout_updated_at_ts"] = _now_ts_for_xero
+                        _xero_retry_after = 0.0
+                        xero_client = _probe_client
+                        _xero_built_at = _now_ts_for_xero
+                        _feed.push("Xero lockout cleared — processing resumed", "success")
+                except Exception:
+                    pass
+            if (_now_ts_for_xero - _xero_lock_notice_ts) >= 300:
+                _mins = int(max(1, (_effective_lock_until - _now_ts_for_xero) // 60))
+                _feed.push(
+                    f"Xero lockout active — queued mode ({_mins}m remaining)",
+                    "warn",
+                )
+                _xero_lock_notice_ts = _now_ts_for_xero
+            save_state(config.state_file, state)
+        elif _persisted_lock_until:
+            state["xero_lockout_until_ts"] = 0.0
+            state["xero_lockout_reason"] = ""
+            state["xero_lockout_updated_at_ts"] = _now_ts_for_xero
+
+        # Rebuild Xero client only when the cached one is stale or missing.
         if (xero_client is None and _now_ts_for_xero >= _xero_retry_after) or (
             xero_client is not None and (_now_ts_for_xero - _xero_built_at) > _XERO_REBUILD_INTERVAL
         ):
@@ -1381,6 +1424,10 @@ def run() -> None:
                 _xero_retry_after = _now_ts_for_xero + 120
             else:
                 _xero_retry_after = 0.0
+                if state.get("xero_lockout_until_ts"):
+                    state["xero_lockout_until_ts"] = 0.0
+                    state["xero_lockout_reason"] = ""
+                    state["xero_lockout_updated_at_ts"] = _now_ts_for_xero
 
         # Global on/off toggle
         _enabled = get_enabled(config.admin_db_file)
@@ -3459,18 +3506,27 @@ def run() -> None:
                 )
                 if _is_xero_429(exc):
                     _retry_hint_seconds = _xero_retry_after_hint_seconds(exc)
+                    _global_lock_until = float(get_xero_rate_limit_until_ts() or 0.0)
+                    _hint_lock_until = (
+                        (time.time() + _retry_hint_seconds)
+                        if _retry_hint_seconds
+                        else 0.0
+                    )
+                    _effective_lock_until = max(_global_lock_until, _hint_lock_until)
                     # Enter a short global cooldown so one rate-limited event does not
                     # trigger a retry storm across all events/calendars.
                     xero_client = None
                     _xero_retry_after = max(
                         _xero_retry_after,
-                        time.time()
-                        + (
-                            _retry_hint_seconds
-                            if _retry_hint_seconds
-                            else _XERO_429_COOLDOWN_SECONDS
+                        _effective_lock_until
+                        if _effective_lock_until
+                        else (
+                            time.time() + _XERO_429_COOLDOWN_SECONDS
                         ),
                     )
+                    state["xero_lockout_until_ts"] = _xero_retry_after
+                    state["xero_lockout_reason"] = "Xero API rate limit (429)"
+                    state["xero_lockout_updated_at_ts"] = time.time()
                     # Also pause retries for this specific event longer; this is the
                     # common case where one problematic event repeatedly re-triggers 429.
                     _retry_map = dict(state.get("event_xero_retry_after", {}) or {})
@@ -3496,9 +3552,14 @@ def run() -> None:
                     if (_now_notice - _last_xero_429_notice_at) >= 60:
                         _mins = int(
                             (
-                                _retry_hint_seconds
-                                if _retry_hint_seconds
-                                else _XERO_429_COOLDOWN_SECONDS
+                                max(
+                                    60,
+                                    int(
+                                        (
+                                            _xero_retry_after - time.time()
+                                        )
+                                    ),
+                                )
                             )
                             / 60
                         )

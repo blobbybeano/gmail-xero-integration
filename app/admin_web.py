@@ -77,7 +77,12 @@ from .admin_store import (
     set_xero_tenants,
     upsert_xero_tenant,
 )
-from .trigger import trigger_poll, trigger_watch_check
+from .trigger import (
+    trigger_poll,
+    trigger_watch_check,
+    queue_calendar_target,
+    queue_event_target,
+)
 from .state import (
     load_state,
     save_state,
@@ -1696,6 +1701,42 @@ def create_app() -> Flask:
         xero_ok = bool(xero_tok and not token_is_expired(xero_tok))
         watch_count = len(watches)
         enabled = get_enabled(config.admin_db_file)
+        xero_lockout_until_ts = float(state.get("xero_lockout_until_ts") or 0.0)
+        xero_lockout_active = xero_lockout_until_ts > time.time()
+        xero_lockout_reason = str(state.get("xero_lockout_reason") or "").strip()
+        xero_lockout_banner = ""
+        xero_lockout_modal = ""
+        if xero_lockout_active:
+            _mins = int(max(1, (xero_lockout_until_ts - time.time()) // 60))
+            _until_local = dt.datetime.fromtimestamp(
+                xero_lockout_until_ts, tz=dt.timezone.utc
+            ).astimezone().strftime("%d %b %Y %H:%M")
+            _reason_txt = xero_lockout_reason or "Xero is temporarily rate-limited."
+            xero_lockout_banner = (
+                '<div class="mx-6 mt-4 flex items-start gap-3 px-4 py-3 rounded-lg border '
+                'border-red-700/50 bg-red-950/40 text-red-200 text-sm">'
+                '<span class="shrink-0 mt-0.5">🔒</span>'
+                f'<span><strong>Xero lockout active.</strong> {_reason_txt} '
+                f'No Xero requests will be sent until unlock. '
+                f'Estimated unlock: {_until_local} '
+                f'(<span id="xero-lockout-countdown" data-until="{int(xero_lockout_until_ts)}">{_mins}m</span>).</span>'
+                '</div>'
+            )
+            xero_lockout_modal = (
+                '<div id="xero-lockout-modal" class="fixed top-5 right-5 z-50 max-w-sm w-[92vw] sm:w-[360px]">'
+                '<div class="rounded-xl border border-red-700/60 bg-red-950/90 shadow-2xl backdrop-blur px-4 py-3">'
+                '<div class="flex items-start gap-3">'
+                '<div class="text-xl leading-none">🔒</div>'
+                '<div class="min-w-0">'
+                '<p class="text-sm font-semibold text-red-100">Xero Lockout Active</p>'
+                f'<p class="text-xs text-red-200 mt-1">{escape(_reason_txt)}</p>'
+                '<p class="text-xs text-red-100 mt-2">Unlock in '
+                f'<span id="xero-lockout-modal-countdown" data-until="{int(xero_lockout_until_ts)}">{_mins}m</span></p>'
+                '</div>'
+                '</div>'
+                '</div>'
+                '</div>'
+            )
 
         # Build home-page warnings
         _dash_warnings: list[str] = []
@@ -1926,6 +1967,7 @@ def create_app() -> Flask:
   </header>
 
   {warnings_html}
+  {xero_lockout_banner}
 
   <!-- Status signals -->
   <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 px-6 pt-5 pb-4">
@@ -1972,6 +2014,8 @@ def create_app() -> Flask:
     <span class="text-neutral-500">· system</span>
   </div>
 
+  {xero_lockout_modal}
+
 <script>
 const term = document.getElementById('terminal');
 const connDot = document.getElementById('conn-dot');
@@ -1979,6 +2023,39 @@ const connLabel = document.getElementById('conn-label');
 const scrollBtn = document.getElementById('scroll-btn');
 const MAX_TERM_LINES = 30;
 let autoScroll = true;
+
+function _fmtRemaining(seconds) {{
+  const s = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (h > 0) return `${{h}}h ${{m}}m`;
+  return `${{m}}m`;
+}}
+
+function updateXeroLockoutCountdowns() {{
+  const ids = ['xero-lockout-countdown', 'xero-lockout-modal-countdown'];
+  let hasActive = false;
+  ids.forEach((id) => {{
+    const el = document.getElementById(id);
+    if (!el) return;
+    const until = parseInt(el.dataset.until || '0', 10);
+    if (!until) return;
+    const now = Math.floor(Date.now() / 1000);
+    const remaining = until - now;
+    if (remaining > 0) {{
+      hasActive = true;
+      el.textContent = _fmtRemaining(remaining);
+    }} else {{
+      el.textContent = '0m';
+    }}
+  }});
+  if (!hasActive) {{
+    const modal = document.getElementById('xero-lockout-modal');
+    if (modal) modal.remove();
+  }}
+}}
+updateXeroLockoutCountdowns();
+setInterval(updateXeroLockoutCountdowns, 1000);
 
 function scrollToBottom() {{
   term.scrollTop = term.scrollHeight;
@@ -3355,11 +3432,22 @@ function toggleEnabled(requested) {{
         if not token and not channel_known:
             return "", 200
 
+        calendar_hint = ""
+        if channel_id:
+            for _cal_id, _w in (get_google_watches(config.admin_db_file) or {}).items():
+                if str((_w or {}).get("channel_id") or "").strip() == channel_id:
+                    calendar_hint = _cal_id
+                    break
+
         if state_header in {"exists", "not_exists", "sync"}:
             _feed.push("Google Calendar change detected — scanning calendars now", "event")
-            trigger_poll()
+            if calendar_hint:
+                queue_calendar_target(calendar_hint)
+            else:
+                trigger_poll()
             print(
-                f"[webhook] Google Calendar change ({state_header}) — poll triggered",
+                f"[webhook] Google Calendar change ({state_header}) — poll triggered"
+                f"{' for ' + calendar_hint if calendar_hint else ''}",
                 flush=True,
             )
         return "", 200
@@ -3498,6 +3586,7 @@ function toggleEnabled(requested) {{
                     event_key = inv_id_to_key.get(invoice_id, "")
                     if event_key and ":" in event_key:
                         cal_id, event_id = event_key.split(":", 1)
+                        queue_event_target(event_key)
                         try:
                             gsvc = build_calendar_service_from_creds(creds) if creds else None
                             if gsvc:
