@@ -115,6 +115,17 @@ def is_invoice_sent(state: Dict, event_id: str) -> bool:
     return event_id in set(state.get("invoice_sent_event_ids", []))
 
 
+def mark_invoice_paid(state: Dict, event_id: str) -> Dict:
+    paid = set(state.get("invoice_paid_event_ids", []))
+    paid.add(event_id)
+    state["invoice_paid_event_ids"] = sorted(paid)
+    return state
+
+
+def is_invoice_paid(state: Dict, event_id: str) -> bool:
+    return event_id in set(state.get("invoice_paid_event_ids", []))
+
+
 def set_invoice_for_event(state: Dict, event_id: str, invoice_id: str) -> Dict:
     mapping = state.get("event_invoice_map", {})
     mapping[event_id] = invoice_id
@@ -208,6 +219,7 @@ def prune_state(state: Dict, keep_recent_events: int = 1500) -> Dict:
         "event_processed_updates",
         "event_invoice_map",
         "event_invoice_updates",
+        "event_xero_retry_after",
         "event_sheet_log_updates",
         "event_sales_log_updates",
         "event_cash_log_updates",
@@ -217,6 +229,7 @@ def prune_state(state: Dict, keep_recent_events: int = 1500) -> Dict:
         "processed_event_ids",
         "prefilled_event_ids",
         "invoice_sent_event_ids",
+        "invoice_paid_event_ids",
     ]
 
     for field in map_fields:

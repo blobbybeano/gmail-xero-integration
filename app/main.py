@@ -152,6 +152,7 @@ def run() -> None:
     _xero_retry_after: float = 0.0
     _XERO_REBUILD_INTERVAL = 3300  # rebuild token ~55 min (Xero tokens last 30 min)
     _XERO_429_COOLDOWN_SECONDS = 180
+    _XERO_EVENT_429_COOLDOWN_SECONDS = 900
     _last_xero_429_notice_at: float = 0.0
 
     _headers_initialized: set[str] = set()  # sheet keys that have had ensure_header run
@@ -1493,6 +1494,11 @@ def run() -> None:
                 event_id = event.get("id") or ""
                 calendar_id = event.get("_calendar_id") or config.google_calendar_id
                 event_key = f"{calendar_id}:{event_id}"
+                _event_retry_after = float((state.get("event_xero_retry_after", {}) or {}).get(event_key) or 0.0)
+                if _event_retry_after and time.time() < _event_retry_after:
+                    _desc = event.get("description") or ""
+                    if done_choice_is_yes(_desc) or send_choice_is_yes(_desc):
+                        continue
                 # If Xero is in cooldown after a 429 burst, avoid touching actionable
                 # invoice events until the cooldown expires.
                 if xero_client is None and time.time() < _xero_retry_after:
@@ -2904,6 +2910,11 @@ def run() -> None:
                                 state = set_contact_update_marker(
                                     state, event_key, event_updated
                                 )
+                            # Clear per-event retry cooldown once this event completes successfully.
+                            _retry_map = dict(state.get("event_xero_retry_after", {}) or {})
+                            if event_key in _retry_map:
+                                _retry_map.pop(event_key, None)
+                                state["event_xero_retry_after"] = _retry_map
                             if get_invoice_for_event(state, event_key):
                                 state = set_invoice_update_marker(
                                     state, event_key, event_updated
@@ -2927,6 +2938,16 @@ def run() -> None:
                     _xero_retry_after = max(
                         _xero_retry_after, time.time() + _XERO_429_COOLDOWN_SECONDS
                     )
+                    # Also pause retries for this specific event longer; this is the
+                    # common case where one problematic event repeatedly re-triggers 429.
+                    _retry_map = dict(state.get("event_xero_retry_after", {}) or {})
+                    try:
+                        _ev_key = event_key  # defined in the current event try block
+                    except Exception:
+                        _ev_key = ""
+                    if _ev_key:
+                        _retry_map[_ev_key] = time.time() + _XERO_EVENT_429_COOLDOWN_SECONDS
+                        state["event_xero_retry_after"] = _retry_map
                     _now_notice = time.time()
                     if (_now_notice - _last_xero_429_notice_at) >= 60:
                         _feed.push(
