@@ -2337,7 +2337,52 @@ def run() -> None:
                                         sales_stats_fields=sales_stats_fields,
                                         state=state,
                                     )
-                                elif pay_mode_retry in {"invoice", "card"} and invoice_id_retry and xero_client:
+                                    # Card means immediate payment: keep retrying Xero payment-post
+                                    # if prior attempts were rate-limited.
+                                    if invoice_id_retry and xero_client:
+                                        try:
+                                            invoice_data = xero_client.get_invoice(invoice_id_retry)
+                                            status = str(invoice_data.get("Status") or "").upper()
+                                            amount_due = float(invoice_data.get("AmountDue") or 0.0)
+                                            if status != "PAID" and amount_due > 0.0001:
+                                                xero_client.record_invoice_payment(
+                                                    invoice_id=invoice_id_retry,
+                                                    amount=amount_due,
+                                                )
+                                                invoice_data = xero_client.get_invoice(invoice_id_retry)
+                                                status = str(invoice_data.get("Status") or "").upper()
+                                                amount_due = float(invoice_data.get("AmountDue") or 0.0)
+                                            is_paid = status == "PAID" or amount_due <= 0.0001
+                                        except Exception as exc:
+                                            print(f"Event {event_id}: failed to verify/mark card payment on retry: {exc}", flush=True)
+                                            is_paid = False
+                                            invoice_data = {}
+                                        if is_paid:
+                                            inv_number = str(invoice_data.get("InvoiceNumber") or "").strip()
+                                            if admin_creds and sheet_target.get("spreadsheet_id", "").strip() and inv_number:
+                                                try:
+                                                    if update_invoice_paid_in_sheet(
+                                                        admin_creds,
+                                                        spreadsheet_id=sheet_target.get("spreadsheet_id", "").strip(),
+                                                        sheet_name=sheet_target.get("sheet_name", "Sheet1").strip() or "Sheet1",
+                                                        invoice_number=inv_number,
+                                                    ):
+                                                        print(f"Master sheet marked Paid for {inv_number}", flush=True)
+                                                except Exception as exc:
+                                                    print(f"Master sheet paid update failed for {inv_number}: {exc}", flush=True)
+                                            if not (event.get("summary") or "").strip().startswith("🟢"):
+                                                updated = safe_update(
+                                                    event_id=event.get("id"),
+                                                    description=event.get("description") or "",
+                                                    label="Card payment settled",
+                                                    summary_status="green",
+                                                    current_summary=event.get("summary"),
+                                                    calendar_id=calendar_id,
+                                                )
+                                                if updated:
+                                                    event_updated = updated.get("updated") or event_updated
+                                            state = mark_invoice_paid(state, event_key)
+                                elif pay_mode_retry == "invoice" and invoice_id_retry and xero_client:
                                     try:
                                         invoice_data = xero_client.get_invoice(invoice_id_retry)
                                         status = str(invoice_data.get("Status") or "").upper()
