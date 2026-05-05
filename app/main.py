@@ -153,6 +153,7 @@ def run() -> None:
     _XERO_REBUILD_INTERVAL = 3300  # rebuild token ~55 min (Xero tokens last 30 min)
     _XERO_429_COOLDOWN_SECONDS = 180
     _XERO_EVENT_429_COOLDOWN_SECONDS = 900
+    _XERO_EVENT_429_MAX_COOLDOWN_SECONDS = 7200
     _last_xero_429_notice_at: float = 0.0
 
     _headers_initialized: set[str] = set()  # sheet keys that have had ensure_header run
@@ -2915,6 +2916,10 @@ def run() -> None:
                             if event_key in _retry_map:
                                 _retry_map.pop(event_key, None)
                                 state["event_xero_retry_after"] = _retry_map
+                            _retry_backoff_map = dict(state.get("event_xero_retry_backoff", {}) or {})
+                            if event_key in _retry_backoff_map:
+                                _retry_backoff_map.pop(event_key, None)
+                                state["event_xero_retry_backoff"] = _retry_backoff_map
                             if get_invoice_for_event(state, event_key):
                                 state = set_invoice_update_marker(
                                     state, event_key, event_updated
@@ -2941,13 +2946,19 @@ def run() -> None:
                     # Also pause retries for this specific event longer; this is the
                     # common case where one problematic event repeatedly re-triggers 429.
                     _retry_map = dict(state.get("event_xero_retry_after", {}) or {})
+                    _retry_backoff_map = dict(state.get("event_xero_retry_backoff", {}) or {})
                     try:
                         _ev_key = event_key  # defined in the current event try block
                     except Exception:
                         _ev_key = ""
                     if _ev_key:
-                        _retry_map[_ev_key] = time.time() + _XERO_EVENT_429_COOLDOWN_SECONDS
+                        _prev = int(_retry_backoff_map.get(_ev_key) or 0)
+                        _next_backoff = max(_XERO_EVENT_429_COOLDOWN_SECONDS, _prev * 2 if _prev else 0)
+                        _next_backoff = min(_next_backoff, _XERO_EVENT_429_MAX_COOLDOWN_SECONDS)
+                        _retry_backoff_map[_ev_key] = _next_backoff
+                        _retry_map[_ev_key] = time.time() + _next_backoff
                         state["event_xero_retry_after"] = _retry_map
+                        state["event_xero_retry_backoff"] = _retry_backoff_map
                     _now_notice = time.time()
                     if (_now_notice - _last_xero_429_notice_at) >= 60:
                         _feed.push(

@@ -220,6 +220,7 @@ def prune_state(state: Dict, keep_recent_events: int = 1500) -> Dict:
         "event_invoice_map",
         "event_invoice_updates",
         "event_xero_retry_after",
+        "event_xero_retry_backoff",
         "event_sheet_log_updates",
         "event_sales_log_updates",
         "event_cash_log_updates",
