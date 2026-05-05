@@ -154,6 +154,7 @@ def run() -> None:
     _XERO_429_COOLDOWN_SECONDS = 180
     _XERO_EVENT_429_COOLDOWN_SECONDS = 900
     _XERO_EVENT_429_MAX_COOLDOWN_SECONDS = 7200
+    _XERO_EVENTS_PER_CYCLE = max(int(os.getenv("XERO_EVENTS_PER_CYCLE", "4") or "4"), 1)
     _last_xero_429_notice_at: float = 0.0
 
     _headers_initialized: set[str] = set()  # sheet keys that have had ensure_header run
@@ -1271,8 +1272,11 @@ def run() -> None:
         if not _was_enabled:
             _feed.push("System resumed — watching for events", "system")
         _was_enabled = True
-        time_min = now - dt.timedelta(days=365)
-        time_max = now + dt.timedelta(days=365)
+        # Keep poll scope realistic; avoids dragging legacy/test history into each cycle.
+        _scan_past_days = max(int(os.getenv("EVENT_SCAN_PAST_DAYS", "45") or "45"), 1)
+        _scan_future_days = max(int(os.getenv("EVENT_SCAN_FUTURE_DAYS", "120") or "120"), 1)
+        time_min = now - dt.timedelta(days=_scan_past_days)
+        time_max = now + dt.timedelta(days=_scan_future_days)
         active_calendars = get_active_calendars(
             config.admin_db_file, config.google_calendar_id
         )
@@ -1398,6 +1402,8 @@ def run() -> None:
             for e in cal_events:
                 e["_calendar_id"] = calendar_id
                 events.append(e)
+        # Process newest changes first so current operations are not starved by backlog.
+        events.sort(key=lambda e: str(e.get("updated") or ""), reverse=True)
         had_changes = bool(events)
 
         admin_creds = load_admin_credentials(config)
@@ -1490,6 +1496,7 @@ def run() -> None:
         _flush_cash_backlog(admin_creds)
         _flush_sales_backlog(admin_creds)
 
+        _xero_events_used = 0
         for event in events:
             try:
                 event_id = event.get("id") or ""
@@ -1584,6 +1591,22 @@ def run() -> None:
                 has_send = send_choice_is_yes(event.get("description"))
                 sent_state = is_invoice_sent(state, event_key)
                 paid_state = is_invoice_paid(state, event_key)
+                pay_mode_hint = payment_choice(event.get("description")) or ""
+                _needs_xero_event_work = bool(
+                    (
+                        (has_done or has_send)
+                        and not sent_state
+                    )
+                    or (
+                        sent_state
+                        and not paid_state
+                        and pay_mode_hint in {"invoice", "card"}
+                    )
+                )
+                if _needs_xero_event_work:
+                    if _xero_events_used >= _XERO_EVENTS_PER_CYCLE:
+                        continue
+                    _xero_events_used += 1
                 # Keep title light resilient: if a move/edit flow overwrites summary
                 # and removes/changes the status prefix, restamp the expected one.
                 current_summary = (event.get("summary") or "").strip()
@@ -1684,7 +1707,6 @@ def run() -> None:
                         and not pending_draft
                     )
                     if skip_unchanged:
-                        pay_mode_hint = payment_choice(event.get("description")) or ""
                         needs_invoice_paid_sync = bool(
                             (has_send or sent_state)
                             and is_invoice_sent(state, event_key)
