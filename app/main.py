@@ -898,7 +898,7 @@ def run() -> None:
         sheet_name = str(route.get("sheet_name", "Sheet1")).strip() or "Sheet1"
 
         invoice = {}
-        if xero_client:
+        if xero_client and invoice_id:
             try:
                 invoice = xero_client.get_invoice(invoice_id)
             except Exception as exc:
@@ -1963,11 +1963,16 @@ def run() -> None:
                             if (
                                 has_send
                                 and invoice_lines
-                                and xero_client
                                 and not is_invoice_sent(state, event_key)
-                                and get_invoice_for_event(state, event_key)
+                                and (
+                                    payment_choice(event.get("description")) == "cash"
+                                    or (
+                                        xero_client
+                                        and get_invoice_for_event(state, event_key)
+                                    )
+                                )
                             ):
-                                invoice_id = get_invoice_for_event(state, event_key)
+                                invoice_id = get_invoice_for_event(state, event_key) or ""
                                 pay_mode = payment_choice(event.get("description"))
                                 if pay_mode not in {"card", "invoice", "cash"}:
                                     failed_description = upsert_send_failure(
@@ -1975,7 +1980,7 @@ def run() -> None:
                                         "Choose PAYMENT TYPE as CARD or INVOICE before SEND",
                                         invoice_url=(
                                             xero_client.get_online_invoice_url(invoice_id)
-                                            if invoice_id
+                                            if xero_client and invoice_id
                                             else None
                                         ),
                                         submitter=submitter_display,
@@ -1995,31 +2000,15 @@ def run() -> None:
                                     state = set_processed_update_marker(state, event_key, event_updated)
                                     continue
                                 if pay_mode == "cash":
-                                    try:
-                                        xero_client.delete_draft_invoice(invoice_id)
-                                    except Exception as exc:
-                                        print(f"Event {event_id}: failed to remove draft for cash flow: {exc}")
-                                        fail_reason = str(exc).splitlines()[0][:220]
-                                        failed_description = upsert_send_failure(
-                                            event.get("description") or "",
-                                            f"Cash finalise failed: {fail_reason}",
-                                            invoice_url=None,
-                                            submitter=submitter_display,
-                                            submitted_at=submitted_at_display,
-                                        )
-                                        updated = safe_update(
-                                            event_id=event.get("id"),
-                                            description=failed_description,
-                                            label="Cash finalise failed",
-                                            summary_status="yellow",
-                                            current_summary=event.get("summary"),
-                                            calendar_id=calendar_id,
-                                        )
-                                        if updated:
-                                            event["description"] = failed_description
-                                            event_updated = updated.get("updated") or event_updated
-                                        state = set_processed_update_marker(state, event_key, event_updated)
-                                        continue
+                                    if invoice_id and xero_client:
+                                        try:
+                                            xero_client.delete_draft_invoice(invoice_id)
+                                        except Exception as exc:
+                                            print(f"Event {event_id}: failed to remove draft for cash flow: {exc}")
+                                            _feed.push(
+                                                f"Cash marked complete but draft cleanup will retry: {str(exc).splitlines()[0][:140]}",
+                                                "warn",
+                                            )
 
                                     # Log sales rows from the original invoice block before
                                     # we rewrite notes for cash completion.
@@ -2064,7 +2053,6 @@ def run() -> None:
                                         cash_sheet_target=cash_sheet_target,
                                         state=state,
                                     )
-                                    state = mark_invoice_sent(state, event_key)
                                     state = mark_invoice_paid(state, event_key)
                                     state = set_invoice_for_event(state, event_key, "")
                                     state = set_invoice_update_marker(state, event_key, event_updated)
@@ -2215,8 +2203,6 @@ def run() -> None:
                                             )
                                             # Card payment is already captured even if e-mail send fails.
                                             state = mark_invoice_paid(state, event_key)
-                                        # Keep send-state true so later loops do not regress to yellow.
-                                        state = mark_invoice_sent(state, event_key)
                                         state = set_invoice_update_marker(
                                             state, event_key, event_updated
                                         )
@@ -2604,8 +2590,19 @@ def run() -> None:
                                                 state, event_key, event_updated
                                             )
 
-                            if has_send and invoice_lines and get_invoice_for_event(state, event_key):
-                                invoice_id = get_invoice_for_event(state, event_key)
+                            if (
+                                has_send
+                                and invoice_lines
+                                and not is_invoice_sent(state, event_key)
+                                and (
+                                    payment_choice(event.get("description")) == "cash"
+                                    or (
+                                        xero_client
+                                        and get_invoice_for_event(state, event_key)
+                                    )
+                                )
+                            ):
+                                invoice_id = get_invoice_for_event(state, event_key) or ""
                                 pay_mode = payment_choice(event.get("description"))
                                 if pay_mode not in {"card", "invoice", "cash"}:
                                     failed_description = upsert_send_failure(
@@ -2613,7 +2610,7 @@ def run() -> None:
                                         "Choose PAYMENT TYPE as CARD or INVOICE before SEND",
                                         invoice_url=(
                                             xero_client.get_online_invoice_url(invoice_id)
-                                            if invoice_id
+                                            if xero_client and invoice_id
                                             else None
                                         ),
                                         submitter=submitter_display,
@@ -2633,31 +2630,15 @@ def run() -> None:
                                     state = set_processed_update_marker(state, event_key, event_updated)
                                     continue
                                 if pay_mode == "cash":
-                                    try:
-                                        xero_client.delete_draft_invoice(invoice_id)
-                                    except Exception as exc:
-                                        print(f"Event {event.get('id')}: failed to remove draft for cash flow: {exc}")
-                                        fail_reason = str(exc).splitlines()[0][:220]
-                                        failed_description = upsert_send_failure(
-                                            event.get("description") or "",
-                                            f"Cash finalise failed: {fail_reason}",
-                                            invoice_url=None,
-                                            submitter=submitter_display,
-                                            submitted_at=submitted_at_display,
-                                        )
-                                        updated = safe_update(
-                                            event_id=event.get("id"),
-                                            description=failed_description,
-                                            label="Cash finalise failed",
-                                            summary_status="yellow",
-                                            current_summary=event.get("summary"),
-                                            calendar_id=calendar_id,
-                                        )
-                                        if updated:
-                                            event["description"] = failed_description
-                                            event_updated = updated.get("updated") or event_updated
-                                        state = set_processed_update_marker(state, event_key, event_updated)
-                                        continue
+                                    if invoice_id and xero_client:
+                                        try:
+                                            xero_client.delete_draft_invoice(invoice_id)
+                                        except Exception as exc:
+                                            print(f"Event {event.get('id')}: failed to remove draft for cash flow: {exc}")
+                                            _feed.push(
+                                                f"Cash marked complete but draft cleanup will retry: {str(exc).splitlines()[0][:140]}",
+                                                "warn",
+                                            )
 
                                     # Log sales rows from the original invoice block before
                                     # we rewrite notes for cash completion.
@@ -2702,7 +2683,6 @@ def run() -> None:
                                         cash_sheet_target=cash_sheet_target,
                                         state=state,
                                     )
-                                    state = mark_invoice_sent(state, event_key)
                                     state = mark_invoice_paid(state, event_key)
                                     state = set_invoice_for_event(state, event_key, "")
                                     state = set_invoice_update_marker(state, event_key, event_updated)
@@ -2853,8 +2833,6 @@ def run() -> None:
                                             )
                                             # Card payment is already captured even if e-mail send fails.
                                             state = mark_invoice_paid(state, event_key)
-                                        # Keep send-state true so later loops do not regress to yellow.
-                                        state = mark_invoice_sent(state, event_key)
                                         state = set_invoice_update_marker(
                                             state, event_key, event_updated
                                         )
