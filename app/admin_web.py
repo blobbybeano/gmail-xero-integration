@@ -1705,7 +1705,6 @@ def create_app() -> Flask:
         xero_lockout_active = xero_lockout_until_ts > time.time()
         xero_lockout_reason = str(state.get("xero_lockout_reason") or "").strip()
         xero_lockout_banner = ""
-        xero_lockout_modal = ""
         if xero_lockout_active:
             _mins = int(max(1, (xero_lockout_until_ts - time.time()) // 60))
             _until_local = dt.datetime.fromtimestamp(
@@ -1720,21 +1719,6 @@ def create_app() -> Flask:
                 f'No Xero requests will be sent until unlock. '
                 f'Estimated unlock: {_until_local} '
                 f'(<span id="xero-lockout-countdown" data-until="{int(xero_lockout_until_ts)}">{_mins}m</span>).</span>'
-                '</div>'
-            )
-            xero_lockout_modal = (
-                '<div id="xero-lockout-modal" class="fixed top-5 right-5 z-50 max-w-sm w-[92vw] sm:w-[360px]">'
-                '<div class="rounded-xl border border-red-700/60 bg-red-950/90 shadow-2xl backdrop-blur px-4 py-3">'
-                '<div class="flex items-start gap-3">'
-                '<div class="text-xl leading-none">🔒</div>'
-                '<div class="min-w-0">'
-                '<p class="text-sm font-semibold text-red-100">Xero Lockout Active</p>'
-                f'<p class="text-xs text-red-200 mt-1">{escape(_reason_txt)}</p>'
-                '<p class="text-xs text-red-100 mt-2">Unlock in '
-                f'<span id="xero-lockout-modal-countdown" data-until="{int(xero_lockout_until_ts)}">{_mins}m</span></p>'
-                '</div>'
-                '</div>'
-                '</div>'
                 '</div>'
             )
 
@@ -2014,8 +1998,6 @@ def create_app() -> Flask:
     <span class="text-neutral-500">· system</span>
   </div>
 
-  {xero_lockout_modal}
-
 <script>
 const term = document.getElementById('terminal');
 const connDot = document.getElementById('conn-dot');
@@ -2033,7 +2015,7 @@ function _fmtRemaining(seconds) {{
 }}
 
 function updateXeroLockoutCountdowns() {{
-  const ids = ['xero-lockout-countdown', 'xero-lockout-modal-countdown'];
+  const ids = ['xero-lockout-countdown'];
   let hasActive = false;
   ids.forEach((id) => {{
     const el = document.getElementById(id);
@@ -2049,10 +2031,6 @@ function updateXeroLockoutCountdowns() {{
       el.textContent = '0m';
     }}
   }});
-  if (!hasActive) {{
-    const modal = document.getElementById('xero-lockout-modal');
-    if (modal) modal.remove();
-  }}
 }}
 updateXeroLockoutCountdowns();
 setInterval(updateXeroLockoutCountdowns, 1000);
