@@ -85,10 +85,12 @@ from .state import (
     get_sales_log_marker,
     is_prefilled,
     is_invoice_sent,
+    is_invoice_paid,
     is_processed,
     load_state,
     mark_prefilled,
     mark_invoice_sent,
+    mark_invoice_paid,
     mark_processed,
     prune_state,
     save_state,
@@ -149,6 +151,8 @@ def run() -> None:
     _xero_built_at: float = time.time()
     _xero_retry_after: float = 0.0
     _XERO_REBUILD_INTERVAL = 3300  # rebuild token ~55 min (Xero tokens last 30 min)
+    _XERO_429_COOLDOWN_SECONDS = 180
+    _last_xero_429_notice_at: float = 0.0
 
     _headers_initialized: set[str] = set()  # sheet keys that have had ensure_header run
 
@@ -193,9 +197,10 @@ def run() -> None:
                     # First draft save from non-orange => plain orange.
                     # Subsequent draft edits while already orange => +1 dot each save.
                     if draft_progress_increment and (current_summary or "").strip().startswith("🟠"):
-                        draft_dots = existing_dots + 1
+                        # Keep title readable: cap progress dots.
+                        draft_dots = min(existing_dots + 1, 3)
                     else:
-                        draft_dots = existing_dots
+                        draft_dots = min(existing_dots, 3)
                 else:
                     # Non-draft states keep orange without progress dots.
                     draft_dots = 0
@@ -336,18 +341,73 @@ def run() -> None:
         text = re.sub(r"^\s*✉️?\s*", "", text)
         return text.strip()
 
+    def _extract_title_status(summary: str | None) -> str | None:
+        text = (summary or "").strip()
+        for em in ("🔵", "🟠", "🟡", "🟢", "🔴"):
+            if text.startswith(em):
+                return em
+        return None
+
+    def _has_managed_sections(description: str | None) -> bool:
+        text = (description or "").lower()
+        return "[contact]" in text and "[invoice]" in text
+
+    def _expected_title_status(
+        description: str | None,
+        *,
+        has_done: bool,
+        has_send: bool,
+        sent_state: bool,
+        paid_state: bool,
+        current_summary: str | None,
+        event_key: str,
+    ) -> str:
+        # If sending is requested but required integrations are down, show red immediately.
+        if integration_issues and (has_done or has_send):
+            return "red"
+        # Once paid is confirmed (webhook or poll), always keep green regardless of mode.
+        if paid_state:
+            return "green"
+        if has_send or sent_state:
+            pay_mode = payment_choice(description) or ""
+            # Card/cash are immediate payment flows once send is confirmed.
+            if sent_state and pay_mode in {"card", "cash"}:
+                return "green"
+            # For INVOICE mode, stay green once paid was observed.
+            if pay_mode == "invoice":
+                if paid_state:
+                    return "green"
+                if (current_summary or "").strip().startswith("🟢"):
+                    return "green"
+            return "yellow"
+        if has_done:
+            return "orange"
+        return "blue"
+
     def _invoice_address_from_overrides(overrides: dict, fallback: dict | None) -> dict:
+        invoice_profile = str(overrides.get("invoice_profile", "") or "").strip()
+        invoice_name = str(overrides.get("invoice_name", "") or "").strip()
         addr1 = str(overrides.get("invoice_address_line_1", "") or "").strip()
         addr2 = str(overrides.get("invoice_address_line_2", "") or "").strip()
         city = str(overrides.get("invoice_city", "") or "").strip()
         postcode = str(overrides.get("invoice_postcode", "") or "").strip()
         country = str(overrides.get("invoice_country", "") or "").strip()
-        if not any([addr1, addr2, city, postcode, country]):
+        has_any_invoice_override = any(
+            [invoice_profile, invoice_name, addr1, addr2, city, postcode, country]
+        )
+        has_address_override = any([addr1, addr2, city, postcode, country])
+
+        # No invoice override lines at all: use parsed Google/location fallback as before.
+        if not has_any_invoice_override:
             return fallback or {}
-        out = {
-            "AddressType": "POBOX",
-            "AddressLine1": addr1 or (fallback or {}).get("AddressLine1", ""),
-        }
+        # Any invoice override line present: never backfill missing address fields
+        # from Google/location data.
+        if not has_address_override:
+            return {}
+
+        out = {"AddressType": "POBOX"}
+        if addr1:
+            out["AddressLine1"] = addr1
         if addr2:
             out["AddressLine2"] = addr2
         if city:
@@ -383,7 +443,8 @@ def run() -> None:
             matched = xero_client.find_contact_by_name(invoice_profile)
             if not matched or not matched.get("ContactID"):
                 return None, address_payload, invoice_name or invoice_profile, "PROFILE_NOT_FOUND"
-            return matched, address_payload, str(matched.get("Name") or invoice_profile), None
+            # Invoice profile mode must not mutate/replace profile contact fields.
+            return matched, {}, str(matched.get("Name") or invoice_profile), None
 
         if not invoice_name:
             return None, address_payload, "", None
@@ -1178,6 +1239,10 @@ def run() -> None:
     _poll_overlap_seconds = int(os.getenv("POLL_OVERLAP_SECONDS", "1200") or "1200")
     _poll_overlap = dt.timedelta(seconds=max(_poll_overlap_seconds, 0))
 
+    def _is_xero_429(exc: Exception) -> bool:
+        text = str(exc or "")
+        return "429" in text or "Too Many Requests" in text
+
     while True:
         now = dt.datetime.now(dt.timezone.utc)
         # Rebuild Xero client only when the cached one is stale or missing.
@@ -1428,6 +1493,12 @@ def run() -> None:
                 event_id = event.get("id") or ""
                 calendar_id = event.get("_calendar_id") or config.google_calendar_id
                 event_key = f"{calendar_id}:{event_id}"
+                # If Xero is in cooldown after a 429 burst, avoid touching actionable
+                # invoice events until the cooldown expires.
+                if xero_client is None and time.time() < _xero_retry_after:
+                    _desc = event.get("description") or ""
+                    if done_choice_is_yes(_desc) or send_choice_is_yes(_desc):
+                        continue
                 submitter_email = (
                     (event.get("creator", {}) or {}).get("email")
                     or (event.get("organizer", {}) or {}).get("email")
@@ -1504,9 +1575,44 @@ def run() -> None:
                 has_done = done_choice_is_yes(event.get("description"))
                 # Only send when user explicitly answers Y/YES.
                 has_send = send_choice_is_yes(event.get("description"))
+                sent_state = is_invoice_sent(state, event_key)
+                paid_state = is_invoice_paid(state, event_key)
+                # Keep title light resilient: if a move/edit flow overwrites summary
+                # and removes/changes the status prefix, restamp the expected one.
+                current_summary = (event.get("summary") or "").strip()
+                if event.get("id") and _has_managed_sections(event.get("description")):
+                    expected_status = _expected_title_status(
+                        event.get("description"),
+                        has_done=has_done,
+                        has_send=has_send,
+                        sent_state=sent_state,
+                        paid_state=paid_state,
+                        current_summary=current_summary,
+                        event_key=event_key,
+                    )
+                    expected_emoji = {
+                        "blue": "🔵",
+                        "orange": "🟠",
+                        "yellow": "🟡",
+                        "green": "🟢",
+                        "red": "🔴",
+                    }.get(expected_status)
+                    current_emoji = _extract_title_status(current_summary)
+                    if expected_emoji and current_emoji != expected_emoji:
+                        updated = safe_update(
+                            event_id=event.get("id"),
+                            description=event.get("description") or "",
+                            label="Title light restamp",
+                            summary_status=expected_status,
+                            current_summary=event.get("summary"),
+                            calendar_id=calendar_id,
+                        )
+                        if updated:
+                            event["summary"] = updated.get("summary", event.get("summary"))
+                            event["updated"] = updated.get("updated", event.get("updated"))
+                            current_summary = (event.get("summary") or "").strip()
                 # Finalised entries (green title) are immutable: do nothing else.
                 # This prevents any follow-up pass from re-touching completed jobs.
-                current_summary = (event.get("summary") or "").strip()
                 if current_summary.startswith("🟢"):
                     state = set_processed_update_marker(
                         state,
@@ -1573,7 +1679,7 @@ def run() -> None:
                     if skip_unchanged:
                         pay_mode_hint = payment_choice(event.get("description")) or ""
                         needs_invoice_paid_sync = bool(
-                            has_send
+                            (has_send or sent_state)
                             and is_invoice_sent(state, event_key)
                             and pay_mode_hint == "invoice"
                             and xero_client
@@ -1599,6 +1705,7 @@ def run() -> None:
                                     f"Invoice paid — marked green: \"{event.get('summary', event_id)}\"",
                                     "success",
                                 )
+                                state = mark_invoice_paid(state, event_key)
                         except Exception as _exc:
                             print(f"Event {event_id}: paid-sync check failed: {_exc}")
                         continue
@@ -1800,6 +1907,7 @@ def run() -> None:
                                                 if updated:
                                                     event_updated = updated.get("updated") or event_updated
                                             state = mark_invoice_sent(state, event_key)
+                                            state = mark_invoice_paid(state, event_key)
                                         state = set_invoice_update_marker(
                                             state, event_key, event_updated
                                         )
@@ -1957,6 +2065,7 @@ def run() -> None:
                                         state=state,
                                     )
                                     state = mark_invoice_sent(state, event_key)
+                                    state = mark_invoice_paid(state, event_key)
                                     state = set_invoice_for_event(state, event_key, "")
                                     state = set_invoice_update_marker(state, event_key, event_updated)
                                     print(f"Cash payment finalised for event {event_id}: draft {invoice_id} deleted")
@@ -2104,6 +2213,13 @@ def run() -> None:
                                                 sales_stats_fields=sales_stats_fields,
                                                 state=state,
                                             )
+                                            # Card payment is already captured even if e-mail send fails.
+                                            state = mark_invoice_paid(state, event_key)
+                                        # Keep send-state true so later loops do not regress to yellow.
+                                        state = mark_invoice_sent(state, event_key)
+                                        state = set_invoice_update_marker(
+                                            state, event_key, event_updated
+                                        )
                                         state = set_processed_update_marker(state, event_key, event_updated)
                                         continue
                                     invoice_url = xero_client.get_online_invoice_url(invoice_id)
@@ -2126,6 +2242,8 @@ def run() -> None:
                                         event["description"] = updated_description
                                         event_updated = updated.get("updated") or event_updated
                                 state = mark_invoice_sent(state, event_key)
+                                if pay_mode == "card":
+                                    state = mark_invoice_paid(state, event_key)
                                 state = set_invoice_update_marker(
                                     state, event_key, event_updated
                                 )
@@ -2438,6 +2556,7 @@ def run() -> None:
                                                     if updated:
                                                         event_updated = updated.get("updated") or event_updated
                                                 state = mark_invoice_sent(state, event_key)
+                                                state = mark_invoice_paid(state, event_key)
                                             state = set_invoice_update_marker(
                                                 state, event_key, event_updated
                                             )
@@ -2584,6 +2703,7 @@ def run() -> None:
                                         state=state,
                                     )
                                     state = mark_invoice_sent(state, event_key)
+                                    state = mark_invoice_paid(state, event_key)
                                     state = set_invoice_for_event(state, event_key, "")
                                     state = set_invoice_update_marker(state, event_key, event_updated)
                                     print(f"Cash payment finalised for event {event.get('id')}: draft {invoice_id} deleted")
@@ -2731,6 +2851,13 @@ def run() -> None:
                                                 sales_stats_fields=sales_stats_fields,
                                                 state=state,
                                             )
+                                            # Card payment is already captured even if e-mail send fails.
+                                            state = mark_invoice_paid(state, event_key)
+                                        # Keep send-state true so later loops do not regress to yellow.
+                                        state = mark_invoice_sent(state, event_key)
+                                        state = set_invoice_update_marker(
+                                            state, event_key, event_updated
+                                        )
                                         state = set_processed_update_marker(state, event_key, event_updated)
                                         continue
                                     invoice_url = xero_client.get_online_invoice_url(invoice_id)
@@ -2753,6 +2880,8 @@ def run() -> None:
                                         event["description"] = updated_description
                                         event_updated = updated.get("updated") or event_updated
                                 state = mark_invoice_sent(state, event_key)
+                                if pay_mode == "card":
+                                    state = mark_invoice_paid(state, event_key)
                                 state = set_invoice_update_marker(
                                     state, event_key, event_updated
                                 )
@@ -2807,6 +2936,21 @@ def run() -> None:
                     f"Event processing error for \"{event.get('summary', _ev_id)}\": {str(exc).splitlines()[0][:120]}",
                     "error",
                 )
+                if _is_xero_429(exc):
+                    # Enter a short global cooldown so one rate-limited event does not
+                    # trigger a retry storm across all events/calendars.
+                    xero_client = None
+                    _xero_retry_after = max(
+                        _xero_retry_after, time.time() + _XERO_429_COOLDOWN_SECONDS
+                    )
+                    _now_notice = time.time()
+                    if (_now_notice - _last_xero_429_notice_at) >= 60:
+                        _feed.push(
+                            "Xero rate-limited (429). Cooling down for ~3 minutes.",
+                            "warn",
+                        )
+                        _last_xero_429_notice_at = _now_notice
+                    break
             # Persist state after each event so Ctrl+C doesn't lose progress and
             # cause duplicate retries/drafts on restart.
             save_state(config.state_file, state)
