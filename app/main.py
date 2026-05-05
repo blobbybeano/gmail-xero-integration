@@ -2000,13 +2000,15 @@ def run() -> None:
                                     state = set_processed_update_marker(state, event_key, event_updated)
                                     continue
                                 if pay_mode == "cash":
+                                    cash_cleanup_warning = None
                                     if invoice_id and xero_client:
                                         try:
                                             xero_client.delete_draft_invoice(invoice_id)
                                         except Exception as exc:
                                             print(f"Event {event_id}: failed to remove draft for cash flow: {exc}")
+                                            cash_cleanup_warning = str(exc).splitlines()[0][:140]
                                             _feed.push(
-                                                f"Cash marked complete but draft cleanup will retry: {str(exc).splitlines()[0][:140]}",
+                                                f"Cash marked complete but draft cleanup will retry: {cash_cleanup_warning}",
                                                 "warn",
                                             )
 
@@ -2029,6 +2031,7 @@ def run() -> None:
                                         event.get("description") or "",
                                         submitter=submitter_display,
                                         submitted_at=submitted_at_display,
+                                        cleanup_warning=cash_cleanup_warning,
                                     )
                                     if updated_description != (event.get("description") or ""):
                                         updated = safe_update(
@@ -2630,13 +2633,15 @@ def run() -> None:
                                     state = set_processed_update_marker(state, event_key, event_updated)
                                     continue
                                 if pay_mode == "cash":
+                                    cash_cleanup_warning = None
                                     if invoice_id and xero_client:
                                         try:
                                             xero_client.delete_draft_invoice(invoice_id)
                                         except Exception as exc:
                                             print(f"Event {event.get('id')}: failed to remove draft for cash flow: {exc}")
+                                            cash_cleanup_warning = str(exc).splitlines()[0][:140]
                                             _feed.push(
-                                                f"Cash marked complete but draft cleanup will retry: {str(exc).splitlines()[0][:140]}",
+                                                f"Cash marked complete but draft cleanup will retry: {cash_cleanup_warning}",
                                                 "warn",
                                             )
 
@@ -2659,6 +2664,7 @@ def run() -> None:
                                         event.get("description") or "",
                                         submitter=submitter_display,
                                         submitted_at=submitted_at_display,
+                                        cleanup_warning=cash_cleanup_warning,
                                     )
                                     if updated_description != (event.get("description") or ""):
                                         updated = safe_update(

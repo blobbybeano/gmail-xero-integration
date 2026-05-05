@@ -189,7 +189,11 @@ def normalize_user_sections(description: str | None) -> str:
         return description or ""
     import re
 
-    text = _reconcile_invoice_lines_outside_block(description)
+    # Google Calendar may store rich-text HTML (<br>, <div>, <pre><code>...).
+    # Normalize to plain text first so section parsing/compaction stays stable.
+    text = _normalize_description(description or "")
+    text = _reconcile_invoice_lines_before_block(text)
+    text = _reconcile_invoice_lines_outside_block(text)
 
     def _norm_contact(block: str) -> str:
         lines = block.splitlines()
@@ -402,6 +406,59 @@ def _reconcile_invoice_lines_outside_block(description: str | None) -> str:
     if remaining and not remaining.startswith("\n"):
         remaining = "\n" + remaining
     return text[: m.start()] + rebuilt_block + remaining
+
+
+def _reconcile_invoice_lines_before_block(description: str | None) -> str:
+    """
+    If users type charge lines between [/contact] and [invoice], pull them into
+    the [invoice] block so draft creation still works.
+    """
+    if not description:
+        return description or ""
+    import re
+
+    text = description.replace("\r\n", "\n").replace("\r", "\n")
+    m_gap = re.search(r"\[/contact\](.*?)\[invoice\]", text, flags=re.I | re.S)
+    m_inv = re.search(r"\[invoice\](.*?)\[/invoice\]", text, flags=re.I | re.S)
+    if not m_gap or not m_inv:
+        return text
+
+    gap_inner = m_gap.group(1) or ""
+    moved: list[str] = []
+    kept: list[str] = []
+    for raw in gap_inner.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if _is_automation_control_line(line):
+            kept.append(line)
+            continue
+        if _looks_like_invoice_line(line):
+            moved.append(line)
+            continue
+        kept.append(line)
+
+    if not moved:
+        return text
+
+    inv_inner = (m_inv.group(1) or "").strip()
+    merged = "\n".join(moved)
+    if inv_inner:
+        merged = f"{merged}\n{inv_inner}"
+
+    rebuilt_inv = f"[invoice]\n{merged}\n[/invoice]"
+
+    # Rebuild the contact->invoice gap without moved charge lines.
+    rebuilt_gap = "\n\n"
+    if kept:
+        rebuilt_gap = "\n" + "\n".join(kept) + "\n"
+
+    # Replace invoice block and then gap block.
+    text = text[: m_inv.start()] + rebuilt_inv + text[m_inv.end() :]
+    m_gap2 = re.search(r"\[/contact\](.*?)\[invoice\]", text, flags=re.I | re.S)
+    if not m_gap2:
+        return text
+    return text[: m_gap2.start()] + "[/contact]" + rebuilt_gap + "[invoice]" + text[m_gap2.end() :]
 
 
 def _normalize_entry_layout(text: str) -> str:
@@ -1263,6 +1320,7 @@ def upsert_cash_confirmation(
     *,
     submitter: str | None = None,
     submitted_at: str | None = None,
+    cleanup_warning: str | None = None,
 ) -> str:
     STATUS_START = "[app-status]"
     STATUS_END = "[/app-status]"
@@ -1277,6 +1335,8 @@ def upsert_cash_confirmation(
         summary_lines.append(_format_status_total_line(totals[0]))
     if totals[1]:
         summary_lines.append(_format_status_total_line(totals[1]))
+    if cleanup_warning:
+        summary_lines.append(f"Draft cleanup pending ⚠️ {cleanup_warning}")
     summary_lines.append("Entry complete ✅")
     summary_lines.append(STATUS_END)
 
