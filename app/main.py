@@ -172,7 +172,10 @@ def run() -> None:
     _XERO_REBUILD_INTERVAL = 3300  # rebuild token ~55 min (Xero tokens last 30 min)
     _XERO_429_COOLDOWN_SECONDS = 180
     _XERO_EVENT_429_COOLDOWN_SECONDS = 900
-    _XERO_EVENT_429_MAX_COOLDOWN_SECONDS = 7200
+    _XERO_EVENT_429_MAX_COOLDOWN_SECONDS = max(
+        int(os.getenv("XERO_EVENT_429_MAX_COOLDOWN_SECONDS", "90000") or "90000"),
+        _XERO_EVENT_429_COOLDOWN_SECONDS,
+    )
     _XERO_EVENTS_PER_CYCLE = max(int(os.getenv("XERO_EVENTS_PER_CYCLE", "4") or "4"), 1)
     _last_xero_429_notice_at: float = 0.0
 
@@ -1293,6 +1296,18 @@ def run() -> None:
     def _is_xero_429(exc: Exception) -> bool:
         text = str(exc or "")
         return "429" in text or "Too Many Requests" in text
+
+    def _xero_retry_after_hint_seconds(exc: Exception) -> int | None:
+        import re
+
+        text = str(exc or "")
+        m = re.search(r"Retry-After=(\d+)", text, flags=re.I)
+        if not m:
+            return None
+        try:
+            return max(60, int(m.group(1)))
+        except Exception:
+            return None
 
     def _event_end_utc(event: dict) -> dt.datetime | None:
         end_obj = (event.get("end") or {}) if isinstance(event, dict) else {}
@@ -3443,11 +3458,18 @@ def run() -> None:
                     "error",
                 )
                 if _is_xero_429(exc):
+                    _retry_hint_seconds = _xero_retry_after_hint_seconds(exc)
                     # Enter a short global cooldown so one rate-limited event does not
                     # trigger a retry storm across all events/calendars.
                     xero_client = None
                     _xero_retry_after = max(
-                        _xero_retry_after, time.time() + _XERO_429_COOLDOWN_SECONDS
+                        _xero_retry_after,
+                        time.time()
+                        + (
+                            _retry_hint_seconds
+                            if _retry_hint_seconds
+                            else _XERO_429_COOLDOWN_SECONDS
+                        ),
                     )
                     # Also pause retries for this specific event longer; this is the
                     # common case where one problematic event repeatedly re-triggers 429.
@@ -3459,7 +3481,12 @@ def run() -> None:
                         _ev_key = ""
                     if _ev_key:
                         _prev = int(_retry_backoff_map.get(_ev_key) or 0)
-                        _next_backoff = max(_XERO_EVENT_429_COOLDOWN_SECONDS, _prev * 2 if _prev else 0)
+                        _next_backoff = max(
+                            _XERO_EVENT_429_COOLDOWN_SECONDS,
+                            _prev * 2 if _prev else 0,
+                        )
+                        if _retry_hint_seconds:
+                            _next_backoff = max(_next_backoff, _retry_hint_seconds)
                         _next_backoff = min(_next_backoff, _XERO_EVENT_429_MAX_COOLDOWN_SECONDS)
                         _retry_backoff_map[_ev_key] = _next_backoff
                         _retry_map[_ev_key] = time.time() + _next_backoff
@@ -3467,8 +3494,16 @@ def run() -> None:
                         state["event_xero_retry_backoff"] = _retry_backoff_map
                     _now_notice = time.time()
                     if (_now_notice - _last_xero_429_notice_at) >= 60:
+                        _mins = int(
+                            (
+                                _retry_hint_seconds
+                                if _retry_hint_seconds
+                                else _XERO_429_COOLDOWN_SECONDS
+                            )
+                            / 60
+                        )
                         _feed.push(
-                            "Xero rate-limited (429). Cooling down for ~3 minutes.",
+                            f"Xero rate-limited (429). Cooling down for ~{max(_mins,1)} minutes.",
                             "warn",
                         )
                         _last_xero_429_notice_at = _now_notice

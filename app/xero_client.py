@@ -4,6 +4,7 @@ import datetime as dt
 import base64
 import json
 import threading
+import time
 from typing import Dict
 
 import requests
@@ -15,6 +16,8 @@ TOKEN_URL = "https://identity.xero.com/connect/token"
 DEFAULT_SALES_ACCOUNT_CODE = "200"
 DEFAULT_PAYMENT_ACCOUNT_CODE = "090"
 _TOKEN_REFRESH_LOCK = threading.Lock()
+_XERO_RATE_LIMIT_LOCK = threading.Lock()
+_XERO_RATE_LIMIT_UNTIL_TS = 0.0
 
 
 def _short_reference(event: Dict) -> str:
@@ -114,11 +117,32 @@ class XeroClient:
             return True
 
     def _request(self, method: str, url: str, **kwargs):
+        global _XERO_RATE_LIMIT_UNTIL_TS
+        now_ts = time.time()
+        if now_ts < _XERO_RATE_LIMIT_UNTIL_TS:
+            remaining = int(max(1, _XERO_RATE_LIMIT_UNTIL_TS - now_ts))
+            raise RuntimeError(
+                f"Xero rate-limited: 429 cooldown active (Retry-After={remaining}s)"
+            )
+
         response = requests.request(method, url, headers=self._headers(), timeout=30, **kwargs)
         if response.status_code == 401 and self._refresh_access_token():
             response = requests.request(
                 method, url, headers=self._headers(), timeout=30, **kwargs
             )
+        if response.status_code == 429:
+            retry_after_seconds = 300
+            raw_retry = str(response.headers.get("Retry-After") or "").strip()
+            if raw_retry.isdigit():
+                try:
+                    retry_after_seconds = max(60, int(raw_retry))
+                except Exception:
+                    retry_after_seconds = 300
+            with _XERO_RATE_LIMIT_LOCK:
+                _XERO_RATE_LIMIT_UNTIL_TS = max(
+                    _XERO_RATE_LIMIT_UNTIL_TS,
+                    time.time() + retry_after_seconds,
+                )
         return response
 
     def get_organisation(self) -> Dict:
