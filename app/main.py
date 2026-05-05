@@ -1688,7 +1688,7 @@ def run() -> None:
                         needs_invoice_paid_sync = bool(
                             (has_send or sent_state)
                             and is_invoice_sent(state, event_key)
-                            and pay_mode_hint == "invoice"
+                            and pay_mode_hint in {"invoice", "card"}
                             and xero_client
                             and get_invoice_for_event(state, event_key)
                             and not (event.get("summary") or "").strip().startswith("🟢")
@@ -2337,7 +2337,7 @@ def run() -> None:
                                         sales_stats_fields=sales_stats_fields,
                                         state=state,
                                     )
-                                elif pay_mode_retry == "invoice" and invoice_id_retry and xero_client:
+                                elif pay_mode_retry in {"invoice", "card"} and invoice_id_retry and xero_client:
                                     try:
                                         invoice_data = xero_client.get_invoice(invoice_id_retry)
                                         status = str(invoice_data.get("Status") or "").upper()
