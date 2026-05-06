@@ -2573,7 +2573,15 @@ def run() -> None:
                                 invoice_url = None
                                 if invoice_id:
                                     try:
-                                        xero_client.authorize_invoice(invoice_id)
+                                        _issue_date = (
+                                            dt.datetime.now(dt.timezone.utc)
+                                            .astimezone(LONDON_TZ)
+                                            .date()
+                                            .isoformat()
+                                        )
+                                        xero_client.authorize_invoice(
+                                            invoice_id, issue_date=_issue_date
+                                        )
                                     except Exception as exc:
                                         print(f"Event {event_id}: failed to authorise invoice for send: {exc}")
                                         fail_reason = str(exc).splitlines()[0][:220]
@@ -3302,7 +3310,15 @@ def run() -> None:
                                 invoice_url = None
                                 if invoice_id:
                                     try:
-                                        xero_client.authorize_invoice(invoice_id)
+                                        _issue_date = (
+                                            dt.datetime.now(dt.timezone.utc)
+                                            .astimezone(LONDON_TZ)
+                                            .date()
+                                            .isoformat()
+                                        )
+                                        xero_client.authorize_invoice(
+                                            invoice_id, issue_date=_issue_date
+                                        )
                                     except Exception as exc:
                                         print(f"Event {event.get('id')}: failed to authorise invoice for send: {exc}")
                                         fail_reason = str(exc).splitlines()[0][:220]

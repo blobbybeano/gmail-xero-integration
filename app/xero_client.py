@@ -338,8 +338,15 @@ class XeroClient:
                 f"Xero invoice void failed: {response.status_code} {response.text}"
             )
 
-    def authorize_invoice(self, invoice_id: str) -> Dict:
-        payload = {"Invoices": [{"InvoiceID": invoice_id, "Status": "AUTHORISED"}]}
+    def authorize_invoice(self, invoice_id: str, *, issue_date: str | None = None) -> Dict:
+        invoice_payload: Dict[str, str] = {
+            "InvoiceID": invoice_id,
+            "Status": "AUTHORISED",
+        }
+        if issue_date:
+            # Keep invoice issue date aligned to the day the invoice is actually sent.
+            invoice_payload["Date"] = issue_date
+        payload = {"Invoices": [invoice_payload]}
         if self.dry_run:
             return {"dry_run": True, "payload": payload}
         url = f"{self.base_url}/Invoices"
