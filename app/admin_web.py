@@ -6,6 +6,7 @@ import json
 import re
 import secrets
 import time
+import uuid
 import urllib.parse
 from pathlib import Path
 from functools import wraps
@@ -59,9 +60,15 @@ from .google_admin import (
     oauth_exchange_code,
     save_admin_credentials,
 )
-from .google_calendar import update_event_description
+from .google_calendar import update_event_description, build_calendar_service
 from .config import AppConfig
-from .xero_client import load_xero_token, save_xero_token, token_is_expired, refresh_xero_token
+from .xero_client import (
+    load_xero_token,
+    save_xero_token,
+    token_is_expired,
+    refresh_xero_token,
+    build_xero_client,
+)
 from .google_sheets import backfill_submitter_in_sheet, update_invoice_paid_in_sheet
 from .google_sheets import ensure_header, append_stats_row
 from .event_processor import extract_sales_lines, parse_customer_fields, payment_choice
@@ -216,6 +223,157 @@ def _validate_google_credentials_json(raw: bytes) -> tuple[bool, str]:
     if not client_id or not client_secret:
         return False, "Credentials JSON is missing client_id/client_secret."
     return True, ""
+
+
+def _assistant_config(db_path: str) -> dict:
+    raw = get_json_setting(
+        db_path,
+        "assistant_config",
+        {
+            "write_enabled": False,
+            "always_confirm": True,
+        },
+    )
+    if not isinstance(raw, dict):
+        raw = {}
+    return {
+        "write_enabled": bool(raw.get("write_enabled", False)),
+        "always_confirm": True,  # enforced
+    }
+
+
+def _set_assistant_config(db_path: str, *, write_enabled: bool) -> None:
+    set_json_setting(
+        db_path,
+        "assistant_config",
+        {"write_enabled": bool(write_enabled), "always_confirm": True},
+    )
+
+
+def _append_assistant_chat(role: str, text: str) -> None:
+    history = session.get("assistant_chat_history") or []
+    if not isinstance(history, list):
+        history = []
+    history.append(
+        {
+            "role": role,
+            "text": text,
+            "ts": dt.datetime.now(dt.timezone.utc).astimezone().strftime("%H:%M"),
+        }
+    )
+    session["assistant_chat_history"] = history[-30:]
+
+
+def _active_calendar_ids(config: AppConfig) -> list[str]:
+    return get_active_calendars(config.admin_db_file, config.google_calendar_id)
+
+
+def _find_events_by_title(config: AppConfig, phrase: str, *, days_back: int = 180, days_forward: int = 60) -> list[dict]:
+    creds = load_admin_credentials(config)
+    if not creds:
+        return []
+    svc = build_calendar_service(config)
+    now = dt.datetime.now(dt.timezone.utc)
+    tmin = (now - dt.timedelta(days=days_back)).isoformat().replace("+00:00", "Z")
+    tmax = (now + dt.timedelta(days=days_forward)).isoformat().replace("+00:00", "Z")
+    target = (phrase or "").strip().lower()
+    if not target:
+        return []
+    hits: list[dict] = []
+    for cal_id in _active_calendar_ids(config):
+        page_token = None
+        while True:
+            resp = (
+                svc.events()
+                .list(
+                    calendarId=cal_id,
+                    timeMin=tmin,
+                    timeMax=tmax,
+                    singleEvents=True,
+                    orderBy="startTime",
+                    maxResults=250,
+                    pageToken=page_token,
+                )
+                .execute()
+            )
+            for ev in (resp.get("items") or []):
+                summary = str(ev.get("summary") or "")
+                if target in summary.lower():
+                    hits.append({"calendar_id": cal_id, "event": ev})
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+    return hits
+
+
+def _list_today_created_event_titles(config: AppConfig) -> list[str]:
+    creds = load_admin_credentials(config)
+    if not creds:
+        return []
+    svc = build_calendar_service(config)
+    tz = dt.datetime.now().astimezone().tzinfo or dt.timezone.utc
+    today = dt.datetime.now(tz).date()
+    out: list[tuple[dt.datetime, str]] = []
+    for cal_id in _active_calendar_ids(config):
+        page_token = None
+        while True:
+            resp = (
+                svc.events()
+                .list(
+                    calendarId=cal_id,
+                    singleEvents=True,
+                    orderBy="updated",
+                    maxResults=250,
+                    pageToken=page_token,
+                )
+                .execute()
+            )
+            for ev in (resp.get("items") or []):
+                created = str(ev.get("created") or "").strip()
+                if not created:
+                    continue
+                try:
+                    created_dt = dt.datetime.fromisoformat(created.replace("Z", "+00:00")).astimezone(tz)
+                except Exception:
+                    continue
+                if created_dt.date() == today:
+                    out.append((created_dt, str(ev.get("summary") or "(no title)")))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+    out.sort(key=lambda x: x[0])
+    return [title for _, title in out]
+
+
+def _xero_fetch_draft_invoices(config: AppConfig) -> list[dict]:
+    tok = load_xero_token(config.xero_token_file)
+    access_token = str(tok.get("access_token") or "").strip()
+    tenant_id = str(tok.get("tenant_id") or "").strip()
+    if not (access_token and tenant_id):
+        return []
+    url = "https://api.xero.com/api.xro/2.0/Invoices"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Xero-tenant-id": tenant_id,
+        "Accept": "application/json",
+    }
+    results: list[dict] = []
+    for page in range(1, 8):
+        resp = requests.get(
+            url,
+            headers=headers,
+            params={"where": 'Status=="DRAFT"', "page": page},
+            timeout=20,
+        )
+        if not resp.ok:
+            break
+        rows = (resp.json() or {}).get("Invoices") or []
+        if not rows:
+            break
+        results.extend(rows)
+        if len(rows) < 100:
+            break
+    return results
 
 
 _xero_acct_cache: "dict[str, tuple[float, list, list, list, str]]" = {}
@@ -1253,6 +1411,244 @@ def create_app() -> Flask:
         session.clear()
         return redirect(url_for("login"))
 
+    @app.get("/assistant")
+    @require_login
+    def assistant_page():
+        cfg = _assistant_config(config.admin_db_file)
+        history = session.get("assistant_chat_history") or []
+        if not isinstance(history, list):
+            history = []
+        pending = session.get("assistant_pending_action") or {}
+        pending_html = ""
+        if isinstance(pending, dict) and pending.get("id") and pending.get("summary"):
+            pending_html = f"""
+              <div class="rounded-xl border border-amber-300 bg-amber-50 p-4">
+                <p class="text-sm font-semibold text-amber-800">Pending write action</p>
+                <p class="text-sm text-amber-900 mt-1">{escape(str(pending.get("summary") or ""))}</p>
+                <form method="post" action="/assistant/confirm" class="mt-3 flex flex-wrap gap-2">
+                  <input type="hidden" name="action_id" value="{escape(str(pending.get("id")))}">
+                  <button name="decision" value="approve" class="px-3 py-1.5 text-sm rounded-lg bg-emerald-600 text-white hover:bg-emerald-700">Approve & Run</button>
+                  <button name="decision" value="reject" class="px-3 py-1.5 text-sm rounded-lg bg-gray-200 text-gray-800 hover:bg-gray-300">Reject</button>
+                </form>
+              </div>
+            """
+
+        lines: list[str] = []
+        for row in history[-20:]:
+            role = "You" if row.get("role") == "user" else "Assistant"
+            role_cls = "text-indigo-700" if role == "You" else "text-emerald-700"
+            lines.append(
+                f'<div class="py-2 border-b border-gray-100">'
+                f'<p class="text-xs {role_cls} font-semibold">{role} · {escape(str(row.get("ts") or ""))}</p>'
+                f'<p class="text-sm text-gray-800 whitespace-pre-wrap">{escape(str(row.get("text") or ""))}</p>'
+                f"</div>"
+            )
+        chat_html = "".join(lines) or '<p class="text-sm text-gray-500">No messages yet.</p>'
+
+        return _page(
+            f"""
+            <div class="max-w-5xl mx-auto py-6 px-4 sm:px-6">
+              <div class="flex items-center justify-between mb-4">
+                <h1 class="text-2xl font-bold text-gray-900">Assistant</h1>
+                <div class="flex items-center gap-2">
+                  <a href="/" class="px-3 py-1.5 text-sm rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-50">Dashboard</a>
+                  <a href="/settings" class="px-3 py-1.5 text-sm rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-50">Settings</a>
+                </div>
+              </div>
+
+              <div class="rounded-xl border border-gray-200 bg-white p-4 mb-4">
+                <p class="text-sm text-gray-700 mb-3">Write mode controls whether the assistant can execute changes after your approval.</p>
+                <form method="post" action="/assistant/config" class="flex flex-wrap items-center gap-4">
+                  <label class="inline-flex items-center gap-2 text-sm text-gray-800">
+                    <input type="checkbox" name="write_enabled" value="1" {"checked" if cfg.get("write_enabled") else ""}>
+                    Enable write actions
+                  </label>
+                  <span class="text-xs text-gray-500">Always confirm is enforced.</span>
+                  <button class="px-3 py-1.5 text-sm rounded-lg bg-indigo-600 text-white hover:bg-indigo-700">Save</button>
+                </form>
+              </div>
+
+              {pending_html}
+
+              <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mt-4">
+                <div class="rounded-xl border border-gray-200 bg-white p-4">
+                  <h2 class="text-sm font-semibold text-gray-900 mb-2">Ask Assistant</h2>
+                  <form method="post" action="/assistant/ask">
+                    <textarea name="prompt" rows="7" class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm" placeholder="Ask a calendar/Xero question..."></textarea>
+                    <button class="mt-3 px-3 py-1.5 text-sm rounded-lg bg-gray-900 text-white hover:bg-black">Send</button>
+                  </form>
+                  <p class="text-xs text-gray-500 mt-3">Examples: "what new entries were created today", "who booked W5 D.S John O'Discoll", "delete orphan drafts".</p>
+                </div>
+                <div class="rounded-xl border border-gray-200 bg-white p-4 max-h-[480px] overflow-y-auto">
+                  <h2 class="text-sm font-semibold text-gray-900 mb-2">Conversation</h2>
+                  {chat_html}
+                </div>
+              </div>
+            </div>
+            """
+        )
+
+    @app.post("/assistant/config")
+    @require_login
+    def assistant_config_save():
+        write_enabled = (request.form.get("write_enabled") or "").strip() in {"1", "true", "on", "yes", "y"}
+        _set_assistant_config(config.admin_db_file, write_enabled=write_enabled)
+        _append_assistant_chat("assistant", f"Write mode {'enabled' if write_enabled else 'disabled'}.")
+        return redirect(url_for("assistant_page"))
+
+    @app.post("/assistant/ask")
+    @require_login
+    def assistant_ask():
+        prompt = (request.form.get("prompt") or "").strip()
+        if not prompt:
+            return redirect(url_for("assistant_page"))
+        _append_assistant_chat("user", prompt)
+        cfg = _assistant_config(config.admin_db_file)
+        low = prompt.lower()
+
+        # Read-only: list today's new entries.
+        if (
+            ("new" in low and "entr" in low and "today" in low)
+            or ("created today" in low and "calendar" in low)
+        ):
+            titles = _list_today_created_event_titles(config)
+            if not titles:
+                _append_assistant_chat("assistant", "No new entries found today.")
+            else:
+                _append_assistant_chat("assistant", "New entries today:\n- " + "\n- ".join(titles))
+            return redirect(url_for("assistant_page"))
+
+        # Read-only: who booked <title>.
+        if "who booked" in low:
+            phrase = re.sub(r"^.*who booked\s*", "", prompt, flags=re.I).strip(" ?\"'")
+            hits = _find_events_by_title(config, phrase)
+            if not hits:
+                _append_assistant_chat("assistant", f"No matching event found for: {phrase}")
+                return redirect(url_for("assistant_page"))
+            ev = hits[0]["event"]
+            created = ev.get("created") or ""
+            creator = ((ev.get("creator") or {}).get("email") or "").strip() or "unknown"
+            summary = str(ev.get("summary") or "(no title)")
+            _append_assistant_chat(
+                "assistant",
+                f'Booked by: {creator}\nEvent: {summary}\nCreated: {created}',
+            )
+            return redirect(url_for("assistant_page"))
+
+        # Write intent: remove orphan drafts.
+        if ("delete" in low or "remove" in low) and "draft" in low and "xero" in low:
+            if not cfg.get("write_enabled"):
+                _append_assistant_chat("assistant", "Write mode is OFF. Enable write actions first, then ask again.")
+                return redirect(url_for("assistant_page"))
+            state = load_state(config.state_file)
+            mapped = {str(v).strip() for v in (state.get("event_invoice_map") or {}).values() if str(v).strip()}
+            drafts = _xero_fetch_draft_invoices(config)
+            orphan = [d for d in drafts if str(d.get("InvoiceID") or "").strip() and str(d.get("InvoiceID") or "").strip() not in mapped]
+            preview = [str(d.get("InvoiceNumber") or d.get("InvoiceID") or "") for d in orphan[:20]]
+            action_id = str(uuid.uuid4())
+            session["assistant_pending_action"] = {
+                "id": action_id,
+                "type": "delete_orphan_drafts",
+                "invoice_ids": [str(d.get("InvoiceID")) for d in orphan],
+                "summary": f"Delete {len(orphan)} orphan draft invoice(s): {', '.join(preview) if preview else 'none'}",
+            }
+            _append_assistant_chat(
+                "assistant",
+                f"Ready to run: delete {len(orphan)} orphan draft invoice(s). Please approve below.",
+            )
+            return redirect(url_for("assistant_page"))
+
+        # Write intent: void app-tracked invoices by contact name fragment.
+        if "void" in low and ("invoice" in low or "payment" in low):
+            if not cfg.get("write_enabled"):
+                _append_assistant_chat("assistant", "Write mode is OFF. Enable write actions first, then ask again.")
+                return redirect(url_for("assistant_page"))
+            m = re.search(r"under\s+(.+)$", prompt, flags=re.I)
+            if not m:
+                _append_assistant_chat("assistant", "Please include a name fragment, e.g. 'void invoices under Test Name'.")
+                return redirect(url_for("assistant_page"))
+            needle = m.group(1).strip(" .\"'")
+            xc = build_xero_client(config)
+            if not xc:
+                _append_assistant_chat("assistant", "Xero client is not connected.")
+                return redirect(url_for("assistant_page"))
+            state = load_state(config.state_file)
+            invoice_ids = sorted({str(v).strip() for v in (state.get("event_invoice_map") or {}).values() if str(v).strip()})
+            matches: list[dict] = []
+            for inv_id in invoice_ids[:500]:
+                try:
+                    inv = xc.get_invoice(inv_id)
+                except Exception:
+                    continue
+                cname = str(((inv.get("Contact") or {}).get("Name") or "")).strip()
+                if needle.lower() in cname.lower():
+                    status = str(inv.get("Status") or "").upper()
+                    if status not in {"VOIDED", "DELETED"}:
+                        matches.append(inv)
+            action_id = str(uuid.uuid4())
+            preview = [str(inv.get("InvoiceNumber") or inv.get("InvoiceID") or "") for inv in matches[:20]]
+            session["assistant_pending_action"] = {
+                "id": action_id,
+                "type": "void_invoices_by_name",
+                "invoice_ids": [str(inv.get("InvoiceID")) for inv in matches],
+                "summary": f'Void {len(matches)} invoice(s) for name containing "{needle}": {", ".join(preview) if preview else "none"}',
+            }
+            _append_assistant_chat(
+                "assistant",
+                f'Ready to run: void {len(matches)} invoice(s) for "{needle}". Please approve below.',
+            )
+            return redirect(url_for("assistant_page"))
+
+        _append_assistant_chat(
+            "assistant",
+            "I can currently help with: new entries today, who booked an event, delete orphan drafts, and void invoices by name.",
+        )
+        return redirect(url_for("assistant_page"))
+
+    @app.post("/assistant/confirm")
+    @require_login
+    def assistant_confirm():
+        decision = (request.form.get("decision") or "").strip().lower()
+        action_id = (request.form.get("action_id") or "").strip()
+        pending = session.get("assistant_pending_action") or {}
+        if not pending or pending.get("id") != action_id:
+            _append_assistant_chat("assistant", "No matching pending action found.")
+            return redirect(url_for("assistant_page"))
+        if decision != "approve":
+            session.pop("assistant_pending_action", None)
+            _append_assistant_chat("assistant", "Pending action cancelled.")
+            return redirect(url_for("assistant_page"))
+
+        cfg = _assistant_config(config.admin_db_file)
+        if not cfg.get("write_enabled"):
+            _append_assistant_chat("assistant", "Write mode is OFF; action not executed.")
+            session.pop("assistant_pending_action", None)
+            return redirect(url_for("assistant_page"))
+
+        xc = build_xero_client(config)
+        if not xc:
+            _append_assistant_chat("assistant", "Xero not connected; action not executed.")
+            session.pop("assistant_pending_action", None)
+            return redirect(url_for("assistant_page"))
+
+        invoice_ids = [str(v).strip() for v in (pending.get("invoice_ids") or []) if str(v).strip()]
+        max_ops = 50
+        invoice_ids = invoice_ids[:max_ops]
+        done = 0
+        failed = 0
+        for inv_id in invoice_ids:
+            try:
+                xc.delete_draft_invoice(inv_id)
+                done += 1
+            except Exception:
+                failed += 1
+        session.pop("assistant_pending_action", None)
+        _append_assistant_chat(
+            "assistant",
+            f"Write action completed. Success: {done}, Failed: {failed}, Attempted: {len(invoice_ids)}.",
+        )
+        return redirect(url_for("assistant_page"))
+
     @app.get("/admin/reset-login")
     def reset_login_page():
         token_set = bool((config.admin_reset_token or "").strip())
@@ -1943,6 +2339,9 @@ def create_app() -> Flask:
       <div class="w-px h-5 bg-neutral-700 mx-1"></div>
       <a href="/settings" class="px-3 py-1.5 text-xs font-medium text-neutral-300 hover:text-white bg-neutral-800 hover:bg-neutral-700 rounded-lg border border-neutral-700 transition-colors">
         Settings
+      </a>
+      <a href="/assistant" class="px-3 py-1.5 text-xs font-medium text-neutral-300 hover:text-white bg-neutral-800 hover:bg-neutral-700 rounded-lg border border-neutral-700 transition-colors">
+        Assistant
       </a>
       <a href="/logout" class="px-3 py-1.5 text-xs font-medium text-neutral-400 hover:text-neutral-300 transition-colors">
         Sign out
@@ -2764,6 +3163,12 @@ function toggleEnabled(requested) {{
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/>
                 </svg>
                 Live Feed
+              </a>
+              <a href="/assistant" class="text-sm text-indigo-600 hover:text-indigo-700 flex items-center gap-1.5 font-medium">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16h6M4 7a2 2 0 012-2h12a2 2 0 012 2v7a2 2 0 01-2 2H8l-4 4V7z"/>
+                </svg>
+                Assistant
               </a>
               <a href="/logout" class="text-sm text-gray-500 hover:text-gray-700 flex items-center gap-1.5">
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
