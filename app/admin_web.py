@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import base64
 import json
+import os
 import re
 import secrets
 import time
@@ -374,6 +375,79 @@ def _xero_fetch_draft_invoices(config: AppConfig) -> list[dict]:
         if len(rows) < 100:
             break
     return results
+
+
+def _openai_assistant_reply(prompt: str) -> tuple[str | None, str | None]:
+    """
+    Return (reply, error_code). error_code is one of:
+    - missing_key
+    - api_error
+    """
+    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        return None, "missing_key"
+
+    model = (os.getenv("OPENAI_MODEL") or "gpt-5-mini").strip()
+    system_prompt = (
+        "You are an assistant for a field-service calendar and invoicing app. "
+        "Be concise and practical. If a user asks for risky write actions, tell them "
+        "the app requires explicit approval before making changes."
+    )
+    payload = {
+        "model": model,
+        "input": [
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": system_prompt}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": prompt}],
+            },
+        ],
+        "max_output_tokens": 500,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers=headers,
+            json=payload,
+            timeout=45,
+        )
+    except Exception:
+        return None, "api_error"
+
+    if not resp.ok:
+        return None, "api_error"
+
+    try:
+        data = resp.json()
+    except Exception:
+        return None, "api_error"
+
+    out = str(data.get("output_text") or "").strip()
+    if out:
+        return out, None
+
+    # Fallback parse for response content structure.
+    parts: list[str] = []
+    for item in (data.get("output") or []):
+        if str(item.get("type") or "") != "message":
+            continue
+        for c in (item.get("content") or []):
+            ctype = str(c.get("type") or "").lower()
+            if ctype in {"output_text", "text", "message_text"}:
+                txt = str(c.get("text") or "").strip()
+                if txt:
+                    parts.append(txt)
+    merged = "\n".join(parts).strip()
+    if merged:
+        return merged, None
+    return None, "api_error"
 
 
 _xero_acct_cache: "dict[str, tuple[float, list, list, list, str]]" = {}
@@ -1415,6 +1489,8 @@ def create_app() -> Flask:
     @require_login
     def assistant_page():
         cfg = _assistant_config(config.admin_db_file)
+        openai_configured = bool((os.getenv("OPENAI_API_KEY") or "").strip())
+        openai_model = (os.getenv("OPENAI_MODEL") or "gpt-5-mini").strip()
         history = session.get("assistant_chat_history") or []
         if not isinstance(history, list):
             history = []
@@ -1466,6 +1542,10 @@ def create_app() -> Flask:
                   <span class="text-xs text-gray-500">Always confirm is enforced.</span>
                   <button class="px-3 py-1.5 text-sm rounded-lg bg-indigo-600 text-white hover:bg-indigo-700">Save</button>
                 </form>
+                <div class="mt-3 text-xs text-gray-600">
+                  <p>OpenAI: <span class="font-semibold {"text-emerald-700" if openai_configured else "text-amber-700"}">{"Connected" if openai_configured else "Not configured"}</span> · model <code>{escape(openai_model)}</code></p>
+                  <p class="mt-1">API keys: <a class="text-indigo-600 hover:underline" href="https://platform.openai.com/api-keys" target="_blank" rel="noopener">platform.openai.com/api-keys</a></p>
+                </div>
               </div>
 
               {pending_html}
@@ -1599,9 +1679,21 @@ def create_app() -> Flask:
             )
             return redirect(url_for("assistant_page"))
 
+        ai_reply, ai_err = _openai_assistant_reply(prompt)
+        if ai_reply:
+            _append_assistant_chat("assistant", ai_reply)
+            return redirect(url_for("assistant_page"))
+        if ai_err == "missing_key":
+            _append_assistant_chat(
+                "assistant",
+                "OpenAI API key is not configured. Add `OPENAI_API_KEY` to Fly secrets. "
+                "Key page: https://platform.openai.com/api-keys",
+            )
+            return redirect(url_for("assistant_page"))
+
         _append_assistant_chat(
             "assistant",
-            "I can currently help with: new entries today, who booked an event, delete orphan drafts, and void invoices by name.",
+            "I couldn't reach OpenAI right now. Try again shortly.",
         )
         return redirect(url_for("assistant_page"))
 
