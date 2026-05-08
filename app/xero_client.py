@@ -218,13 +218,17 @@ class XeroClient:
         self, invoice_id: str, contact: Dict | None = None, line_items: list | None = None
     ) -> Dict:
         prepared_line_items = self._prepare_line_items(line_items)
+        theme_id = self._pick_branding_theme(prepared_line_items or line_items)
+        invoice_payload: Dict[str, object] = {
+            "InvoiceID": invoice_id,
+            "Contact": contact if contact else None,
+            "LineItems": prepared_line_items if prepared_line_items else [],
+        }
+        if theme_id:
+            invoice_payload["BrandingThemeID"] = theme_id
         payload = {
             "Invoices": [
-                {
-                    "InvoiceID": invoice_id,
-                    "Contact": contact if contact else None,
-                    "LineItems": prepared_line_items if prepared_line_items else [],
-                }
+                invoice_payload
             ]
         }
         if self.dry_run:

@@ -23,8 +23,7 @@ Customer contact number:
 ⬇Sales⬇
 
 [/invoice]
-
-Y/N =
+PROCESS DRAFT (Y/N) =
 ```
 
 ## 2) Add job lines
@@ -49,19 +48,39 @@ If the whole job should be treated as no VAT, add this once inside `[invoice]`:
 *cash*
 ```
 
-## 4) Finalise the entry
+## 4) Process the draft
 
 When ready, set:
 
 ```text
-Y/N =Y
+PROCESS DRAFT (Y/N) =Y
 ```
 
-The app then creates/updates draft invoice details automatically.
+The app then creates/updates the draft invoice and writes totals in `[app-status]`.
 
-## 5) Optional invoice-only business details
+## 5) Choose payment type and send
 
-When invoice details are different from the customer details, add optional lines inside `[contact]`:
+In `[app-status]`, set payment type:
+
+```text
+PAYMENT TYPE (CARD/INVOICE) = CARD
+```
+
+or:
+
+```text
+PAYMENT TYPE (CARD/INVOICE) = INVOICE
+```
+
+Then send:
+
+```text
+SEND NOW (Y/N) =Y
+```
+
+## 6) Optional invoice-only business details
+
+When invoice details are different from customer details, add optional lines inside `[contact]`:
 
 ```text
 Invoice name: Jo&Co Ltd
@@ -74,7 +93,10 @@ Invoice country: UK
 
 These override only invoice addressing.
 
-## 6) Shortcut for known business profiles
+After successful processing, this section may be compacted to:
+`Alternate Invoice Address ✅`
+
+## 7) Shortcut for known business profiles
 
 If that business already exists in Xero, use:
 
@@ -84,21 +106,37 @@ Invoice profile: Jo&Co Ltd
 
 Behavior:
 - If profile exists in Xero: app uses that existing contact profile.
-- If profile does not exist: entry stays blue and processing is blocked until corrected.
+- If profile does not exist: entry stays blue, processing is blocked, and the `Invoice profile:` line shows `❌ Customer does not exist`.
 
-## 7) Title light meanings
+## 8) Title light meanings
 
-- `🔵` New/formatted entry.
-- `🟠` Entry edited / in-progress.
-- `🟡` Invoice submitted, waiting for payment.
+- `🔵` Waiting to be processed.
+- `🟠` Draft created.
+- `🟠.` / `🟠..` / `🟠...` Draft edited again.
+- `🟡` Authorised/sent, waiting for payment.
 - `🟢` Paid/finalised.
 - `🔴` Integration problem (Xero/Google/Sheets/Webhook issue).
 - `✉️` Email send failed (shown next to light).
 
-## 8) Common checks
+## 9) Common checks
 
 If entry is not progressing:
-- Confirm `Y/N =Y` is present.
+- Confirm `PROCESS DRAFT (Y/N) =Y` is present.
 - Ensure invoice lines are inside `[invoice]`.
+- Confirm payment type is set before sending.
 - For `Invoice profile`, confirm exact business name exists in Xero.
 - If `🔴` appears, report to management (integration issue).
+
+If you see this warning in `[notes]`:
+`!!! PAYMENT TYPE EMPTY !!!!`
+set `PAYMENT TYPE (CARD/INVOICE) = CARD` or `INVOICE`, then set `SEND NOW (Y/N) =Y`.
+
+## 10) Backward compatibility
+
+Older prompts still work:
+- `Y/N =Y`
+- `SEND Y/N =Y`
+
+Use the new prompts going forward:
+- `PROCESS DRAFT (Y/N) =`
+- `SEND NOW (Y/N) =`

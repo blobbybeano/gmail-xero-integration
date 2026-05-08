@@ -4,11 +4,50 @@ import threading
 
 _poll_event = threading.Event()
 _watch_check_event = threading.Event()
+_targets_lock = threading.Lock()
+_calendar_targets: set[str] = set()
+_event_targets: set[str] = set()
 
 
 def trigger_poll() -> None:
     """Wake the poller up immediately instead of waiting for the next sleep cycle."""
     _poll_event.set()
+
+
+def queue_calendar_target(calendar_id: str) -> None:
+    """Queue one calendar id for prioritized next-cycle scanning."""
+    cid = (calendar_id or "").strip()
+    if not cid:
+        return
+    with _targets_lock:
+        _calendar_targets.add(cid)
+    _poll_event.set()
+
+
+def consume_calendar_targets() -> list[str]:
+    """Return and clear queued calendar targets."""
+    with _targets_lock:
+        out = list(_calendar_targets)
+        _calendar_targets.clear()
+    return out
+
+
+def queue_event_target(event_key: str) -> None:
+    """Queue one event key (<calendar_id>:<event_id>) for prioritized next-cycle handling."""
+    key = (event_key or "").strip()
+    if not key:
+        return
+    with _targets_lock:
+        _event_targets.add(key)
+    _poll_event.set()
+
+
+def consume_event_targets() -> list[str]:
+    """Return and clear queued event targets."""
+    with _targets_lock:
+        out = list(_event_targets)
+        _event_targets.clear()
+    return out
 
 
 def wait_for_poll(timeout: float) -> None:

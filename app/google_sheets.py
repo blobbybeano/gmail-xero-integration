@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 from zoneinfo import ZoneInfo
 import re
 
@@ -344,15 +344,19 @@ def update_invoice_paid_in_sheet(
     spreadsheet_id: str,
     sheet_name: str,
     invoice_number: str,
-) -> bool:
+) -> Literal["updated", "already_paid", "not_found", "missing_headers"]:
     """
     Find rows whose 'Invoice Number' matches and mark payment columns as paid.
     - If a 'Paid' column exists: set it to 'Paid'
     - If a 'Payment Date/Time' column exists: set current timestamp
-    Returns True if a row was updated.
+    Returns:
+    - "updated": one or more cells were changed
+    - "already_paid": invoice row exists and was already marked paid
+    - "not_found": no row matched invoice number
+    - "missing_headers": required columns are missing
     """
     if not invoice_number:
-        return False
+        return "not_found"
     service = build_sheets_service_from_creds(creds)
     resolved = _resolve_existing_sheet_name(service, spreadsheet_id, sheet_name)
 
@@ -364,27 +368,30 @@ def update_invoice_paid_in_sheet(
     )
     rows = resp.get("values", [])
     if len(rows) < 2:
-        return False
+        return "not_found"
 
     header = rows[0]
     try:
         inv_col = header.index("Invoice Number")
     except ValueError:
-        return False
+        return "missing_headers"
     paid_col = header.index("Paid") if "Paid" in header else None
     paid_dt_col = (
         header.index("Payment Date/Time") if "Payment Date/Time" in header else None
     )
     if paid_col is None and paid_dt_col is None:
-        return False
+        return "missing_headers"
 
     safe = resolved.replace("'", "''")
     updates = []
     payment_dt_rows_to_black: list[int] = []
+    matched_row = False
     now_str = _now_london_str()
     for row_idx, row in enumerate(rows[1:], start=2):
         cell_val = row[inv_col].strip() if len(row) > inv_col else ""
         if cell_val.upper() == invoice_number.upper():
+            matched_row = True
+            row_needs_update = False
             if paid_col is not None:
                 current_paid = row[paid_col].strip() if len(row) > paid_col else ""
             else:
@@ -394,6 +401,7 @@ def update_invoice_paid_in_sheet(
                     "range": f"'{safe}'!{_col_letter(paid_col)}{row_idx}",
                     "values": [["Paid"]],
                 })
+                row_needs_update = True
             if paid_dt_col is not None:
                 current_paid_dt = (
                     row[paid_dt_col].strip() if len(row) > paid_dt_col else ""
@@ -405,9 +413,12 @@ def update_invoice_paid_in_sheet(
                         "values": [[now_str]],
                     })
                     payment_dt_rows_to_black.append(row_idx)
+                    row_needs_update = True
 
+    if not matched_row:
+        return "not_found"
     if not updates:
-        return False
+        return "already_paid"
 
     service.spreadsheets().values().batchUpdate(
         spreadsheetId=spreadsheet_id,
@@ -450,7 +461,7 @@ def update_invoice_paid_in_sheet(
                     spreadsheetId=spreadsheet_id,
                     body={"requests": requests},
                 ).execute()
-    return True
+    return "updated"
 
 
 def backfill_submitter_in_sheet(

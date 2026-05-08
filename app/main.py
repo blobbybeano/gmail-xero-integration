@@ -53,6 +53,7 @@ from .event_processor import (
     collapse_invoice_override_section,
     parse_event_address,
     payment_choice,
+    upsert_invoice_profile_missing_hint,
     upsert_send_failure,
     upsert_invoice_summary,
     upsert_cash_confirmation,
@@ -2196,9 +2197,13 @@ def run() -> None:
                                     location=event.get("location"),
                                 )
                                 if resolve_err == "PROFILE_NOT_FOUND":
+                                    hinted_desc = upsert_invoice_profile_missing_hint(
+                                        event.get("description") or "",
+                                        missing=True,
+                                    )
                                     safe_update(
                                         event_id=event.get("id"),
-                                        description=event.get("description") or "",
+                                        description=hinted_desc,
                                         label="Invoice profile missing",
                                         summary_status="blue",
                                         current_summary=event.get("summary"),
@@ -2211,6 +2216,19 @@ def run() -> None:
                                     state = set_processed_update_marker(state, event_key, event_updated)
                                     continue
                                 if contact and contact.get("ContactID"):
+                                    cleaned_desc = upsert_invoice_profile_missing_hint(
+                                        event.get("description") or "",
+                                        missing=False,
+                                    )
+                                    if cleaned_desc != (event.get("description") or ""):
+                                        updated = safe_update(
+                                            event_id=event.get("id"),
+                                            description=cleaned_desc,
+                                            label="Invoice profile warning cleared",
+                                            calendar_id=calendar_id,
+                                        )
+                                        if updated:
+                                            event["description"] = cleaned_desc
                                     existing_contact_id = contact.get("ContactID")
                                     state = set_contact_for_event(
                                         state, event_key, existing_contact_id
@@ -2869,13 +2887,16 @@ def run() -> None:
                                             inv_number = str(invoice_data.get("InvoiceNumber") or "").strip()
                                             if admin_creds and sheet_target.get("spreadsheet_id", "").strip() and inv_number:
                                                 try:
-                                                    if update_invoice_paid_in_sheet(
+                                                    sheet_update_status = update_invoice_paid_in_sheet(
                                                         admin_creds,
                                                         spreadsheet_id=sheet_target.get("spreadsheet_id", "").strip(),
                                                         sheet_name=sheet_target.get("sheet_name", "Sheet1").strip() or "Sheet1",
                                                         invoice_number=inv_number,
-                                                    ):
+                                                    )
+                                                    if sheet_update_status == "updated":
                                                         print(f"Master sheet marked Paid for {inv_number}", flush=True)
+                                                    elif sheet_update_status == "already_paid":
+                                                        print(f"Master sheet already paid for {inv_number}", flush=True)
                                                 except Exception as exc:
                                                     print(f"Master sheet paid update failed for {inv_number}: {exc}", flush=True)
                                             if not (event.get("summary") or "").strip().startswith("🟢"):
@@ -2905,13 +2926,16 @@ def run() -> None:
                                         # Update master sheet paid columns as a poll fallback (webhook is primary).
                                         if admin_creds and sheet_target.get("spreadsheet_id", "").strip() and inv_number:
                                             try:
-                                                if update_invoice_paid_in_sheet(
+                                                sheet_update_status = update_invoice_paid_in_sheet(
                                                     admin_creds,
                                                     spreadsheet_id=sheet_target.get("spreadsheet_id", "").strip(),
                                                     sheet_name=sheet_target.get("sheet_name", "Sheet1").strip() or "Sheet1",
                                                     invoice_number=inv_number,
-                                                ):
+                                                )
+                                                if sheet_update_status == "updated":
                                                     print(f"Master sheet marked Paid for {inv_number}", flush=True)
+                                                elif sheet_update_status == "already_paid":
+                                                    print(f"Master sheet already paid for {inv_number}", flush=True)
                                             except Exception as exc:
                                                 print(f"Master sheet paid update failed for {inv_number}: {exc}", flush=True)
                                         state = _append_sales_rows_if_enabled(
@@ -2993,9 +3017,13 @@ def run() -> None:
                                     location=event.get("location"),
                                 )
                                 if resolve_err == "PROFILE_NOT_FOUND":
+                                    hinted_desc = upsert_invoice_profile_missing_hint(
+                                        event.get("description") or "",
+                                        missing=True,
+                                    )
                                     safe_update(
                                         event_id=event.get("id"),
-                                        description=event.get("description") or "",
+                                        description=hinted_desc,
                                         label="Invoice profile missing",
                                         summary_status="blue",
                                         current_summary=event.get("summary"),
@@ -3008,6 +3036,19 @@ def run() -> None:
                                     state = set_processed_update_marker(state, event_key, event.get("updated") or "")
                                     continue
                                 if contact and contact.get("ContactID"):
+                                    cleaned_desc = upsert_invoice_profile_missing_hint(
+                                        event.get("description") or "",
+                                        missing=False,
+                                    )
+                                    if cleaned_desc != (event.get("description") or ""):
+                                        updated = safe_update(
+                                            event_id=event.get("id"),
+                                            description=cleaned_desc,
+                                            label="Invoice profile warning cleared",
+                                            calendar_id=calendar_id,
+                                        )
+                                        if updated:
+                                            event["description"] = cleaned_desc
                                     _cname = resolved_name or customer.get("name", "")
                                     _feed.push(
                                         f"Customer ready in Xero: {_cname}",

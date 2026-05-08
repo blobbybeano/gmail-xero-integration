@@ -3547,17 +3547,22 @@ function toggleEnabled(requested) {{
                     _feed.push(f"Invoice {inv_number} paid — marking sheet row as Paid", "paid")
                     if creds and spreadsheet_id and inv_number:
                         try:
-                            updated = update_invoice_paid_in_sheet(
+                            sheet_update_status = update_invoice_paid_in_sheet(
                                 creds,
                                 spreadsheet_id=spreadsheet_id,
                                 sheet_name=sheet_name,
                                 invoice_number=inv_number,
                             )
-                            if updated:
+                            if sheet_update_status == "updated":
                                 print(f"[webhook] Sheet row updated for {inv_number}", flush=True)
                                 _feed.push(f"Sheet updated: {inv_number} marked as Paid", "paid")
+                            elif sheet_update_status == "already_paid":
+                                print(f"[webhook] Sheet row already up-to-date for {inv_number}", flush=True)
                             else:
-                                print(f"[webhook] No matching sheet row found for {inv_number}", flush=True)
+                                print(
+                                    f"[webhook] Sheet row update skipped for {inv_number}: {sheet_update_status}",
+                                    flush=True,
+                                )
                         except Exception as exc:
                             print(f"[webhook] Sheet update failed: {exc}", flush=True)
 
