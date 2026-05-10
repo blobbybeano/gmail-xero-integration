@@ -1763,14 +1763,9 @@ function setPrompt(text) {{
         low = prompt.lower()
 
         # Read-only: list today's new entries.
-        # Broad match: catches "calendar entries today", "entries made today",
-        # "what was booked today", "show me today's bookings", etc.
         if (
-            ("entr" in low and "today" in low)
+            ("new" in low and "entr" in low and "today" in low)
             or ("created today" in low)
-            or ("made today" in low and ("calendar" in low or "book" in low or "appoint" in low or "entr" in low))
-            or ("today" in low and ("book" in low or "appoint" in low) and ("what" in low or "show" in low or "list" in low or "tell" in low))
-            or ("what" in low and "today" in low and "calendar" in low)
         ):
             titles = _list_today_created_event_titles(config)
             if not titles:
