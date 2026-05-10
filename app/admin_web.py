@@ -377,63 +377,7 @@ def _xero_fetch_draft_invoices(config: AppConfig) -> list[dict]:
     return results
 
 
-def _xero_find_contact(config: "AppConfig", name_fragment: str) -> list[dict]:
-    """Search Xero contacts by name fragment. Returns list of matching contact dicts."""
-    tok = load_xero_token(config.xero_token_file)
-    access_token = str(tok.get("access_token") or "").strip()
-    tenant_id = str(tok.get("tenant_id") or "").strip()
-    if not (access_token and tenant_id):
-        return []
-    frag = (name_fragment or "").strip()
-    if not frag:
-        return []
-    url = "https://api.xero.com/api.xro/2.0/Contacts"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Xero-tenant-id": tenant_id,
-        "Accept": "application/json",
-    }
-    try:
-        resp = requests.get(
-            url,
-            headers=headers,
-            params={"where": f'Name.Contains("{frag}")', "summaryOnly": "true"},
-            timeout=15,
-        )
-        if not resp.ok:
-            return []
-        return (resp.json() or {}).get("Contacts") or []
-    except Exception:
-        return []
-
-
-def _xero_get_invoice_by_number(config: "AppConfig", inv_number: str) -> dict | None:
-    """Look up a single Xero invoice by its invoice number (e.g. INV-0042)."""
-    tok = load_xero_token(config.xero_token_file)
-    access_token = str(tok.get("access_token") or "").strip()
-    tenant_id = str(tok.get("tenant_id") or "").strip()
-    if not (access_token and tenant_id):
-        return None
-    num = (inv_number or "").strip().upper()
-    if not num:
-        return None
-    url = "https://api.xero.com/api.xro/2.0/Invoices"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Xero-tenant-id": tenant_id,
-        "Accept": "application/json",
-    }
-    try:
-        resp = requests.get(url, headers=headers, params={"InvoiceNumbers": num}, timeout=15)
-        if not resp.ok:
-            return None
-        invs = (resp.json() or {}).get("Invoices") or []
-        return invs[0] if invs else None
-    except Exception:
-        return None
-
-
-def _openai_assistant_reply(prompt: str, history: list[dict] | None = None) -> tuple[str | None, str | None]:
+def _openai_assistant_reply(prompt: str) -> tuple[str | None, str | None]:
     """
     Return (reply, error_code). error_code is one of:
     - missing_key
@@ -443,26 +387,25 @@ def _openai_assistant_reply(prompt: str, history: list[dict] | None = None) -> t
     if not api_key:
         return None, "missing_key"
 
-    model = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
+    model = (os.getenv("OPENAI_MODEL") or "gpt-5-mini").strip()
     system_prompt = (
-        "You are a helpful assistant for Powwash Admin — a field-service calendar and invoicing app. "
-        "The app monitors Google Calendar events marked DONE or SEND and automatically creates Xero invoices. "
-        "It also logs to Google Sheets (master, cash, and sales sheets). "
-        "You help with: finding calendar events, checking invoice or contact status in Xero, "
-        "explaining app behaviour, and (when write mode is on) executing approved write actions. "
-        "Be concise and practical. For any risky write action, remind the user that "
-        "write mode must be enabled and the action must be explicitly approved before it runs."
+        "You are an assistant for a field-service calendar and invoicing app. "
+        "Be concise and practical. If a user asks for risky write actions, tell them "
+        "the app requires explicit approval before making changes."
     )
-    messages: list[dict] = [{"role": "system", "content": system_prompt}]
-    for row in (history or [])[-10:]:
-        role = "user" if row.get("role") == "user" else "assistant"
-        messages.append({"role": role, "content": str(row.get("text") or "")})
-    messages.append({"role": "user", "content": prompt})
-
     payload = {
         "model": model,
-        "messages": messages,
-        "max_tokens": 600,
+        "input": [
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": system_prompt}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": prompt}],
+            },
+        ],
+        "max_output_tokens": 500,
     }
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -470,7 +413,7 @@ def _openai_assistant_reply(prompt: str, history: list[dict] | None = None) -> t
     }
     try:
         resp = requests.post(
-            "https://api.openai.com/v1/chat/completions",
+            "https://api.openai.com/v1/responses",
             headers=headers,
             json=payload,
             timeout=45,
@@ -483,11 +426,27 @@ def _openai_assistant_reply(prompt: str, history: list[dict] | None = None) -> t
 
     try:
         data = resp.json()
-        out = str(data["choices"][0]["message"]["content"] or "").strip()
-        if out:
-            return out, None
     except Exception:
-        pass
+        return None, "api_error"
+
+    out = str(data.get("output_text") or "").strip()
+    if out:
+        return out, None
+
+    # Fallback parse for response content structure.
+    parts: list[str] = []
+    for item in (data.get("output") or []):
+        if str(item.get("type") or "") != "message":
+            continue
+        for c in (item.get("content") or []):
+            ctype = str(c.get("type") or "").lower()
+            if ctype in {"output_text", "text", "message_text"}:
+                txt = str(c.get("text") or "").strip()
+                if txt:
+                    parts.append(txt)
+    merged = "\n".join(parts).strip()
+    if merged:
+        return merged, None
     return None, "api_error"
 
 
@@ -1531,217 +1490,83 @@ def create_app() -> Flask:
     def assistant_page():
         cfg = _assistant_config(config.admin_db_file)
         openai_configured = bool((os.getenv("OPENAI_API_KEY") or "").strip())
-        openai_model = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
+        openai_model = (os.getenv("OPENAI_MODEL") or "gpt-5-mini").strip()
         history = session.get("assistant_chat_history") or []
         if not isinstance(history, list):
             history = []
         pending = session.get("assistant_pending_action") or {}
-
-        # Build chat bubbles
-        bubble_parts: list[str] = []
-        for row in history[-30:]:
-            is_user = row.get("role") == "user"
-            ts = escape(str(row.get("ts") or ""))
-            text = escape(str(row.get("text") or ""))
-            if is_user:
-                bubble_parts.append(
-                    f'<div class="flex justify-end mb-4">'
-                    f'<div class="max-w-[78%]">'
-                    f'<p class="text-xs text-neutral-400 text-right mb-1 pr-1">{ts}</p>'
-                    f'<div class="bg-indigo-600 text-white rounded-2xl rounded-tr-sm px-4 py-2.5 text-sm whitespace-pre-wrap leading-relaxed shadow-sm">{text}</div>'
-                    f'</div>'
-                    f'</div>'
-                )
-            else:
-                bubble_parts.append(
-                    f'<div class="flex justify-start mb-4">'
-                    f'<div class="w-7 h-7 rounded-full bg-neutral-800 flex items-center justify-center mr-2.5 mt-5 shrink-0">'
-                    f'<svg class="w-3.5 h-3.5 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">'
-                    f'<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16h6M4 7a2 2 0 012-2h12a2 2 0 012 2v7a2 2 0 01-2 2H8l-4 4V7z"/>'
-                    f'</svg></div>'
-                    f'<div class="max-w-[78%]">'
-                    f'<p class="text-xs text-neutral-400 mb-1 pl-1">Assistant · {ts}</p>'
-                    f'<div class="bg-white border border-neutral-200 rounded-2xl rounded-tl-sm px-4 py-2.5 text-sm text-neutral-800 whitespace-pre-wrap leading-relaxed shadow-sm">{text}</div>'
-                    f'</div>'
-                    f'</div>'
-                )
-
-        if not bubble_parts:
-            bubbles_html = (
-                '<div class="flex flex-col items-center justify-center h-full text-center py-20">'
-                '<div class="w-16 h-16 rounded-2xl bg-neutral-800 flex items-center justify-center mb-5 shadow-inner">'
-                '<svg class="w-8 h-8 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">'
-                '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M8 10h.01M12 10h.01M16 10h.01M9 16h6M4 7a2 2 0 012-2h12a2 2 0 012 2v7a2 2 0 01-2 2H8l-4 4V7z"/>'
-                '</svg></div>'
-                '<p class="text-sm font-semibold text-neutral-200">How can I help?</p>'
-                '<p class="text-xs text-neutral-500 mt-1.5 max-w-xs">Ask about calendar bookings, Xero invoices, contacts, or app status.</p>'
-                '</div>'
-            )
-        else:
-            bubbles_html = "".join(bubble_parts)
-
-        # Pending action banner
         pending_html = ""
         if isinstance(pending, dict) and pending.get("id") and pending.get("summary"):
-            pending_html = (
-                f'<div class="shrink-0 mx-4 mb-3 flex items-start gap-3 rounded-xl border border-amber-500/40 bg-amber-950/60 px-4 py-3">'
-                f'<div class="text-base leading-none mt-0.5">⚠️</div>'
-                f'<div class="flex-1 min-w-0">'
-                f'<p class="text-sm font-semibold text-amber-300">Pending write action</p>'
-                f'<p class="text-sm text-amber-200/80 mt-0.5">{escape(str(pending.get("summary") or ""))}</p>'
-                f'<form method="post" action="/assistant/confirm" class="mt-2.5 flex flex-wrap gap-2">'
-                f'<input type="hidden" name="action_id" value="{escape(str(pending.get("id")))}">'
-                f'<button name="decision" value="approve" class="px-3 py-1.5 text-xs font-semibold rounded-lg bg-emerald-600 text-white hover:bg-emerald-500 transition-colors">Approve &amp; Run</button>'
-                f'<button name="decision" value="reject" class="px-3 py-1.5 text-xs font-semibold rounded-lg bg-neutral-700 text-neutral-200 hover:bg-neutral-600 transition-colors">Reject</button>'
-                f'</form>'
-                f'</div>'
-                f'</div>'
-            )
+            pending_html = f"""
+              <div class="rounded-xl border border-amber-300 bg-amber-50 p-4">
+                <p class="text-sm font-semibold text-amber-800">Pending write action</p>
+                <p class="text-sm text-amber-900 mt-1">{escape(str(pending.get("summary") or ""))}</p>
+                <form method="post" action="/assistant/confirm" class="mt-3 flex flex-wrap gap-2">
+                  <input type="hidden" name="action_id" value="{escape(str(pending.get("id")))}">
+                  <button name="decision" value="approve" class="px-3 py-1.5 text-sm rounded-lg bg-emerald-600 text-white hover:bg-emerald-700">Approve & Run</button>
+                  <button name="decision" value="reject" class="px-3 py-1.5 text-sm rounded-lg bg-gray-200 text-gray-800 hover:bg-gray-300">Reject</button>
+                </form>
+              </div>
+            """
 
-        write_badge = (
-            '<span class="inline-flex items-center gap-1 text-xs px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-300 font-medium border border-emerald-500/30">✓ Write on</span>'
-            if cfg.get("write_enabled")
-            else '<span class="inline-flex items-center gap-1 text-xs px-2.5 py-1 rounded-full bg-neutral-700/60 text-neutral-400 font-medium border border-neutral-700">Write off</span>'
-        )
-        openai_badge = (
-            f'<span class="inline-flex items-center gap-1 text-xs px-2.5 py-1 rounded-full bg-indigo-500/20 text-indigo-300 font-medium border border-indigo-500/30">⚡ {escape(openai_model)}</span>'
-            if openai_configured
-            else '<span class="inline-flex items-center gap-1 text-xs px-2.5 py-1 rounded-full bg-amber-500/20 text-amber-300 font-medium border border-amber-500/30">⚠ No API key</span>'
-        )
+        lines: list[str] = []
+        for row in history[-20:]:
+            role = "You" if row.get("role") == "user" else "Assistant"
+            role_cls = "text-indigo-700" if role == "You" else "text-emerald-700"
+            lines.append(
+                f'<div class="py-2 border-b border-gray-100">'
+                f'<p class="text-xs {role_cls} font-semibold">{role} · {escape(str(row.get("ts") or ""))}</p>'
+                f'<p class="text-sm text-gray-800 whitespace-pre-wrap">{escape(str(row.get("text") or ""))}</p>'
+                f"</div>"
+            )
+        chat_html = "".join(lines) or '<p class="text-sm text-gray-500">No messages yet.</p>'
 
         return _page(
-            f"""<style>
-  body {{ margin: 0; overflow: hidden; }}
-  #chat::-webkit-scrollbar {{ width: 6px; }}
-  #chat::-webkit-scrollbar-track {{ background: transparent; }}
-  #chat::-webkit-scrollbar-thumb {{ background: #404040; border-radius: 3px; }}
-</style>
-<div class="flex flex-col bg-neutral-950" style="height:100vh;">
+            f"""
+            <div class="max-w-5xl mx-auto py-6 px-4 sm:px-6">
+              <div class="flex items-center justify-between mb-4">
+                <h1 class="text-2xl font-bold text-gray-900">Assistant</h1>
+                <div class="flex items-center gap-2">
+                  <a href="/" class="px-3 py-1.5 text-sm rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-50">Dashboard</a>
+                  <a href="/settings" class="px-3 py-1.5 text-sm rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-50">Settings</a>
+                </div>
+              </div>
 
-  <!-- Header -->
-  <header class="shrink-0 flex items-center justify-between px-4 py-2.5 bg-neutral-900 border-b border-neutral-800/80">
-    <div class="flex items-center gap-3">
-      <a href="/" class="flex items-center gap-1.5 text-neutral-500 hover:text-white transition-colors group">
-        <svg class="w-4 h-4 group-hover:-translate-x-0.5 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
-        </svg>
-        <span class="text-xs font-medium">Dashboard</span>
-      </a>
-      <div class="w-px h-4 bg-neutral-700"></div>
-      <span class="text-sm font-semibold text-white flex items-center gap-2">
-        <svg class="w-4 h-4 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16h6M4 7a2 2 0 012-2h12a2 2 0 012 2v7a2 2 0 01-2 2H8l-4 4V7z"/>
-        </svg>
-        Assistant
-      </span>
-      <div class="flex items-center gap-1.5">
-        {openai_badge}
-        {write_badge}
-      </div>
-    </div>
-    <div class="flex items-center gap-2">
-      <button onclick="document.getElementById('cfg-panel').classList.toggle('hidden')"
-        class="px-2.5 py-1.5 text-xs text-neutral-400 hover:text-white border border-neutral-700 hover:border-neutral-500 rounded-lg transition-colors">
-        ⚙ Settings
-      </button>
-      <form method="post" action="/assistant/clear" class="inline">
-        <button class="px-2.5 py-1.5 text-xs text-neutral-500 hover:text-red-400 border border-neutral-700 hover:border-red-800 rounded-lg transition-colors">
-          Clear chat
-        </button>
-      </form>
-    </div>
-  </header>
+              <div class="rounded-xl border border-gray-200 bg-white p-4 mb-4">
+                <p class="text-sm text-gray-700 mb-3">Write mode controls whether the assistant can execute changes after your approval.</p>
+                <form method="post" action="/assistant/config" class="flex flex-wrap items-center gap-4">
+                  <label class="inline-flex items-center gap-2 text-sm text-gray-800">
+                    <input type="checkbox" name="write_enabled" value="1" {"checked" if cfg.get("write_enabled") else ""}>
+                    Enable write actions
+                  </label>
+                  <span class="text-xs text-gray-500">Always confirm is enforced.</span>
+                  <button class="px-3 py-1.5 text-sm rounded-lg bg-indigo-600 text-white hover:bg-indigo-700">Save</button>
+                </form>
+                <div class="mt-3 text-xs text-gray-600">
+                  <p>OpenAI: <span class="font-semibold {"text-emerald-700" if openai_configured else "text-amber-700"}">{"Connected" if openai_configured else "Not configured"}</span> · model <code>{escape(openai_model)}</code></p>
+                  <p class="mt-1">API keys: <a class="text-indigo-600 hover:underline" href="https://platform.openai.com/api-keys" target="_blank" rel="noopener">platform.openai.com/api-keys</a></p>
+                </div>
+              </div>
 
-  <!-- Settings panel (hidden by default) -->
-  <div id="cfg-panel" class="hidden shrink-0 bg-neutral-900/95 border-b border-neutral-800 px-5 py-3.5">
-    <form method="post" action="/assistant/config" class="flex flex-wrap items-center gap-5">
-      <label class="inline-flex items-center gap-2.5 text-sm text-neutral-200 cursor-pointer select-none">
-        <input type="checkbox" name="write_enabled" value="1" {"checked" if cfg.get("write_enabled") else ""}
-          class="w-4 h-4 rounded border-neutral-600 accent-indigo-500 bg-neutral-700">
-        Enable write actions
-      </label>
-      <span class="text-xs text-neutral-600">Always-confirm is enforced — every write action requires your approval.</span>
-      <button class="px-3 py-1.5 text-xs font-semibold rounded-lg bg-indigo-600 text-white hover:bg-indigo-500 transition-colors">Save</button>
-    </form>
-    <p class="text-xs text-neutral-600 mt-2.5">
-      OpenAI: <span class="{"text-emerald-400" if openai_configured else "text-amber-400"}">{"Configured" if openai_configured else "Missing OPENAI_API_KEY — add to Fly secrets"}</span>
-      {"&nbsp;·&nbsp;<a href='https://platform.openai.com/api-keys' target='_blank' rel='noopener' class='text-indigo-500 hover:text-indigo-400 underline'>Get key</a>" if not openai_configured else ""}
-    </p>
-  </div>
+              {pending_html}
 
-  <!-- Chat area -->
-  <div id="chat" class="flex-1 overflow-y-auto px-4 py-5">
-    {bubbles_html}
-  </div>
-
-  <!-- Pending action -->
-  {pending_html}
-
-  <!-- Quick-action pills -->
-  <div class="shrink-0 px-4 pb-2 pt-1 flex flex-wrap gap-1.5 border-t border-neutral-800/60">
-    <button type="button" onclick="setPrompt('What new entries were created today?')"
-      class="text-xs px-3 py-1.5 rounded-full bg-neutral-800 border border-neutral-700 text-neutral-300 hover:border-indigo-500 hover:text-indigo-300 transition-colors">
-      New entries today
-    </button>
-    <button type="button" onclick="setPrompt('List all draft invoices in Xero')"
-      class="text-xs px-3 py-1.5 rounded-full bg-neutral-800 border border-neutral-700 text-neutral-300 hover:border-indigo-500 hover:text-indigo-300 transition-colors">
-      List draft invoices
-    </button>
-    <button type="button" onclick="setPrompt('Who booked ')" id="pill-whobooked"
-      class="text-xs px-3 py-1.5 rounded-full bg-neutral-800 border border-neutral-700 text-neutral-300 hover:border-indigo-500 hover:text-indigo-300 transition-colors">
-      Who booked…
-    </button>
-    <button type="button" onclick="setPrompt('Does contact  exist in Xero?')"
-      class="text-xs px-3 py-1.5 rounded-full bg-neutral-800 border border-neutral-700 text-neutral-300 hover:border-indigo-500 hover:text-indigo-300 transition-colors">
-      Contact exists?
-    </button>
-    <button type="button" onclick="setPrompt('What is the status of invoice INV-')"
-      class="text-xs px-3 py-1.5 rounded-full bg-neutral-800 border border-neutral-700 text-neutral-300 hover:border-indigo-500 hover:text-indigo-300 transition-colors">
-      Invoice status
-    </button>
-    <button type="button" onclick="setPrompt('Delete orphan draft invoices in Xero')"
-      class="text-xs px-3 py-1.5 rounded-full bg-neutral-800 border border-neutral-700 text-neutral-300 hover:border-red-700 hover:text-red-400 transition-colors">
-      Delete orphan drafts
-    </button>
-  </div>
-
-  <!-- Input bar -->
-  <div class="shrink-0 bg-neutral-900 border-t border-neutral-800 px-4 py-3">
-    <form method="post" action="/assistant/ask" class="flex items-end gap-3">
-      <textarea id="prompt-input" name="prompt" rows="2"
-        class="flex-1 resize-none bg-neutral-800 border border-neutral-700 rounded-xl px-4 py-2.5 text-sm text-neutral-100 placeholder-neutral-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition-colors"
-        placeholder="Ask about bookings, invoices, Xero contacts…"
-        onkeydown="if(event.key==='Enter'&&!event.shiftKey){{event.preventDefault();this.form.submit();}}"></textarea>
-      <button type="submit"
-        class="shrink-0 w-10 h-10 flex items-center justify-center rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white transition-colors shadow-lg shadow-indigo-900/40">
-        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/>
-        </svg>
-      </button>
-    </form>
-  </div>
-
-</div>
-<script>
-function setPrompt(text) {{
-  const el = document.getElementById('prompt-input');
-  el.value = text;
-  el.focus();
-  el.setSelectionRange(text.length, text.length);
-}}
-(function() {{
-  const c = document.getElementById('chat');
-  if (c) c.scrollTop = c.scrollHeight;
-}})();
-</script>"""
+              <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mt-4">
+                <div class="rounded-xl border border-gray-200 bg-white p-4">
+                  <h2 class="text-sm font-semibold text-gray-900 mb-2">Ask Assistant</h2>
+                  <form method="post" action="/assistant/ask">
+                    <textarea name="prompt" rows="7" class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm" placeholder="Ask a calendar/Xero question..."></textarea>
+                    <button class="mt-3 px-3 py-1.5 text-sm rounded-lg bg-gray-900 text-white hover:bg-black">Send</button>
+                  </form>
+                  <p class="text-xs text-gray-500 mt-3">Examples: "what new entries were created today", "who booked W5 D.S John O'Discoll", "delete orphan drafts".</p>
+                </div>
+                <div class="rounded-xl border border-gray-200 bg-white p-4 max-h-[480px] overflow-y-auto">
+                  <h2 class="text-sm font-semibold text-gray-900 mb-2">Conversation</h2>
+                  {chat_html}
+                </div>
+              </div>
+            </div>
+            """
         )
-
-    @app.post("/assistant/clear")
-    @require_login
-    def assistant_clear():
-        session.pop("assistant_chat_history", None)
-        session.pop("assistant_pending_action", None)
-        return redirect(url_for("assistant_page"))
 
     @app.post("/assistant/config")
     @require_login
@@ -1757,7 +1582,6 @@ function setPrompt(text) {{
         prompt = (request.form.get("prompt") or "").strip()
         if not prompt:
             return redirect(url_for("assistant_page"))
-        history_before = list(session.get("assistant_chat_history") or [])
         _append_assistant_chat("user", prompt)
         cfg = _assistant_config(config.admin_db_file)
         low = prompt.lower()
@@ -1765,7 +1589,7 @@ function setPrompt(text) {{
         # Read-only: list today's new entries.
         if (
             ("new" in low and "entr" in low and "today" in low)
-            or ("created today" in low)
+            or ("created today" in low and "calendar" in low)
         ):
             titles = _list_today_created_event_titles(config)
             if not titles:
@@ -1787,83 +1611,14 @@ function setPrompt(text) {{
             summary = str(ev.get("summary") or "(no title)")
             _append_assistant_chat(
                 "assistant",
-                f"Booked by: {creator}\nEvent: {summary}\nCreated: {created}",
+                f'Booked by: {creator}\nEvent: {summary}\nCreated: {created}',
             )
-            return redirect(url_for("assistant_page"))
-
-        # Read-only: list draft invoices.
-        if ("list" in low or "show" in low or "how many" in low) and "draft" in low:
-            drafts = _xero_fetch_draft_invoices(config)
-            if not drafts:
-                _append_assistant_chat("assistant", "No draft invoices found in Xero (or Xero is not connected).")
-            else:
-                lines = []
-                for d in drafts[:30]:
-                    num = str(d.get("InvoiceNumber") or d.get("InvoiceID") or "?")
-                    name = str((d.get("Contact") or {}).get("Name") or "Unknown")
-                    amt = d.get("Total") or 0
-                    lines.append(f"{num} — {name} — £{amt:.2f}")
-                reply = f"{len(drafts)} draft invoice(s) in Xero:\n" + "\n".join(lines)
-                if len(drafts) > 30:
-                    reply += f"\n…and {len(drafts) - 30} more."
-                _append_assistant_chat("assistant", reply)
-            return redirect(url_for("assistant_page"))
-
-        # Read-only: check if a contact exists in Xero.
-        if (
-            ("does" in low and "exist" in low)
-            or ("find contact" in low)
-            or ("contact" in low and "xero" in low and ("exist" in low or "search" in low or "find" in low or "check" in low))
-        ):
-            m = re.search(
-                r"(?:does contact|find contact|contact)\s+(.+?)(?:\s+exist|\s+in xero|[?]|$)",
-                prompt, flags=re.I,
-            )
-            if not m:
-                m = re.search(r"does\s+(.+?)\s+exist", prompt, flags=re.I)
-            if not m:
-                _append_assistant_chat("assistant", "Please name the contact to search for, e.g. 'Does contact Acme Ltd exist in Xero?'")
-                return redirect(url_for("assistant_page"))
-            frag = m.group(1).strip(" \"'")
-            contacts = _xero_find_contact(config, frag)
-            if not contacts:
-                _append_assistant_chat("assistant", f'No Xero contact matching "{frag}" was found.')
-            else:
-                names = [str(c.get("Name") or c.get("ContactID") or "?") for c in contacts[:10]]
-                _append_assistant_chat(
-                    "assistant",
-                    f'{len(contacts)} contact(s) found matching "{frag}":\n- ' + "\n- ".join(names),
-                )
-            return redirect(url_for("assistant_page"))
-
-        # Read-only: invoice status by number.
-        if (
-            ("status" in low and ("invoice" in low or "inv-" in low or "inv " in low))
-            or re.search(r"\binv[-\s]\d+", low)
-        ):
-            m = re.search(r"(inv[-\s]\d+)", prompt, flags=re.I)
-            if not m:
-                _append_assistant_chat("assistant", "Please include the invoice number, e.g. 'status of INV-0042'.")
-                return redirect(url_for("assistant_page"))
-            inv_number = m.group(1).replace(" ", "-").upper()
-            inv = _xero_get_invoice_by_number(config, inv_number)
-            if not inv:
-                _append_assistant_chat("assistant", f"Invoice {inv_number} not found in Xero.")
-            else:
-                status = str(inv.get("Status") or "?")
-                contact = str((inv.get("Contact") or {}).get("Name") or "Unknown")
-                total = inv.get("Total") or 0
-                due = str(inv.get("DueDate") or "").split("T")[0]
-                _append_assistant_chat(
-                    "assistant",
-                    f"{inv_number}\nContact: {contact}\nStatus: {status}\nTotal: £{total:.2f}\nDue: {due}",
-                )
             return redirect(url_for("assistant_page"))
 
         # Write intent: remove orphan drafts.
-        if ("delete" in low or "remove" in low) and "draft" in low:
+        if ("delete" in low or "remove" in low) and "draft" in low and "xero" in low:
             if not cfg.get("write_enabled"):
-                _append_assistant_chat("assistant", "Write mode is OFF. Enable write actions in Settings first, then ask again.")
+                _append_assistant_chat("assistant", "Write mode is OFF. Enable write actions first, then ask again.")
                 return redirect(url_for("assistant_page"))
             state = load_state(config.state_file)
             mapped = {str(v).strip() for v in (state.get("event_invoice_map") or {}).values() if str(v).strip()}
@@ -1875,7 +1630,7 @@ function setPrompt(text) {{
                 "id": action_id,
                 "type": "delete_orphan_drafts",
                 "invoice_ids": [str(d.get("InvoiceID")) for d in orphan],
-                "summary": f"Delete {len(orphan)} orphan draft invoice(s): {', '.join(preview) if preview else 'none found'}",
+                "summary": f"Delete {len(orphan)} orphan draft invoice(s): {', '.join(preview) if preview else 'none'}",
             }
             _append_assistant_chat(
                 "assistant",
@@ -1886,7 +1641,7 @@ function setPrompt(text) {{
         # Write intent: void app-tracked invoices by contact name fragment.
         if "void" in low and ("invoice" in low or "payment" in low):
             if not cfg.get("write_enabled"):
-                _append_assistant_chat("assistant", "Write mode is OFF. Enable write actions in Settings first, then ask again.")
+                _append_assistant_chat("assistant", "Write mode is OFF. Enable write actions first, then ask again.")
                 return redirect(url_for("assistant_page"))
             m = re.search(r"under\s+(.+)$", prompt, flags=re.I)
             if not m:
@@ -1924,15 +1679,14 @@ function setPrompt(text) {{
             )
             return redirect(url_for("assistant_page"))
 
-        # Fall through to OpenAI, passing conversation history for context.
-        ai_reply, ai_err = _openai_assistant_reply(prompt, history=history_before)
+        ai_reply, ai_err = _openai_assistant_reply(prompt)
         if ai_reply:
             _append_assistant_chat("assistant", ai_reply)
             return redirect(url_for("assistant_page"))
         if ai_err == "missing_key":
             _append_assistant_chat(
                 "assistant",
-                "OpenAI API key is not configured. Add OPENAI_API_KEY to Fly secrets.\n"
+                "OpenAI API key is not configured. Add `OPENAI_API_KEY` to Fly secrets. "
                 "Key page: https://platform.openai.com/api-keys",
             )
             return redirect(url_for("assistant_page"))
