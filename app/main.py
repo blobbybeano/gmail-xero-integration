@@ -2133,6 +2133,11 @@ def run() -> None:
                     )
                     if skip_unchanged:
                         _sync_invoice_id = get_invoice_for_event(state, event_key)
+                        _desc_now = event.get("description") or ""
+                        _stale_payment_alert = (
+                            "!!! payment type empty !!!!" in _desc_now.lower()
+                        )
+                        _has_sent_marker = "invoice sent ✅" in _desc_now.lower()
                         needs_invoice_paid_sync = bool(
                             has_done
                             and _allow_paid_reconcile
@@ -2141,6 +2146,40 @@ def run() -> None:
                             and pay_mode_hint in {"invoice", "card"}
                             and not (event.get("summary") or "").strip().startswith("🟢")
                         )
+                        # Cleanup stale payment-type alert when invoice was already sent
+                        # (or paid) and no resend action is pending.
+                        if _stale_payment_alert and (sent_state or paid_state or _has_sent_marker):
+                            _invoice_url = ""
+                            for _ln in _desc_now.splitlines():
+                                if _ln.strip().lower().startswith("invoice link:"):
+                                    _invoice_url = _ln.split(":", 1)[1].strip()
+                                    break
+                            if xero_client and _sync_invoice_id:
+                                try:
+                                    _live_url = xero_client.get_online_invoice_url(_sync_invoice_id)
+                                    if _live_url:
+                                        _invoice_url = _live_url
+                                except Exception:
+                                    pass
+                            _cleaned = upsert_send_confirmation(
+                                _desc_now,
+                                invoice_url=_invoice_url or None,
+                                submitter=submitter_display,
+                                submitted_at=submitted_at_display,
+                            )
+                            _summary_target = "green" if paid_state else "yellow"
+                            _upd = safe_update(
+                                event_id=event.get("id"),
+                                description=_cleaned,
+                                label="Clear stale payment alert",
+                                summary_status=_summary_target,
+                                current_summary=event.get("summary"),
+                                calendar_id=calendar_id,
+                            )
+                            if _upd:
+                                event["description"] = _cleaned
+                                event_updated = _upd.get("updated") or event_updated
+                                state = set_processed_update_marker(state, event_key, event_updated)
                         if not needs_invoice_paid_sync:
                             continue
                         # Poll Xero for payment status on unchanged INVOICE-mode events.
