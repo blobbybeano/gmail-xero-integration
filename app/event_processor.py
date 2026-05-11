@@ -1232,6 +1232,83 @@ def _parse_line_items(block: str, *, force_no_vat: bool = False) -> list[dict]:
     return lines
 
 
+def sync_invoice_block_from_xero(
+    description: str | None,
+    line_items: list[dict] | None,
+) -> str:
+    """
+    Replace the customer-facing lines inside [invoice] with the current Xero
+    invoice line items, while preserving the internal sales area below ⬇Sales⬇.
+    """
+    if not description:
+        return description or ""
+    if not line_items:
+        return _normalize_entry_layout(description)
+
+    import re
+
+    text = _normalize_description(description)
+    m = re.search(r"\[invoice\](.*?)\[/invoice\]", text, re.I | re.S)
+    if not m:
+        return _normalize_entry_layout(text)
+
+    block = m.group(1)
+    invoice_part, sales_part = _split_invoice_sales(block)
+
+    preserve_cash = any(
+        re.fullmatch(r"[\*\s]*cash[\*\s]*", ln.strip(), flags=re.I)
+        for ln in (invoice_part or "").splitlines()
+    )
+
+    rendered: list[str] = []
+    for li in line_items:
+        desc = " ".join(str((li or {}).get("Description") or "").split())
+        if not desc:
+            continue
+        try:
+            qty = float((li or {}).get("Quantity") or 1.0)
+        except Exception:
+            qty = 1.0
+        try:
+            unit = float((li or {}).get("UnitAmount") or 0.0)
+        except Exception:
+            unit = 0.0
+        try:
+            if (li or {}).get("LineAmount") not in (None, ""):
+                line_total = float((li or {}).get("LineAmount"))
+            else:
+                line_total = qty * unit
+        except Exception:
+            line_total = qty * unit
+        tax_suffix = (
+            "+VAT" if str((li or {}).get("TaxType") or "").upper() == "OUTPUT2" else ""
+        )
+        rendered.append(f"{desc} = £{line_total:.2f}{tax_suffix}")
+
+    if not rendered:
+        return _normalize_entry_layout(text)
+
+    invoice_lines: list[str] = []
+    if preserve_cash:
+        invoice_lines.append("*cash*")
+        invoice_lines.append("")
+    invoice_lines.extend(rendered)
+    invoice_text = "\n".join(invoice_lines).strip("\n")
+    sales_text = (sales_part or "").strip("\n")
+
+    new_block_lines: list[str] = ["[invoice]", ""]
+    if invoice_text:
+        new_block_lines.extend(invoice_text.splitlines())
+    new_block_lines.append("⬇Sales⬇")
+    if sales_text:
+        new_block_lines.extend(sales_text.splitlines())
+    new_block_lines.extend(["", "[/invoice]"])
+    rebuilt = "\n".join(new_block_lines)
+
+    text = text[: m.start()] + rebuilt + text[m.end() :]
+    return _normalize_entry_layout(text)
+
+
 def _normalize_invoice_text(description: str) -> str:
     import html
     import re

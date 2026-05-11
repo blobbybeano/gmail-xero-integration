@@ -50,7 +50,11 @@ from .admin_store import (
     set_stats_fields,
 )
 from .config import load_config
-from .event_processor import set_title_status_emoji, set_title_mail_emoji
+from .event_processor import (
+    set_title_status_emoji,
+    set_title_mail_emoji,
+    sync_invoice_block_from_xero,
+)
 from .google_admin import (
     build_calendar_service_from_creds,
     build_sheets_service_from_creds,
@@ -97,6 +101,8 @@ from .state import (
     get_last_sync,
     get_sales_log_marker,
     set_sales_log_marker,
+    mark_invoice_sent,
+    mark_invoice_paid,
 )
 from .log_feed import feed as _feed
 
@@ -4018,6 +4024,17 @@ function toggleEnabled(requested) {{
             invoices = resp.json().get("Invoices", [])
             return invoices[0] if invoices else None
 
+        def _is_invoice_paid(invoice_obj: dict | None) -> bool:
+            if not invoice_obj:
+                return False
+            status_raw = str(invoice_obj.get("Status") or "").upper()
+            try:
+                amount_due = float(invoice_obj.get("AmountDue") or 0.0)
+            except Exception:
+                amount_due = 0.0
+            # Treat fully settled invoices as paid even if status text lags.
+            return status_raw == "PAID" or amount_due <= 0.0001
+
         for ev in events:
             if ev.get("eventCategory") != "INVOICE":
                 continue
@@ -4028,18 +4045,63 @@ function toggleEnabled(requested) {{
 
             try:
                 invoice = _fetch_invoice(invoice_id)
-                if invoice:
-                    status_raw = str(invoice.get("Status") or "").upper()
+                status_raw = str((invoice or {}).get("Status") or "").upper()
+                is_paid_or_settled = _is_invoice_paid(invoice)
+                is_sent_or_authorised = status_raw in {"AUTHORISED", "PAID"}
+                inv_number = str((invoice or {}).get("InvoiceNumber") or "").strip()
+                event_key = inv_id_to_key.get(invoice_id, "")
+
+                # Keep mapped diary entry in sync with Xero-side invoice edits and status.
+                if event_key and ":" in event_key and creds and invoice:
+                    cal_id, event_id = event_key.split(":", 1)
+                    queue_event_target(event_key)
                     try:
-                        amount_due = float(invoice.get("AmountDue") or 0.0)
-                    except Exception:
-                        amount_due = 0.0
-                    # Treat fully settled invoices as paid even if status lags.
-                    is_paid_or_settled = status_raw == "PAID" or amount_due <= 0.0001
-                else:
-                    is_paid_or_settled = False
+                        gsvc = build_calendar_service_from_creds(creds)
+                        ge = gsvc.events().get(calendarId=cal_id, eventId=event_id).execute()
+                        cur_desc = ge.get("description") or ""
+                        synced_desc = sync_invoice_block_from_xero(
+                            cur_desc,
+                            (invoice.get("LineItems") or []),
+                        )
+                        cur_summary = ge.get("summary")
+                        desired_status = ""
+                        if is_paid_or_settled:
+                            desired_status = "green"
+                        elif is_sent_or_authorised:
+                            pay_mode = payment_choice(synced_desc or cur_desc)
+                            desired_status = "green" if pay_mode in {"card", "cash"} else "yellow"
+
+                        next_summary = cur_summary
+                        if desired_status:
+                            next_summary = set_title_status_emoji(next_summary, desired_status)
+                        next_summary = set_title_mail_emoji(
+                            next_summary,
+                            "invoice send failed" in (synced_desc or "").lower(),
+                        )
+
+                        if synced_desc != cur_desc or next_summary != cur_summary:
+                            update_event_description(
+                                config,
+                                event_id=event_id,
+                                description=synced_desc,
+                                summary=next_summary,
+                                calendar_id=cal_id,
+                            )
+                            print(
+                                f"[webhook] Calendar synced from Xero for {event_key} "
+                                f"(status={status_raw or 'UNKNOWN'})",
+                                flush=True,
+                            )
+
+                        if is_sent_or_authorised:
+                            app_state = mark_invoice_sent(app_state, event_key)
+                        if is_paid_or_settled:
+                            app_state = mark_invoice_paid(app_state, event_key)
+                        save_state(config.state_file, app_state)
+                    except Exception as exc:
+                        print(f"[webhook] Calendar sync failed for {event_key}: {exc}", flush=True)
+
                 if is_paid_or_settled:
-                    inv_number = invoice.get("InvoiceNumber", "")
                     print(f"[webhook] Invoice {inv_number} is PAID — updating sheet + calendar", flush=True)
                     _feed.push(f"Invoice {inv_number} paid — marking sheet row as Paid", "paid")
                     if creds and spreadsheet_id and inv_number:
@@ -4063,7 +4125,6 @@ function toggleEnabled(requested) {{
                         except Exception as exc:
                             print(f"[webhook] Sheet update failed: {exc}", flush=True)
 
-                    event_key = inv_id_to_key.get(invoice_id, "")
                     if event_key and ":" in event_key:
                         cal_id, event_id = event_key.split(":", 1)
                         queue_event_target(event_key)
@@ -4218,6 +4279,140 @@ function toggleEnabled(requested) {{
 
         trigger_poll()
         return "", 200
+
+    @app.post("/admin/sync-today-invoices")
+    @require_login
+    def admin_sync_today_invoices():
+        """
+        Manual backfill: check today's active-calendar events that already have
+        mapped Xero invoices, then mirror Xero line/status changes into Calendar.
+        """
+        creds = load_admin_credentials(config)
+        xero_client = build_xero_client(config)
+        if not creds:
+            session["save_notice"] = "error:Google is not connected. Cannot run invoice sync."
+            return redirect(url_for("index"))
+        if not xero_client:
+            session["save_notice"] = "error:Xero is not connected. Cannot run invoice sync."
+            return redirect(url_for("index"))
+
+        try:
+            from zoneinfo import ZoneInfo
+        except Exception:
+            ZoneInfo = None  # type: ignore[assignment]
+
+        london_tz = ZoneInfo("Europe/London") if ZoneInfo else dt.timezone.utc
+        today_london = dt.datetime.now(london_tz).date()
+
+        def _event_is_today_london(event_obj: dict) -> bool:
+            start = (event_obj.get("start", {}) or {}).get("dateTime") or (
+                event_obj.get("start", {}) or {}
+            ).get("date")
+            if not start:
+                return False
+            try:
+                if "T" in start:
+                    obj = dt.datetime.fromisoformat(start.replace("Z", "+00:00"))
+                    if obj.tzinfo is None:
+                        obj = obj.replace(tzinfo=dt.timezone.utc)
+                    return obj.astimezone(london_tz).date() == today_london
+                return dt.date.fromisoformat(start) == today_london
+            except Exception:
+                return False
+
+        def _invoice_paid(invoice_obj: dict | None) -> bool:
+            if not invoice_obj:
+                return False
+            status_raw = str(invoice_obj.get("Status") or "").upper()
+            try:
+                amount_due = float(invoice_obj.get("AmountDue") or 0.0)
+            except Exception:
+                amount_due = 0.0
+            return status_raw == "PAID" or amount_due <= 0.0001
+
+        app_state = load_state(config.state_file)
+        inv_map = dict(app_state.get("event_invoice_map") or {})
+        active_cals = set(get_active_calendars(config.admin_db_file, config.google_calendar_id))
+        gsvc = build_calendar_service_from_creds(creds)
+
+        scanned = 0
+        updated = 0
+        status_only = 0
+        for event_key, invoice_id in inv_map.items():
+            if ":" not in event_key:
+                continue
+            cal_id, event_id = event_key.split(":", 1)
+            if cal_id not in active_cals:
+                continue
+            if not invoice_id:
+                continue
+            try:
+                ge = gsvc.events().get(calendarId=cal_id, eventId=event_id).execute()
+            except Exception:
+                continue
+            if not _event_is_today_london(ge):
+                continue
+            scanned += 1
+
+            try:
+                invoice = xero_client.get_invoice(invoice_id)
+            except Exception:
+                continue
+            if not invoice:
+                continue
+
+            synced_desc = sync_invoice_block_from_xero(
+                ge.get("description") or "",
+                invoice.get("LineItems") or [],
+            )
+            status_raw = str(invoice.get("Status") or "").upper()
+            is_paid = _invoice_paid(invoice)
+            is_sent_or_authorised = status_raw in {"AUTHORISED", "PAID"}
+            desired_status = ""
+            if is_paid:
+                desired_status = "green"
+            elif is_sent_or_authorised:
+                pay_mode = payment_choice(synced_desc or ge.get("description") or "")
+                desired_status = "green" if pay_mode in {"card", "cash"} else "yellow"
+
+            cur_summary = ge.get("summary")
+            next_summary = cur_summary
+            if desired_status:
+                next_summary = set_title_status_emoji(next_summary, desired_status)
+            next_summary = set_title_mail_emoji(
+                next_summary,
+                "invoice send failed" in (synced_desc or "").lower(),
+            )
+
+            changed = synced_desc != (ge.get("description") or "") or next_summary != cur_summary
+            if changed:
+                try:
+                    update_event_description(
+                        config,
+                        event_id=event_id,
+                        description=synced_desc,
+                        summary=next_summary,
+                        calendar_id=cal_id,
+                    )
+                    updated += 1
+                    queue_event_target(event_key)
+                except Exception:
+                    continue
+            elif desired_status:
+                status_only += 1
+
+            if is_sent_or_authorised:
+                app_state = mark_invoice_sent(app_state, event_key)
+            if is_paid:
+                app_state = mark_invoice_paid(app_state, event_key)
+
+        save_state(config.state_file, app_state)
+        trigger_poll()
+        session["save_notice"] = (
+            f"success:Today Xero sync checked {scanned} event(s), "
+            f"updated {updated}, status-confirmed {status_only}."
+        )
+        return redirect(url_for("index"))
 
     @app.post("/setup/register-google-watches")
     @require_login
