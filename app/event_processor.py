@@ -1539,6 +1539,7 @@ def _status_base_lines(description: str) -> list[str]:
             or "invoice sent" in plain
             or "invoice link" in plain
             or "payment type" in plain
+            or "payment type empty" in plain
             or "card/invoice" in plain
             or "submitted by:" in plain
             or "submitted at:" in plain
