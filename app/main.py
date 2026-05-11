@@ -2407,7 +2407,8 @@ def run() -> None:
                                             print(
                                                 f"Event {event_id}: skip invoice update, status={status}"
                                             )
-                                            if (status or "").upper() == "PAID":
+                                            status_upper = (status or "").upper()
+                                            if status_upper == "PAID":
                                                 if not (event.get("summary") or "").strip().startswith("🟢"):
                                                     updated = safe_update(
                                                         event_id=event.get("id"),
@@ -2421,6 +2422,44 @@ def run() -> None:
                                                         event_updated = updated.get("updated") or event_updated
                                                 state = mark_invoice_sent(state, event_key)
                                                 state = mark_invoice_paid(state, event_key)
+                                            elif status_upper == "AUTHORISED":
+                                                state = mark_invoice_sent(state, event_key)
+                                                _pay_mode = payment_choice(event.get("description")) or ""
+                                                _summary_target = "green" if _pay_mode in {"card", "cash"} else "yellow"
+                                                _desc = event.get("description") or ""
+                                                if "invoice sent ✅" not in _desc.lower():
+                                                    _updated_description = upsert_send_confirmation(
+                                                        _desc,
+                                                        invoice_url=(
+                                                            xero_client.get_online_invoice_url(invoice_id)
+                                                            if xero_client and invoice_id
+                                                            else None
+                                                        ),
+                                                        submitter=submitter_display,
+                                                        submitted_at=submitted_at_display,
+                                                    )
+                                                    _upd = safe_update(
+                                                        event_id=event.get("id"),
+                                                        description=_updated_description,
+                                                        label="Invoice authorised",
+                                                        summary_status=_summary_target,
+                                                        current_summary=event.get("summary"),
+                                                        calendar_id=calendar_id,
+                                                    )
+                                                    if _upd:
+                                                        event["description"] = _updated_description
+                                                        event_updated = _upd.get("updated") or event_updated
+                                                else:
+                                                    _upd = safe_update(
+                                                        event_id=event.get("id"),
+                                                        description=_desc,
+                                                        label="Invoice authorised",
+                                                        summary_status=_summary_target,
+                                                        current_summary=event.get("summary"),
+                                                        calendar_id=calendar_id,
+                                                    )
+                                                    if _upd:
+                                                        event_updated = _upd.get("updated") or event_updated
                                             state = set_invoice_update_marker(
                                                 state, event_key, event_updated
                                             )
@@ -3172,7 +3211,8 @@ def run() -> None:
                                             print(
                                                 f"Event {event.get('id')}: skip invoice update, status={status}"
                                             )
-                                            if (status or "").upper() == "PAID":
+                                            status_upper = (status or "").upper()
+                                            if status_upper == "PAID":
                                                 if not (event.get("summary") or "").strip().startswith("🟢"):
                                                     updated = safe_update(
                                                         event_id=event.get("id"),
@@ -3186,6 +3226,44 @@ def run() -> None:
                                                         event_updated = updated.get("updated") or event_updated
                                                 state = mark_invoice_sent(state, event_key)
                                                 state = mark_invoice_paid(state, event_key)
+                                            elif status_upper == "AUTHORISED":
+                                                state = mark_invoice_sent(state, event_key)
+                                                _pay_mode = payment_choice(event.get("description")) or ""
+                                                _summary_target = "green" if _pay_mode in {"card", "cash"} else "yellow"
+                                                _desc = event.get("description") or ""
+                                                if "invoice sent ✅" not in _desc.lower():
+                                                    _updated_description = upsert_send_confirmation(
+                                                        _desc,
+                                                        invoice_url=(
+                                                            xero_client.get_online_invoice_url(invoice_id)
+                                                            if xero_client and invoice_id
+                                                            else None
+                                                        ),
+                                                        submitter=submitter_display,
+                                                        submitted_at=submitted_at_display,
+                                                    )
+                                                    _upd = safe_update(
+                                                        event_id=event.get("id"),
+                                                        description=_updated_description,
+                                                        label="Invoice authorised",
+                                                        summary_status=_summary_target,
+                                                        current_summary=event.get("summary"),
+                                                        calendar_id=calendar_id,
+                                                    )
+                                                    if _upd:
+                                                        event["description"] = _updated_description
+                                                        event_updated = _upd.get("updated") or event_updated
+                                                else:
+                                                    _upd = safe_update(
+                                                        event_id=event.get("id"),
+                                                        description=_desc,
+                                                        label="Invoice authorised",
+                                                        summary_status=_summary_target,
+                                                        current_summary=event.get("summary"),
+                                                        calendar_id=calendar_id,
+                                                    )
+                                                    if _upd:
+                                                        event_updated = _upd.get("updated") or event_updated
                                             state = set_invoice_update_marker(
                                                 state, event_key, event_updated
                                             )
