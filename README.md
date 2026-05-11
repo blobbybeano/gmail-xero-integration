@@ -86,6 +86,11 @@ python scripts/test_xero.py
 - `app/event_processor.py` keyword check + extraction
 - `app/xero_client.py` Xero REST wrapper
 - `app/state.py` last sync tracking
+- `app/receipts/` receipt-processing scaffold (feature-flagged, isolated)
+
+## Engineering Guardrails
+- Read `docs/ENGINEERING_LOGIC_GUARDRAILS.md` before editing core logic.
+- If you modify `app/main.py`, `app/admin_web.py`, or `app/event_processor.py`, update that document in the same commit.
 
 ## Notes
 - By default it runs in `DRY_RUN=true` to avoid writes to Xero.

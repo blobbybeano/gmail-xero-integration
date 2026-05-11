@@ -105,6 +105,12 @@ from .state import (
     mark_invoice_paid,
 )
 from .log_feed import feed as _feed
+from .receipts import ReceiptService
+
+# Engineering note:
+# Webhook/admin flows here are coupled to poller state semantics.
+# If invoice/calendar sync behavior changes, update
+# docs/ENGINEERING_LOGIC_GUARDRAILS.md.
 
 
 XERO_AUTH_URL = "https://login.xero.com/identity/connect/authorize"
@@ -4441,6 +4447,76 @@ function toggleEnabled(requested) {{
         set_xero_webhook_verified(config.admin_db_file, False)
         session["save_notice"] = "success:Xero webhook key saved. Now click \"Send intent to receive\" in the Xero Developer portal to verify."
         return redirect(url_for("index"))
+
+    @app.get("/receipts")
+    @require_login
+    def receipts_scaffold():
+        svc = ReceiptService(config)
+        records = svc.list_recent(limit=50) if svc.enabled else []
+        rows = []
+        for rec in records:
+            rows.append(
+                "<tr class='border-b border-gray-100'>"
+                f"<td class='px-3 py-2 text-xs text-gray-700'>{escape(rec.created_at)}</td>"
+                f"<td class='px-3 py-2 text-xs text-gray-700'>{escape(rec.status)}</td>"
+                f"<td class='px-3 py-2 text-xs text-gray-700'>{escape(rec.merchant)}</td>"
+                f"<td class='px-3 py-2 text-xs text-gray-700'>{escape(rec.transaction_ref)}</td>"
+                f"<td class='px-3 py-2 text-xs text-gray-700'>{escape(rec.event_key)}</td>"
+                f"<td class='px-3 py-2 text-xs text-gray-700'>{'' if rec.amount is None else f'£{rec.amount:.2f}'}</td>"
+                "</tr>"
+            )
+        table_html = (
+            "<div class='overflow-x-auto border border-gray-200 rounded-xl bg-white'>"
+            "<table class='min-w-full text-left'>"
+            "<thead class='bg-gray-50 text-[11px] uppercase tracking-wide text-gray-500'>"
+            "<tr>"
+            "<th class='px-3 py-2'>Created</th>"
+            "<th class='px-3 py-2'>Status</th>"
+            "<th class='px-3 py-2'>Merchant</th>"
+            "<th class='px-3 py-2'>Reference</th>"
+            "<th class='px-3 py-2'>Event Key</th>"
+            "<th class='px-3 py-2'>Amount</th>"
+            "</tr></thead><tbody>"
+            + ("".join(rows) if rows else "<tr><td colspan='6' class='px-3 py-6 text-sm text-gray-500'>No receipts yet.</td></tr>")
+            + "</tbody></table></div>"
+        )
+        body = f"""
+        <main class="max-w-5xl mx-auto p-6 space-y-6">
+          <div class="flex items-center justify-between gap-4">
+            <div>
+              <h1 class="text-2xl font-semibold text-gray-900">Receipt Processing (Scaffold)</h1>
+              <p class="text-sm text-gray-600 mt-1">Isolated module. No live calendar/Xero writes are performed here yet.</p>
+            </div>
+            <a href="/" class="px-3 py-2 text-sm rounded-lg bg-gray-100 hover:bg-gray-200 text-gray-800">Back</a>
+          </div>
+          <div class="rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-900">
+            <strong>Feature flag:</strong> RECEIPTS_ENABLED={'true' if svc.enabled else 'false'} ·
+            <strong>Write confirm required:</strong> {'yes' if svc.write_confirmation_required else 'no'}
+          </div>
+          <form method="post" action="/receipts/create" class="rounded-xl border border-gray-200 bg-white p-4 space-y-3">
+            <label class="block text-sm font-medium text-gray-800">Paste receipt text</label>
+            <textarea name="raw_text" rows="6" class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm" placeholder="Merchant\\nTotal £12.34\\nRef ABC123"></textarea>
+            <button type="submit" class="px-3 py-2 text-sm rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white" {'disabled' if not svc.enabled else ''}>Create Draft Receipt</button>
+          </form>
+          {table_html}
+        </main>
+        """
+        return _page(body)
+
+    @app.post("/receipts/create")
+    @require_login
+    def receipts_create_scaffold():
+        svc = ReceiptService(config)
+        if not svc.enabled:
+            session["save_notice"] = "error:Receipts feature is disabled (RECEIPTS_ENABLED=false)."
+            return redirect(url_for("receipts_scaffold"))
+        raw_text = (request.form.get("raw_text") or "").strip()
+        if not raw_text:
+            session["save_notice"] = "error:Paste receipt text before creating a draft."
+            return redirect(url_for("receipts_scaffold"))
+        created = svc.create_draft(raw_text, source="admin_scaffold")
+        session["save_notice"] = f"success:Receipt draft created ({created.id})."
+        return redirect(url_for("receipts_scaffold"))
 
     @app.post("/test-xero-webhook")
     @require_login

@@ -123,6 +123,10 @@ from .log_feed import feed as _feed
 
 LONDON_TZ = ZoneInfo("Europe/London")
 
+# Engineering note:
+# If you change polling/retry/title-state behavior in this module, update
+# docs/ENGINEERING_LOGIC_GUARDRAILS.md in the same commit.
+
 
 def run() -> None:
     config = load_config()

@@ -6,6 +6,11 @@ PROCESS_DRAFT_PROMPT = "PROCESS DRAFT (Y/N) ="
 PAYMENT_TYPE_PROMPT = "PAYMENT TYPE (CARD/INVOICE) ="
 SEND_PROMPT = "SEND NOW (Y/N) ="
 
+# Engineering note:
+# This file defines parsing and formatting invariants used by live automation.
+# If you change block parsing/output shape, update
+# docs/ENGINEERING_LOGIC_GUARDRAILS.md.
+
 
 def event_contains_keyword(event: Dict, keyword: str) -> bool:
     """

@@ -73,6 +73,9 @@ class AppConfig:
     web_host: str
     web_port: int
     admin_db_file: str
+    receipts_enabled: bool
+    receipts_store_file: str
+    receipts_require_write_confirmation: bool
 
 
 def load_config() -> AppConfig:
@@ -130,4 +133,10 @@ def load_config() -> AppConfig:
         web_host=os.getenv("WEB_HOST", "0.0.0.0"),
         web_port=int(os.getenv("WEB_PORT", "8080")),
         admin_db_file=admin_db_file,
+        receipts_enabled=os.getenv("RECEIPTS_ENABLED", "false").lower() == "true",
+        receipts_store_file=os.getenv("RECEIPTS_STORE_FILE", "receipts_store.json"),
+        receipts_require_write_confirmation=os.getenv(
+            "RECEIPTS_REQUIRE_WRITE_CONFIRMATION", "true"
+        ).lower()
+        == "true",
     )
