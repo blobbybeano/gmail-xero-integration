@@ -321,7 +321,10 @@ def run() -> None:
 
     def _is_invoice_mutable(invoice_id: str) -> tuple[bool, str]:
         """
-        Only DRAFT invoices should be mutated from calendar edits.
+        Invoices can be mutated from calendar edits when:
+        - DRAFT
+        - SUBMITTED
+        - AUTHORISED with no payments applied yet
         """
         if not xero_client:
             return False, "NO_CLIENT"
@@ -330,7 +333,15 @@ def run() -> None:
         except Exception as exc:
             return False, f"LOOKUP_FAILED: {exc}"
         status = (invoice_data.get("Status") or "").upper()
-        return status == "DRAFT", status or "UNKNOWN"
+        if status in {"DRAFT", "SUBMITTED"}:
+            return True, status
+        if status == "AUTHORISED":
+            try:
+                amount_paid = float(invoice_data.get("AmountPaid") or 0.0)
+            except Exception:
+                amount_paid = 0.0
+            return amount_paid <= 0.0001, status
+        return False, status or "UNKNOWN"
 
     def _format_display_datetime(raw: str | None = None) -> str:
         if raw:
