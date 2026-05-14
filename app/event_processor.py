@@ -1087,10 +1087,31 @@ def extract_invoice_lines(description: str | None) -> list[dict]:
         return []
     cash_mode = _invoice_block_has_cash_marker(block)
     invoice_part, sales_part = _split_invoice_sales(block)
-    combined = "\n".join(
-        part for part in (invoice_part, sales_part) if (part or "").strip()
-    ).strip()
-    return _parse_line_items(combined, force_no_vat=cash_mode)
+    invoice_items = _parse_line_items(invoice_part, force_no_vat=cash_mode)
+    sales_items = _parse_line_items(sales_part, force_no_vat=cash_mode)
+
+    # If the same line appears both above and below the sales marker,
+    # treat it as one customer invoice line to avoid accidental duplication
+    # caused by layout/sync churn.
+    seen = {
+        (
+            str((li or {}).get("Description") or "").strip(),
+            float((li or {}).get("UnitAmount") or 0),
+            str((li or {}).get("TaxType") or "").strip().upper(),
+        )
+        for li in invoice_items
+    }
+    for li in sales_items:
+        sig = (
+            str((li or {}).get("Description") or "").strip(),
+            float((li or {}).get("UnitAmount") or 0),
+            str((li or {}).get("TaxType") or "").strip().upper(),
+        )
+        if sig in seen:
+            continue
+        invoice_items.append(li)
+        seen.add(sig)
+    return invoice_items
 
 
 def extract_sales_lines(description: str | None) -> list[dict]:

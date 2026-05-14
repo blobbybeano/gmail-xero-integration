@@ -41,6 +41,8 @@ Primary controls:
 - Per-event Xero retry backoff and retry-after maps.
 - Limited Xero events processed per cycle.
 - Hourly reconcile windows and bounded cleanup queues.
+- Draft-sync fingerprints are persisted on attempted draft-create calls so
+  unchanged events do not repeatedly re-submit drafts during transient Xero failures.
 
 Key files:
 - `app/main.py` (`_XERO_*` constants, per-event retry maps, hourly reconcile sections)
@@ -109,4 +111,3 @@ Key files:
 - `app/receipts/store.py`
 - `app/receipts/service.py`
 - `app/admin_web.py` (`/receipts` routes)
-

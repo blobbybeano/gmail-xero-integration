@@ -2389,6 +2389,12 @@ def run() -> None:
                                     _feed.push(f"Creating invoice in Xero for \"{event.get('summary', event_id)}\"…", "info")
                                     details = extract_event_details(event)
                                     state = set_draft_sync_attempted_at(state, event_key, now_ts)
+                                    # Persist attempted fingerprint before Xero call so
+                                    # repeated cycles with unchanged data do not re-fire
+                                    # draft creation during transient failures.
+                                    state = set_draft_sync_fingerprint(
+                                        state, event_key, draft_fp
+                                    )
                                     result = xero_client.create_invoice_from_event(
                                         details, contact=contact_ref, line_items=invoice_lines
                                     )
@@ -2399,9 +2405,6 @@ def run() -> None:
                                         if invoice_id:
                                             state = set_invoice_for_event(
                                                 state, event_key, invoice_id
-                                            )
-                                            state = set_draft_sync_fingerprint(
-                                                state, event_key, draft_fp
                                             )
                                             state = set_invoice_update_marker(
                                                 state, event_key, event_updated
@@ -2435,7 +2438,9 @@ def run() -> None:
                                                 summary_status="orange",
                                                 current_summary=event.get("summary"),
                                                 calendar_id=calendar_id,
-                                                draft_progress_increment=True,
+                                                draft_progress_increment=bool(
+                                                    last_draft_fp and draft_fp != last_draft_fp
+                                                ),
                                             )
                                             if updated:
                                                 event["description"] = updated_description
@@ -2552,7 +2557,9 @@ def run() -> None:
                                                         summary_status="orange",
                                                         current_summary=event.get("summary"),
                                                         calendar_id=calendar_id,
-                                                        draft_progress_increment=True,
+                                                        draft_progress_increment=bool(
+                                                            last_draft_fp and draft_fp != last_draft_fp
+                                                        ),
                                                     )
                                                     if updated:
                                                         event["description"] = updated_description
@@ -3189,6 +3196,12 @@ def run() -> None:
                                             )
                                         continue
                                     state = set_draft_sync_attempted_at(state, event_key, now_ts)
+                                    # Persist attempted fingerprint before Xero call so
+                                    # repeated cycles with unchanged data do not re-fire
+                                    # draft creation during transient failures.
+                                    state = set_draft_sync_fingerprint(
+                                        state, event_key, draft_fp
+                                    )
                                     result = xero_client.create_invoice_from_event(
                                         details, contact=contact_ref, line_items=invoice_lines
                                     )
@@ -3201,9 +3214,6 @@ def run() -> None:
                                         if invoice_id:
                                             state = set_invoice_for_event(
                                                 state, event_key, invoice_id
-                                            )
-                                            state = set_draft_sync_fingerprint(
-                                                state, event_key, draft_fp
                                             )
                                             state = set_invoice_update_marker(
                                                 state, event_key, event_updated
@@ -3233,7 +3243,9 @@ def run() -> None:
                                                 summary_status="orange",
                                                 current_summary=event.get("summary"),
                                                 calendar_id=calendar_id,
-                                                draft_progress_increment=True,
+                                                draft_progress_increment=bool(
+                                                    last_draft_fp and draft_fp != last_draft_fp
+                                                ),
                                             )
                                             if updated:
                                                 event["description"] = updated_description
@@ -3356,7 +3368,9 @@ def run() -> None:
                                                         summary_status="orange",
                                                         current_summary=event.get("summary"),
                                                         calendar_id=calendar_id,
-                                                        draft_progress_increment=True,
+                                                        draft_progress_increment=bool(
+                                                            last_draft_fp and draft_fp != last_draft_fp
+                                                        ),
                                                     )
                                                     if updated:
                                                         event["description"] = updated_description
