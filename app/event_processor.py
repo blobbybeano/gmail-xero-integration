@@ -836,9 +836,9 @@ def parse_invoice_contact_overrides(description: str | None) -> Dict:
 
 def collapse_invoice_override_section(description: str | None) -> str:
     """
-    Reduce verbose invoice-only contact override lines to a compact marker:
+    Reduce verbose invoice-only address override lines to a compact marker:
       Alternate Invoice Address ✅
-    Keeps core customer lines untouched.
+    Keeps core customer lines and Invoice profile untouched.
     """
     if not description:
         return description or ""
@@ -857,8 +857,7 @@ def collapse_invoice_override_section(description: str | None) -> str:
         line = raw.strip()
         low = line.lower()
         if (
-            low.startswith("invoice profile:")
-            or low.startswith("invoice name:")
+            low.startswith("invoice name:")
             or low.startswith("invoice address line 1:")
             or low.startswith("invoice address line 2:")
             or low.startswith("invoice city:")

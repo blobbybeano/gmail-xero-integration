@@ -442,7 +442,10 @@ def run() -> None:
             return "red"
         # Resilience: if notes already show cash completion, keep green even if
         # runtime state flags were lost during a restart/redeploy.
-        if "entry complete" in desc_l:
+        # Guarded to cash-mode only so normal invoice flows still use yellow->green.
+        if "entry complete" in desc_l and (
+            payment_choice(description) == "cash" or invoice_has_cash_marker(description)
+        ):
             return "green"
         # Once paid is confirmed (webhook or poll), always keep green regardless of mode.
         if paid_state:
@@ -3091,8 +3094,13 @@ def run() -> None:
                         if profile_mode:
                             blocking_errors = {}
                         if errors:
+                            hint_errors = dict(errors)
+                            if profile_mode:
+                                # Invoice profile mode should not force a free-text
+                                # customer name or add a name error hint.
+                                hint_errors.pop("name", None)
                             hinted = apply_validation_hints(
-                                event.get("description") or "", errors
+                                event.get("description") or "", hint_errors
                             )
                             if hinted != (event.get("description") or ""):
                                 updated = safe_update(
