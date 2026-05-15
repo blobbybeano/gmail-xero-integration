@@ -99,6 +99,25 @@ If you edit `app/main.py`, `app/event_processor.py`, or `app/admin_web.py`:
 3. Verify no extra Xero call loops were introduced.
 4. Update this document if behavior changed.
 
+## Enforcement
+
+Use the guardrail checker before commit/deploy:
+
+```bash
+python3 scripts/guardrail_check.py --staged
+```
+
+What it enforces:
+- If critical files are touched (`app/main.py`, `app/event_processor.py`, `app/admin_web.py`, `app/google_sheets.py`, `app/state.py`):
+  - compile check must pass
+  - this guardrail doc must be included in the same change by default
+
+Override (rare, with explicit intent):
+
+```bash
+python3 scripts/guardrail_check.py --staged --allow-missing-doc-update
+```
+
 ## Receipt Scaffold Safety Contract
 
 Current contract:
