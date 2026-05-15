@@ -1119,9 +1119,8 @@ def extract_sales_lines(description: str | None) -> list[dict]:
     Extract internal sales lines from the [invoice] block section below the
     "⬇Sales⬇" marker.
 
-    Fallback: if a sales marker exists but no lines are below it, parse lines
-    above the marker instead. This handles entries where users accidentally
-    type the sales line before the marker.
+    Only rows below the sales marker are treated as sales. If there are no
+    lines below the marker, no sales are returned.
     """
     block = _extract_invoice_block(description)
     if not block:
@@ -1135,10 +1134,7 @@ def extract_sales_lines(description: str | None) -> list[dict]:
         return []
 
     invoice_part, sales_part = _split_invoice_sales(block)
-    sales_lines = _parse_line_items(sales_part)
-    if sales_lines:
-        return sales_lines
-    return _parse_line_items(invoice_part)
+    return _parse_line_items(sales_part)
 
 
 def invoice_has_cash_marker(description: str | None) -> bool:
