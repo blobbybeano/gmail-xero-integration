@@ -436,9 +436,14 @@ def run() -> None:
         current_summary: str | None,
         event_key: str,
     ) -> str:
+        desc_l = (description or "").lower()
         # If sending is requested but required integrations are down, show red immediately.
         if integration_issues and (has_done or has_send):
             return "red"
+        # Resilience: if notes already show cash completion, keep green even if
+        # runtime state flags were lost during a restart/redeploy.
+        if "entry complete" in desc_l:
+            return "green"
         # Once paid is confirmed (webhook or poll), always keep green regardless of mode.
         if paid_state:
             return "green"
