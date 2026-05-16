@@ -1974,9 +1974,25 @@ def run() -> None:
                 # Process any event with DONE/SEND, regardless of when it was created.
                 has_done = done_choice_is_yes(event.get("description"))
                 # Only send when user explicitly answers Y/YES.
-                has_send = send_choice_is_yes(event.get("description"))
+                _desc_now = event.get("description") or ""
+                has_send = send_choice_is_yes(_desc_now)
                 sent_state = is_invoice_sent(state, event_key)
                 paid_state = is_invoice_paid(state, event_key)
+                # Self-heal legacy/stale state for completed cash jobs:
+                # if notes already show cash completion, keep state aligned so
+                # status and downstream logic cannot fall back to orange.
+                _cash_complete = invoice_has_cash_marker(_desc_now) and (
+                    "entry complete" in _desc_now.lower()
+                )
+                if _cash_complete:
+                    if not sent_state:
+                        state = mark_invoice_sent(state, event_key)
+                        sent_state = True
+                    if not paid_state:
+                        state = mark_invoice_paid(state, event_key)
+                        paid_state = True
+                    if get_invoice_for_event(state, event_key):
+                        state = set_invoice_for_event(state, event_key, "")
                 pay_mode_hint = payment_choice(event.get("description")) or ""
                 _event_end = _event_end_utc(event)
                 _event_is_past = bool(_event_end and _event_end <= now)

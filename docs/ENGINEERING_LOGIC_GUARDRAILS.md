@@ -34,6 +34,11 @@ Key files:
 - `app/main.py` (`_expected_title_status`, `safe_update`)
 - `app/event_processor.py` (`set_title_status_emoji`, `set_title_mail_emoji`)
 
+Cash-complete resilience:
+- If a diary entry already contains `Entry complete ✅` and cash marker in
+  `[invoice]`, runtime state is self-healed to sent+paid and title must remain
+  `🟢` (never regress to orange/yellow due to stale markers).
+
 ## Throttling Reduction Logic
 
 Primary controls:
