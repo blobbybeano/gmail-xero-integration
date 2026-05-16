@@ -2177,12 +2177,25 @@ def run() -> None:
                             "!!! payment type empty !!!!" in _desc_now.lower()
                         )
                         _has_sent_marker = "invoice sent ✅" in _desc_now.lower()
+                        _has_send_intent = bool(
+                            has_send
+                            or "invoice sent ✅" in _desc_now.lower()
+                            or "invoice send failed ❌" in _desc_now.lower()
+                            or sent_state
+                            or paid_state
+                        )
+                        _allow_card_paid_sync = bool(
+                            pay_mode_hint == "card"
+                            and (_event_is_past or _has_send_intent)
+                        )
+                        _allow_invoice_paid_sync = bool(
+                            pay_mode_hint == "invoice" and _allow_paid_reconcile
+                        )
                         needs_invoice_paid_sync = bool(
                             has_done
-                            and _allow_paid_reconcile
                             and xero_client
                             and _sync_invoice_id
-                            and pay_mode_hint in {"invoice", "card"}
+                            and (_allow_invoice_paid_sync or _allow_card_paid_sync)
                             and not (event.get("summary") or "").strip().startswith("🟢")
                         )
                         # Cleanup stale payment-type alert when invoice was already sent
@@ -2221,7 +2234,9 @@ def run() -> None:
                                 state = set_processed_update_marker(state, event_key, event_updated)
                         if not needs_invoice_paid_sync:
                             continue
-                        # Poll Xero for payment status on unchanged INVOICE-mode events.
+                        # Poll Xero for payment status on unchanged eligible events:
+                        # - INVOICE mode: bounded reconcile windows
+                        # - CARD mode: only past jobs or explicit send-attempt history
                         _sync_inv_id = _sync_invoice_id
                         try:
                             _sync_inv = xero_client.get_invoice(_sync_inv_id)

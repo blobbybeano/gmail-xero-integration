@@ -39,6 +39,13 @@ Cash-complete resilience:
   `[invoice]`, runtime state is self-healed to sent+paid and title must remain
   `🟢` (never regress to orange/yellow due to stale markers).
 
+Card paid-state reconcile:
+- For unchanged `CARD` entries, paid-state sync from Xero is allowed only when
+  the event is in the past, or there is explicit send intent/history
+  (`SEND NOW=Y`, `Invoice sent ✅`, `Invoice send failed ❌`, or sent/paid state).
+- This reconcile path must never run for unrelated modes and must not edit
+  invoice line items.
+
 ## Throttling Reduction Logic
 
 Primary controls:
