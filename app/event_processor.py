@@ -257,15 +257,37 @@ def normalize_user_sections(description: str | None) -> str:
 
     def _norm_invoice(block: str) -> str:
         out: list[str] = []
+        amount_re = r"£?\s*\d+(?:\.\d+)?\s*(?:\+?\s*vat)?"
         for raw in block.splitlines():
             line = raw.strip()
             if not line:
                 out.append("")
                 continue
-            m = re.match(r"^(.+?)\s*([=:\-])\s*(.+)$", line)
-            if m:
-                desc = _norm_title(m.group(1))
-                rhs = _norm_rhs(m.group(3))
+            # Repair legacy corruption where repeated equals accumulated before amount:
+            #   "Pressure washing = Driveway = = = £165+VAT"
+            # -> "Pressure washing - Driveway = £165+VAT"
+            m_fix = re.match(
+                rf"^(.+?)\s*=\s*(.+?)\s*=\s*(?:=\s*)*({amount_re})\s*$",
+                line,
+                flags=re.I,
+            )
+            if m_fix:
+                left = _norm_title(m_fix.group(1))
+                right_desc = _norm_title(m_fix.group(2))
+                rhs = _norm_rhs(m_fix.group(3))
+                out.append(f"{left} - {right_desc} = {rhs}")
+                continue
+            # Explicit separators only when RHS is a numeric amount.
+            m_eq = re.match(rf"^(.+?)\s*[=:]\s*({amount_re})\s*$", line, flags=re.I)
+            if m_eq:
+                desc = _norm_title(m_eq.group(1))
+                rhs = _norm_rhs(m_eq.group(2))
+                out.append(f"{desc} = {rhs}")
+                continue
+            m_dash = re.match(rf"^(.+?)\s+-\s*({amount_re})\s*$", line, flags=re.I)
+            if m_dash:
+                desc = _norm_title(m_dash.group(1))
+                rhs = _norm_rhs(m_dash.group(2))
                 out.append(f"{desc} = {rhs}")
                 continue
             m2 = re.match(r"^(.+?)\s+(£?\s*\d+(?:\.\d+)?\s*(?:\+?\s*vat)?)\s*$", line, re.I)
@@ -1221,21 +1243,31 @@ def _parse_line_items(block: str, *, force_no_vat: bool = False) -> list[dict]:
         vat_flag = False
         amount = None
 
-        # Preferred explicit separators: "item = 12+VAT", "item: 12"
-        for sep in ("=", ":", "-"):
-            if sep in line:
-                left, right = line.split(sep, 1)
-                desc = left.strip()
-                amt_str = right.strip()
-                vat_flag = "vat" in amt_str.lower()
-                amt_clean = re.sub(r"[£$,]", "", amt_str, flags=re.I)
-                amt_clean = re.sub(r"\+?\s*vat", "", amt_clean, flags=re.I)
-                amt_clean = amt_clean.strip()
-                try:
-                    amount = float(amt_clean)
-                except ValueError:
-                    amount = None
-                break
+        # Repair repeated-separator artifact before parsing.
+        line = re.sub(r"(?:\s*=\s*){2,}(£?\s*\d)", r" = \1", line, flags=re.I)
+
+        # Explicit forms where the RHS is a numeric amount.
+        m_sep = re.match(
+            r"^(.+?)\s*[=:]\s*(£?\s*\d+(?:\.\d+)?\s*(?:\+?\s*vat)?)\s*$",
+            line,
+            flags=re.I,
+        )
+        if not m_sep:
+            m_sep = re.match(
+                r"^(.+?)\s+-\s*(£?\s*\d+(?:\.\d+)?\s*(?:\+?\s*vat)?)\s*$",
+                line,
+                flags=re.I,
+            )
+        if m_sep:
+            desc = m_sep.group(1).strip()
+            amt_str = m_sep.group(2).strip()
+            vat_flag = "vat" in amt_str.lower()
+            amt_clean = re.sub(r"[£$,]", "", amt_str, flags=re.I)
+            amt_clean = re.sub(r"\+?\s*vat", "", amt_clean, flags=re.I).strip()
+            try:
+                amount = float(amt_clean)
+            except ValueError:
+                amount = None
 
         # Tolerant format: "item 12+VAT" or "item £12.50 + VAT"
         if amount is None:
@@ -1293,6 +1325,11 @@ def sync_invoice_block_from_xero(
     rendered: list[str] = []
     for li in line_items:
         desc = " ".join(str((li or {}).get("Description") or "").split())
+        # Self-heal historical separator artifacts from prior formatting bug.
+        desc = re.sub(r"\s*=\s*$", "", desc).strip()
+        m_corrupt = re.match(r"^(.+?)\s*=\s*(.+?)\s*=\s*(?:=\s*)*$", desc)
+        if m_corrupt:
+            desc = f"{m_corrupt.group(1).strip()} - {m_corrupt.group(2).strip()}"
         if not desc:
             continue
         try:
