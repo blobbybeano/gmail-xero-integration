@@ -2485,9 +2485,11 @@ def run() -> None:
                                                 event["description"] = updated_description
                                                 event_updated = updated.get("updated") or event_updated
                                 else:
+                                    # Only re-push a draft when invoice-relevant fingerprint changes.
+                                    # This avoids update loops from metadata-only event edits
+                                    # (status text, webhook sync touches, summary tweaks).
                                     should_try_update = bool(
-                                        (event_updated and event_updated != last_invoice_update)
-                                        or (draft_fp != last_draft_fp)
+                                        (draft_fp != last_draft_fp) or (not last_draft_fp)
                                     )
                                     if not should_try_update:
                                         pass
@@ -3301,9 +3303,11 @@ def run() -> None:
                                     last_invoice_update = get_invoice_update_marker(
                                         state, event_key
                                     )
+                                    # Only re-push a draft when invoice-relevant fingerprint changes.
+                                    # This avoids update loops from metadata-only event edits
+                                    # (status text, webhook sync touches, summary tweaks).
                                     should_try_update = bool(
-                                        (event_updated and event_updated != last_invoice_update)
-                                        or (draft_fp != last_draft_fp)
+                                        (draft_fp != last_draft_fp) or (not last_draft_fp)
                                     )
                                     if not should_try_update:
                                         pass
