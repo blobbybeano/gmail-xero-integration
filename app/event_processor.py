@@ -330,9 +330,11 @@ def _set_notes_error_alert(description: str, alert: str | None) -> str:
 
 def upsert_invoice_profile_missing_hint(description: str | None, *, missing: bool) -> str:
     """
-    Add/remove an inline warning next to `Invoice profile:` in [contact].
+    Add/remove inline status next to `Invoice profile:` in [contact].
     When missing=True:
       Invoice profile: Acme Ltd ❌ Customer does not exist
+    When missing=False:
+      Invoice profile: Acme Ltd ✅ Existing Xero customer
     """
     import re
 
@@ -342,6 +344,7 @@ def upsert_invoice_profile_missing_hint(description: str | None, *, missing: boo
         return text
 
     warning = "❌ Customer does not exist"
+    success = "✅ Existing Xero customer"
     changed = False
     out_lines: list[str] = []
     for raw in (m.group(2) or "").splitlines():
@@ -349,6 +352,7 @@ def upsert_invoice_profile_missing_hint(description: str | None, *, missing: boo
         plain = re.sub(r"<[^>]+>", "", line).strip().lower()
         if plain.startswith("invoice profile:"):
             base = re.sub(r"\s*❌\s*customer does not exist\s*$", "", line, flags=re.I).rstrip()
+            base = re.sub(r"\s*✅\s*existing xero customer\s*$", "", base, flags=re.I).rstrip()
             if missing:
                 if warning.lower() not in plain:
                     line = f"{base} {warning}".rstrip()
@@ -356,9 +360,13 @@ def upsert_invoice_profile_missing_hint(description: str | None, *, missing: boo
                 else:
                     line = base + " " + warning
             else:
-                if base != line:
+                profile_value = ""
+                if ":" in base:
+                    profile_value = base.split(":", 1)[1].strip()
+                target = f"{base} {success}".rstrip() if profile_value else base
+                if target != line:
                     changed = True
-                line = base
+                line = target
         out_lines.append(line)
 
     if not changed:
@@ -1051,6 +1059,7 @@ def _strip_error_hint(value: str) -> str:
 
     cleaned = re.sub(r"\s*\(error:.*\)$", "", value, flags=re.I).strip()
     cleaned = re.sub(r"\s*❌\s*customer does not exist\s*$", "", cleaned, flags=re.I).strip()
+    cleaned = re.sub(r"\s*✅\s*existing xero customer\s*$", "", cleaned, flags=re.I).strip()
     return cleaned
 
 
