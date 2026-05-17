@@ -55,6 +55,12 @@ Primary controls:
 - Hourly reconcile windows and bounded cleanup queues.
 - Draft-sync fingerprints are persisted on attempted draft-create calls so
   unchanged events do not repeatedly re-submit drafts during transient Xero failures.
+- Draft update must be fingerprint-gated (not generic `event.updated` gated):
+  - in `app/main.py`, both draft-update paths now compute:
+    - `_draft_sync_fingerprint(...)`
+    - `last_draft_fp = get_draft_sync_fingerprint(...)`
+    - `should_try_update = (draft_fp != last_draft_fp) or (not last_draft_fp)`
+  - this is intentional anti-loop protection against webhook/metadata churn.
 
 Key files:
 - `app/main.py` (`_XERO_*` constants, per-event retry maps, hourly reconcile sections)
@@ -93,10 +99,39 @@ Rules:
 - Preserve internal sales section under `⬇Sales⬇`.
 - Keep invoice totals/status lines in the expected formatting path.
 - Bold handling currently runs through `event_processor` helpers; do not move ad-hoc to random call sites.
+- Invoice-line normalizer must not reinterpret hyphenated descriptions as value separators.
+  - `Pressure washing - Driveway = £165+VAT` must stay one description line.
+- Repeated-separator corruption must be self-healed:
+  - examples like `... = Driveway = = = £165+VAT` must normalize back to a single canonical line.
 
 Key files:
 - `app/event_processor.py` (`normalize_user_sections`, `extract_*`, `upsert_*`)
 - `app/main.py` (where those helpers are invoked)
+
+### Invoice Line Parsing Invariants (Critical)
+
+These invariants exist specifically to prevent formatter loops and duplicate draft pushes:
+
+- `app/event_processor.py`:
+  - `normalize_user_sections` → `_norm_invoice`:
+    - only treat `=`, `:`, `-` as separators when RHS is numeric amount.
+    - keep descriptive hyphens in the left-side text.
+    - repair legacy repeated `=` artifacts before writing canonical text.
+  - `_parse_line_items`:
+    - explicit parse only when RHS matches numeric amount pattern.
+    - pre-clean repeated `=` artifact sequence before parse.
+  - `sync_invoice_block_from_xero`:
+    - self-heal historical corrupted descriptions from prior parser behavior.
+
+- `app/main.py`:
+  - draft update decision in both flow branches must remain fingerprint-led:
+    - around `should_try_update` blocks (both occurrences),
+    - never revert to `event_updated != last_invoice_update` as a primary update trigger.
+
+If any of the above is changed, run a targeted regression against:
+- one line with hyphenated description (`A - B = £x+VAT`)
+- one line with accidental extra equals (`A = B = = £x+VAT`)
+- repeated webhook/calendar sync events with unchanged invoice data.
 
 ## Change Checklist (Required)
 
@@ -109,6 +144,7 @@ If you edit `app/main.py`, `app/event_processor.py`, or `app/admin_web.py`:
    - stale error alert cleanup
    - invoice draft update behavior for mutable vs non-mutable statuses
 3. Verify no extra Xero call loops were introduced.
+4. Specifically verify draft-update gating still depends on draft fingerprint delta (not metadata-only event update timestamps).
 4. Update this document if behavior changed.
 
 ## Enforcement
