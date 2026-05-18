@@ -1453,7 +1453,16 @@ def upsert_invoice_summary(
     cleaned = cleaned_joined.splitlines()
     cleaned_text = _bold_invoice_amounts("\n".join(cleaned))
     cleaned = [_format_process_prompt_line(l) for l in cleaned_text.splitlines()]
+    # Hard guard: never auto-downgrade or switch payment type while rebuilding
+    # app-status. Prefer parsed value, then preserve the exact existing prompt line.
     current_payment = payment_choice(description).upper()
+    if not current_payment:
+        existing_payment_line = _extract_existing_payment_type(description)
+        if existing_payment_line:
+            import re
+            m = re.search(r"\b(CARD|INVOICE|CASH)\b", existing_payment_line, flags=re.I)
+            if m:
+                current_payment = m.group(1).upper()
 
     summary_lines: list[str] = []
     summary_lines.append(STATUS_START)

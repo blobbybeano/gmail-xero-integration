@@ -1978,6 +1978,28 @@ def run() -> None:
                 has_send = send_choice_is_yes(_desc_now)
                 sent_state = is_invoice_sent(state, event_key)
                 paid_state = is_invoice_paid(state, event_key)
+                # Self-heal: if mapped invoice was voided/deleted in Xero,
+                # drop local sent/paid flags so the event can be rebuilt/resubmitted.
+                existing_invoice_id = get_invoice_for_event(state, event_key) or ""
+                if existing_invoice_id and xero_client and (sent_state or paid_state):
+                    try:
+                        _mutable_probe, _status_probe = _is_invoice_mutable(existing_invoice_id)
+                        _status_upper_probe = (_status_probe or "").upper()
+                        if _status_upper_probe in {"VOIDED", "DELETED"}:
+                            state["invoice_sent_event_ids"] = [
+                                _x
+                                for _x in (state.get("invoice_sent_event_ids") or [])
+                                if _x != event_key
+                            ]
+                            state["invoice_paid_event_ids"] = [
+                                _x
+                                for _x in (state.get("invoice_paid_event_ids") or [])
+                                if _x != event_key
+                            ]
+                            sent_state = False
+                            paid_state = False
+                    except Exception:
+                        pass
                 # Self-heal legacy/stale state for completed cash jobs:
                 # if notes already show cash completion, keep state aligned so
                 # status and downstream logic cannot fall back to orange.
@@ -2508,6 +2530,34 @@ def run() -> None:
                                                 f"Event {event_id}: skip invoice update, status={status}"
                                             )
                                             status_upper = (status or "").upper()
+                                            if status_upper in {"VOIDED", "DELETED"}:
+                                                try:
+                                                    _details = extract_event_details(event)
+                                                    _replacement = xero_client.create_invoice_from_event(
+                                                        _details,
+                                                        contact=contact_ref,
+                                                        line_items=invoice_lines,
+                                                    )
+                                                    _replacement_id = (
+                                                        ((_replacement.get("Invoices") or [{}])[0]).get("InvoiceID")
+                                                        or ""
+                                                    )
+                                                    if _replacement_id:
+                                                        state = set_invoice_for_event(
+                                                            state, event_key, _replacement_id
+                                                        )
+                                                        state = set_draft_sync_fingerprint(
+                                                            state, event_key, draft_fp
+                                                        )
+                                                        state = set_invoice_update_marker(
+                                                            state, event_key, event_updated
+                                                        )
+                                                except Exception as exc:
+                                                    print(
+                                                        f"Event {event_id}: failed to recreate voided/deleted invoice: {exc}"
+                                                    )
+                                                    _mark_event_xero_retry(state, event_key)
+                                                continue
                                             if status_upper == "PAID":
                                                 if not (event.get("summary") or "").strip().startswith("🟢"):
                                                     updated = safe_update(
@@ -3375,6 +3425,34 @@ def run() -> None:
                                                 f"Event {event.get('id')}: skip invoice update, status={status}"
                                             )
                                             status_upper = (status or "").upper()
+                                            if status_upper in {"VOIDED", "DELETED"}:
+                                                try:
+                                                    _details = extract_event_details(event)
+                                                    _replacement = xero_client.create_invoice_from_event(
+                                                        _details,
+                                                        contact=contact_ref,
+                                                        line_items=invoice_lines,
+                                                    )
+                                                    _replacement_id = (
+                                                        ((_replacement.get("Invoices") or [{}])[0]).get("InvoiceID")
+                                                        or ""
+                                                    )
+                                                    if _replacement_id:
+                                                        state = set_invoice_for_event(
+                                                            state, event_key, _replacement_id
+                                                        )
+                                                        state = set_draft_sync_fingerprint(
+                                                            state, event_key, draft_fp
+                                                        )
+                                                        state = set_invoice_update_marker(
+                                                            state, event_key, event_updated
+                                                        )
+                                                except Exception as exc:
+                                                    print(
+                                                        f"Event {event.get('id')}: failed to recreate voided/deleted invoice: {exc}"
+                                                    )
+                                                    _mark_event_xero_retry(state, event_key)
+                                                continue
                                             if status_upper == "PAID":
                                                 if not (event.get("summary") or "").strip().startswith("🟢"):
                                                     updated = safe_update(
