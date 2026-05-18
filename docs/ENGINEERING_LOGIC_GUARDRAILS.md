@@ -130,6 +130,11 @@ These invariants exist specifically to prevent formatter loops and duplicate dra
   - draft update decision in both flow branches must remain fingerprint-led:
     - around `should_try_update` blocks (both occurrences),
     - never revert to `event_updated != last_invoice_update` as a primary update trigger.
+  - send path (`has_send`) must perform a final pre-send draft sync for
+    `CARD/INVOICE` payments:
+    - update mutable draft invoice with current parsed `invoice_lines` before
+      authorize/email/payment,
+    - fail send with explicit error note if pre-send sync fails.
 
 If any of the above is changed, run a targeted regression against:
 - one line with hyphenated description (`A - B = £x+VAT`)

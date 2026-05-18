@@ -2656,6 +2656,55 @@ def run() -> None:
                                         event_updated = updated.get("updated") or event_updated
                                     state = set_processed_update_marker(state, event_key, event_updated)
                                     continue
+                                # Final pre-send invoice sync:
+                                # if staff edited amounts/lines and pressed SEND in the same save,
+                                # force draft invoice to match current calendar content before
+                                # authorise/email/payment actions.
+                                if invoice_id and xero_client and pay_mode in {"card", "invoice"}:
+                                    contact_ref = (
+                                        {"ContactID": existing_contact_id}
+                                        if existing_contact_id
+                                        else None
+                                    )
+                                    try:
+                                        mutable, status = _is_invoice_mutable(invoice_id)
+                                        if mutable:
+                                            xero_client.update_invoice(
+                                                invoice_id=invoice_id,
+                                                contact=contact_ref,
+                                                line_items=invoice_lines,
+                                            )
+                                        else:
+                                            print(
+                                                f"Event {event_id}: pre-send sync skipped (invoice status={status})"
+                                            )
+                                    except Exception as exc:
+                                        print(f"Event {event_id}: pre-send invoice sync failed: {exc}")
+                                        fail_reason = str(exc).splitlines()[0][:220]
+                                        failed_description = upsert_send_failure(
+                                            event.get("description") or "",
+                                            f"Pre-send sync failed: {fail_reason}",
+                                            invoice_url=(
+                                                xero_client.get_online_invoice_url(invoice_id)
+                                                if xero_client and invoice_id
+                                                else None
+                                            ),
+                                            submitter=submitter_display,
+                                            submitted_at=submitted_at_display,
+                                        )
+                                        updated = safe_update(
+                                            event_id=event.get("id"),
+                                            description=failed_description,
+                                            label="Invoice send failed",
+                                            summary_status="yellow",
+                                            current_summary=event.get("summary"),
+                                            calendar_id=calendar_id,
+                                        )
+                                        if updated:
+                                            event["description"] = failed_description
+                                            event_updated = updated.get("updated") or event_updated
+                                        state = set_processed_update_marker(state, event_key, event_updated)
+                                        continue
                                 if pay_mode == "cash":
                                     cash_cleanup_warning = None
                                     _cleanup_queue = dict(state.get("draft_cleanup_queue", {}) or {})
@@ -3469,6 +3518,55 @@ def run() -> None:
                                         event_updated = updated.get("updated") or event_updated
                                     state = set_processed_update_marker(state, event_key, event_updated)
                                     continue
+                                # Final pre-send invoice sync:
+                                # if staff edited amounts/lines and pressed SEND in the same save,
+                                # force draft invoice to match current calendar content before
+                                # authorise/email/payment actions.
+                                if invoice_id and xero_client and pay_mode in {"card", "invoice"}:
+                                    contact_ref = (
+                                        {"ContactID": contact.get("ContactID")}
+                                        if contact and contact.get("ContactID")
+                                        else None
+                                    )
+                                    try:
+                                        mutable, status = _is_invoice_mutable(invoice_id)
+                                        if mutable:
+                                            xero_client.update_invoice(
+                                                invoice_id=invoice_id,
+                                                contact=contact_ref,
+                                                line_items=invoice_lines,
+                                            )
+                                        else:
+                                            print(
+                                                f"Event {event_id}: pre-send sync skipped (invoice status={status})"
+                                            )
+                                    except Exception as exc:
+                                        print(f"Event {event_id}: pre-send invoice sync failed: {exc}")
+                                        fail_reason = str(exc).splitlines()[0][:220]
+                                        failed_description = upsert_send_failure(
+                                            event.get("description") or "",
+                                            f"Pre-send sync failed: {fail_reason}",
+                                            invoice_url=(
+                                                xero_client.get_online_invoice_url(invoice_id)
+                                                if xero_client and invoice_id
+                                                else None
+                                            ),
+                                            submitter=submitter_display,
+                                            submitted_at=submitted_at_display,
+                                        )
+                                        updated = safe_update(
+                                            event_id=event.get("id"),
+                                            description=failed_description,
+                                            label="Invoice send failed",
+                                            summary_status="yellow",
+                                            current_summary=event.get("summary"),
+                                            calendar_id=calendar_id,
+                                        )
+                                        if updated:
+                                            event["description"] = failed_description
+                                            event_updated = updated.get("updated") or event_updated
+                                        state = set_processed_update_marker(state, event_key, event_updated)
+                                        continue
                                 if pay_mode == "cash":
                                     cash_cleanup_warning = None
                                     _cleanup_queue = dict(state.get("draft_cleanup_queue", {}) or {})
