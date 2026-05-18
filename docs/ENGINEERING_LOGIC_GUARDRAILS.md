@@ -122,6 +122,9 @@ These invariants exist specifically to prevent formatter loops and duplicate dra
     - pre-clean repeated `=` artifact sequence before parse.
   - `sync_invoice_block_from_xero`:
     - self-heal historical corrupted descriptions from prior parser behavior.
+    - never mirror lines from the `⬇Sales⬇` section into the customer-facing
+      section above the marker (prevents visible duplicates while still keeping
+      sales included in Xero totals).
 
 - `app/main.py`:
   - draft update decision in both flow branches must remain fingerprint-led:

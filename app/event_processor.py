@@ -1322,6 +1322,19 @@ def sync_invoice_block_from_xero(
         for ln in (invoice_part or "").splitlines()
     )
 
+    # Keep sales lines visually below the marker only.
+    # They are still part of the Xero invoice total, but should not be mirrored
+    # into the customer-facing section above ⬇Sales⬇ in calendar notes.
+    sales_signatures: set[tuple[str, float, str]] = set()
+    for s_li in _parse_line_items(sales_part):
+        try:
+            s_total = round(float((s_li or {}).get("UnitAmount") or 0.0), 2)
+        except Exception:
+            s_total = 0.0
+        s_desc = " ".join(str((s_li or {}).get("Description") or "").split()).lower()
+        s_tax = str((s_li or {}).get("TaxType") or "").upper()
+        sales_signatures.add((s_desc, s_total, s_tax))
+
     rendered: list[str] = []
     for li in line_items:
         desc = " ".join(str((li or {}).get("Description") or "").split())
@@ -1347,8 +1360,11 @@ def sync_invoice_block_from_xero(
                 line_total = qty * unit
         except Exception:
             line_total = qty * unit
+        tax_type = str((li or {}).get("TaxType") or "").upper()
+        if (" ".join(desc.split()).lower(), round(float(line_total), 2), tax_type) in sales_signatures:
+            continue
         tax_suffix = (
-            "+VAT" if str((li or {}).get("TaxType") or "").upper() == "OUTPUT2" else ""
+            "+VAT" if tax_type == "OUTPUT2" else ""
         )
         rendered.append(f"{desc} = £{line_total:.2f}{tax_suffix}")
 
