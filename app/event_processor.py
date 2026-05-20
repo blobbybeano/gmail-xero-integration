@@ -101,19 +101,21 @@ def payment_choice(description: str | None) -> str:
     import re
 
     text = _normalize_description(description)
-    text = _strip_bracket_blocks(text).lower()
+    text = _strip_bracket_blocks(text)
     for raw in text.splitlines():
         line = raw.strip()
         if not line:
             continue
-        if "payment" in line or "card" in line or "invoice" in line or "cash" in line:
-            m = re.search(
-                r"(payment(?:\s*type)?|card\s*(?:or|/)\s*invoice(?:\s*(?:or|/)\s*cash)?)\s*(?:\([^)]*\))?\s*(?:=|:)?\s*(card|invoice|cash)\b",
-                line,
-                flags=re.I,
-            )
-            if m:
-                return m.group(2).lower()
+        # Strict parse from explicit payment prompt lines only.
+        # This prevents accidental prefill from unrelated text containing
+        # words like "card" or "invoice".
+        m = re.match(
+            r"^(?:payment(?:\s*type)?|card\s*(?:or|/)\s*invoice(?:\s*(?:or|/)\s*cash)?)\s*(?:\([^)]*\))?\s*(?:=|:)\s*(card|invoice|cash)\b",
+            line,
+            flags=re.I,
+        )
+        if m:
+            return m.group(1).lower()
     return ""
 
 
@@ -314,6 +316,8 @@ def normalize_user_sections(description: str | None) -> str:
         text,
         flags=re.I | re.S,
     )
+    text = _bold_invoice_amounts(text)
+    text = "\n".join(_format_process_prompt_line(l) for l in text.splitlines())
     return _normalize_entry_layout(text)
 
 
