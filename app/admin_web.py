@@ -2204,9 +2204,14 @@ def create_app() -> Flask:
         xero_lockout_until_ts = float(state.get("xero_lockout_until_ts") or 0.0)
         xero_lockout_active = xero_lockout_until_ts > time.time()
         xero_lockout_reason = str(state.get("xero_lockout_reason") or "").strip()
+        xero_lockout_remaining_seconds = int(
+            max(0, xero_lockout_until_ts - time.time())
+        )
+        xero_event_retry_count = len(state.get("event_xero_retry_after") or {})
+        xero_action_attempt_count = len(state.get("event_xero_action_attempts") or {})
         xero_lockout_banner = ""
         if xero_lockout_active:
-            _mins = int(max(1, (xero_lockout_until_ts - time.time()) // 60))
+            _mins = int(max(1, xero_lockout_remaining_seconds // 60))
             _until_local = dt.datetime.fromtimestamp(
                 xero_lockout_until_ts, tz=dt.timezone.utc
             ).astimezone().strftime("%d %b %Y %H:%M")
@@ -2342,6 +2347,46 @@ def create_app() -> Flask:
         else:
             invoice_card = _signal_card("Last invoice", f"{total_invoices} total" if total_invoices else "None yet", "Session history", "text-neutral-400")
 
+        if xero_lockout_active:
+            _pressure_value = "Locked out"
+            _pressure_sub = (
+                f"{xero_event_retry_count} event cooldown"
+                f"{'s' if xero_event_retry_count != 1 else ''}; "
+                f"until {dt.datetime.fromtimestamp(xero_lockout_until_ts, tz=dt.timezone.utc).astimezone().strftime('%H:%M')}"
+            )
+            _pressure_color = "text-red-300"
+            _pressure_bar = "bg-red-500"
+        elif xero_event_retry_count or xero_action_attempt_count:
+            _pressure_value = "Pressure"
+            _pressure_sub = (
+                f"{xero_event_retry_count} event cooldown"
+                f"{'s' if xero_event_retry_count != 1 else ''}; "
+                f"{xero_action_attempt_count} action marker"
+                f"{'s' if xero_action_attempt_count != 1 else ''}"
+            )
+            _pressure_color = "text-amber-300"
+            _pressure_bar = "bg-amber-400"
+        else:
+            _pressure_value = "Clear"
+            _pressure_sub = "No lockout or queued Xero retries"
+            _pressure_color = "text-emerald-300"
+            _pressure_bar = "bg-emerald-400"
+        xero_pressure_card = (
+            '<div class="bg-neutral-900 border border-neutral-800 rounded-xl p-4 min-w-0">'
+            '<div class="flex items-center justify-between gap-3 mb-2">'
+            '<p class="text-xs text-neutral-500 uppercase tracking-wider">Xero pressure</p>'
+            f'<span id="xero-pressure-countdown" data-until="{int(xero_lockout_until_ts) if xero_lockout_active else 0}" '
+            f'class="text-xs font-mono {escape(_pressure_color)}">'
+            f'{"0m" if not xero_lockout_active else ""}</span>'
+            '</div>'
+            f'<p class="text-sm font-semibold {_pressure_color} truncate">{escape(_pressure_value)}</p>'
+            f'<div class="mt-2 h-1.5 rounded-full bg-neutral-800 overflow-hidden">'
+            f'<div class="h-full {_pressure_bar}" style="width: {"100%" if xero_lockout_active else ("55%" if (xero_event_retry_count or xero_action_attempt_count) else "12%")}"></div>'
+            '</div>'
+            f'<p class="text-xs text-neutral-600 mt-1.5">{escape(_pressure_sub)}</p>'
+            '</div>'
+        )
+
         # Connection badges
         google_badge = (
             '<span class="flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-900/60 text-emerald-300 border border-emerald-700/50">'
@@ -2457,11 +2502,12 @@ def create_app() -> Flask:
   {xero_lockout_banner}
 
   <!-- Status signals -->
-  <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 px-6 pt-5 pb-4">
+  <div class="grid grid-cols-2 lg:grid-cols-5 gap-3 px-6 pt-5 pb-4">
     {webhook_card}
     {event_card}
     {contact_card}
     {invoice_card}
+    {xero_pressure_card}
   </div>
 
   <!-- Terminal -->
@@ -2518,7 +2564,7 @@ function _fmtRemaining(seconds) {{
 }}
 
 function updateXeroLockoutCountdowns() {{
-  const ids = ['xero-lockout-countdown'];
+  const ids = ['xero-lockout-countdown', 'xero-pressure-countdown'];
   let hasActive = false;
   ids.forEach((id) => {{
     const el = document.getElementById(id);

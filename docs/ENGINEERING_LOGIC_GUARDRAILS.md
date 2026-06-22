@@ -61,6 +61,9 @@ Primary controls:
     the next real event-processing call may then proceed.
   - this preserves Xero calls for customer work and keeps every rate-limit
     event attributable to a real action where possible.
+- The admin dashboard must expose Xero pressure/lockout state from local app
+  state only. It may show lockout countdowns, event retry counts, and action
+  attempt counts, but must not call Xero just to populate a health meter.
 - Draft-sync fingerprints are persisted on attempted draft-create calls so
   unchanged events do not repeatedly re-submit drafts during transient Xero failures.
 - Each event may carry a compact app-owned ledger at the bottom of the notes:
