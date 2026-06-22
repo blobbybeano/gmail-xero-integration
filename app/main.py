@@ -2282,7 +2282,13 @@ def run() -> None:
                         continue
                     if has_done and not invoice_lines:
                         print(f"Event {event_id}: no invoice lines found, skipping invoice")
-                        _feed.push(f"No job details in \"{event.get('summary', event_id)}\" — awaiting line items", "warn")
+                        if event_updated != last_processed_update:
+                            _feed.push(
+                                f"No job details in \"{event.get('summary', event_id)}\" — awaiting line items",
+                                "warn",
+                            )
+                        state = set_processed_update_marker(state, event_key, event_updated)
+                        continue
                     if is_processed(state, event_key):
                         # If we have a stored contact, update it only when the event changed.
                         existing_contact_id = get_contact_for_event(state, event_key)

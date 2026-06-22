@@ -55,6 +55,12 @@ Primary controls:
 - Hourly reconcile windows and bounded cleanup queues.
 - Draft-sync fingerprints are persisted on attempted draft-create calls so
   unchanged events do not repeatedly re-submit drafts during transient Xero failures.
+- Google Calendar webhook feed messages are coalesced. A burst of webhook pings
+  must not create a misleading live-feed storm; the webhook may still queue the
+  exact changed calendar for incremental sync.
+- `DONE` entries with no invoice line items must mark the current calendar
+  update as handled and then stop. A later staff re-save changes `event.updated`
+  and allows the app to check the entry again after line items are added.
 - Draft update must be fingerprint-gated (not generic `event.updated` gated):
   - in `app/main.py`, both draft-update paths now compute:
     - `_draft_sync_fingerprint(...)`

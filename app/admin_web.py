@@ -3927,7 +3927,14 @@ function toggleEnabled(requested) {{
                     break
 
         if state_header in {"exists", "not_exists", "sync"}:
-            _feed.push("Google Calendar change detected — scanning calendars now", "event")
+            _now_ts = time.time()
+            _last_feed_ts = float(app.config.get("_last_google_webhook_feed_ts") or 0.0)
+            if (_now_ts - _last_feed_ts) >= 60:
+                _feed.push(
+                    "Google Calendar changes detected — processing recent changes",
+                    "event",
+                )
+                app.config["_last_google_webhook_feed_ts"] = _now_ts
             if calendar_hint:
                 queue_calendar_target(calendar_hint)
             else:
