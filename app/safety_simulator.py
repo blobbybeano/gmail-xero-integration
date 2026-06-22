@@ -147,8 +147,22 @@ class FakeXero:
     invoices: dict[str, dict] = field(default_factory=dict)
     call_log: list[dict] = field(default_factory=list)
     next_invoice_number: int = 1
+    token_expired: bool = False
+    refresh_plan: list[str] = field(default_factory=list)
+    refresh_count: int = 0
+
+    def ensure_connected(self) -> None:
+        if not self.token_expired:
+            return
+        self.refresh_count += 1
+        self.call_log.append({"action": "refresh_token", "event_key": "", "invoice_id": ""})
+        outcome = self.refresh_plan.pop(0) if self.refresh_plan else "ok"
+        if outcome != "ok":
+            raise FakeXeroError(f"Xero simulated token refresh failed: {outcome}")
+        self.token_expired = False
 
     def _call(self, action: str, event_key: str = "", invoice_id: str = "") -> None:
+        self.ensure_connected()
         self.call_log.append(
             {"action": action, "event_key": event_key, "invoice_id": invoice_id}
         )
@@ -531,16 +545,27 @@ def run_default_suite() -> list[ScenarioResult]:
         scenario_successful_invoice_send(),
         scenario_missing_lines_hold(),
         scenario_repeated_xero_429_stops(),
+        scenario_token_refresh_before_draft(),
+        scenario_xero_disconnect_does_not_red_flicker(),
         scenario_old_event_ignored_until_touched(),
         scenario_webhook_storm_no_duplicate_invoice(),
     ]
     return results
 
 
-def _new_sim(fail_plan: dict[str, list[str]] | None = None) -> SafetySimulator:
+def _new_sim(
+    fail_plan: dict[str, list[str]] | None = None,
+    *,
+    token_expired: bool = False,
+    refresh_plan: list[str] | None = None,
+) -> SafetySimulator:
     clock = SimClock(dt.datetime(2026, 6, 22, 8, 0, tzinfo=LONDON_TZ))
     calendar = FakeGoogleCalendar(clock)
-    xero = FakeXero(fail_plan=copy.deepcopy(fail_plan or {}))
+    xero = FakeXero(
+        fail_plan=copy.deepcopy(fail_plan or {}),
+        token_expired=token_expired,
+        refresh_plan=list(refresh_plan or []),
+    )
     return SafetySimulator(clock=clock, calendar=calendar, xero=xero)
 
 
@@ -652,6 +677,69 @@ def scenario_repeated_xero_429_stops() -> ScenarioResult:
         "repeated_xero_429_stops",
         passed,
         [f"create_calls={len(create_calls)}", f"ledger={ledger}"],
+        len(sim.xero.call_log),
+        sim.calendar.write_count,
+    )
+
+
+def scenario_token_refresh_before_draft() -> ScenarioResult:
+    sim = _new_sim(token_expired=True, refresh_plan=["ok"])
+    event = _event(
+        event_id="token-refresh",
+        summary="🔵 GC Token Refresh",
+        description=_draft_description(name="Token Refresh", price=110),
+        clock=sim.clock,
+    )
+    key = FakeGoogleCalendar.key(event.calendar_id, event.id)
+    sim.calendar.add_event(event)
+    sim.run_until_idle()
+    calls = [row["action"] for row in sim.xero.call_log]
+    final = sim.calendar.events[key]
+    passed = (
+        calls.count("refresh_token") == 1
+        and calls.count("create_invoice") == 1
+        and not sim.xero.token_expired
+        and not final.summary.startswith("🔴")
+    )
+    return ScenarioResult(
+        "token_refresh_before_draft",
+        passed,
+        [f"calls={calls}", f"summary={final.summary}"],
+        len(calls),
+        sim.calendar.write_count,
+    )
+
+
+def scenario_xero_disconnect_does_not_red_flicker() -> ScenarioResult:
+    sim = _new_sim(token_expired=True, refresh_plan=["invalid_refresh_token"])
+    event = _event(
+        event_id="xero-disconnect",
+        summary="🔵 GC Xero Down",
+        description=_draft_description(name="Xero Down", price=115),
+        clock=sim.clock,
+    )
+    key = FakeGoogleCalendar.key(event.calendar_id, event.id)
+    sim.calendar.add_event(event)
+    sim.run_until_idle()
+    sim.run_until_idle()
+    final = sim.calendar.events[key]
+    ledger = parse_app_ledger(final.description)
+    passed = (
+        sim.xero.refresh_count == 1
+        and not final.summary.startswith("🔴")
+        and ledger.get("s") == "error"
+        and ledger.get("w") == "human_save"
+        and final.app_update_count <= 2
+    )
+    return ScenarioResult(
+        "xero_disconnect_does_not_red_flicker",
+        passed,
+        [
+            f"refresh_count={sim.xero.refresh_count}",
+            f"summary={final.summary}",
+            f"ledger={ledger}",
+            f"app_updates={final.app_update_count}",
+        ],
         len(sim.xero.call_log),
         sim.calendar.write_count,
     )

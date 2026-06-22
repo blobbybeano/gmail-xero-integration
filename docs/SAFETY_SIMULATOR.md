@@ -13,6 +13,8 @@ It is designed to catch the failure modes that have caused operational risk:
 
 - app-owned calendar updates waking the app again,
 - repeated Xero calls after the same unchanged failure,
+- Xero token refresh success/failure before invoice work,
+- temporary Xero disconnects flickering job titles red,
 - missing invoice-line entries being checked repeatedly,
 - old appointments being ignored until explicitly touched,
 - webhook storms creating duplicate invoices.
@@ -26,6 +28,8 @@ Current scenarios:
 - `successful_invoice_send`
 - `missing_lines_hold`
 - `repeated_xero_429_stops`
+- `token_refresh_before_draft`
+- `xero_disconnect_does_not_red_flicker`
 - `old_event_ignored_until_touched`
 - `webhook_storm_no_duplicate_invoice`
 

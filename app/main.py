@@ -466,8 +466,10 @@ def run() -> None:
         event_key: str,
     ) -> str:
         desc_l = (description or "").lower()
-        # If sending is requested but required integrations are down, show red immediately.
-        if blocking_integration_issues and (has_done or has_send):
+        # If the calendar/Google layer is broken, show red because the diary
+        # state itself cannot be trusted. Temporary Xero disconnects are shown
+        # in the app health UI/feed instead of flickering every job title red.
+        if _title_blocking_integration_issues and (has_done or has_send):
             return "red"
         # Resilience: if notes already show cash completion, keep green even if
         # runtime state flags were lost during a restart/redeploy.
@@ -1957,6 +1959,11 @@ def run() -> None:
             for issue in integration_issues
             if issue in {"xero_disconnected", "google_disconnected", "calendar_read_failed"}
         ]
+        _title_blocking_integration_issues = [
+            issue
+            for issue in blocking_integration_issues
+            if issue in {"google_disconnected", "calendar_read_failed"}
+        ]
 
         state = _flush_sheet_backlog(admin_creds, sheet_target, state)
         _flush_cash_backlog(admin_creds)
@@ -2263,9 +2270,10 @@ def run() -> None:
                         event.get("updated") or "",
                     )
                     continue
-                # If integrations are down, mark actionable entries red so staff can
-                # immediately see they need intervention before retrying.
-                if blocking_integration_issues and (has_done or has_send):
+                # Only diary/Google failures should paint job titles red. Xero
+                # disconnect/refresh issues are global health problems and must
+                # not cause red-title flicker across otherwise valid jobs.
+                if _title_blocking_integration_issues and (has_done or has_send):
                     if not current_summary.startswith("🔴"):
                         updated = safe_update(
                             event_id=event.get("id"),
@@ -2278,11 +2286,11 @@ def run() -> None:
                         if updated:
                             event["updated"] = updated.get("updated", event.get("updated"))
                     print(
-                        f"Event {event_id}: blocked due to integration issues: {', '.join(blocking_integration_issues)}",
+                        f"Event {event_id}: blocked due to integration issues: {', '.join(_title_blocking_integration_issues)}",
                         flush=True,
                     )
                     _feed.push(
-                        f"Blocked \"{event.get('summary', event_id)}\": {', '.join(blocking_integration_issues)}",
+                        f"Blocked \"{event.get('summary', event_id)}\": {', '.join(_title_blocking_integration_issues)}",
                         "error",
                     )
                     continue

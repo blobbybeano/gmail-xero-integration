@@ -87,10 +87,11 @@ Primary controls:
   re-saved. Once invoice lines exist, normal title updates must remove that
   marker. This malformed-entry hold must run before integration issue marking,
   title restamping, and Xero budget accounting.
-- Red title stamping is reserved for genuinely blocking runtime failures:
-  Xero disconnected, Google disconnected, or calendar read failure. Sheet
-  routing/backlog issues and Google webhook registration warnings must not turn
-  job titles red because the app can still process or recover from those paths.
+- Red title stamping is reserved for failures that make the diary state itself
+  untrustworthy: Google disconnected or calendar read failure. Xero token
+  refresh/disconnect failures are global health problems; they must be shown in
+  the app health/feed and recorded in the event ledger, but must not flicker
+  otherwise valid job titles red.
 - Draft update must be fingerprint-gated (not generic `event.updated` gated):
   - in `app/main.py`, both draft-update paths now compute:
     - `_draft_sync_fingerprint(...)`
@@ -215,6 +216,8 @@ If you edit `app/main.py`, `app/event_processor.py`, or `app/admin_web.py`:
 4. Specifically verify draft-update gating still depends on draft fingerprint delta (not metadata-only event update timestamps).
 5. For calendar/Xero lifecycle changes, run:
    - `.venv/bin/python scripts/safety_simulation.py --json`
+   - include token-refresh and colour-flicker scenarios when Xero auth/title
+     behaviour changes.
 6. Update this document if behavior changed.
 
 ## Enforcement
