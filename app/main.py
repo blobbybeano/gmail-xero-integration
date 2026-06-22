@@ -208,6 +208,9 @@ def run() -> None:
     _HOURLY_RECONCILE_PAST_DAYS = max(
         int(os.getenv("HOURLY_RECONCILE_PAST_DAYS", "45") or "45"), 1
     )
+    _PAST_EVENT_AUTO_XERO_HOURS = max(
+        int(os.getenv("PAST_EVENT_AUTO_XERO_HOURS", "24") or "24"), 1
+    )
     _DRAFT_CLEANUP_PER_HOURLY = max(
         int(os.getenv("DRAFT_CLEANUP_PER_HOURLY", "1") or "1"), 1
     )
@@ -2109,6 +2112,22 @@ def run() -> None:
                     (event_key in _target_event_keys)
                     or (calendar_id in _target_calendar_ids)
                 )
+                _event_stale_for_automatic_xero = bool(
+                    _event_end
+                    and _event_end < (now - dt.timedelta(hours=_PAST_EVENT_AUTO_XERO_HOURS))
+                    and not _event_targeted
+                )
+                if _event_stale_for_automatic_xero and (has_done or has_send):
+                    # Old unfinished jobs must not be re-scanned forever during
+                    # broad/hourly calendar sweeps. Staff can re-save the entry
+                    # to make it webhook-targeted, or Xero can update payment
+                    # state via its own webhook path.
+                    state = set_processed_update_marker(
+                        state,
+                        event_key,
+                        event.get("updated") or "",
+                    )
+                    continue
                 _allow_paid_reconcile = bool(
                     _event_is_past and (_is_hourly_reconcile_cycle or _event_targeted)
                 )

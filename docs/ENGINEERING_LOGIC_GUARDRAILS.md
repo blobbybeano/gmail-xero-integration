@@ -79,6 +79,11 @@ Primary controls:
   that calendar in addition to the normal date windows. This lets an old event
   edited today be considered once without bringing all old untouched events
   back into Xero processing.
+- Broad/hourly sweeps must not keep re-opening old unfinished jobs. Events more
+  than `PAST_EVENT_AUTO_XERO_HOURS` hours past their end time default to no
+  automatic Xero processing unless they are part of the current targeted
+  Google-calendar change. Staff can re-save a stale entry to make it eligible
+  again; otherwise it is manual.
 - `DONE` entries with no invoice line items must mark the current calendar
   update as handled and then stop. A later staff re-save changes `event.updated`
   and allows the app to check the entry again after line items are added.
@@ -218,6 +223,8 @@ If you edit `app/main.py`, `app/event_processor.py`, or `app/admin_web.py`:
    - `.venv/bin/python scripts/safety_simulation.py --json`
    - include token-refresh and colour-flicker scenarios when Xero auth/title
      behaviour changes.
+   - include the fast-forward diary scenario when scan-window, webhook, stale
+     event, or Xero pressure behaviour changes.
 6. Update this document if behavior changed.
 
 ## Enforcement

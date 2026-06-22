@@ -36,6 +36,7 @@ from .state import (
 
 LONDON_TZ = ZoneInfo("Europe/London")
 MAX_XERO_ATTEMPTS = 2
+PAST_EVENT_AUTO_XERO_HOURS = 24
 
 
 @dataclass
@@ -257,12 +258,21 @@ class SafetySimulator:
                     self.calendar.list_updated_since(calendar_id, self.last_sync),
                     key=lambda item: str(item.get("updated") or ""),
                 ):
-                    self.process_event(event)
+                    self.process_event(event, targeted=True)
             self.last_sync = self.clock.now
             self.clock.advance(5)
         raise AssertionError("simulator did not become idle; likely webhook loop")
 
-    def process_event(self, event: dict) -> None:
+    def run_hourly_sweep(self) -> None:
+        """Simulate the app's broad/hourly calendar sweep without a targeted save."""
+        for event in sorted(
+            (copy.deepcopy(item.to_google()) for item in self.calendar.events.values()),
+            key=lambda item: str(item.get("updated") or ""),
+            reverse=True,
+        ):
+            self.process_event(event, targeted=False)
+
+    def process_event(self, event: dict, *, targeted: bool = True) -> None:
         event_key = FakeGoogleCalendar.key(event["_calendar_id"], event["id"])
         description = normalize_user_sections(event.get("description") or "")
         if description != (event.get("description") or ""):
@@ -272,6 +282,19 @@ class SafetySimulator:
         has_done = done_choice_is_yes(description)
         has_send = send_choice_is_yes(description)
         if not has_done and not has_send:
+            return
+
+        event_end = self._parse_event_end(event)
+        if (
+            not targeted
+            and event_end
+            and event_end < (self.clock.now - dt.timedelta(hours=PAST_EVENT_AUTO_XERO_HOURS))
+        ):
+            self.state = set_processed_update_marker(
+                self.state,
+                event_key,
+                str(event.get("updated") or ""),
+            )
             return
 
         invoice_lines = extract_invoice_lines(description)
@@ -499,6 +522,16 @@ class SafetySimulator:
             text = text[1:].strip()
         return f"{emoji} {text}".strip()
 
+    @staticmethod
+    def _parse_event_end(event: dict) -> dt.datetime | None:
+        raw = ((event.get("end") or {}).get("dateTime") or "").strip()
+        if not raw:
+            return None
+        try:
+            return dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
 
 def _event(
     *,
@@ -507,11 +540,12 @@ def _event(
     description: str,
     clock: SimClock,
     days_from_now: int = 0,
+    calendar_id: str = "fake-calendar",
 ) -> FakeCalendarEvent:
     start = (clock.now + dt.timedelta(days=days_from_now)).astimezone(LONDON_TZ)
     return FakeCalendarEvent(
         id=event_id,
-        calendar_id="fake-calendar",
+        calendar_id=calendar_id,
         summary=summary,
         description=description,
         start=start,
@@ -549,6 +583,7 @@ def run_default_suite() -> list[ScenarioResult]:
         scenario_xero_disconnect_does_not_red_flicker(),
         scenario_old_event_ignored_until_touched(),
         scenario_webhook_storm_no_duplicate_invoice(),
+        scenario_fast_forward_current_diary_load(),
     ]
     return results
 
@@ -795,6 +830,159 @@ def scenario_webhook_storm_no_duplicate_invoice() -> ScenarioResult:
         [
             f"create_calls={len(create_calls)}",
             f"app_updates={sim.calendar.events[key].app_update_count}",
+        ],
+        len(sim.xero.call_log),
+        sim.calendar.write_count,
+    )
+
+
+def scenario_fast_forward_current_diary_load() -> ScenarioResult:
+    calendars = ["ben-calendar", "troy-calendar", "patrick-calendar"]
+    sim = _new_sim(token_expired=True, refresh_plan=["ok", "ok", "ok"])
+
+    # Seed old completed jobs that should never be re-opened by broad sweeps.
+    for idx in range(18):
+        calendar_id = calendars[idx % len(calendars)]
+        event = _event(
+            event_id=f"old-complete-{idx}",
+            calendar_id=calendar_id,
+            summary=f"🟢 GC Old Complete {idx}",
+            description=_draft_description(name=f"Old Complete {idx}", price=90 + idx),
+            clock=sim.clock,
+            days_from_now=-(3 + (idx % 20)),
+        )
+        event.updated = sim.clock.now - dt.timedelta(days=2 + (idx % 12))
+        key = FakeGoogleCalendar.key(calendar_id, event.id)
+        sim.calendar.events[key] = event
+        sim.state = set_invoice_for_event(sim.state, key, f"old-inv-{idx}")
+        sim.state = mark_invoice_sent(sim.state, key)
+        sim.state = mark_invoice_paid(sim.state, key)
+
+    old_unfinished = _event(
+        event_id="old-unfinished-lynn",
+        calendar_id="ben-calendar",
+        summary="🟠 GC Lynn Barber WS4",
+        description=_draft_description(name="Lynn Old", price=125),
+        clock=sim.clock,
+        days_from_now=-10,
+    )
+    old_unfinished.updated = sim.clock.now - dt.timedelta(days=6)
+    old_key = FakeGoogleCalendar.key(old_unfinished.calendar_id, old_unfinished.id)
+    sim.calendar.events[old_key] = old_unfinished
+
+    malformed = _event(
+        event_id="current-missing-lines",
+        calendar_id="troy-calendar",
+        summary="🔵 GC E1 Michelle",
+        description=ensure_notes_template(
+            """[contact]
+Customer name: Missing Current
+Customer email address: missing.current@example.test
+Customer contact number: 07000000000
+[/contact]
+
+[invoice]
+[/invoice]
+
+PROCESS DRAFT (Y/N) = Y
+PAYMENT TYPE (CARD/INVOICE) = INVOICE
+SEND NOW (Y/N) =
+"""
+        ),
+        clock=sim.clock,
+    )
+    malformed_key = FakeGoogleCalendar.key(malformed.calendar_id, malformed.id)
+    sim.calendar.add_event(malformed)
+
+    live_keys: list[str] = []
+    for idx in range(12):
+        calendar_id = calendars[idx % len(calendars)]
+        event = _event(
+            event_id=f"current-job-{idx}",
+            calendar_id=calendar_id,
+            summary=f"🔵 {'PW' if idx % 2 else 'GC'} Current Job {idx}",
+            description=_draft_description(name=f"Current Customer {idx}", price=100 + idx * 5),
+            clock=sim.clock,
+            days_from_now=idx % 2,
+        )
+        key = FakeGoogleCalendar.key(calendar_id, event.id)
+        live_keys.append(key)
+        sim.calendar.add_event(event)
+
+    sim.run_hourly_sweep()
+    old_calls_after_sweep = [
+        row for row in sim.xero.call_log if row["event_key"] == old_key
+    ]
+
+    for minute in range(0, 240, 15):
+        sim.clock.advance(15 * 60)
+        if minute == 30:
+            sim.calendar.user_edit(
+                old_key,
+                lambda ev: setattr(ev, "description", ev.description + "\nStaff re-save"),
+            )
+        if minute == 60:
+            sim.calendar.user_edit(
+                malformed_key,
+                lambda ev: setattr(
+                    ev,
+                    "description",
+                    ev.description.replace(
+                        "[/invoice]",
+                        "Gutter clean = £125+VAT\n[/invoice]",
+                        1,
+                    ),
+                ),
+            )
+        for idx, key in enumerate(live_keys):
+            if minute == 90 + (idx % 4) * 15:
+                sim.calendar.user_edit(
+                    key,
+                    lambda ev: setattr(
+                        ev,
+                        "description",
+                        ev.description.replace("SEND NOW (Y/N) =", "SEND NOW (Y/N) = Y"),
+                    ),
+                )
+        for _ in range(3):
+            for key in live_keys[:4]:
+                event = sim.calendar.events[key]
+                sim.calendar.webhook_queue.append((event.calendar_id, event.id))
+        sim.run_until_idle(max_cycles=100)
+        sim.run_hourly_sweep()
+
+    create_by_event: dict[str, int] = {}
+    for row in sim.xero.call_log:
+        if row["action"] == "create_invoice":
+            create_by_event[row["event_key"]] = create_by_event.get(row["event_key"], 0) + 1
+    duplicate_creates = {k: v for k, v in create_by_event.items() if v > 1}
+    red_titles = [
+        event.summary
+        for event in sim.calendar.events.values()
+        if event.summary.startswith("🔴")
+    ]
+    old_calls_total = [row for row in sim.xero.call_log if row["event_key"] == old_key]
+    missing_ledger = parse_app_ledger(sim.calendar.events[malformed_key].description)
+    passed = (
+        len(old_calls_after_sweep) == 0
+        and len(old_calls_total) == 1
+        and not duplicate_creates
+        and not red_titles
+        and missing_ledger.get("s") in {"draft", "sent"}
+        and sim.xero.refresh_count == 1
+    )
+    return ScenarioResult(
+        "fast_forward_current_diary_load",
+        passed,
+        [
+            f"events={len(sim.calendar.events)}",
+            f"xero_actions={len(sim.xero.call_log)}",
+            f"old_calls_after_broad_sweep={len(old_calls_after_sweep)}",
+            f"old_calls_after_staff_resave={len(old_calls_total)}",
+            f"duplicate_creates={duplicate_creates}",
+            f"red_titles={red_titles}",
+            f"missing_ledger={missing_ledger}",
+            f"refresh_count={sim.xero.refresh_count}",
         ],
         len(sim.xero.call_log),
         sim.calendar.write_count,

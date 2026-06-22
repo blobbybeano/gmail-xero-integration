@@ -17,7 +17,8 @@ It is designed to catch the failure modes that have caused operational risk:
 - temporary Xero disconnects flickering job titles red,
 - missing invoice-line entries being checked repeatedly,
 - old appointments being ignored until explicitly touched,
-- webhook storms creating duplicate invoices.
+- webhook storms creating duplicate invoices,
+- fast-forward diary loads with old/current/future jobs across multiple calendars.
 
 The simulator deliberately models Google push notifications as noisy: every
 user edit and every app patch can enqueue another webhook. Passing scenarios
@@ -32,6 +33,13 @@ Current scenarios:
 - `xero_disconnect_does_not_red_flicker`
 - `old_event_ignored_until_touched`
 - `webhook_storm_no_duplicate_invoice`
+- `fast_forward_current_diary_load`
+
+The fast-forward scenario simulates a diary with old completed jobs, an old
+unfinished job, current jobs, a malformed entry repaired by a later save, Google
+webhook bursts, and Xero token refresh. It asserts that broad/hourly sweeps make
+zero Xero calls for stale unfinished jobs, while a deliberate staff re-save
+processes only the touched entry.
 
 Before changing calendar/Xero processing logic, run:
 
