@@ -10,6 +10,7 @@ If you change logic in the files referenced below, update this document in the s
 - `app/event_processor.py`: parsing/normalization of calendar notes, status-block rendering, title emoji semantics.
 - `app/google_sheets.py`: sheet writes, dedupe signatures, backlog flushing.
 - `app/state.py`: persistent markers for processed/sent/paid/draft-sync and retry cooldowns.
+- `app/safety_simulator.py`: offline fake Google/Xero simulator for webhook loops, Xero failures, and old-entry handling.
 - `app/receipts/*`: scaffold-only receipt module (feature-flagged, isolated, no live write-through yet).
 
 ## Critical Invariants
@@ -212,7 +213,9 @@ If you edit `app/main.py`, `app/event_processor.py`, or `app/admin_web.py`:
    - invoice draft update behavior for mutable vs non-mutable statuses
 3. Verify no extra Xero call loops were introduced.
 4. Specifically verify draft-update gating still depends on draft fingerprint delta (not metadata-only event update timestamps).
-4. Update this document if behavior changed.
+5. For calendar/Xero lifecycle changes, run:
+   - `.venv/bin/python scripts/safety_simulation.py --json`
+6. Update this document if behavior changed.
 
 ## Enforcement
 

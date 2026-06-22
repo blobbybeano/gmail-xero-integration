@@ -1,0 +1,753 @@
+from __future__ import annotations
+
+import argparse
+import copy
+import datetime as dt
+import hashlib
+import json
+from dataclasses import dataclass, field
+from typing import Callable
+from zoneinfo import ZoneInfo
+
+from .event_processor import (
+    done_choice_is_yes,
+    ensure_notes_template,
+    extract_invoice_lines,
+    normalize_user_sections,
+    parse_app_ledger,
+    payment_choice,
+    send_choice_is_yes,
+    strip_app_ledger,
+    upsert_app_ledger,
+    upsert_invoice_summary,
+    upsert_send_confirmation,
+)
+from .state import (
+    bump_xero_action_attempts,
+    get_invoice_for_event,
+    get_processed_update_marker,
+    get_xero_action_attempts,
+    is_invoice_sent,
+    mark_invoice_paid,
+    mark_invoice_sent,
+    set_invoice_for_event,
+    set_processed_update_marker,
+)
+
+LONDON_TZ = ZoneInfo("Europe/London")
+MAX_XERO_ATTEMPTS = 2
+
+
+@dataclass
+class SimClock:
+    now: dt.datetime
+
+    def advance(self, seconds: int) -> None:
+        self.now += dt.timedelta(seconds=seconds)
+
+    def iso(self) -> str:
+        return self.now.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+@dataclass
+class FakeCalendarEvent:
+    id: str
+    calendar_id: str
+    summary: str
+    description: str
+    start: dt.datetime
+    end: dt.datetime
+    created: dt.datetime
+    updated: dt.datetime
+    app_update_count: int = 0
+    user_update_count: int = 0
+
+    def to_google(self) -> dict:
+        return {
+            "id": self.id,
+            "_calendar_id": self.calendar_id,
+            "summary": self.summary,
+            "description": self.description,
+            "created": self.created.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+            "updated": self.updated.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+            "start": {"dateTime": self.start.isoformat()},
+            "end": {"dateTime": self.end.isoformat()},
+            "creator": {"email": "engineer@example.test"},
+            "organizer": {"email": "engineer@example.test"},
+        }
+
+
+@dataclass
+class FakeGoogleCalendar:
+    clock: SimClock
+    events: dict[str, FakeCalendarEvent] = field(default_factory=dict)
+    webhook_queue: list[tuple[str, str]] = field(default_factory=list)
+    read_count: int = 0
+    write_count: int = 0
+
+    def add_event(self, event: FakeCalendarEvent) -> None:
+        self.events[self.key(event.calendar_id, event.id)] = event
+        self.webhook_queue.append((event.calendar_id, event.id))
+
+    def user_edit(self, event_key: str, editor: Callable[[FakeCalendarEvent], None]) -> None:
+        event = self.events[event_key]
+        editor(event)
+        event.updated = self.clock.now
+        event.user_update_count += 1
+        self.webhook_queue.append((event.calendar_id, event.id))
+
+    def app_patch(
+        self,
+        event_key: str,
+        *,
+        description: str | None = None,
+        summary: str | None = None,
+    ) -> None:
+        event = self.events[event_key]
+        if description is not None:
+            event.description = description
+        if summary is not None:
+            event.summary = summary
+        event.updated = self.clock.now
+        event.app_update_count += 1
+        self.write_count += 1
+        # Google push notifications also happen after app writes. The simulator
+        # intentionally queues this to prove app-owned updates do not loop.
+        self.webhook_queue.append((event.calendar_id, event.id))
+
+    def pop_webhooks(self) -> list[tuple[str, str]]:
+        out = self.webhook_queue[:]
+        self.webhook_queue.clear()
+        return out
+
+    def list_updated_since(self, calendar_id: str, updated_min: dt.datetime) -> list[dict]:
+        self.read_count += 1
+        return [
+            copy.deepcopy(event.to_google())
+            for event in self.events.values()
+            if event.calendar_id == calendar_id and event.updated >= updated_min
+        ]
+
+    @staticmethod
+    def key(calendar_id: str, event_id: str) -> str:
+        return f"{calendar_id}:{event_id}"
+
+
+class FakeXeroError(RuntimeError):
+    pass
+
+
+class FakeXeroRateLimit(FakeXeroError):
+    pass
+
+
+@dataclass
+class FakeXero:
+    fail_plan: dict[str, list[str]] = field(default_factory=dict)
+    invoices: dict[str, dict] = field(default_factory=dict)
+    call_log: list[dict] = field(default_factory=list)
+    next_invoice_number: int = 1
+
+    def _call(self, action: str, event_key: str = "", invoice_id: str = "") -> None:
+        self.call_log.append(
+            {"action": action, "event_key": event_key, "invoice_id": invoice_id}
+        )
+        plan = self.fail_plan.get(action) or []
+        if plan:
+            outcome = plan.pop(0)
+            if outcome == "429":
+                raise FakeXeroRateLimit("Xero simulated 429")
+            if outcome == "timeout":
+                raise FakeXeroError("Xero simulated timeout")
+            if outcome == "email_failed":
+                raise FakeXeroError("Xero simulated email failure")
+
+    def create_invoice(self, *, event_key: str, line_items: list[dict]) -> dict:
+        self._call("create_invoice", event_key=event_key)
+        invoice_id = f"fake-inv-{self.next_invoice_number:04d}"
+        invoice_number = f"SIM-{self.next_invoice_number:04d}"
+        self.next_invoice_number += 1
+        subtotal = sum(float(line.get("UnitAmount") or 0.0) for line in line_items)
+        total = subtotal + sum(
+            float(line.get("UnitAmount") or 0.0) * (0.2 if line.get("TaxType") else 0.0)
+            for line in line_items
+        )
+        invoice = {
+            "InvoiceID": invoice_id,
+            "InvoiceNumber": invoice_number,
+            "Status": "DRAFT",
+            "SubTotal": subtotal,
+            "Total": total,
+            "AmountDue": total,
+            "LineItems": copy.deepcopy(line_items),
+        }
+        self.invoices[invoice_id] = invoice
+        return {"Invoices": [copy.deepcopy(invoice)]}
+
+    def update_invoice(self, *, event_key: str, invoice_id: str, line_items: list[dict]) -> dict:
+        self._call("update_invoice", event_key=event_key, invoice_id=invoice_id)
+        invoice = self.invoices[invoice_id]
+        invoice["LineItems"] = copy.deepcopy(line_items)
+        return {"Invoices": [copy.deepcopy(invoice)]}
+
+    def authorize_invoice(self, *, event_key: str, invoice_id: str) -> dict:
+        self._call("authorize_invoice", event_key=event_key, invoice_id=invoice_id)
+        invoice = self.invoices[invoice_id]
+        invoice["Status"] = "AUTHORISED"
+        return {"Invoices": [copy.deepcopy(invoice)]}
+
+    def email_invoice(self, *, event_key: str, invoice_id: str) -> bool:
+        try:
+            self._call("email_invoice", event_key=event_key, invoice_id=invoice_id)
+        except FakeXeroError:
+            return False
+        return True
+
+    def record_payment(self, *, event_key: str, invoice_id: str) -> dict:
+        self._call("record_payment", event_key=event_key, invoice_id=invoice_id)
+        invoice = self.invoices[invoice_id]
+        invoice["Status"] = "PAID"
+        invoice["AmountDue"] = 0.0
+        return {"Payments": [{"Invoice": {"InvoiceID": invoice_id}}]}
+
+    def online_url(self, invoice_id: str) -> str:
+        return f"https://fake.xero.test/{invoice_id}"
+
+
+@dataclass
+class ScenarioResult:
+    name: str
+    passed: bool
+    notes: list[str]
+    xero_calls: int
+    calendar_writes: int
+
+
+class SafetySimulator:
+    def __init__(self, *, clock: SimClock, calendar: FakeGoogleCalendar, xero: FakeXero):
+        self.clock = clock
+        self.calendar = calendar
+        self.xero = xero
+        self.state: dict = {}
+        self.last_sync = self.clock.now - dt.timedelta(seconds=1)
+        self.notes: list[str] = []
+
+    def run_until_idle(self, *, max_cycles: int = 50) -> None:
+        for _ in range(max_cycles):
+            webhooks = self.calendar.pop_webhooks()
+            if not webhooks:
+                return
+            calendar_ids = sorted({calendar_id for calendar_id, _event_id in webhooks})
+            for calendar_id in calendar_ids:
+                for event in sorted(
+                    self.calendar.list_updated_since(calendar_id, self.last_sync),
+                    key=lambda item: str(item.get("updated") or ""),
+                ):
+                    self.process_event(event)
+            self.last_sync = self.clock.now
+            self.clock.advance(5)
+        raise AssertionError("simulator did not become idle; likely webhook loop")
+
+    def process_event(self, event: dict) -> None:
+        event_key = FakeGoogleCalendar.key(event["_calendar_id"], event["id"])
+        description = normalize_user_sections(event.get("description") or "")
+        if description != (event.get("description") or ""):
+            self.calendar.app_patch(event_key, description=description)
+            event["description"] = description
+
+        has_done = done_choice_is_yes(description)
+        has_send = send_choice_is_yes(description)
+        if not has_done and not has_send:
+            return
+
+        invoice_lines = extract_invoice_lines(description)
+        if has_done and not invoice_lines:
+            fingerprint = self._fingerprint("format", description)
+            ledger = parse_app_ledger(description)
+            if (
+                ledger.get("s") == "needs_input"
+                and ledger.get("r") == "missing_lines"
+                and ledger.get("fp") == fingerprint
+            ):
+                self.state = set_processed_update_marker(self.state, event_key, str(event.get("updated") or ""))
+                return
+            blocked = upsert_app_ledger(
+                description,
+                message="Needs input - missing invoice lines",
+                state="needs_input",
+                reason="missing_lines",
+                fingerprint=fingerprint,
+                xero_attempts=0,
+                wait="human_save",
+            )
+            self.calendar.app_patch(event_key, description=blocked, summary=self._with_marker(event["summary"]))
+            self.state = set_processed_update_marker(self.state, event_key, self.clock.iso())
+            return
+
+        processed_marker = get_processed_update_marker(self.state, event_key)
+        if processed_marker == str(event.get("updated") or "") and not self._has_pending_work(event_key, description):
+            return
+
+        invoice_id = get_invoice_for_event(self.state, event_key) or ""
+        draft_fp = self._fingerprint(
+            "draft",
+            json.dumps(
+                {
+                    "lines": invoice_lines,
+                    "payment": payment_choice(description),
+                },
+                sort_keys=True,
+            ),
+        )
+        if has_done and invoice_lines and not invoice_id and not is_invoice_sent(self.state, event_key):
+            if self._waiting_for_human(description, draft_fp):
+                self.state = set_processed_update_marker(self.state, event_key, str(event.get("updated") or ""))
+                return
+            if not self._allow_xero_action(event_key, "draft", draft_fp, description):
+                self._block_action(event_key, event, "draft", draft_fp, "draft_attempt_limit")
+                return
+            try:
+                result = self.xero.create_invoice(event_key=event_key, line_items=invoice_lines)
+            except FakeXeroError as exc:
+                self._record_action_failure(event_key, event, "draft", draft_fp, str(exc))
+                return
+            invoice = result["Invoices"][0]
+            invoice_id = invoice["InvoiceID"]
+            self.state = set_invoice_for_event(self.state, event_key, invoice_id)
+            desc = upsert_invoice_summary(
+                description,
+                float(invoice.get("SubTotal") or 0.0),
+                float(invoice.get("Total") or 0.0),
+                sent=False,
+                invoice_url=self.xero.online_url(invoice_id),
+                include_prompt=True,
+            )
+            desc = upsert_app_ledger(
+                desc,
+                message="Draft ready",
+                state="draft",
+                reason="ok",
+                fingerprint=draft_fp,
+                xero_attempts=get_xero_action_attempts(self.state, event_key, "draft", draft_fp),
+                wait="send",
+                invoice=invoice_id,
+            )
+            self.calendar.app_patch(event_key, description=desc, summary=self._set_status(event["summary"], "orange"))
+            self.state = set_processed_update_marker(self.state, event_key, self.clock.iso())
+            return
+
+        if has_send and invoice_lines and invoice_id and not is_invoice_sent(self.state, event_key):
+            mode = payment_choice(description)
+            send_fp = self._fingerprint("send", f"{draft_fp}|{invoice_id}|{mode}")
+            if self._waiting_for_human(description, send_fp):
+                self.state = set_processed_update_marker(self.state, event_key, str(event.get("updated") or ""))
+                return
+            if not self._allow_xero_action(event_key, "send", send_fp, description):
+                self._block_action(event_key, event, "send", send_fp, "send_attempt_limit")
+                return
+            try:
+                self.xero.update_invoice(event_key=event_key, invoice_id=invoice_id, line_items=invoice_lines)
+                self.xero.authorize_invoice(event_key=event_key, invoice_id=invoice_id)
+                if mode == "card":
+                    self.xero.record_payment(event_key=event_key, invoice_id=invoice_id)
+                if not self.xero.email_invoice(event_key=event_key, invoice_id=invoice_id):
+                    raise FakeXeroError("Xero simulated email failure")
+            except FakeXeroError as exc:
+                self._record_action_failure(event_key, event, "send", send_fp, str(exc))
+                return
+
+            desc = upsert_send_confirmation(description, invoice_url=self.xero.online_url(invoice_id))
+            desc = upsert_app_ledger(
+                desc,
+                message=f"Sent - {invoice_id}",
+                state="sent",
+                reason="ok",
+                fingerprint=send_fp,
+                xero_attempts=get_xero_action_attempts(self.state, event_key, "send", send_fp),
+                wait="none",
+                invoice=invoice_id,
+            )
+            self.state = mark_invoice_sent(self.state, event_key)
+            if mode == "card":
+                self.state = mark_invoice_paid(self.state, event_key)
+            self.calendar.app_patch(
+                event_key,
+                description=desc,
+                summary=self._set_status(event["summary"], "green" if mode == "card" else "yellow"),
+            )
+            self.state = set_processed_update_marker(self.state, event_key, self.clock.iso())
+
+    def _allow_xero_action(
+        self,
+        event_key: str,
+        action: str,
+        fingerprint: str,
+        description: str,
+    ) -> bool:
+        attempts = get_xero_action_attempts(self.state, event_key, action, fingerprint)
+        ledger = parse_app_ledger(description)
+        if ledger.get("fp") == fingerprint:
+            try:
+                attempts = max(attempts, int(ledger.get("x") or 0))
+            except Exception:
+                pass
+        if attempts >= MAX_XERO_ATTEMPTS:
+            return False
+        self.state, _attempts = bump_xero_action_attempts(
+            self.state, event_key, action, fingerprint
+        )
+        return True
+
+    @staticmethod
+    def _waiting_for_human(description: str, fingerprint: str) -> bool:
+        ledger = parse_app_ledger(description)
+        return bool(
+            ledger.get("fp") == fingerprint
+            and ledger.get("w") == "human_save"
+            and ledger.get("s") in {"error", "needs_input"}
+        )
+
+    def _record_action_failure(
+        self,
+        event_key: str,
+        event: dict,
+        action: str,
+        fingerprint: str,
+        reason: str,
+    ) -> None:
+        attempts = get_xero_action_attempts(self.state, event_key, action, fingerprint)
+        desc = upsert_app_ledger(
+            event.get("description") or "",
+            message=f"Needs input - {action} failed",
+            state="error",
+            reason=self._slug(reason),
+            fingerprint=fingerprint,
+            xero_attempts=attempts,
+            wait="human_save",
+        )
+        self.calendar.app_patch(event_key, description=desc, summary=self._set_status(event["summary"], "orange"))
+        self.state = set_processed_update_marker(self.state, event_key, self.clock.iso())
+
+    def _block_action(
+        self,
+        event_key: str,
+        event: dict,
+        action: str,
+        fingerprint: str,
+        reason: str,
+    ) -> None:
+        attempts = get_xero_action_attempts(self.state, event_key, action, fingerprint)
+        desc = upsert_app_ledger(
+            event.get("description") or "",
+            message="Needs input - repeated Xero attempts stopped",
+            state="needs_input",
+            reason=reason,
+            fingerprint=fingerprint,
+            xero_attempts=attempts,
+            wait="human_save",
+        )
+        self.calendar.app_patch(event_key, description=desc, summary=self._set_status(event["summary"], "orange"))
+        self.state = set_processed_update_marker(self.state, event_key, self.clock.iso())
+
+    def _has_pending_work(self, event_key: str, description: str) -> bool:
+        return bool(
+            done_choice_is_yes(description)
+            and extract_invoice_lines(description)
+            and not get_invoice_for_event(self.state, event_key)
+        )
+
+    @staticmethod
+    def _fingerprint(kind: str, value: str) -> str:
+        stable = strip_app_ledger(value).strip()
+        return hashlib.sha1(f"{kind}:{stable}".encode("utf-8")).hexdigest()[:10]
+
+    @staticmethod
+    def _slug(value: str) -> str:
+        return "".join(ch.lower() if ch.isalnum() else "_" for ch in value)[:48].strip("_")
+
+    @staticmethod
+    def _with_marker(summary: str) -> str:
+        if "(Check Formatting)" in summary:
+            return summary
+        return f"{summary} (Check Formatting)"
+
+    @staticmethod
+    def _set_status(summary: str, status: str) -> str:
+        emoji = {
+            "blue": "🔵",
+            "orange": "🟠",
+            "yellow": "🟡",
+            "green": "🟢",
+            "red": "🔴",
+        }.get(status, "🟠")
+        text = summary
+        while text and text[0] in "🔵🟠🟡🟢🔴":
+            text = text[1:].strip()
+        return f"{emoji} {text}".strip()
+
+
+def _event(
+    *,
+    event_id: str,
+    summary: str,
+    description: str,
+    clock: SimClock,
+    days_from_now: int = 0,
+) -> FakeCalendarEvent:
+    start = (clock.now + dt.timedelta(days=days_from_now)).astimezone(LONDON_TZ)
+    return FakeCalendarEvent(
+        id=event_id,
+        calendar_id="fake-calendar",
+        summary=summary,
+        description=description,
+        start=start,
+        end=start + dt.timedelta(hours=1),
+        created=clock.now,
+        updated=clock.now,
+    )
+
+
+def _draft_description(*, name: str = "Test Customer", price: int = 120) -> str:
+    return ensure_notes_template(
+        f"""[contact]
+Customer name: {name}
+Customer email address: {name.lower().replace(' ', '.')}@example.test
+Customer contact number: 07000000000
+[/contact]
+
+[invoice]
+Gutter clean = £{price}+VAT
+[/invoice]
+
+PROCESS DRAFT (Y/N) = Y
+PAYMENT TYPE (CARD/INVOICE) = INVOICE
+SEND NOW (Y/N) =
+"""
+    )
+
+
+def run_default_suite() -> list[ScenarioResult]:
+    results = [
+        scenario_successful_invoice_send(),
+        scenario_missing_lines_hold(),
+        scenario_repeated_xero_429_stops(),
+        scenario_old_event_ignored_until_touched(),
+        scenario_webhook_storm_no_duplicate_invoice(),
+    ]
+    return results
+
+
+def _new_sim(fail_plan: dict[str, list[str]] | None = None) -> SafetySimulator:
+    clock = SimClock(dt.datetime(2026, 6, 22, 8, 0, tzinfo=LONDON_TZ))
+    calendar = FakeGoogleCalendar(clock)
+    xero = FakeXero(fail_plan=copy.deepcopy(fail_plan or {}))
+    return SafetySimulator(clock=clock, calendar=calendar, xero=xero)
+
+
+def scenario_successful_invoice_send() -> ScenarioResult:
+    sim = _new_sim()
+    event = _event(
+        event_id="success-send",
+        summary="🔵 SW19 G.C Rachel",
+        description=_draft_description(name="Rachel Test", price=140),
+        clock=sim.clock,
+    )
+    key = FakeGoogleCalendar.key(event.calendar_id, event.id)
+    sim.calendar.add_event(event)
+    sim.run_until_idle()
+    sim.clock.advance(60)
+    sim.calendar.user_edit(
+        key,
+        lambda ev: setattr(
+            ev,
+            "description",
+            ev.description.replace("SEND NOW (Y/N) =", "SEND NOW (Y/N) = Y"),
+        ),
+    )
+    sim.run_until_idle()
+    calls = [row["action"] for row in sim.xero.call_log]
+    final = sim.calendar.events[key]
+    passed = (
+        calls.count("create_invoice") == 1
+        and calls.count("authorize_invoice") == 1
+        and "Invoice sent" in final.description
+        and parse_app_ledger(final.description).get("s") == "sent"
+    )
+    return ScenarioResult(
+        "successful_invoice_send",
+        passed,
+        [f"calls={calls}", f"ledger={parse_app_ledger(final.description)}"],
+        len(calls),
+        sim.calendar.write_count,
+    )
+
+
+def scenario_missing_lines_hold() -> ScenarioResult:
+    sim = _new_sim()
+    description = ensure_notes_template(
+        """[contact]
+Customer name: Missing Lines
+Customer email address: missing.lines@example.test
+Customer contact number: 07000000000
+[/contact]
+
+[invoice]
+[/invoice]
+
+PROCESS DRAFT (Y/N) = Y
+PAYMENT TYPE (CARD/INVOICE) = INVOICE
+SEND NOW (Y/N) =
+"""
+    )
+    event = _event(
+        event_id="missing-lines",
+        summary="🔵 GC E1 Michelle",
+        description=description,
+        clock=sim.clock,
+    )
+    key = FakeGoogleCalendar.key(event.calendar_id, event.id)
+    sim.calendar.add_event(event)
+    sim.run_until_idle()
+    sim.run_until_idle()
+    final = sim.calendar.events[key]
+    ledger = parse_app_ledger(final.description)
+    passed = (
+        len(sim.xero.call_log) == 0
+        and ledger.get("s") == "needs_input"
+        and ledger.get("r") == "missing_lines"
+        and "(Check Formatting)" in final.summary
+    )
+    return ScenarioResult(
+        "missing_lines_hold",
+        passed,
+        [f"ledger={ledger}", f"summary={final.summary}"],
+        len(sim.xero.call_log),
+        sim.calendar.write_count,
+    )
+
+
+def scenario_repeated_xero_429_stops() -> ScenarioResult:
+    sim = _new_sim({"create_invoice": ["429", "429", "429", "429"]})
+    event = _event(
+        event_id="rate-limited",
+        summary="🔵 SW15 G.C Gordon",
+        description=_draft_description(name="Gordon Retry", price=145),
+        clock=sim.clock,
+    )
+    key = FakeGoogleCalendar.key(event.calendar_id, event.id)
+    sim.calendar.add_event(event)
+    for _ in range(4):
+        sim.run_until_idle()
+        sim.clock.advance(60)
+        sim.calendar.user_edit(key, lambda ev: setattr(ev, "description", ev.description))
+    final = sim.calendar.events[key]
+    ledger = parse_app_ledger(final.description)
+    create_calls = [row for row in sim.xero.call_log if row["action"] == "create_invoice"]
+    passed = (
+        0 < len(create_calls) <= MAX_XERO_ATTEMPTS
+        and ledger.get("s") in {"error", "needs_input"}
+        and ledger.get("w") == "human_save"
+    )
+    return ScenarioResult(
+        "repeated_xero_429_stops",
+        passed,
+        [f"create_calls={len(create_calls)}", f"ledger={ledger}"],
+        len(sim.xero.call_log),
+        sim.calendar.write_count,
+    )
+
+
+def scenario_old_event_ignored_until_touched() -> ScenarioResult:
+    sim = _new_sim()
+    old_event = _event(
+        event_id="old-event",
+        summary="🔵 GC Lynn Barber WS4",
+        description=_draft_description(name="Lynn Old", price=95),
+        clock=sim.clock,
+        days_from_now=-14,
+    )
+    old_event.updated = sim.clock.now - dt.timedelta(days=10)
+    key = FakeGoogleCalendar.key(old_event.calendar_id, old_event.id)
+    sim.calendar.events[key] = old_event
+    sim.run_until_idle()
+    untouched_calls = len(sim.xero.call_log)
+    sim.clock.advance(60)
+    sim.calendar.user_edit(key, lambda ev: setattr(ev, "description", ev.description + "\n"))
+    sim.run_until_idle()
+    touched_calls = len(sim.xero.call_log)
+    passed = untouched_calls == 0 and touched_calls == 1
+    return ScenarioResult(
+        "old_event_ignored_until_touched",
+        passed,
+        [f"untouched_calls={untouched_calls}", f"touched_calls={touched_calls}"],
+        len(sim.xero.call_log),
+        sim.calendar.write_count,
+    )
+
+
+def scenario_webhook_storm_no_duplicate_invoice() -> ScenarioResult:
+    sim = _new_sim()
+    event = _event(
+        event_id="storm",
+        summary="🔵 PW B90 Angela King",
+        description=_draft_description(name="Angela Storm", price=288),
+        clock=sim.clock,
+    )
+    key = FakeGoogleCalendar.key(event.calendar_id, event.id)
+    sim.calendar.add_event(event)
+    for _ in range(30):
+        sim.calendar.webhook_queue.append((event.calendar_id, event.id))
+    sim.run_until_idle()
+    sim.run_until_idle()
+    create_calls = [row for row in sim.xero.call_log if row["action"] == "create_invoice"]
+    passed = len(create_calls) == 1 and sim.calendar.events[key].app_update_count <= 3
+    return ScenarioResult(
+        "webhook_storm_no_duplicate_invoice",
+        passed,
+        [
+            f"create_calls={len(create_calls)}",
+            f"app_updates={sim.calendar.events[key].app_update_count}",
+        ],
+        len(sim.xero.call_log),
+        sim.calendar.write_count,
+    )
+
+
+def format_report(results: list[ScenarioResult]) -> str:
+    payload = {
+        "passed": all(result.passed for result in results),
+        "scenario_count": len(results),
+        "scenarios": [
+            {
+                "name": result.name,
+                "passed": result.passed,
+                "notes": result.notes,
+                "xero_calls": result.xero_calls,
+                "calendar_writes": result.calendar_writes,
+            }
+            for result in results
+        ],
+    }
+    return json.dumps(payload, indent=2)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Run the offline Xero/Google safety simulator.")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON report only.",
+    )
+    args = parser.parse_args(argv)
+    results = run_default_suite()
+    report = format_report(results)
+    if args.json:
+        print(report)
+    else:
+        print("Offline Xero/Google safety simulation")
+        print(report)
+    return 0 if all(result.passed for result in results) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

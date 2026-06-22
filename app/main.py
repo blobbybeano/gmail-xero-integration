@@ -1460,6 +1460,14 @@ def run() -> None:
                 pass
         return attempts
 
+    def _ledger_waits_for_human(description: str | None, fingerprint: str) -> bool:
+        ledger = parse_app_ledger(description)
+        return bool(
+            ledger.get("fp") == fingerprint
+            and ledger.get("w") == "human_save"
+            and ledger.get("s") in {"error", "needs_input"}
+        )
+
     def _mark_xero_action_blocked(
         *,
         event: dict,
@@ -2663,6 +2671,13 @@ def run() -> None:
                                         draft_fp=draft_fp,
                                         payment_mode=payment_choice(event.get("description")) or "",
                                     )
+                                    if _ledger_waits_for_human(
+                                        event.get("description"), draft_action_fp
+                                    ):
+                                        state = set_processed_update_marker(
+                                            state, event_key, event_updated
+                                        )
+                                        continue
                                     draft_attempts = _xero_attempts_for(
                                         event_key=event_key,
                                         action="draft",
@@ -2776,6 +2791,13 @@ def run() -> None:
                                             invoice_id=invoice_id,
                                             payment_mode=payment_choice(event.get("description")) or "",
                                         )
+                                        if _ledger_waits_for_human(
+                                            event.get("description"), draft_action_fp
+                                        ):
+                                            state = set_processed_update_marker(
+                                                state, event_key, event_updated
+                                            )
+                                            continue
                                         draft_attempts = _xero_attempts_for(
                                             event_key=event_key,
                                             action="draft",
@@ -2999,6 +3021,13 @@ def run() -> None:
                                     invoice_id=invoice_id or "",
                                     payment_mode=pay_mode,
                                 )
+                                if _ledger_waits_for_human(
+                                    event.get("description"), send_action_fp
+                                ):
+                                    state = set_processed_update_marker(
+                                        state, event_key, event_updated
+                                    )
+                                    continue
                                 send_attempts = _xero_attempts_for(
                                     event_key=event_key,
                                     action="send",
@@ -3736,6 +3765,13 @@ def run() -> None:
                                         draft_fp=draft_fp,
                                         payment_mode=payment_choice(event.get("description")) or "",
                                     )
+                                    if _ledger_waits_for_human(
+                                        event.get("description"), draft_action_fp
+                                    ):
+                                        state = set_processed_update_marker(
+                                            state, event_key, event_updated
+                                        )
+                                        continue
                                     draft_attempts = _xero_attempts_for(
                                         event_key=event_key,
                                         action="draft",
@@ -3850,6 +3886,13 @@ def run() -> None:
                                             invoice_id=invoice_id,
                                             payment_mode=payment_choice(event.get("description")) or "",
                                         )
+                                        if _ledger_waits_for_human(
+                                            event.get("description"), draft_action_fp
+                                        ):
+                                            state = set_processed_update_marker(
+                                                state, event_key, event_updated
+                                            )
+                                            continue
                                         draft_attempts = _xero_attempts_for(
                                             event_key=event_key,
                                             action="draft",
@@ -4068,6 +4111,13 @@ def run() -> None:
                                     invoice_id=invoice_id or "",
                                     payment_mode=pay_mode,
                                 )
+                                if _ledger_waits_for_human(
+                                    event.get("description"), send_action_fp
+                                ):
+                                    state = set_processed_update_marker(
+                                        state, event_key, event_updated
+                                    )
+                                    continue
                                 send_attempts = _xero_attempts_for(
                                     event_key=event_key,
                                     action="send",
