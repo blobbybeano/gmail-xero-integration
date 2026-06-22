@@ -75,14 +75,19 @@ def send_choice_is_yes(description: str | None) -> bool:
     #   SEND =Y
     #   SEND: YES
     #   SEND YES
-    for raw in text.splitlines():
-        line = raw.strip().lower()
+    lines = [re.sub(r"<[^>]+>", "", raw).strip().lower() for raw in text.splitlines()]
+    for idx, line in enumerate(lines):
         if not line.startswith("send"):
             continue
         if re.fullmatch(r"send(?:\s+now)?\s*(?:\(\s*y\s*/\s*n\s*\)|y\s*/\s*n)?\s*(?:=|:)\s*(y|yes)\s*", line):
             return True
         if re.fullmatch(r"send\s+(y|yes)\s*", line):
             return True
+        if re.fullmatch(r"send(?:\s+now)?\s*(?:\(\s*y\s*/\s*n\s*\)|y\s*/\s*n)?\s*(?:=|:)\s*", line):
+            for next_line in lines[idx + 1 :]:
+                if not next_line:
+                    continue
+                return bool(re.fullmatch(r"y|yes", next_line))
     return False
 
 
@@ -102,20 +107,31 @@ def payment_choice(description: str | None) -> str:
 
     text = _normalize_description(description)
     text = _strip_bracket_blocks(text)
-    for raw in text.splitlines():
-        line = raw.strip()
+    lines = [re.sub(r"<[^>]+>", "", raw).strip() for raw in text.splitlines()]
+    prompt_re = (
+        r"^(?:payment(?:\s*type)?|card\s*(?:or|/)\s*invoice(?:\s*(?:or|/)\s*cash)?)"
+        r"\s*(?:\([^)]*\))?\s*(?:=|:)"
+    )
+    for idx, line in enumerate(lines):
         if not line:
             continue
         # Strict parse from explicit payment prompt lines only.
         # This prevents accidental prefill from unrelated text containing
         # words like "card" or "invoice".
         m = re.match(
-            r"^(?:payment(?:\s*type)?|card\s*(?:or|/)\s*invoice(?:\s*(?:or|/)\s*cash)?)\s*(?:\([^)]*\))?\s*(?:=|:)\s*(card|invoice|cash)\b",
+            prompt_re + r"\s*(card|invoice|cash)\b",
             line,
             flags=re.I,
         )
         if m:
             return m.group(1).lower()
+        if re.match(prompt_re + r"\s*$", line, flags=re.I):
+            for next_line in lines[idx + 1 :]:
+                if not next_line:
+                    continue
+                if re.fullmatch(r"card|invoice|cash", next_line, flags=re.I):
+                    return next_line.lower()
+                break
     return ""
 
 
@@ -316,6 +332,7 @@ def normalize_user_sections(description: str | None) -> str:
         text,
         flags=re.I | re.S,
     )
+    text = _collapse_control_answer_lines(text)
     text = _bold_invoice_amounts(text)
     text = "\n".join(_format_process_prompt_line(l) for l in text.splitlines())
     return _normalize_entry_layout(text)
@@ -538,6 +555,75 @@ def _reconcile_invoice_lines_before_block(description: str | None) -> str:
     if not m_gap2:
         return text
     return text[: m_gap2.start()] + "[/contact]" + rebuilt_gap + "[invoice]" + text[m_gap2.end() :]
+
+
+def _collapse_control_answer_lines(text: str) -> str:
+    """
+    Collapse mobile/editor-friendly two-line answers into canonical controls:
+      PAYMENT TYPE (CARD/INVOICE) =
+      INVOICE
+    becomes:
+      PAYMENT TYPE (CARD/INVOICE) = INVOICE
+
+    Only exact next-line answers are accepted; unrelated notes are left alone.
+    """
+    import re
+
+    if not text:
+        return ""
+
+    lines = text.splitlines()
+    out: list[str] = []
+    consumed: set[int] = set()
+
+    def plain(value: str) -> str:
+        return re.sub(r"<[^>]+>", "", value or "").strip()
+
+    def find_next_answer(start_idx: int, answer_re: str) -> tuple[int | None, str]:
+        for next_idx in range(start_idx + 1, len(lines)):
+            candidate = plain(lines[next_idx])
+            if not candidate:
+                continue
+            if re.fullmatch(answer_re, candidate, flags=re.I):
+                return next_idx, candidate.upper()
+            return None, ""
+        return None, ""
+
+    payment_blank_re = (
+        r"(?:payment(?:\s*type)?|card\s*(?:or|/)\s*invoice(?:\s*(?:or|/)\s*cash)?)"
+        r"\s*(?:\([^)]*\))?\s*(?:=|:)\s*"
+    )
+    send_blank_re = r"send(?:\s+now)?\s*(?:\(\s*y\s*/\s*n\s*\)|y\s*/\s*n)?\s*(?:=|:)\s*"
+    process_blank_re = (
+        r"(?:process\s*draft\s*\(\s*y\s*/\s*n\s*\)|(?:done\s+)?y\s*/\s*n)"
+        r"\s*(?:=|:)\s*"
+    )
+
+    for idx, raw in enumerate(lines):
+        if idx in consumed:
+            continue
+        stripped = plain(raw)
+        if re.fullmatch(payment_blank_re, stripped, flags=re.I):
+            answer_idx, answer = find_next_answer(idx, r"card|invoice|cash")
+            if answer_idx is not None:
+                out.append(f"{PAYMENT_TYPE_PROMPT} {answer}")
+                consumed.add(answer_idx)
+                continue
+        if re.fullmatch(send_blank_re, stripped, flags=re.I):
+            answer_idx, answer = find_next_answer(idx, r"y|yes|n|no")
+            if answer_idx is not None:
+                out.append(f"{SEND_PROMPT} {answer}")
+                consumed.add(answer_idx)
+                continue
+        if re.fullmatch(process_blank_re, stripped, flags=re.I):
+            answer_idx, answer = find_next_answer(idx, r"y|yes|n|no")
+            if answer_idx is not None:
+                out.append(f"{PROCESS_DRAFT_PROMPT} {answer}")
+                consumed.add(answer_idx)
+                continue
+        out.append(raw)
+
+    return "\n".join(out)
 
 
 def _normalize_entry_layout(text: str) -> str:
@@ -1692,6 +1778,25 @@ def _format_process_prompt_line(line: str) -> str:
     plain = re.sub(r"<[^>]+>", "", line or "").strip()
     if not plain:
         return line
+    m_payment = re.fullmatch(
+        r"(?:payment(?:\s*type)?|card\s*(?:or|/)\s*invoice(?:\s*(?:or|/)\s*cash)?)"
+        r"\s*(?:\([^)]*\))?\s*(?:=|:)\s*(card|invoice|cash)?\s*",
+        plain,
+        flags=re.I,
+    )
+    if m_payment:
+        answer = (m_payment.group(1) or "").upper()
+        body = f"{PAYMENT_TYPE_PROMPT} {answer}".rstrip()
+        return f"<b>{body}</b>"
+    m_send = re.fullmatch(
+        r"send(?:\s+now)?\s*(?:\(\s*y\s*/\s*n\s*\)|y\s*/\s*n)?\s*(?:=|:)\s*(y|n|yes|no)?\s*",
+        plain,
+        flags=re.I,
+    )
+    if m_send:
+        answer = (m_send.group(1) or "").upper()
+        body = f"{SEND_PROMPT} {answer}".rstrip()
+        return f"<b>{body}</b>"
     if re.fullmatch(
         r"(?:process\s*draft\s*\(\s*y\s*/\s*n\s*\)|(?:done\s+)?y\s*/\s*n)\s*(?:=|:)\s*(?:y|n|yes|no)?\s*",
         plain,
@@ -1706,11 +1811,21 @@ def _format_process_prompt_line(line: str) -> str:
 def _extract_existing_payment_type(description: str) -> str:
     import re
 
+    choice = payment_choice(description)
+    if choice:
+        return f"{PAYMENT_TYPE_PROMPT} {choice.upper()}"
+
     text = _normalize_description(description or "")
     for raw in text.splitlines():
         line = re.sub(r"<[^>]+>", "", raw).strip()
-        if "payment type" in line.lower():
-            return line
+        m = re.match(
+            r"^(?:payment(?:\s*type)?|card\s*(?:or|/)\s*invoice(?:\s*(?:or|/)\s*cash)?)"
+            r"\s*(?:\([^)]*\))?\s*(?:=|:)\s*(card|invoice|cash)\b",
+            line,
+            flags=re.I,
+        )
+        if m:
+            return f"{PAYMENT_TYPE_PROMPT} {m.group(1).upper()}"
     return ""
 
 

@@ -114,6 +114,15 @@ Rules:
 - Preserve internal sales section under `⬇Sales⬇`.
 - Keep invoice totals/status lines in the expected formatting path.
 - Bold handling currently runs through `event_processor` helpers; do not move ad-hoc to random call sites.
+- Managed control prompts are explicit state, not defaults:
+  - `PAYMENT TYPE (CARD/INVOICE) =` must remain blank until staff enter
+    `CARD`, `INVOICE`, or `CASH`.
+  - Never infer `CARD` from the prompt options text itself.
+  - If Calendar/mobile editing places the answer on the next nonblank line
+    immediately after the prompt, collapse it to the canonical single-line
+    prompt before processing.
+  - Apply the same immediate-next-line tolerance to `SEND NOW (Y/N) =` and
+    `PROCESS DRAFT (Y/N) =`; do not scan arbitrary later notes for answers.
 - Invoice-line normalizer must not reinterpret hyphenated descriptions as value separators.
   - `Pressure washing - Driveway = £165+VAT` must stay one description line.
 - Repeated-separator corruption must be self-healed:
@@ -154,6 +163,8 @@ These invariants exist specifically to prevent formatter loops and duplicate dra
 If any of the above is changed, run a targeted regression against:
 - one line with hyphenated description (`A - B = £x+VAT`)
 - one line with accidental extra equals (`A = B = = £x+VAT`)
+- blank `PAYMENT TYPE (CARD/INVOICE) =` staying blank after status rebuild
+- next-line control answers (`INVOICE` / `Y`) being collapsed and processed
 - repeated webhook/calendar sync events with unchanged invoice data.
 
 ## Change Checklist (Required)
