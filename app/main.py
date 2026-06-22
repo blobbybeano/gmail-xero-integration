@@ -4,6 +4,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import time
 from zoneinfo import ZoneInfo
 
@@ -233,11 +234,12 @@ def run() -> None:
         current_summary: str | None = None,
         calendar_id: str | None = None,
         draft_progress_increment: bool = False,
+        summary_override: str | None = None,
     ):
         import re
 
-        summary = None
-        if summary_status:
+        summary = summary_override
+        if summary is None and summary_status:
             # Never downgrade a paid/green title back to yellow/orange.
             # This avoids regressions when delayed poll paths run after a paid webhook update.
             if (
@@ -267,6 +269,8 @@ def run() -> None:
                 else:
                     # Non-draft states keep orange without progress dots.
                     draft_dots = 0
+            if extract_invoice_lines(description):
+                current_summary = _without_check_formatting_marker(current_summary)
             summary = set_title_status_emoji(
                 current_summary,
                 summary_status,
@@ -421,6 +425,19 @@ def run() -> None:
             if text.startswith(em):
                 return em
         return None
+
+    def _without_check_formatting_marker(summary: str | None) -> str:
+        return re.sub(
+            r"\s*(?:[-–—]\s*)?\(Check Formatting\)\s*$",
+            "",
+            summary or "",
+            flags=re.I,
+        ).strip()
+
+    def _with_check_formatting_marker(summary: str | None) -> str:
+        base = _without_check_formatting_marker(summary)
+        base = set_title_status_emoji(base, "orange")
+        return f"{base} (Check Formatting)"
 
     def _has_managed_sections(description: str | None) -> bool:
         text = (description or "").lower()
@@ -2025,10 +2042,46 @@ def run() -> None:
                 _allow_paid_reconcile = bool(
                     _event_is_past and (_is_hourly_reconcile_cycle or _event_targeted)
                 )
+                _budget_description = (
+                    normalize_user_sections(event.get("description") or "")
+                    if (has_done or has_send)
+                    else (event.get("description") or "")
+                )
+                _pre_budget_invoice_lines = extract_invoice_lines(_budget_description)
+                if has_done and event.get("id") and not _pre_budget_invoice_lines:
+                    event_updated = event.get("updated") or ""
+                    last_processed_update = get_processed_update_marker(state, event_key)
+                    marker_summary = _with_check_formatting_marker(event.get("summary"))
+                    next_description = _budget_description
+                    needs_calendar_update = bool(
+                        marker_summary != (event.get("summary") or "")
+                        or next_description != (event.get("description") or "")
+                    )
+                    if needs_calendar_update:
+                        updated = safe_update(
+                            event_id=event.get("id"),
+                            description=next_description,
+                            label="Check formatting",
+                            calendar_id=calendar_id,
+                            summary_override=marker_summary,
+                        )
+                        if updated:
+                            event["summary"] = updated.get("summary", marker_summary)
+                            event["description"] = updated.get("description", next_description)
+                            event["updated"] = updated.get("updated", event.get("updated"))
+                            event_updated = event.get("updated") or event_updated
+                    if event_updated != last_processed_update:
+                        _feed.push(
+                            f"Check formatting: \"{event.get('summary', event_id)}\" needs invoice line items",
+                            "warn",
+                        )
+                    state = set_processed_update_marker(state, event_key, event_updated)
+                    continue
                 _needs_xero_event_work = bool(
                     (
                         (has_done or has_send)
                         and not sent_state
+                        and len(_pre_budget_invoice_lines) > 0
                     )
                     or (
                         sent_state
@@ -2282,9 +2335,22 @@ def run() -> None:
                         continue
                     if has_done and not invoice_lines:
                         print(f"Event {event_id}: no invoice lines found, skipping invoice")
+                        marker_summary = _with_check_formatting_marker(event.get("summary"))
+                        if marker_summary != (event.get("summary") or ""):
+                            updated = safe_update(
+                                event_id=event.get("id"),
+                                description=event.get("description") or "",
+                                label="Check formatting",
+                                calendar_id=calendar_id,
+                                summary_override=marker_summary,
+                            )
+                            if updated:
+                                event["summary"] = updated.get("summary", marker_summary)
+                                event["updated"] = updated.get("updated", event.get("updated"))
+                                event_updated = event.get("updated") or event_updated
                         if event_updated != last_processed_update:
                             _feed.push(
-                                f"No job details in \"{event.get('summary', event_id)}\" — awaiting line items",
+                                f"Check formatting: \"{event.get('summary', event_id)}\" needs invoice line items",
                                 "warn",
                             )
                         state = set_processed_update_marker(state, event_key, event_updated)

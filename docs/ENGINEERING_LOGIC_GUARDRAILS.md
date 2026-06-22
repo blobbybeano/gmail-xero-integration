@@ -61,6 +61,11 @@ Primary controls:
 - `DONE` entries with no invoice line items must mark the current calendar
   update as handled and then stop. A later staff re-save changes `event.updated`
   and allows the app to check the entry again after line items are added.
+- Missing-line-item entries must not reserve a Xero processing slot. Mark the
+  title once with `(Check Formatting)` and do not retry until the entry is
+  re-saved. Once invoice lines exist, normal title updates must remove that
+  marker. This malformed-entry hold must run before integration issue marking,
+  title restamping, and Xero budget accounting.
 - Draft update must be fingerprint-gated (not generic `event.updated` gated):
   - in `app/main.py`, both draft-update paths now compute:
     - `_draft_sync_fingerprint(...)`
