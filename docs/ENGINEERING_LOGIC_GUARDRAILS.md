@@ -76,6 +76,15 @@ Primary controls:
     - `last_draft_fp = get_draft_sync_fingerprint(...)`
     - `should_try_update = (draft_fp != last_draft_fp) or (not last_draft_fp)`
   - this is intentional anti-loop protection against webhook/metadata churn.
+- Same-save submit/send is allowed only when safe:
+  - if staff enter `PROCESS DRAFT = Y`, a payment type, and `SEND NOW = Y`
+    together, the app may create the missing draft and then continue to send
+    in the same event processing pass.
+  - if the calendar notes already contain an `Invoice link:` but state has no
+    stored invoice id for the event, the app must stop with an explicit
+    duplicate-protection message instead of creating another Xero invoice.
+  - this guard must run before contact/invoice Xero lookups so rate limits do
+    not cause silent no-op behavior.
 
 Key files:
 - `app/main.py` (`_XERO_*` constants, per-event retry maps, hourly reconcile sections)

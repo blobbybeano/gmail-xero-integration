@@ -443,6 +443,16 @@ def run() -> None:
         text = (description or "").lower()
         return "[contact]" in text and "[invoice]" in text
 
+    def _extract_existing_invoice_link(description: str | None) -> str:
+        import re
+
+        text = re.sub(r"<[^>]+>", "", description or "")
+        for raw in text.replace("\r\n", "\n").replace("\r", "\n").splitlines():
+            line = raw.strip()
+            if line.lower().startswith("invoice link:"):
+                return line.split(":", 1)[1].strip()
+        return ""
+
     def _expected_title_status(
         description: str | None,
         *,
@@ -2360,6 +2370,31 @@ def run() -> None:
                             )
                         state = set_processed_update_marker(state, event_key, event_updated)
                         continue
+                    if has_send and invoice_lines and not existing_invoice_id:
+                        existing_invoice_link = _extract_existing_invoice_link(
+                            event.get("description")
+                        )
+                        if existing_invoice_link:
+                            failed_description = upsert_send_failure(
+                                event.get("description") or "",
+                                "Existing invoice link found but the app has no stored invoice ID. Stopped to avoid creating a duplicate; relink/check Xero before retry.",
+                                invoice_url=existing_invoice_link,
+                                submitter=submitter_display,
+                                submitted_at=submitted_at_display,
+                            )
+                            updated = safe_update(
+                                event_id=event.get("id"),
+                                description=failed_description,
+                                label="Invoice send failed",
+                                summary_status="orange",
+                                current_summary=event.get("summary"),
+                                calendar_id=calendar_id,
+                            )
+                            if updated:
+                                event["description"] = failed_description
+                                event_updated = updated.get("updated") or event_updated
+                            state = set_processed_update_marker(state, event_key, event_updated)
+                            continue
                     if is_processed(state, event_key):
                         # If we have a stored contact, update it only when the event changed.
                         existing_contact_id = get_contact_for_event(state, event_key)
@@ -2491,7 +2526,7 @@ def run() -> None:
                                 and xero_client
                                 and existing_contact_id
                                 and not is_invoice_sent(state, event_key)
-                                and not has_send
+                                and (not has_send or not get_invoice_for_event(state, event_key))
                             ):
                                 invoice_id = get_invoice_for_event(state, event_key)
                                 last_invoice_update = get_invoice_update_marker(
@@ -2517,6 +2552,30 @@ def run() -> None:
                                     (now_ts - last_draft_attempt) < _DRAFT_SYNC_COOLDOWN_SECONDS
                                 )
                                 if not invoice_id:
+                                    existing_invoice_link = _extract_existing_invoice_link(
+                                        event.get("description")
+                                    )
+                                    if has_send and existing_invoice_link:
+                                        failed_description = upsert_send_failure(
+                                            event.get("description") or "",
+                                            "Existing invoice link found but the app has no stored invoice ID. Stopped to avoid creating a duplicate; relink/check Xero before retry.",
+                                            invoice_url=existing_invoice_link,
+                                            submitter=submitter_display,
+                                            submitted_at=submitted_at_display,
+                                        )
+                                        updated = safe_update(
+                                            event_id=event.get("id"),
+                                            description=failed_description,
+                                            label="Invoice send failed",
+                                            summary_status="orange",
+                                            current_summary=event.get("summary"),
+                                            calendar_id=calendar_id,
+                                        )
+                                        if updated:
+                                            event["description"] = failed_description
+                                            event_updated = updated.get("updated") or event_updated
+                                        state = set_processed_update_marker(state, event_key, event_updated)
+                                        continue
                                     if in_cooldown and draft_fp == last_draft_fp:
                                         if event_updated:
                                             state = set_invoice_update_marker(
@@ -3387,7 +3446,7 @@ def run() -> None:
                                 and contact
                                 and contact.get("ContactID")
                                 and not is_invoice_sent(state, event_key)
-                                and not has_send
+                                and (not has_send or not get_invoice_for_event(state, event_key))
                             ):
                                 event_updated = event.get("updated") or ""
                                 invoice_id = get_invoice_for_event(state, event_key)
@@ -3411,6 +3470,30 @@ def run() -> None:
                                     (now_ts - last_draft_attempt) < _DRAFT_SYNC_COOLDOWN_SECONDS
                                 )
                                 if not invoice_id:
+                                    existing_invoice_link = _extract_existing_invoice_link(
+                                        event.get("description")
+                                    )
+                                    if has_send and existing_invoice_link:
+                                        failed_description = upsert_send_failure(
+                                            event.get("description") or "",
+                                            "Existing invoice link found but the app has no stored invoice ID. Stopped to avoid creating a duplicate; relink/check Xero before retry.",
+                                            invoice_url=existing_invoice_link,
+                                            submitter=submitter_display,
+                                            submitted_at=submitted_at_display,
+                                        )
+                                        updated = safe_update(
+                                            event_id=event.get("id"),
+                                            description=failed_description,
+                                            label="Invoice send failed",
+                                            summary_status="orange",
+                                            current_summary=event.get("summary"),
+                                            calendar_id=calendar_id,
+                                        )
+                                        if updated:
+                                            event["description"] = failed_description
+                                            event_updated = updated.get("updated") or event_updated
+                                        state = set_processed_update_marker(state, event_key, event_updated)
+                                        continue
                                     if in_cooldown and draft_fp == last_draft_fp:
                                         if event_updated:
                                             state = set_invoice_update_marker(
