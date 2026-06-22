@@ -455,7 +455,7 @@ def run() -> None:
     ) -> str:
         desc_l = (description or "").lower()
         # If sending is requested but required integrations are down, show red immediately.
-        if integration_issues and (has_done or has_send):
+        if blocking_integration_issues and (has_done or has_send):
             return "red"
         # Resilience: if notes already show cash completion, keep green even if
         # runtime state flags were lost during a restart/redeploy.
@@ -1894,6 +1894,11 @@ def run() -> None:
                         break
                 if bad_watch:
                     integration_issues.append("google_webhook_not_attached")
+        blocking_integration_issues = [
+            issue
+            for issue in integration_issues
+            if issue in {"xero_disconnected", "google_disconnected", "calendar_read_failed"}
+        ]
 
         state = _flush_sheet_backlog(admin_creds, sheet_target, state)
         _flush_cash_backlog(admin_creds)
@@ -2191,7 +2196,7 @@ def run() -> None:
                     continue
                 # If integrations are down, mark actionable entries red so staff can
                 # immediately see they need intervention before retrying.
-                if integration_issues and (has_done or has_send):
+                if blocking_integration_issues and (has_done or has_send):
                     if not current_summary.startswith("🔴"):
                         updated = safe_update(
                             event_id=event.get("id"),
@@ -2204,11 +2209,11 @@ def run() -> None:
                         if updated:
                             event["updated"] = updated.get("updated", event.get("updated"))
                     print(
-                        f"Event {event_id}: blocked due to integration issues: {', '.join(integration_issues)}",
+                        f"Event {event_id}: blocked due to integration issues: {', '.join(blocking_integration_issues)}",
                         flush=True,
                     )
                     _feed.push(
-                        f"Blocked \"{event.get('summary', event_id)}\": {', '.join(integration_issues)}",
+                        f"Blocked \"{event.get('summary', event_id)}\": {', '.join(blocking_integration_issues)}",
                         "error",
                     )
                     continue

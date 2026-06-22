@@ -66,6 +66,10 @@ Primary controls:
   re-saved. Once invoice lines exist, normal title updates must remove that
   marker. This malformed-entry hold must run before integration issue marking,
   title restamping, and Xero budget accounting.
+- Red title stamping is reserved for genuinely blocking runtime failures:
+  Xero disconnected, Google disconnected, or calendar read failure. Sheet
+  routing/backlog issues and Google webhook registration warnings must not turn
+  job titles red because the app can still process or recover from those paths.
 - Draft update must be fingerprint-gated (not generic `event.updated` gated):
   - in `app/main.py`, both draft-update paths now compute:
     - `_draft_sync_fingerprint(...)`
