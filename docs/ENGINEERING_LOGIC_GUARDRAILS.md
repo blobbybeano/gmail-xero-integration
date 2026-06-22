@@ -62,9 +62,22 @@ Primary controls:
     event attributable to a real action where possible.
 - Draft-sync fingerprints are persisted on attempted draft-create calls so
   unchanged events do not repeatedly re-submit drafts during transient Xero failures.
+- Each event may carry a compact app-owned ledger at the bottom of the notes:
+  - human line: `App status: ...`
+  - machine line: `[app]s=...;r=...;fp=...;x=...;w=...[/app]`
+  - users should not edit this block manually; it records the app state,
+    reason, input/action fingerprint, Xero attempt count, and wait condition.
+  - Xero draft/send actions are hard-budgeted by event/action/fingerprint
+    (`XERO_ACTION_MAX_ATTEMPTS`, default 2). Once the same unchanged action
+    reaches the budget, the app marks the entry as needing human input and
+    must stop before calling Xero again.
 - Google Calendar webhook feed messages are coalesced. A burst of webhook pings
   must not create a misleading live-feed storm; the webhook may still queue the
   exact changed calendar for incremental sync.
+- On webhook-targeted calendar cycles, the app reads recently updated events on
+  that calendar in addition to the normal date windows. This lets an old event
+  edited today be considered once without bringing all old untouched events
+  back into Xero processing.
 - `DONE` entries with no invoice line items must mark the current calendar
   update as handled and then stop. A later staff re-save changes `event.updated`
   and allows the app to check the entry again after line items are added.
@@ -87,6 +100,10 @@ Primary controls:
   - if staff enter `PROCESS DRAFT = Y`, a payment type, and `SEND NOW = Y`
     together, the app may create the missing draft and then continue to send
     in the same event processing pass.
+  - `SEND NOW = Y` is a one-shot command. After successful processing the
+    status block must show `Invoice sent ✅` rather than leaving a reusable send
+    command active; repeated sends are also gated by the app ledger/action
+    fingerprint budget.
   - if the calendar notes already contain an `Invoice link:` but state has no
     stored invoice id for the event, the app must stop with an explicit
     duplicate-protection message instead of creating another Xero invoice.

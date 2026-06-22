@@ -54,7 +54,9 @@ from .event_processor import (
     collapse_invoice_override_section,
     parse_event_address,
     payment_choice,
+    parse_app_ledger,
     upsert_invoice_profile_missing_hint,
+    upsert_app_ledger,
     upsert_send_failure,
     upsert_invoice_summary,
     upsert_cash_confirmation,
@@ -67,6 +69,7 @@ from .event_processor import (
 from .google_calendar import (
     build_calendar_service,
     list_recent_events,
+    list_updated_events,
     update_event_description,
     register_calendar_watch,
     stop_calendar_watch,
@@ -99,6 +102,9 @@ from .state import (
     is_invoice_paid,
     is_processed,
     load_state,
+    bump_xero_action_attempts,
+    clear_xero_action_attempts,
+    get_xero_action_attempts,
     mark_prefilled,
     mark_invoice_sent,
     mark_invoice_paid,
@@ -214,6 +220,9 @@ def run() -> None:
     )
     _DRAFT_SYNC_COOLDOWN_SECONDS = max(
         int(os.getenv("DRAFT_SYNC_COOLDOWN_SECONDS", "120") or "120"), 10
+    )
+    _XERO_ACTION_MAX_ATTEMPTS = max(
+        int(os.getenv("XERO_ACTION_MAX_ATTEMPTS", "2") or "2"), 1
     )
 
     backoff_seconds = max(config.poll_seconds, 5)
@@ -1419,6 +1428,80 @@ def run() -> None:
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
+    def _xero_action_fingerprint(
+        *,
+        action: str,
+        draft_fp: str,
+        invoice_id: str = "",
+        payment_mode: str = "",
+    ) -> str:
+        payload = {
+            "action": str(action or "").lower(),
+            "draft_fp": str(draft_fp or ""),
+            "invoice_id": str(invoice_id or ""),
+            "payment_mode": str(payment_mode or "").lower(),
+        }
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+
+    def _xero_attempts_for(
+        *,
+        event_key: str,
+        action: str,
+        fingerprint: str,
+        description: str | None,
+    ) -> int:
+        attempts = get_xero_action_attempts(state, event_key, action, fingerprint)
+        ledger = parse_app_ledger(description)
+        if ledger.get("fp") == fingerprint:
+            try:
+                attempts = max(attempts, int(ledger.get("x") or 0))
+            except Exception:
+                pass
+        return attempts
+
+    def _mark_xero_action_blocked(
+        *,
+        event: dict,
+        event_key: str,
+        action: str,
+        fingerprint: str,
+        attempts: int,
+        reason: str,
+        calendar_id: str,
+    ) -> str:
+        nonlocal state
+
+        message = "Needs input - repeated Xero attempts stopped"
+        blocked_description = upsert_app_ledger(
+            event.get("description") or "",
+            message=message,
+            state="needs_input",
+            reason=reason,
+            fingerprint=fingerprint,
+            xero_attempts=attempts,
+            wait="human_save",
+        )
+        updated = safe_update(
+            event_id=event.get("id"),
+            description=blocked_description,
+            label=f"Xero {action} stopped",
+            summary_status="orange",
+            current_summary=event.get("summary"),
+            calendar_id=calendar_id,
+        )
+        event_updated = event.get("updated") or ""
+        if updated:
+            event["description"] = blocked_description
+            event["updated"] = updated.get("updated", event.get("updated"))
+            event_updated = event.get("updated") or event_updated
+        state = set_processed_update_marker(state, event_key, event_updated)
+        _feed.push(
+            f"Stopped repeated Xero {action} for \"{event.get('summary', event.get('id'))}\" — human input needed",
+            "warn",
+        )
+        return event_updated
+
     while True:
         now = dt.datetime.now(dt.timezone.utc)
         _now_ts_for_xero = time.time()
@@ -1662,6 +1745,14 @@ def run() -> None:
         for calendar_id in calendars_to_scan:
             try:
                 cal_events: list[dict] = []
+                if _is_targeted_cycle:
+                    cal_events.extend(
+                        list_updated_events(
+                            config=config,
+                            updated_min=query_updated_min,
+                            calendar_id=calendar_id,
+                        )
+                    )
                 for _time_min, _time_max in _scan_windows:
                     cal_events.extend(
                         list_recent_events(
@@ -2016,7 +2107,18 @@ def run() -> None:
                     event_updated = event.get("updated") or ""
                     last_processed_update = get_processed_update_marker(state, event_key)
                     marker_summary = _with_check_formatting_marker(event.get("summary"))
-                    next_description = _budget_description
+                    _format_fp = hashlib.sha1(
+                        _budget_description.encode("utf-8")
+                    ).hexdigest()[:10]
+                    next_description = upsert_app_ledger(
+                        _budget_description,
+                        message="Needs input - missing invoice lines",
+                        state="needs_input",
+                        reason="missing_lines",
+                        fingerprint=_format_fp,
+                        xero_attempts=0,
+                        wait="human_save",
+                    )
                     needs_calendar_update = bool(
                         marker_summary != (event.get("summary") or "")
                         or next_description != (event.get("description") or "")
@@ -2300,16 +2402,41 @@ def run() -> None:
                     if has_done and not invoice_lines:
                         print(f"Event {event_id}: no invoice lines found, skipping invoice")
                         marker_summary = _with_check_formatting_marker(event.get("summary"))
+                        _format_fp = hashlib.sha1(
+                            (event.get("description") or "").encode("utf-8")
+                        ).hexdigest()[:10]
+                        format_description = upsert_app_ledger(
+                            event.get("description") or "",
+                            message="Needs input - missing invoice lines",
+                            state="needs_input",
+                            reason="missing_lines",
+                            fingerprint=_format_fp,
+                            xero_attempts=0,
+                            wait="human_save",
+                        )
                         if marker_summary != (event.get("summary") or ""):
                             updated = safe_update(
                                 event_id=event.get("id"),
-                                description=event.get("description") or "",
+                                description=format_description,
                                 label="Check formatting",
                                 calendar_id=calendar_id,
                                 summary_override=marker_summary,
                             )
                             if updated:
                                 event["summary"] = updated.get("summary", marker_summary)
+                                event["description"] = updated.get("description", format_description)
+                                event["updated"] = updated.get("updated", event.get("updated"))
+                                event_updated = event.get("updated") or event_updated
+                        elif format_description != (event.get("description") or ""):
+                            updated = safe_update(
+                                event_id=event.get("id"),
+                                description=format_description,
+                                label="Check formatting",
+                                calendar_id=calendar_id,
+                                current_summary=event.get("summary"),
+                            )
+                            if updated:
+                                event["description"] = updated.get("description", format_description)
                                 event["updated"] = updated.get("updated", event.get("updated"))
                                 event_updated = event.get("updated") or event_updated
                         if event_updated != last_processed_update:
@@ -2531,9 +2658,37 @@ def run() -> None:
                                                 state, event_key, event_updated
                                             )
                                         continue
+                                    draft_action_fp = _xero_action_fingerprint(
+                                        action="draft",
+                                        draft_fp=draft_fp,
+                                        payment_mode=payment_choice(event.get("description")) or "",
+                                    )
+                                    draft_attempts = _xero_attempts_for(
+                                        event_key=event_key,
+                                        action="draft",
+                                        fingerprint=draft_action_fp,
+                                        description=event.get("description"),
+                                    )
+                                    if draft_attempts >= _XERO_ACTION_MAX_ATTEMPTS:
+                                        event_updated = _mark_xero_action_blocked(
+                                            event=event,
+                                            event_key=event_key,
+                                            action="draft",
+                                            fingerprint=draft_action_fp,
+                                            attempts=draft_attempts,
+                                            reason="draft_attempt_limit",
+                                            calendar_id=calendar_id,
+                                        )
+                                        continue
                                     print(f"Event {event_id}: creating draft invoice")
                                     _feed.push(f"Creating invoice in Xero for \"{event.get('summary', event_id)}\"…", "info")
                                     details = extract_event_details(event)
+                                    state, draft_attempts = bump_xero_action_attempts(
+                                        state,
+                                        event_key,
+                                        "draft",
+                                        draft_action_fp,
+                                    )
                                     state = set_draft_sync_attempted_at(state, event_key, now_ts)
                                     # Persist attempted fingerprint before Xero call so
                                     # repeated cycles with unchanged data do not re-fire
@@ -2576,6 +2731,15 @@ def run() -> None:
                                             submitter=submitter_display,
                                             submitted_at=submitted_at_display,
                                         )
+                                        updated_description = upsert_app_ledger(
+                                            updated_description,
+                                            message="Draft ready",
+                                            state="draft",
+                                            reason="ok",
+                                            fingerprint=draft_action_fp,
+                                            xero_attempts=draft_attempts,
+                                            wait="send",
+                                        )
                                         if updated_description != (event.get("description") or ""):
                                             updated = safe_update(
                                                 event_id=event.get("id"),
@@ -2606,6 +2770,35 @@ def run() -> None:
                                                 state, event_key, event_updated
                                             )
                                     else:
+                                        draft_action_fp = _xero_action_fingerprint(
+                                            action="draft",
+                                            draft_fp=draft_fp,
+                                            invoice_id=invoice_id,
+                                            payment_mode=payment_choice(event.get("description")) or "",
+                                        )
+                                        draft_attempts = _xero_attempts_for(
+                                            event_key=event_key,
+                                            action="draft",
+                                            fingerprint=draft_action_fp,
+                                            description=event.get("description"),
+                                        )
+                                        if draft_attempts >= _XERO_ACTION_MAX_ATTEMPTS:
+                                            event_updated = _mark_xero_action_blocked(
+                                                event=event,
+                                                event_key=event_key,
+                                                action="draft",
+                                                fingerprint=draft_action_fp,
+                                                attempts=draft_attempts,
+                                                reason="draft_attempt_limit",
+                                                calendar_id=calendar_id,
+                                            )
+                                            continue
+                                        state, draft_attempts = bump_xero_action_attempts(
+                                            state,
+                                            event_key,
+                                            "draft",
+                                            draft_action_fp,
+                                        )
                                         state = set_draft_sync_attempted_at(
                                             state, event_key, now_ts
                                         )
@@ -2725,6 +2918,15 @@ def run() -> None:
                                                     submitter=submitter_display,
                                                     submitted_at=submitted_at_display,
                                                 )
+                                                updated_description = upsert_app_ledger(
+                                                    updated_description,
+                                                    message="Draft updated",
+                                                    state="draft",
+                                                    reason="ok",
+                                                    fingerprint=draft_action_fp,
+                                                    xero_attempts=draft_attempts,
+                                                    wait="send",
+                                                )
                                                 if updated_description != (event.get("description") or ""):
                                                     updated = safe_update(
                                                         event_id=event.get("id"),
@@ -2791,6 +2993,35 @@ def run() -> None:
                                         event_updated = updated.get("updated") or event_updated
                                     state = set_processed_update_marker(state, event_key, event_updated)
                                     continue
+                                send_action_fp = _xero_action_fingerprint(
+                                    action="send",
+                                    draft_fp=draft_fp,
+                                    invoice_id=invoice_id or "",
+                                    payment_mode=pay_mode,
+                                )
+                                send_attempts = _xero_attempts_for(
+                                    event_key=event_key,
+                                    action="send",
+                                    fingerprint=send_action_fp,
+                                    description=event.get("description"),
+                                )
+                                if send_attempts >= _XERO_ACTION_MAX_ATTEMPTS:
+                                    event_updated = _mark_xero_action_blocked(
+                                        event=event,
+                                        event_key=event_key,
+                                        action="send",
+                                        fingerprint=send_action_fp,
+                                        attempts=send_attempts,
+                                        reason="send_attempt_limit",
+                                        calendar_id=calendar_id,
+                                    )
+                                    continue
+                                state, send_attempts = bump_xero_action_attempts(
+                                    state,
+                                    event_key,
+                                    "send",
+                                    send_action_fp,
+                                )
                                 # Final pre-send invoice sync:
                                 # if staff edited amounts/lines and pressed SEND in the same save,
                                 # force draft invoice to match current calendar content before
@@ -2826,6 +3057,16 @@ def run() -> None:
                                             ),
                                             submitter=submitter_display,
                                             submitted_at=submitted_at_display,
+                                        )
+                                        failed_description = upsert_app_ledger(
+                                            failed_description,
+                                            message="Needs input - pre-send sync failed",
+                                            state="error",
+                                            reason="pre_send_sync_failed",
+                                            fingerprint=send_action_fp,
+                                            xero_attempts=send_attempts,
+                                            wait="human_save",
+                                            invoice=invoice_id[:8],
                                         )
                                         updated = safe_update(
                                             event_id=event.get("id"),
@@ -2935,6 +3176,16 @@ def run() -> None:
                                             submitter=submitter_display,
                                             submitted_at=submitted_at_display,
                                         )
+                                        failed_description = upsert_app_ledger(
+                                            failed_description,
+                                            message="Needs input - send failed",
+                                            state="error",
+                                            reason="send_failed",
+                                            fingerprint=send_action_fp,
+                                            xero_attempts=send_attempts,
+                                            wait="human_save",
+                                            invoice=invoice_id[:8],
+                                        )
                                         updated = safe_update(
                                             event_id=event.get("id"),
                                             description=failed_description,
@@ -2985,6 +3236,16 @@ def run() -> None:
                                                 submitter=submitter_display,
                                                 submitted_at=submitted_at_display,
                                             )
+                                            failed_description = upsert_app_ledger(
+                                                failed_description,
+                                                message="Needs input - card payment failed",
+                                                state="error",
+                                                reason="card_payment_failed",
+                                                fingerprint=send_action_fp,
+                                                xero_attempts=send_attempts,
+                                                wait="human_save",
+                                                invoice=invoice_id[:8],
+                                            )
                                             updated = safe_update(
                                                 event_id=event.get("id"),
                                                 description=failed_description,
@@ -3024,6 +3285,16 @@ def run() -> None:
                                             invoice_url=xero_client.get_online_invoice_url(invoice_id),
                                             submitter=submitter_display,
                                             submitted_at=submitted_at_display,
+                                        )
+                                        failed_description = upsert_app_ledger(
+                                            failed_description,
+                                            message="Needs input - email failed",
+                                            state="error",
+                                            reason="email_failed",
+                                            fingerprint=send_action_fp,
+                                            xero_attempts=send_attempts,
+                                            wait="human_save",
+                                            invoice=invoice_id[:8],
                                         )
                                         updated = safe_update(
                                             event_id=event.get("id"),
@@ -3076,6 +3347,16 @@ def run() -> None:
                                     submitter=submitter_display,
                                     submitted_at=submitted_at_display,
                                 )
+                                updated_description = upsert_app_ledger(
+                                    updated_description,
+                                    message=f"Sent - {invoice_id[:8]}",
+                                    state="sent",
+                                    reason="ok",
+                                    fingerprint=send_action_fp,
+                                    xero_attempts=send_attempts,
+                                    wait="none",
+                                    invoice=invoice_id[:8],
+                                )
                                 if updated_description != (event.get("description") or ""):
                                     updated = safe_update(
                                         event_id=event.get("id"),
@@ -3091,6 +3372,7 @@ def run() -> None:
                                 state = mark_invoice_sent(state, event_key)
                                 if pay_mode == "card":
                                     state = mark_invoice_paid(state, event_key)
+                                state = clear_xero_action_attempts(state, event_key)
                                 state = set_invoice_update_marker(
                                     state, event_key, event_updated
                                 )
@@ -3449,6 +3731,34 @@ def run() -> None:
                                                 state, event_key, event_updated
                                             )
                                         continue
+                                    draft_action_fp = _xero_action_fingerprint(
+                                        action="draft",
+                                        draft_fp=draft_fp,
+                                        payment_mode=payment_choice(event.get("description")) or "",
+                                    )
+                                    draft_attempts = _xero_attempts_for(
+                                        event_key=event_key,
+                                        action="draft",
+                                        fingerprint=draft_action_fp,
+                                        description=event.get("description"),
+                                    )
+                                    if draft_attempts >= _XERO_ACTION_MAX_ATTEMPTS:
+                                        event_updated = _mark_xero_action_blocked(
+                                            event=event,
+                                            event_key=event_key,
+                                            action="draft",
+                                            fingerprint=draft_action_fp,
+                                            attempts=draft_attempts,
+                                            reason="draft_attempt_limit",
+                                            calendar_id=calendar_id,
+                                        )
+                                        continue
+                                    state, draft_attempts = bump_xero_action_attempts(
+                                        state,
+                                        event_key,
+                                        "draft",
+                                        draft_action_fp,
+                                    )
                                     state = set_draft_sync_attempted_at(state, event_key, now_ts)
                                     # Persist attempted fingerprint before Xero call so
                                     # repeated cycles with unchanged data do not re-fire
@@ -3489,6 +3799,15 @@ def run() -> None:
                                             submitter=submitter_display,
                                             submitted_at=submitted_at_display,
                                         )
+                                        updated_description = upsert_app_ledger(
+                                            updated_description,
+                                            message="Draft ready",
+                                            state="draft",
+                                            reason="ok",
+                                            fingerprint=draft_action_fp,
+                                            xero_attempts=draft_attempts,
+                                            wait="send",
+                                        )
                                         if updated_description != (event.get("description") or ""):
                                             updated = safe_update(
                                                 event_id=event.get("id"),
@@ -3525,6 +3844,35 @@ def run() -> None:
                                                 state, event_key, event_updated
                                             )
                                     else:
+                                        draft_action_fp = _xero_action_fingerprint(
+                                            action="draft",
+                                            draft_fp=draft_fp,
+                                            invoice_id=invoice_id,
+                                            payment_mode=payment_choice(event.get("description")) or "",
+                                        )
+                                        draft_attempts = _xero_attempts_for(
+                                            event_key=event_key,
+                                            action="draft",
+                                            fingerprint=draft_action_fp,
+                                            description=event.get("description"),
+                                        )
+                                        if draft_attempts >= _XERO_ACTION_MAX_ATTEMPTS:
+                                            event_updated = _mark_xero_action_blocked(
+                                                event=event,
+                                                event_key=event_key,
+                                                action="draft",
+                                                fingerprint=draft_action_fp,
+                                                attempts=draft_attempts,
+                                                reason="draft_attempt_limit",
+                                                calendar_id=calendar_id,
+                                            )
+                                            continue
+                                        state, draft_attempts = bump_xero_action_attempts(
+                                            state,
+                                            event_key,
+                                            "draft",
+                                            draft_action_fp,
+                                        )
                                         state = set_draft_sync_attempted_at(
                                             state, event_key, now_ts
                                         )
@@ -3644,6 +3992,15 @@ def run() -> None:
                                                     submitter=submitter_display,
                                                     submitted_at=submitted_at_display,
                                                 )
+                                                updated_description = upsert_app_ledger(
+                                                    updated_description,
+                                                    message="Draft updated",
+                                                    state="draft",
+                                                    reason="ok",
+                                                    fingerprint=draft_action_fp,
+                                                    xero_attempts=draft_attempts,
+                                                    wait="send",
+                                                )
                                                 if updated_description != (event.get("description") or ""):
                                                     updated = safe_update(
                                                         event_id=event.get("id"),
@@ -3705,6 +4062,35 @@ def run() -> None:
                                         event_updated = updated.get("updated") or event_updated
                                     state = set_processed_update_marker(state, event_key, event_updated)
                                     continue
+                                send_action_fp = _xero_action_fingerprint(
+                                    action="send",
+                                    draft_fp=draft_fp,
+                                    invoice_id=invoice_id or "",
+                                    payment_mode=pay_mode,
+                                )
+                                send_attempts = _xero_attempts_for(
+                                    event_key=event_key,
+                                    action="send",
+                                    fingerprint=send_action_fp,
+                                    description=event.get("description"),
+                                )
+                                if send_attempts >= _XERO_ACTION_MAX_ATTEMPTS:
+                                    event_updated = _mark_xero_action_blocked(
+                                        event=event,
+                                        event_key=event_key,
+                                        action="send",
+                                        fingerprint=send_action_fp,
+                                        attempts=send_attempts,
+                                        reason="send_attempt_limit",
+                                        calendar_id=calendar_id,
+                                    )
+                                    continue
+                                state, send_attempts = bump_xero_action_attempts(
+                                    state,
+                                    event_key,
+                                    "send",
+                                    send_action_fp,
+                                )
                                 # Final pre-send invoice sync:
                                 # if staff edited amounts/lines and pressed SEND in the same save,
                                 # force draft invoice to match current calendar content before
@@ -3990,6 +4376,16 @@ def run() -> None:
                                     submitter=submitter_display,
                                     submitted_at=submitted_at_display,
                                 )
+                                updated_description = upsert_app_ledger(
+                                    updated_description,
+                                    message=f"Sent - {invoice_id[:8]}",
+                                    state="sent",
+                                    reason="ok",
+                                    fingerprint=send_action_fp,
+                                    xero_attempts=send_attempts,
+                                    wait="none",
+                                    invoice=invoice_id[:8],
+                                )
                                 if updated_description != (event.get("description") or ""):
                                     updated = safe_update(
                                         event_id=event.get("id"),
@@ -4005,6 +4401,7 @@ def run() -> None:
                                 state = mark_invoice_sent(state, event_key)
                                 if pay_mode == "card":
                                     state = mark_invoice_paid(state, event_key)
+                                state = clear_xero_action_attempts(state, event_key)
                                 state = set_invoice_update_marker(
                                     state, event_key, event_updated
                                 )

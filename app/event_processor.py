@@ -5,6 +5,8 @@ from typing import Dict
 PROCESS_DRAFT_PROMPT = "PROCESS DRAFT (Y/N) ="
 PAYMENT_TYPE_PROMPT = "PAYMENT TYPE (CARD/INVOICE) ="
 SEND_PROMPT = "SEND NOW (Y/N) ="
+APP_LEDGER_START = "[app]"
+APP_LEDGER_END = "[/app]"
 
 # Engineering note:
 # This file defines parsing and formatting invariants used by live automation.
@@ -1709,6 +1711,7 @@ def _status_base_lines(description: str) -> list[str]:
         text,
         flags=re.I | re.S,
     )
+    text = strip_app_ledger(text)
     lines = text.splitlines()
     # Remove legacy status-only lines if they existed outside block.
     cleaned: list[str] = []
@@ -1732,6 +1735,91 @@ def _status_base_lines(description: str) -> list[str]:
             continue
         cleaned.append(line)
     return cleaned
+
+
+def parse_app_ledger(description: str | None) -> dict[str, str]:
+    import re
+
+    text = description or ""
+    match = re.search(
+        r"\[app\](.*?)\[/app\]",
+        text,
+        flags=re.I | re.S,
+    )
+    if not match:
+        return {}
+    out: dict[str, str] = {}
+    for part in match.group(1).strip().split(";"):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = re.sub(r"[^a-z0-9_]", "", key.strip().lower())
+        if key:
+            out[key] = value.strip()
+    return out
+
+
+def strip_app_ledger(description: str | None) -> str:
+    import re
+
+    text = description or ""
+    text = re.sub(
+        r"\n*\[app\].*?\[/app\]\s*",
+        "\n",
+        text,
+        flags=re.I | re.S,
+    )
+    text = re.sub(
+        r"(?im)^\s*App status:\s*.*(?:\n|$)",
+        "",
+        text,
+    )
+    return text.strip()
+
+
+def upsert_app_ledger(
+    description: str | None,
+    *,
+    message: str | None,
+    state: str,
+    reason: str = "",
+    fingerprint: str = "",
+    xero_attempts: int | None = None,
+    wait: str = "",
+    invoice: str = "",
+) -> str:
+    import re
+
+    def clean_value(value: str | int | None) -> str:
+        raw = "" if value is None else str(value)
+        return re.sub(r"[;\[\]\n\r]", " ", raw).strip()[:80]
+
+    base = strip_app_ledger(description)
+    fields = [
+        ("s", state),
+        ("r", reason),
+        ("fp", fingerprint),
+    ]
+    if xero_attempts is not None:
+        fields.append(("x", str(max(int(xero_attempts), 0))))
+    if wait:
+        fields.append(("w", wait))
+    if invoice:
+        fields.append(("inv", invoice))
+    ledger = ";".join(
+        f"{key}={clean_value(value)}"
+        for key, value in fields
+        if clean_value(value)
+    )
+    suffix: list[str] = []
+    if message:
+        suffix.append(f"App status: {clean_value(message)}")
+    suffix.append(f"{APP_LEDGER_START}{ledger}{APP_LEDGER_END}")
+    if base:
+        text = f"{base}\n\n" + "\n".join(suffix)
+    else:
+        text = "\n".join(suffix)
+    return _normalize_entry_layout(text)
 
 
 def _extract_existing_totals(description: str) -> tuple[str, str]:

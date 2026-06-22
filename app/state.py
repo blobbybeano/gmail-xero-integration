@@ -174,6 +174,46 @@ def set_draft_sync_attempted_at(state: Dict, event_id: str, when_ts: float) -> D
     return state
 
 
+def get_xero_action_attempts(
+    state: Dict,
+    event_id: str,
+    action: str,
+    fingerprint: str,
+) -> int:
+    key = f"{event_id}|{action}|{fingerprint}"
+    try:
+        return int((state.get("event_xero_action_attempts", {}) or {}).get(key) or 0)
+    except Exception:
+        return 0
+
+
+def bump_xero_action_attempts(
+    state: Dict,
+    event_id: str,
+    action: str,
+    fingerprint: str,
+) -> tuple[Dict, int]:
+    key = f"{event_id}|{action}|{fingerprint}"
+    mapping = state.get("event_xero_action_attempts", {})
+    try:
+        attempts = int(mapping.get(key) or 0) + 1
+    except Exception:
+        attempts = 1
+    mapping[key] = attempts
+    state["event_xero_action_attempts"] = mapping
+    return state, attempts
+
+
+def clear_xero_action_attempts(state: Dict, event_id: str) -> Dict:
+    mapping = state.get("event_xero_action_attempts", {})
+    if isinstance(mapping, dict):
+        prefix = f"{event_id}|"
+        state["event_xero_action_attempts"] = {
+            k: v for k, v in mapping.items() if not str(k).startswith(prefix)
+        }
+    return state
+
+
 def get_sheet_log_marker(state: Dict, event_id: str) -> str | None:
     return state.get("event_sheet_log_updates", {}).get(event_id)
 
@@ -249,6 +289,7 @@ def prune_state(state: Dict, keep_recent_events: int = 1500) -> Dict:
         "event_draft_sync_attempted_at",
         "event_xero_retry_after",
         "event_xero_retry_backoff",
+        "event_xero_action_attempts",
         "draft_cleanup_queue",
         "event_sheet_log_updates",
         "event_sales_log_updates",
@@ -265,7 +306,14 @@ def prune_state(state: Dict, keep_recent_events: int = 1500) -> Dict:
     for field in map_fields:
         value = state.get(field)
         if isinstance(value, dict):
-            state[field] = {k: v for k, v in value.items() if k in keep_keys}
+            if field == "event_xero_action_attempts":
+                state[field] = {
+                    k: v
+                    for k, v in value.items()
+                    if str(k).split("|", 1)[0] in keep_keys
+                }
+            else:
+                state[field] = {k: v for k, v in value.items() if k in keep_keys}
 
     for field in list_fields:
         value = state.get(field)
