@@ -53,6 +53,13 @@ Primary controls:
 - Per-event Xero retry backoff and retry-after maps.
 - Limited Xero events processed per cycle.
 - Hourly reconcile windows and bounded cleanup queues.
+- Xero health must be passive/event-driven:
+  - do not call Xero Organisation or other endpoints just to probe health,
+    clear lockout, or test whether a cooldown is over.
+  - once a 429 lockout is recorded, wait until the recorded timestamp expires;
+    the next real event-processing call may then proceed.
+  - this preserves Xero calls for customer work and keeps every rate-limit
+    event attributable to a real action where possible.
 - Draft-sync fingerprints are persisted on attempted draft-create calls so
   unchanged events do not repeatedly re-submit drafts during transient Xero failures.
 - Google Calendar webhook feed messages are coalesced. A burst of webhook pings

@@ -183,13 +183,6 @@ def run() -> None:
         int(os.getenv("XERO_EVENT_429_MAX_COOLDOWN_SECONDS", "90000") or "90000"),
         _XERO_EVENT_429_COOLDOWN_SECONDS,
     )
-    _XERO_LOCK_PROBE_SECONDS = max(
-        int(os.getenv("XERO_LOCK_PROBE_SECONDS", "1800") or "1800"), 300
-    )
-    _XERO_HEALTH_CHECK_SECONDS = max(
-        int(os.getenv("XERO_HEALTH_CHECK_SECONDS", "1800") or "1800"), 300
-    )
-    _last_xero_health_check_ts: float = 0.0
     _XERO_EVENTS_PER_CYCLE = max(int(os.getenv("XERO_EVENTS_PER_CYCLE", "4") or "4"), 1)
     _last_xero_429_notice_at: float = 0.0
 
@@ -1439,22 +1432,6 @@ def run() -> None:
             state["xero_lockout_updated_at_ts"] = _now_ts_for_xero
             if xero_client is not None:
                 xero_client = None
-            _last_probe = float(state.get("xero_lockout_last_probe_ts") or 0.0)
-            if (_now_ts_for_xero - _last_probe) >= _XERO_LOCK_PROBE_SECONDS:
-                state["xero_lockout_last_probe_ts"] = _now_ts_for_xero
-                try:
-                    _probe_client = _build_xero_client_safe()
-                    if _probe_client:
-                        _probe_client.get_organisation()
-                        state["xero_lockout_until_ts"] = 0.0
-                        state["xero_lockout_reason"] = ""
-                        state["xero_lockout_updated_at_ts"] = _now_ts_for_xero
-                        _xero_retry_after = 0.0
-                        xero_client = _probe_client
-                        _xero_built_at = _now_ts_for_xero
-                        _feed.push("Xero lockout cleared — processing resumed", "success")
-                except Exception:
-                    pass
             if (_now_ts_for_xero - _xero_lock_notice_ts) >= 300:
                 _mins = int(max(1, (_effective_lock_until - _now_ts_for_xero) // 60))
                 _feed.push(
@@ -1479,34 +1456,6 @@ def run() -> None:
                 _xero_retry_after = _now_ts_for_xero + 120
             else:
                 _xero_retry_after = 0.0
-        # Lightweight health check to detect lockouts even before staff submit anything.
-        if (
-            xero_client is not None
-            and _xero_retry_after <= _now_ts_for_xero
-            and (_now_ts_for_xero - _last_xero_health_check_ts) >= _XERO_HEALTH_CHECK_SECONDS
-        ):
-            _last_xero_health_check_ts = _now_ts_for_xero
-            try:
-                xero_client.get_organisation()
-            except Exception as exc:
-                if _is_xero_429(exc):
-                    _retry_hint_seconds = _xero_retry_after_hint_seconds(exc)
-                    _global_lock_until = float(get_xero_rate_limit_until_ts() or 0.0)
-                    _hint_lock_until = (
-                        (time.time() + _retry_hint_seconds)
-                        if _retry_hint_seconds
-                        else (time.time() + _XERO_429_COOLDOWN_SECONDS)
-                    )
-                    _xero_retry_after = max(_xero_retry_after, _global_lock_until, _hint_lock_until)
-                    state["xero_lockout_until_ts"] = _xero_retry_after
-                    state["xero_lockout_reason"] = "Xero API rate limit (429)"
-                    state["xero_lockout_updated_at_ts"] = time.time()
-                    xero_client = None
-                    _mins = int(max(1, (_xero_retry_after - time.time()) // 60))
-                    _feed.push(
-                        f"Xero lockout detected by health check — cooling down for ~{_mins}m.",
-                        "warn",
-                    )
 
         # Global on/off toggle
         _enabled = get_enabled(config.admin_db_file)
