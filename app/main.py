@@ -1979,16 +1979,21 @@ def run() -> None:
                 calendar_id = event.get("_calendar_id") or config.google_calendar_id
                 event_key = f"{calendar_id}:{event_id}"
                 _event_retry_after = float((state.get("event_xero_retry_after", {}) or {}).get(event_key) or 0.0)
-                if _event_retry_after and time.time() < _event_retry_after:
+                _global_xero_lock_active = bool(
+                    xero_client is None and time.time() < _xero_retry_after
+                )
+                if (
+                    _event_retry_after
+                    and time.time() < _event_retry_after
+                    and not _global_xero_lock_active
+                ):
                     _desc = event.get("description") or ""
                     if done_choice_is_yes(_desc) or send_choice_is_yes(_desc):
                         continue
-                # If Xero is in cooldown after a 429 burst, avoid touching actionable
-                # invoice events until the cooldown expires.
-                if xero_client is None and time.time() < _xero_retry_after:
-                    _desc = event.get("description") or ""
-                    if done_choice_is_yes(_desc) or send_choice_is_yes(_desc):
-                        continue
+                # During a global Xero lockout, keep processing calendar-only
+                # formatting/status work. Xero write/read branches are gated on
+                # xero_client being present, so they remain blocked without
+                # freezing notes prefill and "(Check Formatting)" updates.
                 submitter_email = (
                     (event.get("creator", {}) or {}).get("email")
                     or (event.get("organizer", {}) or {}).get("email")

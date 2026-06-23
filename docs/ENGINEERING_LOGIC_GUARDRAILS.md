@@ -64,6 +64,9 @@ Primary controls:
 - The admin dashboard must expose Xero pressure/lockout state from local app
   state only. It may show lockout countdowns, event retry counts, and action
   attempt counts, but must not call Xero just to populate a health meter.
+- A global Xero lockout must not freeze calendar-only formatting. Prefill,
+  normalization, title/status cleanup, and missing-line "(Check Formatting)"
+  updates may continue while Xero client work remains blocked.
 - Draft-sync fingerprints are persisted on attempted draft-create calls so
   unchanged events do not repeatedly re-submit drafts during transient Xero failures.
 - Each event may carry a compact app-owned ledger at the bottom of the notes:
