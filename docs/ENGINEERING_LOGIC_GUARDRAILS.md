@@ -205,6 +205,8 @@ These invariants exist specifically to prevent formatter loops and duplicate dra
   - update mutable draft invoice with current parsed `invoice_lines` before
     authorize/email/payment,
   - fail send with explicit error note if pre-send sync fails.
+  - build its own send fingerprint from current invoice lines/contact/payment
+    mode, because existing-draft SEND paths may skip the draft-sync branch.
 - `CARD` payment posts to Xero must use the Google Calendar appointment start
   date as the Xero payment date, not the machine/current date. This keeps late
   edits and catch-up processing from recording card payments on the wrong day.

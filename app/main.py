@@ -3070,9 +3070,17 @@ def run() -> None:
                                         event_updated = updated.get("updated") or event_updated
                                     state = set_processed_update_marker(state, event_key, event_updated)
                                     continue
+                                send_draft_fp = _draft_sync_fingerprint(
+                                    invoice_lines=invoice_lines,
+                                    contact_id=existing_contact_id
+                                    or get_contact_for_event(state, event_key)
+                                    or "",
+                                    payment_mode=pay_mode,
+                                    force_no_vat=invoice_has_cash_marker(event.get("description")),
+                                )
                                 send_action_fp = _xero_action_fingerprint(
                                     action="send",
-                                    draft_fp=draft_fp,
+                                    draft_fp=send_draft_fp,
                                     invoice_id=invoice_id or "",
                                     payment_mode=pay_mode,
                                 )
@@ -4162,9 +4170,17 @@ def run() -> None:
                                         event_updated = updated.get("updated") or event_updated
                                     state = set_processed_update_marker(state, event_key, event_updated)
                                     continue
+                                send_draft_fp = _draft_sync_fingerprint(
+                                    invoice_lines=invoice_lines,
+                                    contact_id=existing_contact_id
+                                    or get_contact_for_event(state, event_key)
+                                    or "",
+                                    payment_mode=pay_mode,
+                                    force_no_vat=invoice_has_cash_marker(event.get("description")),
+                                )
                                 send_action_fp = _xero_action_fingerprint(
                                     action="send",
-                                    draft_fp=draft_fp,
+                                    draft_fp=send_draft_fp,
                                     invoice_id=invoice_id or "",
                                     payment_mode=pay_mode,
                                 )
