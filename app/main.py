@@ -135,6 +135,29 @@ LONDON_TZ = ZoneInfo("Europe/London")
 # docs/ENGINEERING_LOGIC_GUARDRAILS.md in the same commit.
 
 
+def _event_start_date_iso(event: dict, *, fallback: dt.date | None = None) -> str:
+    start_obj = (event.get("start") or {}) if isinstance(event, dict) else {}
+    raw_date = str(start_obj.get("date") or "").strip()
+    if raw_date:
+        try:
+            return dt.date.fromisoformat(raw_date).isoformat()
+        except Exception:
+            pass
+
+    raw_dt = str(start_obj.get("dateTime") or "").strip()
+    if raw_dt:
+        try:
+            out = dt.datetime.fromisoformat(raw_dt.replace("Z", "+00:00"))
+            if out.tzinfo is None:
+                out = out.replace(tzinfo=LONDON_TZ)
+            return out.astimezone(LONDON_TZ).date().isoformat()
+        except Exception:
+            pass
+
+    fallback_date = fallback or dt.datetime.now(dt.timezone.utc).astimezone(LONDON_TZ).date()
+    return fallback_date.isoformat()
+
+
 def run() -> None:
     config = load_config()
     init_admin_store(config.admin_db_file)
@@ -3282,6 +3305,7 @@ def run() -> None:
                                                 xero_client.record_invoice_payment(
                                                     invoice_id=invoice_id,
                                                     amount=amount_due,
+                                                    when=_event_start_date_iso(event),
                                                 )
                                         except Exception as exc:
                                             print(f"Event {event_id}: failed to mark invoice paid: {exc}")
@@ -3542,6 +3566,7 @@ def run() -> None:
                                                 xero_client.record_invoice_payment(
                                                     invoice_id=invoice_id_retry,
                                                     amount=amount_due,
+                                                    when=_event_start_date_iso(event),
                                                 )
                                                 invoice_data = xero_client.get_invoice(invoice_id_retry)
                                                 status = str(invoice_data.get("Status") or "").upper()
@@ -4352,6 +4377,7 @@ def run() -> None:
                                                 xero_client.record_invoice_payment(
                                                     invoice_id=invoice_id,
                                                     amount=amount_due,
+                                                    when=_event_start_date_iso(event),
                                                 )
                                         except Exception as exc:
                                             print(f"Event {event.get('id')}: failed to mark invoice paid: {exc}")
