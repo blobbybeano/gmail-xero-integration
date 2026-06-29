@@ -210,13 +210,20 @@ These invariants exist specifically to prevent formatter loops and duplicate dra
 - `CARD` payment posts to Xero must use the Google Calendar appointment start
   date as the Xero payment date, not the machine/current date. This keeps late
   edits and catch-up processing from recording card payments on the wrong day.
+- If the linked Xero invoice is already `PAID`, the send path must not call
+  authorise, email, or payment mutation endpoints again. Treat it as already
+  complete, sync the calendar/sheet state, clear retry attempts, and stop.
+  `AUTHORISED` invoices can be emailed/paid if needed, but must not be
+  re-authorised.
 
 If any of the above is changed, run a targeted regression against:
 - one line with hyphenated description (`A - B = £x+VAT`)
 - one line with accidental extra equals (`A = B = = £x+VAT`)
 - blank `PAYMENT TYPE (CARD/INVOICE) =` staying blank after status rebuild
 - next-line control answers (`INVOICE` / `Y`) being collapsed and processed
-- repeated webhook/calendar sync events with unchanged invoice data.
+- repeated webhook/calendar sync events with unchanged invoice data
+- an already-paid linked invoice with `SEND NOW = Y` being synced without any
+  further Xero mutation calls.
 
 ## Change Checklist (Required)
 

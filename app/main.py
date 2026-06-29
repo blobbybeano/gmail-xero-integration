@@ -3114,6 +3114,7 @@ def run() -> None:
                                     "send",
                                     send_action_fp,
                                 )
+                                invoice_status_for_send = ""
                                 # Final pre-send invoice sync:
                                 # if staff edited amounts/lines and pressed SEND in the same save,
                                 # force draft invoice to match current calendar content before
@@ -3126,6 +3127,7 @@ def run() -> None:
                                     )
                                     try:
                                         mutable, status = _is_invoice_mutable(invoice_id)
+                                        invoice_status_for_send = status
                                         if mutable:
                                             xero_client.update_invoice(
                                                 invoice_id=invoice_id,
@@ -3249,15 +3251,84 @@ def run() -> None:
                                 invoice_url = None
                                 if invoice_id:
                                     try:
-                                        _issue_date = (
-                                            dt.datetime.now(dt.timezone.utc)
-                                            .astimezone(LONDON_TZ)
-                                            .date()
-                                            .isoformat()
-                                        )
-                                        xero_client.authorize_invoice(
-                                            invoice_id, issue_date=_issue_date
-                                        )
+                                        if not invoice_status_for_send:
+                                            invoice_status_for_send = (
+                                                xero_client.get_invoice(invoice_id).get("Status")
+                                                or ""
+                                            ).upper()
+                                        if invoice_status_for_send == "PAID":
+                                            invoice_url = xero_client.get_online_invoice_url(invoice_id)
+                                            updated_description = upsert_send_confirmation(
+                                                event.get("description") or "",
+                                                invoice_url=invoice_url,
+                                                submitter=submitter_display,
+                                                submitted_at=submitted_at_display,
+                                            )
+                                            updated_description = upsert_app_ledger(
+                                                updated_description,
+                                                message=f"Already paid - {invoice_id[:8]}",
+                                                state="sent",
+                                                reason="already_paid",
+                                                fingerprint=send_action_fp,
+                                                xero_attempts=send_attempts,
+                                                wait="none",
+                                                invoice=invoice_id[:8],
+                                            )
+                                            if updated_description != (event.get("description") or ""):
+                                                updated = safe_update(
+                                                    event_id=event.get("id"),
+                                                    description=updated_description,
+                                                    label="Invoice already paid",
+                                                    summary_status="green",
+                                                    current_summary=event.get("summary"),
+                                                    calendar_id=calendar_id,
+                                                )
+                                                if updated:
+                                                    event["description"] = updated_description
+                                                    event_updated = updated.get("updated") or event_updated
+                                            state = mark_invoice_sent(state, event_key)
+                                            state = mark_invoice_paid(state, event_key)
+                                            state = clear_xero_action_attempts(state, event_key)
+                                            state = set_invoice_update_marker(
+                                                state, event_key, event_updated
+                                            )
+                                            state = _append_sheet_stats_if_enabled(
+                                                event=event,
+                                                event_key=event_key,
+                                                invoice_id=invoice_id,
+                                                payment_method=pay_mode,
+                                                submitter_display=submitter_display,
+                                                admin_creds=admin_creds,
+                                                sheet_target=sheet_target,
+                                                stats_fields=stats_fields,
+                                                state=state,
+                                            )
+                                            if pay_mode == "card":
+                                                state = _append_sales_rows_if_enabled(
+                                                    event=event,
+                                                    event_key=event_key,
+                                                    invoice_id=invoice_id,
+                                                    payment_method=pay_mode,
+                                                    submitter_email=submitter_email,
+                                                    submitter_display=submitter_display,
+                                                    admin_creds=admin_creds,
+                                                    sales_sheet_target=sales_sheet_target,
+                                                    sales_stats_fields=sales_stats_fields,
+                                                    state=state,
+                                                )
+                                            print(f"Event {event_id}: invoice already paid, no send mutation needed")
+                                            state = set_processed_update_marker(state, event_key, event_updated)
+                                            continue
+                                        if invoice_status_for_send != "AUTHORISED":
+                                            _issue_date = (
+                                                dt.datetime.now(dt.timezone.utc)
+                                                .astimezone(LONDON_TZ)
+                                                .date()
+                                                .isoformat()
+                                            )
+                                            xero_client.authorize_invoice(
+                                                invoice_id, issue_date=_issue_date
+                                            )
                                     except Exception as exc:
                                         print(f"Event {event_id}: failed to authorise invoice for send: {exc}")
                                         fail_reason = str(exc).splitlines()[0][:220]
@@ -4214,6 +4285,7 @@ def run() -> None:
                                     "send",
                                     send_action_fp,
                                 )
+                                invoice_status_for_send = ""
                                 # Final pre-send invoice sync:
                                 # if staff edited amounts/lines and pressed SEND in the same save,
                                 # force draft invoice to match current calendar content before
@@ -4226,6 +4298,7 @@ def run() -> None:
                                     )
                                     try:
                                         mutable, status = _is_invoice_mutable(invoice_id)
+                                        invoice_status_for_send = status
                                         if mutable:
                                             xero_client.update_invoice(
                                                 invoice_id=invoice_id,
@@ -4339,15 +4412,84 @@ def run() -> None:
                                 invoice_url = None
                                 if invoice_id:
                                     try:
-                                        _issue_date = (
-                                            dt.datetime.now(dt.timezone.utc)
-                                            .astimezone(LONDON_TZ)
-                                            .date()
-                                            .isoformat()
-                                        )
-                                        xero_client.authorize_invoice(
-                                            invoice_id, issue_date=_issue_date
-                                        )
+                                        if not invoice_status_for_send:
+                                            invoice_status_for_send = (
+                                                xero_client.get_invoice(invoice_id).get("Status")
+                                                or ""
+                                            ).upper()
+                                        if invoice_status_for_send == "PAID":
+                                            invoice_url = xero_client.get_online_invoice_url(invoice_id)
+                                            updated_description = upsert_send_confirmation(
+                                                event.get("description") or "",
+                                                invoice_url=invoice_url,
+                                                submitter=submitter_display,
+                                                submitted_at=submitted_at_display,
+                                            )
+                                            updated_description = upsert_app_ledger(
+                                                updated_description,
+                                                message=f"Already paid - {invoice_id[:8]}",
+                                                state="sent",
+                                                reason="already_paid",
+                                                fingerprint=send_action_fp,
+                                                xero_attempts=send_attempts,
+                                                wait="none",
+                                                invoice=invoice_id[:8],
+                                            )
+                                            if updated_description != (event.get("description") or ""):
+                                                updated = safe_update(
+                                                    event_id=event.get("id"),
+                                                    description=updated_description,
+                                                    label="Invoice already paid",
+                                                    summary_status="green",
+                                                    current_summary=event.get("summary"),
+                                                    calendar_id=calendar_id,
+                                                )
+                                                if updated:
+                                                    event["description"] = updated_description
+                                                    event_updated = updated.get("updated") or event_updated
+                                            state = mark_invoice_sent(state, event_key)
+                                            state = mark_invoice_paid(state, event_key)
+                                            state = clear_xero_action_attempts(state, event_key)
+                                            state = set_invoice_update_marker(
+                                                state, event_key, event_updated
+                                            )
+                                            state = _append_sheet_stats_if_enabled(
+                                                event=event,
+                                                event_key=event_key,
+                                                invoice_id=invoice_id,
+                                                payment_method=pay_mode,
+                                                submitter_display=submitter_display,
+                                                admin_creds=admin_creds,
+                                                sheet_target=sheet_target,
+                                                stats_fields=stats_fields,
+                                                state=state,
+                                            )
+                                            if pay_mode == "card":
+                                                state = _append_sales_rows_if_enabled(
+                                                    event=event,
+                                                    event_key=event_key,
+                                                    invoice_id=invoice_id,
+                                                    payment_method=pay_mode,
+                                                    submitter_email=submitter_email,
+                                                    submitter_display=submitter_display,
+                                                    admin_creds=admin_creds,
+                                                    sales_sheet_target=sales_sheet_target,
+                                                    sales_stats_fields=sales_stats_fields,
+                                                    state=state,
+                                                )
+                                            print(f"Event {event.get('id')}: invoice already paid, no send mutation needed")
+                                            state = set_processed_update_marker(state, event_key, event_updated)
+                                            continue
+                                        if invoice_status_for_send != "AUTHORISED":
+                                            _issue_date = (
+                                                dt.datetime.now(dt.timezone.utc)
+                                                .astimezone(LONDON_TZ)
+                                                .date()
+                                                .isoformat()
+                                            )
+                                            xero_client.authorize_invoice(
+                                                invoice_id, issue_date=_issue_date
+                                            )
                                     except Exception as exc:
                                         print(f"Event {event.get('id')}: failed to authorise invoice for send: {exc}")
                                         fail_reason = str(exc).splitlines()[0][:220]

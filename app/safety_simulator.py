@@ -383,9 +383,34 @@ class SafetySimulator:
                 self._block_action(event_key, event, "send", send_fp, "send_attempt_limit")
                 return
             try:
-                self.xero.update_invoice(event_key=event_key, invoice_id=invoice_id, line_items=invoice_lines)
-                self.xero.authorize_invoice(event_key=event_key, invoice_id=invoice_id)
-                if mode == "card":
+                status = (self.xero.invoices[invoice_id].get("Status") or "").upper()
+                if status == "PAID":
+                    desc = upsert_send_confirmation(description, invoice_url=self.xero.online_url(invoice_id))
+                    desc = upsert_app_ledger(
+                        desc,
+                        message=f"Already paid - {invoice_id}",
+                        state="sent",
+                        reason="already_paid",
+                        fingerprint=send_fp,
+                        xero_attempts=get_xero_action_attempts(self.state, event_key, "send", send_fp),
+                        wait="none",
+                        invoice=invoice_id,
+                    )
+                    self.state = mark_invoice_sent(self.state, event_key)
+                    self.state = mark_invoice_paid(self.state, event_key)
+                    self.calendar.app_patch(
+                        event_key,
+                        description=desc,
+                        summary=self._set_status(event["summary"], "green"),
+                    )
+                    self.state = set_processed_update_marker(self.state, event_key, self.clock.iso())
+                    return
+                if status in {"DRAFT", "SUBMITTED"}:
+                    self.xero.update_invoice(event_key=event_key, invoice_id=invoice_id, line_items=invoice_lines)
+                    self.xero.authorize_invoice(event_key=event_key, invoice_id=invoice_id)
+                elif status != "AUTHORISED":
+                    raise FakeXeroError(f"Unsupported invoice status for send: {status or 'UNKNOWN'}")
+                if mode == "card" and (self.xero.invoices[invoice_id].get("Status") or "").upper() != "PAID":
                     self.xero.record_payment(event_key=event_key, invoice_id=invoice_id)
                 if not self.xero.email_invoice(event_key=event_key, invoice_id=invoice_id):
                     raise FakeXeroError("Xero simulated email failure")
@@ -577,6 +602,7 @@ SEND NOW (Y/N) =
 def run_default_suite() -> list[ScenarioResult]:
     results = [
         scenario_successful_invoice_send(),
+        scenario_already_paid_send_does_not_mutate_xero(),
         scenario_missing_lines_hold(),
         scenario_repeated_xero_429_stops(),
         scenario_token_refresh_before_draft(),
@@ -638,6 +664,49 @@ def scenario_successful_invoice_send() -> ScenarioResult:
         passed,
         [f"calls={calls}", f"ledger={parse_app_ledger(final.description)}"],
         len(calls),
+        sim.calendar.write_count,
+    )
+
+
+def scenario_already_paid_send_does_not_mutate_xero() -> ScenarioResult:
+    sim = _new_sim()
+    event = _event(
+        event_id="already-paid-send",
+        summary="🟢 PW W5 Barbara",
+        description=_draft_description(name="Barbara Paid", price=185),
+        clock=sim.clock,
+    )
+    key = FakeGoogleCalendar.key(event.calendar_id, event.id)
+    sim.calendar.add_event(event)
+    sim.run_until_idle()
+    invoice_id = get_invoice_for_event(sim.state, key) or ""
+    sim.xero.invoices[invoice_id]["Status"] = "PAID"
+    sim.xero.invoices[invoice_id]["AmountDue"] = 0.0
+    before_calls = len(sim.xero.call_log)
+    sim.clock.advance(60)
+    sim.calendar.user_edit(
+        key,
+        lambda ev: setattr(
+            ev,
+            "description",
+            ev.description.replace("SEND NOW (Y/N) =", "SEND NOW (Y/N) = Y"),
+        ),
+    )
+    sim.run_until_idle()
+    new_calls = sim.xero.call_log[before_calls:]
+    final = sim.calendar.events[key]
+    ledger = parse_app_ledger(final.description)
+    passed = (
+        not new_calls
+        and ledger.get("s") == "sent"
+        and ledger.get("r") == "already_paid"
+        and final.summary.startswith("🟢")
+    )
+    return ScenarioResult(
+        "already_paid_send_does_not_mutate_xero",
+        passed,
+        [f"new_calls={new_calls}", f"ledger={ledger}", f"summary={final.summary}"],
+        len(sim.xero.call_log),
         sim.calendar.write_count,
     )
 
