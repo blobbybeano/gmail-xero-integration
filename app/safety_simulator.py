@@ -5,6 +5,7 @@ import copy
 import datetime as dt
 import hashlib
 import json
+import random
 from dataclasses import dataclass, field
 from typing import Callable
 from zoneinfo import ZoneInfo
@@ -142,11 +143,17 @@ class FakeXeroRateLimit(FakeXeroError):
     pass
 
 
+class FakeXeroSafetyViolation(FakeXeroError):
+    pass
+
+
 @dataclass
 class FakeXero:
     fail_plan: dict[str, list[str]] = field(default_factory=dict)
     invoices: dict[str, dict] = field(default_factory=dict)
     call_log: list[dict] = field(default_factory=list)
+    safety_violations: list[str] = field(default_factory=list)
+    externally_paid_invoices: set[str] = field(default_factory=set)
     next_invoice_number: int = 1
     token_expired: bool = False
     refresh_plan: list[str] = field(default_factory=list)
@@ -164,6 +171,18 @@ class FakeXero:
 
     def _call(self, action: str, event_key: str = "", invoice_id: str = "") -> None:
         self.ensure_connected()
+        if invoice_id and invoice_id in self.externally_paid_invoices and action in {
+            "update_invoice",
+            "authorize_invoice",
+            "email_invoice",
+            "record_payment",
+        }:
+            message = (
+                f"blocked unsafe {action} against externally paid invoice "
+                f"{invoice_id} for {event_key}"
+            )
+            self.safety_violations.append(message)
+            raise FakeXeroSafetyViolation(message)
         self.call_log.append(
             {"action": action, "event_key": event_key, "invoice_id": invoice_id}
         )
@@ -225,6 +244,12 @@ class FakeXero:
         invoice["AmountDue"] = 0.0
         return {"Payments": [{"Invoice": {"InvoiceID": invoice_id}}]}
 
+    def mark_invoice_paid_external(self, invoice_id: str) -> None:
+        invoice = self.invoices[invoice_id]
+        invoice["Status"] = "PAID"
+        invoice["AmountDue"] = 0.0
+        self.externally_paid_invoices.add(invoice_id)
+
     def online_url(self, invoice_id: str) -> str:
         return f"https://fake.xero.test/{invoice_id}"
 
@@ -274,13 +299,9 @@ class SafetySimulator:
 
     def process_event(self, event: dict, *, targeted: bool = True) -> None:
         event_key = FakeGoogleCalendar.key(event["_calendar_id"], event["id"])
-        description = normalize_user_sections(event.get("description") or "")
-        if description != (event.get("description") or ""):
-            self.calendar.app_patch(event_key, description=description)
-            event["description"] = description
-
-        has_done = done_choice_is_yes(description)
-        has_send = send_choice_is_yes(description)
+        raw_description = event.get("description") or ""
+        has_done = done_choice_is_yes(raw_description)
+        has_send = send_choice_is_yes(raw_description)
         if not has_done and not has_send:
             return
 
@@ -296,6 +317,11 @@ class SafetySimulator:
                 str(event.get("updated") or ""),
             )
             return
+
+        description = normalize_user_sections(raw_description)
+        if description != raw_description:
+            self.calendar.app_patch(event_key, description=description)
+            event["description"] = description
 
         invoice_lines = extract_invoice_lines(description)
         if has_done and not invoice_lines:
@@ -610,6 +636,7 @@ def run_default_suite() -> list[ScenarioResult]:
         scenario_old_event_ignored_until_touched(),
         scenario_webhook_storm_no_duplicate_invoice(),
         scenario_fast_forward_current_diary_load(),
+        scenario_long_running_mixed_diary_stress(),
     ]
     return results
 
@@ -680,8 +707,7 @@ def scenario_already_paid_send_does_not_mutate_xero() -> ScenarioResult:
     sim.calendar.add_event(event)
     sim.run_until_idle()
     invoice_id = get_invoice_for_event(sim.state, key) or ""
-    sim.xero.invoices[invoice_id]["Status"] = "PAID"
-    sim.xero.invoices[invoice_id]["AmountDue"] = 0.0
+    sim.xero.mark_invoice_paid_external(invoice_id)
     before_calls = len(sim.xero.call_log)
     sim.clock.advance(60)
     sim.calendar.user_edit(
@@ -698,6 +724,7 @@ def scenario_already_paid_send_does_not_mutate_xero() -> ScenarioResult:
     ledger = parse_app_ledger(final.description)
     passed = (
         not new_calls
+        and not sim.xero.safety_violations
         and ledger.get("s") == "sent"
         and ledger.get("r") == "already_paid"
         and final.summary.startswith("🟢")
@@ -705,7 +732,12 @@ def scenario_already_paid_send_does_not_mutate_xero() -> ScenarioResult:
     return ScenarioResult(
         "already_paid_send_does_not_mutate_xero",
         passed,
-        [f"new_calls={new_calls}", f"ledger={ledger}", f"summary={final.summary}"],
+        [
+            f"new_calls={new_calls}",
+            f"safety_violations={sim.xero.safety_violations}",
+            f"ledger={ledger}",
+            f"summary={final.summary}",
+        ],
         len(sim.xero.call_log),
         sim.calendar.write_count,
     )
@@ -1052,6 +1084,174 @@ SEND NOW (Y/N) =
             f"red_titles={red_titles}",
             f"missing_ledger={missing_ledger}",
             f"refresh_count={sim.xero.refresh_count}",
+        ],
+        len(sim.xero.call_log),
+        sim.calendar.write_count,
+    )
+
+
+def scenario_long_running_mixed_diary_stress() -> ScenarioResult:
+    rng = random.Random(20260629)
+    calendars = ["ben-calendar", "troy-calendar", "patrick-calendar", "sam-calendar"]
+    sim = _new_sim(token_expired=True, refresh_plan=["ok"] * 20)
+    live_keys: list[str] = []
+    paid_keys: list[str] = []
+    missing_keys: list[str] = []
+    old_keys: list[str] = []
+
+    for idx in range(70):
+        calendar_id = calendars[idx % len(calendars)]
+        mode = "CARD" if idx % 3 == 0 else "INVOICE"
+        desc = _draft_description(name=f"Stress Customer {idx}", price=80 + (idx % 17) * 7)
+        desc = desc.replace(
+            "PAYMENT TYPE (CARD/INVOICE) = INVOICE",
+            f"PAYMENT TYPE (CARD/INVOICE) = {mode}",
+        )
+        event = _event(
+            event_id=f"stress-live-{idx}",
+            calendar_id=calendar_id,
+            summary=f"🔵 {'PW' if idx % 2 else 'GC'} Stress {idx}",
+            description=desc,
+            clock=sim.clock,
+            days_from_now=rng.choice([-1, 0, 1]),
+        )
+        key = FakeGoogleCalendar.key(calendar_id, event.id)
+        live_keys.append(key)
+        sim.calendar.add_event(event)
+
+    for idx in range(8):
+        calendar_id = calendars[idx % len(calendars)]
+        event = _event(
+            event_id=f"stress-missing-{idx}",
+            calendar_id=calendar_id,
+            summary=f"🔵 GC Missing Stress {idx}",
+            description=ensure_notes_template(
+                f"""[contact]
+Customer name: Missing Stress {idx}
+Customer email address: missing.stress.{idx}@example.test
+Customer contact number: 07000000000
+[/contact]
+
+[invoice]
+[/invoice]
+
+PROCESS DRAFT (Y/N) = Y
+PAYMENT TYPE (CARD/INVOICE) = INVOICE
+SEND NOW (Y/N) =
+"""
+            ),
+            clock=sim.clock,
+        )
+        key = FakeGoogleCalendar.key(calendar_id, event.id)
+        missing_keys.append(key)
+        sim.calendar.add_event(event)
+
+    for idx in range(18):
+        calendar_id = calendars[idx % len(calendars)]
+        event = _event(
+            event_id=f"stress-old-{idx}",
+            calendar_id=calendar_id,
+            summary=f"🟢 GC Old Stress {idx}",
+            description=_draft_description(name=f"Old Stress {idx}", price=90 + idx),
+            clock=sim.clock,
+            days_from_now=-(3 + idx),
+        )
+        event.updated = sim.clock.now - dt.timedelta(days=3 + idx)
+        key = FakeGoogleCalendar.key(calendar_id, event.id)
+        old_keys.append(key)
+        sim.calendar.events[key] = event
+
+    sim.run_until_idle(max_cycles=300)
+
+    for key in live_keys[::5]:
+        invoice_id = get_invoice_for_event(sim.state, key) or ""
+        if invoice_id:
+            sim.xero.mark_invoice_paid_external(invoice_id)
+            paid_keys.append(key)
+
+    for tick in range(96):
+        sim.clock.advance(10 * 60)
+
+        for key in rng.sample(live_keys, k=min(10, len(live_keys))):
+            if rng.random() < 0.55:
+                sim.calendar.user_edit(
+                    key,
+                    lambda ev: setattr(
+                        ev,
+                        "description",
+                        ev.description.replace("SEND NOW (Y/N) =", "SEND NOW (Y/N) = Y"),
+                    ),
+                )
+            else:
+                sim.calendar.user_edit(key, lambda ev: setattr(ev, "description", ev.description + "\n"))
+
+        if tick % 8 == 0:
+            key = rng.choice(missing_keys)
+            sim.calendar.user_edit(
+                key,
+                lambda ev: setattr(
+                    ev,
+                    "description",
+                    ev.description.replace("[/invoice]", "Gutter clean = £99+VAT\n[/invoice]", 1),
+                ),
+            )
+
+        if tick in {24, 48, 72}:
+            key = old_keys[(tick // 24) - 1]
+            sim.calendar.user_edit(key, lambda ev: setattr(ev, "description", ev.description + "\nStaff re-save"))
+
+        for _ in range(12):
+            key = rng.choice(live_keys + missing_keys)
+            event = sim.calendar.events[key]
+            sim.calendar.webhook_queue.append((event.calendar_id, event.id))
+
+        sim.run_until_idle(max_cycles=500)
+        if tick % 6 == 0:
+            sim.run_hourly_sweep()
+
+    create_by_event: dict[str, int] = {}
+    forbidden_after_paid = [
+        row
+        for row in sim.xero.call_log
+        if row["event_key"] in paid_keys
+        and row["action"] in {"update_invoice", "authorize_invoice", "email_invoice", "record_payment"}
+    ]
+    for row in sim.xero.call_log:
+        if row["action"] == "create_invoice":
+            create_by_event[row["event_key"]] = create_by_event.get(row["event_key"], 0) + 1
+    duplicate_creates = {k: v for k, v in create_by_event.items() if v > 1}
+    red_titles = [
+        event.summary
+        for event in sim.calendar.events.values()
+        if event.summary.startswith("🔴")
+    ]
+    old_calls_without_staff_touch = [
+        row
+        for row in sim.xero.call_log
+        if row["event_key"] in set(old_keys[3:])
+    ]
+    passed = (
+        not sim.xero.safety_violations
+        and not forbidden_after_paid
+        and not duplicate_creates
+        and not red_titles
+        and not old_calls_without_staff_touch
+        and sim.calendar.write_count < 1200
+    )
+    return ScenarioResult(
+        "long_running_mixed_diary_stress",
+        passed,
+        [
+            f"events={len(sim.calendar.events)}",
+            f"simulated_minutes={96 * 10}",
+            f"xero_actions={len(sim.xero.call_log)}",
+            f"calendar_writes={sim.calendar.write_count}",
+            f"externally_paid={len(paid_keys)}",
+            f"forbidden_after_paid={forbidden_after_paid[:5]}",
+            f"safety_violations={sim.xero.safety_violations[:5]}",
+            f"duplicate_creates={duplicate_creates}",
+            f"red_titles={red_titles}",
+            f"old_calls_without_staff_touch={len(old_calls_without_staff_touch)}",
         ],
         len(sim.xero.call_log),
         sim.calendar.write_count,
