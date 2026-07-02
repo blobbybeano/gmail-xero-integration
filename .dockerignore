@@ -1,0 +1,20 @@
+.git
+.gitignore
+.venv
+__pycache__/
+*.pyc
+
+# Local/dev secrets and runtime state
+.env
+.env.*
+credentials.json
+google_token.json
+google_admin_token.json
+xero_token.json
+state.json
+admin.db
+admin_auth.json
+
+# Local certs / IDE artifacts
+certs/
+.DS_Store

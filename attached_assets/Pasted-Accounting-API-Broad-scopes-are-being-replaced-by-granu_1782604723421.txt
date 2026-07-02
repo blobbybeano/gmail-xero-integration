@@ -1,0 +1,142 @@
+Accounting API
+Broad scopes are being replaced by granular scopes. We encourage you to adopt the new granular scopes as soon as they're assigned to your app. Broad scopes will remain available until September 2027.
+
+Web and PKCE apps – Since March 2026, all new and existing Web and PKCE apps have been assigned granular scopes.
+
+Custom connections – Since 29 April 2026, all custom connections will have access to granular scopes.
+
+Existing apps & connections – If your app or connection currently uses broad scopes, you can continue to use them until September 2027.
+
+Deprecated scopes	New granular scopes
+accounting.transactions	accounting.invoices
+accounting.payments
+accounting.banktransactions
+accounting.manualjournals
+accounting.transactions.read	accounting.invoices.read
+accounting.payments.read
+accounting.banktransactions.read
+accounting.manualjournals.read
+accounting.reports.read	accounting.reports.aged.read
+accounting.reports.balancesheet.read
+accounting.reports.banksummary.read
+accounting.reports.budgetsummary.read
+accounting.reports.executivesummary.read
+accounting.reports.profitandloss.read
+accounting.reports.trialbalance.read
+accounting.reports.taxreports.read
+See the Granular Scopes FAQs for more information.
+
+
+Broad scopes being replaced are marked "Deprecated". New granular scopes are marked "New".
+
+Scope	Status	Description	Resources
+accounting.transactions	Deprecated	View and manage your business transactions	BankTransactions, BankTransfers, BatchPayments, CreditNotes, ExpenseClaims, Invoices, LinkedTransactions, ManualJournals, Overpayments, Quotes, Payments, Prepayments, PurchaseOrders, Receipts, RepeatingInvoices
+accounting.transactions.read	Deprecated	View your business transactions	As above but GET only
+accounting.invoices	New	View and manage invoices	CreditNotes, Invoices, LinkedTransactions, Quotes, PurchaseOrders, RepeatingInvoices, Items
+accounting.invoices.read	New	View invoices	As above but GET only
+accounting.payments	New	View and manage payments	BatchPayments, Overpayments, Payments, Prepayments
+accounting.payments.read	New	View payments	As above but GET only
+accounting.banktransactions	New	View and manage bank transactions	BankTransactions, BankTransfers
+accounting.banktransactions.read	New	View bank transactions	As above but GET only
+accounting.manualjournals	New	View and manage manual journals	ManualJournals
+accounting.manualjournals.read	New	View manual journals	As above but GET only
+accounting.reports.read	Deprecated	View your reports	AgedPayablesByContact, AgedReceivablesByContact, BalanceSheet, BankSummary, BASReport, BudgetSummary, ExecutiveSummary, GSTReport, ProfitAndLoss, TrialBalance
+accounting.reports.aged.read	New	View aged reports	AgedPayablesByContact, AgedReceivablesByContact
+accounting.reports.balancesheet.read	New	View balance sheets	BalanceSheet
+accounting.reports.banksummary.read	New	View bank summary	BankSummary
+accounting.reports.budgetsummary.read	New	View budget summary	BudgetSummary
+accounting.reports.executivesummary.read	New	View executive summary	ExecutiveSummary
+accounting.reports.profitandloss.read	New	View profit and loss	ProfitAndLoss
+accounting.reports.trialbalance.read	New	View trial balance	TrialBalance
+accounting.reports.taxreports.read	New	View GST or BAS reports	GSTReport, BASReport
+accounting.reports.tenninetynine.read		View your 1099 reports	1099Report
+accounting.journals.read		View your general ledger	Journals
+accounting.settings		View and manage your organisation settings	Accounts, BrandingThemes, Currencies, Items, InvoiceReminders, Organisation, TaxRates, TrackingCategories, Users
+accounting.settings.read		View your organisation settings	As above but GET only
+accounting.contacts		View and manage your contacts	Contacts, ContactGroups
+accounting.contacts.read		View your contacts	As above but GET only
+accounting.attachments		View and manage your attachments	Accounts, BankTransactions, BankTransfers, Contacts, CreditNotes, Invoices, LinkedTransactions, ManualJournals, PurchaseOrders, Receipts, RepeatingInvoices
+accounting.attachments.read		View your attachments	As above but GET only
+accounting.budgets.read		View your budgets	Budgets
+Payroll API Australia
+Scope	Description	Resources
+payroll.employees	View and manage your employees	Employees, LeaveApplications
+payroll.employees.read	View your employees	As above but GET only
+payroll.payruns	View and manage your pay runs	Payruns
+payroll.payruns.read	View your pay runs	As above but GET only
+payroll.payslip	View and manage your payslips	Payslips
+payroll.payslip.read	View your payslips	As above but GET only
+payroll.timesheets	View and manage your timesheets	Timesheets
+payroll.timesheets.read	View your timesheets	As above but GET only
+payroll.settings	View and manage your payroll settings	Settings, PayrollCalendars, PayItems, SuperFunds, SuperFundProducts
+payroll.settings.read	View your payroll settings	As above but GET only
+Payroll API UK
+Scope	Description	Resources
+payroll.employees	View and manage your employees	Employees, Employment, Leave, Leave Balances, Statutory Leave Balances, Statutory Leave Summary, Statutory Sick Leave, Payment Methods, Salary and Wages, Opening Balances, Leave Periods, Leave Types, Employee Pay Templates
+payroll.employees.read	View your employees	As above but GET only
+payroll.payruns	View and manage your pay runs	Payruns
+payroll.payruns.read	View your pay runs	As above but GET only
+payroll.payslip	View and manage your payslips	Payslips
+payroll.payslip.read	View your payslips	As above but GET only
+payroll.timesheets	View and manage your timesheets	Timesheets
+payroll.timesheets.read	View your timesheets	As above but GET only
+payroll.settings	View and manage your payroll settings	Settings, Payrun Calendars, Tracking Categories, Earning Rates, Deductions, Leave Types, Reimbursements, Earnings Orders, Employer Pensions
+payroll.settings.read	View your payroll settings	As above but GET only
+Payroll API New Zealand
+Scope	Description	Resources
+payroll.employees	View and manage your employees	Employees, Employment, Tax, Leave, Leave Setup, Leave Balances, Payment Methods, Salary and Wages, Opening Balances, Leave Periods, Leave Types, Employee Pay Templates
+payroll.employees.read	View your employees	As above but GET only
+payroll.payruns	View and manage your pay runs	Payruns
+payroll.payruns.read	View your pay runs	As above but GET only
+payroll.payslip	View and manage your payslips	Payslips
+payroll.payslip.read	View your payslips	As above but GET only
+payroll.timesheets	View and manage your timesheets	Timesheets
+payroll.timesheets.read	View your timesheets	As above but GET only
+payroll.settings	View and manage your payroll settings	Settings, Payrun Calendars, Tracking Categories, Earning Rates, Deductions, Leave Types, Reimbursements, Statutory Deductions
+payroll.settings.read	View your payroll settings	As above but GET only
+Files API
+Scope	Description	Resources
+files	View and manage your file library	Files, Folders, Associations
+files.read	View your file library	As above but GET only
+Assets API
+Scope	Description	Resources
+assets	View and manage your fixed assets	Assets, Asset Types, Settings
+assets.read	View your fixed assets	As above but GET only
+Projects API
+Scope	Description	Resources
+projects	View and manage your projects	Projects, Tasks, Time
+projects.read	View your projects	As above but GET only
+The following scopes are only available after additional certification. If you require access to these scopes please let us know once you register to be a partner. Additional commercial agreements may apply.
+
+Payment services
+Scope	Description	Resources
+paymentservices	View and manage your payment services	PaymentServices
+Bank feeds
+Scope	Description	Resources
+bankfeeds	View and manage your bank statements	FeedConnections, Statements
+Finance API
+Scope	Description	Resources
+finance.accountingactivity.read	View your Xero usage activity	Accounting Activities
+finance.cashvalidation.read	View your Bank statement and reconciliation data	Cash Validation
+finance.statements.read	View your financial statements	Financial Statements
+finance.bankstatementsplus.read	View your Bank statement and reconciled transactions	Bank Statements Plus
+Practice Manager account scopes
+
+Request these scopes if your app needs to access data in a Practice Manager account.
+
+To access the Practice Manager API you will need to first register as an app partner and complete a security self-assessment questionnaire. Your app won’t be able to request Practice Manager scopes until you’ve started this process.
+
+Practice Manager API
+Scope	Description	Resources
+practicemanager.job	View and manage your Practice Manager job data	Access to job endpoints
+practicemanager.job.read	View your Practice Manager job data	As above but GET only
+practicemanager.client	View and manage your Practice Manager client data	Access to client endpoints and client group endpoints
+practicemanager.client.read	View your Practice Manager client data	As above but GET only
+practicemanager.staff	View and manage your Practice Manager staff data	Access to staff endpoints
+practicemanager.staff.read	View your Practice Manager staff data	As above but GET only
+practicemanager.time	View and manage your Practice Manager time data	Access to time endpoints
+practicemanager.time.read	View your Practice Manager time data	As above but GET only
+eInvoicing API
+
+Scope	Description	Resources
+einvoicing	View and manage registration information

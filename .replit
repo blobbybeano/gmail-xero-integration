@@ -1,0 +1,50 @@
+modules = ["python-3.12", "postgresql-16"]
+[agent]
+expertMode = true
+integrations = ["python_openai_ai_integrations:1.0.0"]
+
+[nix]
+channel = "stable-25_05"
+packages = ["cargo", "freetype", "lcms2", "libaom", "libde265", "libheif", "libiconv", "libimagequant", "libjpeg", "libtiff", "libwebp", "libxcrypt", "nasm", "openjpeg", "openssl", "pkg-config", "rustc", "tcl", "tk", "x265", "zlib"]
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Start application"
+
+[[workflows.workflow]]
+name = "Start application"
+author = "agent"
+
+[workflows.workflow.metadata]
+outputType = "webview"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python run.py"
+waitForPort = 5000
+
+[[ports]]
+localPort = 5000
+externalPort = 80
+
+[deployment]
+deploymentTarget = "autoscale"
+run = ["gunicorn", "--bind=0.0.0.0:5000", "--reuse-port", "run:app"]
+
+[userenv]
+
+[userenv.shared]
+RECEIPTS_ENABLED = "true"
+PLAID_ENV = "sandbox"
+
+[postMerge]
+path = "scripts/post-merge.sh"
+timeoutMs = 180000

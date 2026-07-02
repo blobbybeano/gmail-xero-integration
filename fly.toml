@@ -1,0 +1,46 @@
+app = "gmail-xero-integration"
+primary_region = "lhr"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[deploy]
+  strategy = "immediate"
+
+[env]
+  WEB_HOST = "0.0.0.0"
+  WEB_PORT = "8080"
+  PYTHONUNBUFFERED = "1"
+  POLL_SECONDS = "600"
+  XERO_EVENTS_PER_CYCLE = "1"
+  HOURLY_RECONCILE_SECONDS = "3600"
+  HOURLY_RECONCILE_PAST_HOURS = "24"
+  APP_BASE_URL = "https://gmail-xero-integration.fly.dev"
+  ADMIN_DB_FILE = "/data/admin.db"
+  STATE_FILE = "/data/state.json"
+  XERO_TOKEN_FILE = "/data/xero_token.json"
+  GOOGLE_TOKEN_FILE = "/data/google_token.json"
+  GOOGLE_ADMIN_TOKEN_FILE = "/data/google_admin_token.json"
+  GOOGLE_CREDENTIALS_FILE = "/data/credentials.json"
+
+[processes]
+  app = "gunicorn -b 0.0.0.0:8080 --workers 1 --threads 6 --timeout 120 run:app"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
+  processes = ["app"]
+
+[[mounts]]
+  source = "powwash_data"
+  destination = "/data"
+  processes = ["app"]
