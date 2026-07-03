@@ -41,6 +41,8 @@ the workspace.
 | `GOOGLE_TOKEN_FILE` | `/data/google_token.json` | `google_token.json` |
 | `GOOGLE_ADMIN_TOKEN_FILE` | `/data/google_admin_token.json` | `google_admin_token.json` |
 | `GOOGLE_CREDENTIALS_FILE` | `/data/credentials.json` | `credentials.json` |
+| `RECEIPTS_STORE_FILE` | `/data/receipts_store.json` | `receipts_store.json` |
+| `RECEIPTS_UPLOAD_DIR` | `/data/receipt_uploads` | `receipt_uploads` |
 
 These are all set in `fly.toml [env]` for Fly.io. On Replit they fall back to local
 paths automatically — **do not set these in Replit Secrets** unless you want to
@@ -97,8 +99,14 @@ Both environments share the same secret names:
 - `XERO_CLIENT_ID`, `XERO_CLIENT_SECRET`
 - `ADMIN_USERNAME`, `ADMIN_PASSWORD`
 - `WEB_SECRET_KEY`
-- `PLAID_CLIENT_ID`, `PLAID_SECRET`
+- `ENABLE_BANKING_APP_ID`, `ENABLE_BANKING_PRIVATE_KEY` if Enable Banking is used
+- Cashflows API settings are normally set in the app UI; env fallbacks use the
+  `CASHFLOWS_*` names from `.env.example`
 - `OPENAI_API_KEY` (or set via Admin → Settings in the app)
+
+The Gmail invoice importer uses the same Google admin OAuth connection as the
+Calendar/Sheets admin tools, but it also needs the `gmail.readonly` scope. If it
+shows disconnected, reconnect Google from the app so the expanded scope is granted.
 
 ---
 
@@ -110,6 +118,8 @@ These differences are handled automatically by the code:
 - **Fly.io URL**: `FLY_APP_NAME` only present on Fly.io; skipped on Replit
 - **SQLite paths**: all default to workspace root on Replit
 - **`pillow-heif`**: already installed in Replit (`v1.4.0`)
+- **Receipt/cashflows writes**: Fly keeps uploaded receipt files and receipt JSON
+  on `/data`; Replit keeps them in the workspace for preview/testing.
 
 ---
 
@@ -117,9 +127,9 @@ These differences are handled automatically by the code:
 
 - **Codex** works on the `feature/receipts-cashflows-sync` branch on GitHub
 - **Replit** is the live working environment (this workspace)
-- After Codex pushes changes, pull them into Replit by downloading the changed files
-  from the GitHub branch (do not do a full `git pull` — use targeted file updates to
-  avoid overwriting Replit-only files like `app/admin_web.py`)
+- After Codex pushes changes, pull them into Replit carefully. If Replit has active
+  UI/feature edits, prefer targeted file updates for the Codex-owned files below
+  instead of a blind overwrite.
 - After Replit work, push the full snapshot to `feature/receipts-cashflows-sync`
   using the GitHub API (as done in this session)
 
@@ -128,8 +138,8 @@ These differences are handled automatically by the code:
 `app/google_sheets.py`, `app/state.py`, `app/xero_client.py`,
 `app/safety_simulator.py`, `app/cashflows_csv.py`
 
-**Files Replit owns** (never overwrite from GitHub):
-`app/admin_web.py`, `app/plaid_client.py`, `app/plaid_match.py`,
+**Files Replit owns** (never overwrite blindly):
+`app/admin_web.py`, `app/plaid_match.py`,
 `app/receipts/expense_store.py`, `app/receipts/dump_store.py`,
 `app/receipts/email_pipeline.py`, `app/receipts/email_store.py`,
 `app/cashflows_calendar.py`, `app/cashflows_reconciliation.py`,

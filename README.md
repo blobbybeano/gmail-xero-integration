@@ -28,7 +28,7 @@ Fill in your values in `.env`.
 
 Important for Xero granular scopes (newer apps):
 ```env
-XERO_SCOPES=offline_access accounting.invoices accounting.payments accounting.contacts accounting.settings
+XERO_SCOPES=offline_access accounting.invoices accounting.payments accounting.contacts accounting.settings accounting.attachments accounting.banktransactions
 ```
 
 3. Google Calendar auth:
