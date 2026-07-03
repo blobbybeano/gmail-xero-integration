@@ -88,6 +88,7 @@ from .xero_client import (
     refresh_xero_token,
     build_xero_client,
     xero_is_disabled,
+    xero_lockout_is_active,
 )
 from .google_sheets import backfill_submitter_in_sheet, update_invoice_paid_in_sheet
 from .google_sheets import ensure_header, append_stats_row
@@ -6073,6 +6074,15 @@ function toggleReceiptsEnabled(requested) {{
         app_state = load_state(config.state_file)
         inv_map = app_state.get("event_invoice_map", {})
         inv_id_to_key = {v: k for k, v in inv_map.items()}
+
+        if xero_is_disabled() or xero_lockout_is_active(config):
+            print(
+                "[webhook] Xero invoice webhook received while Xero is paused/locked; "
+                "skipping Xero token refresh and invoice fetch",
+                flush=True,
+            )
+            trigger_poll()
+            return "", 200
 
         creds = load_admin_credentials(config)
         sheet_target = get_sheet_target(config.admin_db_file)
