@@ -40,6 +40,20 @@ def guard_xero(action: str = "Xero request") -> None:
         )
 
 
+def persisted_xero_lockout_until(config: AppConfig) -> float:
+    """Return the persisted Xero lockout timestamp without making network calls."""
+    try:
+        with open(config.state_file, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        return float(state.get("xero_lockout_until_ts") or 0.0)
+    except Exception:
+        return 0.0
+
+
+def xero_lockout_is_active(config: AppConfig) -> bool:
+    return persisted_xero_lockout_until(config) > time.time()
+
+
 def get_xero_rate_limit_until_ts() -> float:
     with _XERO_RATE_LIMIT_LOCK:
         return float(_XERO_RATE_LIMIT_UNTIL_TS or 0.0)
@@ -997,6 +1011,12 @@ def build_xero_client(config: AppConfig) -> XeroClient | None:
     Build a Xero client using the first enabled tenant from per-tenant config,
     falling back to the token's stored tenant_id if no per-tenant config exists.
     """
+    # This function is used by the poller, Xero webhooks, dashboard health
+    # checks, and receipt/cashflows tools. It must not refresh tokens or touch
+    # Xero while the global kill-switch or persisted 429 lockout is active.
+    if xero_is_disabled() or xero_lockout_is_active(config):
+        return None
+
     token = load_xero_token(config.xero_token_file)
 
     client_id = config.xero_client_id or str(
