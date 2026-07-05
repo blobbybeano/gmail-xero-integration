@@ -257,6 +257,21 @@ _CF_SUBMIT_JOB_KEY = "cashflows_csv_submit_job"
 _CF_SUBMIT_PACE_SECONDS = 1.1
 
 
+def _clear_finished_cashflows_submit_job(admin_db_file: str) -> None:
+    """Clear stale Cashflows submit progress after a fresh preview is loaded."""
+    with _cf_submit_lock:
+        if any(
+            str(job.get("status") or "") in {"running", "paused"}
+            for job in _cf_submit_job.values()
+        ):
+            return
+        _cf_submit_job.clear()
+    try:
+        set_json_setting(admin_db_file, _CF_SUBMIT_JOB_KEY, {})
+    except Exception:
+        pass
+
+
 # ── Field Expenses helpers ────────────────────────────────────────────────────
 
 _EXPENSE_STATUS_BADGES = {
@@ -8675,6 +8690,7 @@ function toggleReceiptsEnabled(requested) {{
             result["source_filename"] = (upload.filename or "").strip()
             cached_preview = {**result, "_source_csv_text": csv_text}
             set_json_setting(config.admin_db_file, "cashflows_csv_preview", cached_preview)
+            _clear_finished_cashflows_submit_job(config.admin_db_file)
             counts = result.get("status_counts", {})
             _feed.push(
                 "Cashflows CSV preview: "
@@ -8718,6 +8734,7 @@ function toggleReceiptsEnabled(requested) {{
             result["source_filename"] = str(preview.get("source_filename") or "").strip()
             cached_preview = {**result, "_source_csv_text": csv_text}
             set_json_setting(config.admin_db_file, "cashflows_csv_preview", cached_preview)
+            _clear_finished_cashflows_submit_job(config.admin_db_file)
             counts = result.get("status_counts", {})
             _feed.push(
                 "Cashflows CSV refreshed: "

@@ -697,6 +697,9 @@ class CashflowsCsvSubmitTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
 
     def test_refresh_csv_preview_rebuilds_from_cached_csv(self):
+        from app.admin_store import get_json_setting, set_json_setting
+        from app.admin_web import _CF_SUBMIT_JOB_KEY
+
         cached_csv = (
             "'Ref','Date','Time','Description','Type','Debit','Credit','Balance'\n"
             '"1","2026-05-01","10:00","Sale AAA","Sale Settlement","","100.00","100.00"\n'
@@ -705,6 +708,12 @@ class CashflowsCsvSubmitTests(unittest.TestCase):
         )
         preview = {"preview_id": "preview-1", "_source_csv_text": cached_csv}
         app = self._app_with_preview(preview)
+        db_path = os.environ["ADMIN_DB_FILE"]
+        set_json_setting(
+            db_path,
+            _CF_SUBMIT_JOB_KEY,
+            {"status": "error", "message": "old stopped job", "total": 3, "completed": 2},
+        )
         fake = FakeXeroClient()
         with app.test_client() as client:
             with client.session_transaction() as session:
@@ -719,6 +728,7 @@ class CashflowsCsvSubmitTests(unittest.TestCase):
         self.assertEqual(data["totals"]["payout_count"], 1)
         self.assertEqual(data["status_counts"]["no_bank_line"], 1)
         self.assertNotIn("_source_csv_text", data)
+        self.assertEqual(get_json_setting(db_path, _CF_SUBMIT_JOB_KEY, {}), {})
 
     def test_refresh_csv_preview_requires_cached_csv(self):
         app = self._app_with_preview({"preview_id": "preview-1", "batches": []})
