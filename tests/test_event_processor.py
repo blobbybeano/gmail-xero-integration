@@ -52,12 +52,12 @@ class InvoiceSalesParsingTests(unittest.TestCase):
         sales_lines = extract_sales_lines(description)
 
         self.assertEqual(len(invoice_lines), 2)
-        self.assertEqual(invoice_lines[1]["Description"], "Additional sales")
+        self.assertEqual(invoice_lines[1]["Description"], "Sales item")
         self.assertEqual(invoice_lines[1]["UnitAmount"], 25.0)
         self.assertEqual(invoice_lines[1]["TaxType"], "OUTPUT2")
         self.assertEqual(compute_invoice_totals(invoice_lines), (265.0, 318.0))
         self.assertEqual(len(sales_lines), 1)
-        self.assertEqual(sales_lines[0]["Description"], "Additional sales")
+        self.assertEqual(sales_lines[0]["Description"], "Sales item")
 
     def test_amount_only_invoice_line_above_sales_marker_is_ignored(self):
         description = (

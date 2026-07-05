@@ -1429,7 +1429,7 @@ def _parse_line_items(
                 )
                 if not m_amount_only:
                     continue
-                desc = "Additional sales"
+                desc = "Sales item"
                 amount = float(m_amount_only.group(1))
                 vat_flag = bool(m_amount_only.group(2))
             else:
