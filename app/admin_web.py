@@ -7447,7 +7447,7 @@ function toggleReceiptsEnabled(requested) {{
         function _adjustmentLabel(adj) {{
           if (!adj) return '';
           if (adj.type === 'discount') return 'discount / credit adjustment ' + money(adj.amount);
-          if (adj.type === 'extra_invoice') return 'extra Parking invoice ' + money(adj.amount);
+          if (adj.type === 'extra_invoice') return 'invoice/card difference ' + money(adj.amount);
           return 'adjustment ' + money(adj.amount);
         }}
         function _selectedInvoiceForSale(batch, sale, idx) {{
@@ -7850,10 +7850,10 @@ function toggleReceiptsEnabled(requested) {{
               const activeLabel = adjustmentOk ? '&#10003; ' + _adjustmentLabel(adjustment) : '';
               const actionText = expectedAdj.type === 'discount'
                 ? 'Add discount plan'
-                : 'Add Parking invoice plan';
+                : 'Confirm separate adjustment';
               const helpText = expectedAdj.type === 'discount'
                 ? 'Card payment is lower than invoice total. Xero needs a discount/credit-style adjustment before this can fully match.'
-                : 'Card payment is higher than this invoice. Xero needs an extra invoice, normally to Parking, for the difference.';
+                : 'Card payment is higher than this invoice. First check whether the matched invoice is missing a line; if it is, amend the invoice and refresh this batch. Only use a separate adjustment if the extra money is genuinely not part of that customer invoice.';
               invCell += '<div class="mt-2 rounded border ' + (adjustmentOk ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-amber-200 bg-amber-50 text-amber-800') + ' p-2">'
                 + '<div class="text-[11px] font-semibold">Adjustment needed: ' + expLabel + '</div>'
                 + '<div class="text-[10px] mt-0.5">' + helpText + '</div>'
@@ -9113,7 +9113,7 @@ function toggleReceiptsEnabled(requested) {{
                     elif diff > 0.01:
                         if not adjustment or adjustment.get("type") != "extra_invoice":
                             blocking_errors.append(
-                                f"Batch {batch_id} sale {sale_ref or idx + 1} is £{diff:.2f} higher than already-paid invoice {selected.get('number') or selected_id} (£{payable_amount:.2f} paid vs £{sale_gross:.2f} card sale). Confirm the overpayment adjustment or refresh after editing the invoice in Xero."
+                                f"Batch {batch_id} sale {sale_ref or idx + 1} is £{diff:.2f} higher than already-paid invoice {selected.get('number') or selected_id} (£{payable_amount:.2f} paid vs £{sale_gross:.2f} card sale). If the invoice is missing a line, edit the invoice and refresh this batch. Only confirm a separate adjustment if the extra money is genuinely not part of that customer invoice."
                             )
                             continue
                         paid_invoice_extra_total = round(paid_invoice_extra_total + diff, 2)
@@ -9199,7 +9199,7 @@ function toggleReceiptsEnabled(requested) {{
                     if diff > 0.01:
                         if not adjustment or adjustment.get("type") != "extra_invoice":
                             blocking_errors.append(
-                                f"Batch {batch_id} sale {sale_ref or idx + 1} needs an extra invoice for the overpayment."
+                                f"Batch {batch_id} sale {sale_ref or idx + 1} is higher than the selected invoice. If the invoice is missing a line, edit the invoice and refresh this batch. Only confirm a separate adjustment if the extra money is genuinely not part of that customer invoice."
                             )
                             continue
                         extra_amount = round(diff, 2)
