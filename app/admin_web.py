@@ -7763,6 +7763,7 @@ function toggleReceiptsEnabled(requested) {{
             // still keeping the candidates below for manual cross-referencing.
             const favAmountMatch = !!(favoured && favoured.amount_match);
             const noAmountMatch = isMissing && !userChosen && !!favoured && !favAmountMatch;
+            const needsSuggestionConfirm = isMissing && !userChosen && !!favoured && favAmountMatch;
             const likelyCal = (s.calendar_suggestions || []).find(function(c) {{
               const eventGross = Number(c.event_gross);
               const saleGross = Number(s.gross || 0);
@@ -7786,10 +7787,19 @@ function toggleReceiptsEnabled(requested) {{
                     ? '<span class="text-teal-800">' + esc(likelyCal.customer || 'Calendar job') + '</span>'
                     : '<span class="text-amber-700">' + money(s.gross) + ' card sale</span>')
                 : esc(favoured.contact_name || favoured.number || '\u2014');
+            const calLineTone = needsSuggestionConfirm ? 'text-amber-700' : 'text-teal-700';
+            const calLineAmountTone = needsSuggestionConfirm ? 'text-amber-700' : 'text-teal-700';
             const calLine = (favCal && !noAmountMatch)
-              ? '<div class="text-[11px] text-teal-700 mt-0.5">&#128197; Calendar entry \u2014 ' + esc(_fmtCalEntry(favCal))
-                  + ((favCal.event_gross !== null && favCal.event_gross !== undefined) ? ' <span class="text-xs font-bold text-teal-700">(\u00a3' + favCal.event_gross.toFixed(2) + ')</span>' : '')
+              ? '<div class="text-[11px] ' + calLineTone + ' mt-0.5">&#128197; Calendar entry \u2014 ' + esc(_fmtCalEntry(favCal))
+                  + ((favCal.event_gross !== null && favCal.event_gross !== undefined) ? ' <span class="text-xs font-bold ' + calLineAmountTone + '">(\u00a3' + favCal.event_gross.toFixed(2) + ')</span>' : '')
+                  + (needsSuggestionConfirm ? ' <span class="text-[10px] font-semibold bg-amber-100 border border-amber-200 rounded px-1">needs confirmation</span>' : '')
                   + '</div>'
+              : '';
+            const suggestedConfirmBtn = needsSuggestionConfirm
+              ? '<div class="mt-2 rounded border border-amber-200 bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800 flex items-center justify-between gap-2">'
+                  + '<span><span class="font-semibold">Suggested invoice only.</span> Confirm this row before it counts toward the batch total.</span>'
+                  + '<button class="cf-cand-pick shrink-0 px-2 py-1 rounded bg-amber-600 text-white text-[11px] font-semibold hover:bg-amber-700" data-si="' + idx + '" data-ci="' + favIdx + '" data-cal-slot="' + esc((favCal && favCal.event_date && favCal.event_start) ? (favCal.event_date + 'T' + favCal.event_start) : '') + '">Confirm this invoice</button>'
+                + '</div>'
               : '';
             const suggestionLine = noAmountMatch && favoured
               ? '<div class="mt-2 rounded border border-amber-200 bg-white px-2 py-2 text-[11px] text-gray-700">'
@@ -7833,7 +7843,7 @@ function toggleReceiptsEnabled(requested) {{
               : noAmountMatch
                 ? suggestionLine
                 : '<span class="text-indigo-700 font-mono">' + esc(favoured.number || '') + '</span> '
-                    + '<span class="text-gray-400 font-mono">' + esc(favoured.reference || '') + '</span>' + calLine;
+                    + '<span class="text-gray-400 font-mono">' + esc(favoured.reference || '') + '</span>' + calLine + suggestedConfirmBtn;
             if (noMatch) {{ invCell += '<div class="mt-1">' + qiBtn + '</div>'; }}
             if (favoured && expectedAdj) {{
               const expLabel = _adjustmentLabel(expectedAdj);
@@ -7865,7 +7875,7 @@ function toggleReceiptsEnabled(requested) {{
             }} else if (noAmountMatch) {{
               statusBadge = '<span class="text-amber-700 font-semibold">\u26a0 no matching invoice</span>';
             }} else if (isMissing) {{
-              statusBadge = '<span class="text-amber-700 font-semibold">\u23f3 suggested \u2014 confirm in Xero</span>';
+              statusBadge = '<span class="text-amber-700 font-semibold">\u23f3 suggested \u2014 confirm this row</span>';
             }} else if (expectedAdj && !adjustmentOk) {{
               statusBadge = '<span class="text-amber-700 font-semibold">\u26a0 adjustment needed</span>';
             }} else if (ambiguous) {{
@@ -7990,11 +8000,11 @@ function toggleReceiptsEnabled(requested) {{
                 + '<td class="px-3 py-2.5" colspan="3">'
                 +   '<span class="font-semibold">&#128161; Action needed to balance</span>'
                 +   ' <span class="text-[11px] text-amber-600">\u2014 '
-                +   missingCount + ' CSV payment' + (missingCount===1?'':'s') + ' missing an invoice or adjustment plan</span>'
+                +   missingCount + ' CSV payment' + (missingCount===1?'':'s') + ' need a confirmed invoice or adjustment plan</span>'
                 + '</td>'
                 + '<td class="px-3 py-2.5 text-right font-bold text-amber-900">' + money(missingGross) + '</td>'
                 + '<td class="px-3 py-2.5 text-right text-amber-700">' + money(missingFees) + '</td>'
-                + '<td class="px-3 py-2.5 text-[11px] text-amber-700">Choose the right invoice, then add any required discount or extra-invoice plan.</td>'
+                + '<td class="px-3 py-2.5 text-[11px] text-amber-700">Confirm the orange suggested row(s), or choose another option if the suggestion is wrong.</td>'
                 + '</tr>'
             : '';
           const totalCheck = balanced
