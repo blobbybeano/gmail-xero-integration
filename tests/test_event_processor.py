@@ -39,6 +39,37 @@ class InvoiceSalesParsingTests(unittest.TestCase):
         self.assertEqual(sales_lines[0]["Description"], "Upsell commission")
         self.assertEqual(sales_lines[0]["UnitAmount"], 50.0)
 
+    def test_amount_only_sales_line_is_counted_below_sales_marker(self):
+        description = (
+            "[invoice]\n"
+            "Pressure washing = \u00a3240.00+VAT\n"
+            f"{SALES_MARKER}\n"
+            "\u00a325+VAT\n"
+            "[/invoice]"
+        )
+
+        invoice_lines = extract_invoice_lines(description)
+        sales_lines = extract_sales_lines(description)
+
+        self.assertEqual(len(invoice_lines), 2)
+        self.assertEqual(invoice_lines[1]["Description"], "Additional sales")
+        self.assertEqual(invoice_lines[1]["UnitAmount"], 25.0)
+        self.assertEqual(invoice_lines[1]["TaxType"], "OUTPUT2")
+        self.assertEqual(compute_invoice_totals(invoice_lines), (265.0, 318.0))
+        self.assertEqual(len(sales_lines), 1)
+        self.assertEqual(sales_lines[0]["Description"], "Additional sales")
+
+    def test_amount_only_invoice_line_above_sales_marker_is_ignored(self):
+        description = (
+            "[invoice]\n"
+            "\u00a325+VAT\n"
+            f"{SALES_MARKER}\n"
+            "[/invoice]"
+        )
+
+        self.assertEqual(extract_invoice_lines(description), [])
+        self.assertEqual(extract_sales_lines(description), [])
+
     def test_sales_only_section_is_still_an_invoice(self):
         description = (
             "[invoice]\n"

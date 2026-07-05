@@ -1246,7 +1246,11 @@ def extract_invoice_lines(description: str | None) -> list[dict]:
     cash_mode = _invoice_block_has_cash_marker(block)
     invoice_part, sales_part = _split_invoice_sales(block)
     invoice_items = _parse_line_items(invoice_part, force_no_vat=cash_mode)
-    sales_items = _parse_line_items(sales_part, force_no_vat=cash_mode)
+    sales_items = _parse_line_items(
+        sales_part,
+        force_no_vat=cash_mode,
+        allow_amount_only=True,
+    )
 
     # If the same line appears both above and below the sales marker,
     # treat it as one customer invoice line to avoid accidental duplication
@@ -1296,7 +1300,7 @@ def extract_sales_lines(description: str | None) -> list[dict]:
         return []
 
     invoice_part, sales_part = _split_invoice_sales(block)
-    return _parse_line_items(sales_part)
+    return _parse_line_items(sales_part, allow_amount_only=True)
 
 
 def invoice_has_cash_marker(description: str | None) -> bool:
@@ -1356,7 +1360,12 @@ def _invoice_block_has_cash_marker(block: str) -> bool:
     return bool(re.search(r"\bcash\b", normalized, flags=re.I))
 
 
-def _parse_line_items(block: str, *, force_no_vat: bool = False) -> list[dict]:
+def _parse_line_items(
+    block: str,
+    *,
+    force_no_vat: bool = False,
+    allow_amount_only: bool = False,
+) -> list[dict]:
     import re
 
     if not block:
@@ -1408,11 +1417,23 @@ def _parse_line_items(block: str, *, force_no_vat: bool = False) -> list[dict]:
                 line,
                 flags=re.I,
             )
-            if not m:
+            if m:
+                desc = m.group(1).strip()
+                amount = float(m.group(2))
+                vat_flag = bool(m.group(3))
+            elif allow_amount_only:
+                m_amount_only = re.match(
+                    r"^£?\s*(\d+(?:\.\d+)?)\s*(\+?\s*vat)?\s*$",
+                    line,
+                    flags=re.I,
+                )
+                if not m_amount_only:
+                    continue
+                desc = "Additional sales"
+                amount = float(m_amount_only.group(1))
+                vat_flag = bool(m_amount_only.group(2))
+            else:
                 continue
-            desc = m.group(1).strip()
-            amount = float(m.group(2))
-            vat_flag = bool(m.group(3))
 
         line_item = {
             "Description": desc,
@@ -1457,7 +1478,7 @@ def sync_invoice_block_from_xero(
     # They are still part of the Xero invoice total, but should not be mirrored
     # into the customer-facing section above ⬇Sales⬇ in calendar notes.
     sales_signatures: set[tuple[str, float]] = set()
-    for s_li in _parse_line_items(sales_part):
+    for s_li in _parse_line_items(sales_part, allow_amount_only=True):
         try:
             s_total = round(float((s_li or {}).get("UnitAmount") or 0.0), 2)
         except Exception:
