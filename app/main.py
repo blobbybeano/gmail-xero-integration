@@ -126,6 +126,7 @@ from .state import (
     was_recent_xero_webhook,
 )
 from .xero_client import XeroClient, build_xero_client, get_xero_rate_limit_until_ts
+from .xero_busy import xero_busy_status
 from .log_feed import feed as _feed
 
 LONDON_TZ = ZoneInfo("Europe/London")
@@ -216,6 +217,7 @@ def run() -> None:
     _xero_built_at: float = time.time()
     _xero_retry_after: float = float(state.get("xero_lockout_until_ts") or 0.0)
     _xero_lock_notice_ts: float = 0.0
+    _xero_busy_notice_ts: float = 0.0
     _XERO_REBUILD_INTERVAL = 3300  # rebuild token ~55 min (Xero tokens last 30 min)
     _XERO_429_COOLDOWN_SECONDS = 180
     _XERO_EVENT_429_COOLDOWN_SECONDS = 900
@@ -1603,9 +1605,24 @@ def run() -> None:
             state["xero_lockout_reason"] = ""
             state["xero_lockout_updated_at_ts"] = _now_ts_for_xero
 
+        _xero_busy = xero_busy_status(config.admin_db_file)
+        if _xero_busy.get("active"):
+            if xero_client is not None:
+                xero_client = None
+            if (_now_ts_for_xero - _xero_busy_notice_ts) >= 300:
+                _feed.push(
+                    f"Xero busy with {(_xero_busy.get('owner') or 'another task')} — calendar Xero work deferred",
+                    "system",
+                )
+                _xero_busy_notice_ts = _now_ts_for_xero
+
         # Rebuild Xero client only when the cached one is stale or missing.
-        if (xero_client is None and _now_ts_for_xero >= _xero_retry_after) or (
-            xero_client is not None and (_now_ts_for_xero - _xero_built_at) > _XERO_REBUILD_INTERVAL
+        if not _xero_busy.get("active") and (
+            (xero_client is None and _now_ts_for_xero >= _xero_retry_after)
+            or (
+                xero_client is not None
+                and (_now_ts_for_xero - _xero_built_at) > _XERO_REBUILD_INTERVAL
+            )
         ):
             xero_client = _build_xero_client_safe()
             _xero_built_at = _now_ts_for_xero

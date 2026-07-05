@@ -149,6 +149,7 @@ from .cashflows_csv import (
     build_csv_reconciliation_preview,
     recommend_export_range,
 )
+from .xero_busy import clear_xero_busy, mark_xero_busy, xero_busy_status
 
 # Engineering note:
 # Webhook/admin flows here are coupled to poller state semantics.
@@ -6102,6 +6103,15 @@ function toggleReceiptsEnabled(requested) {{
             )
             trigger_poll()
             return "", 200
+        _busy = xero_busy_status(config.admin_db_file)
+        if _busy.get("active"):
+            print(
+                "[webhook] Xero invoice webhook received while Xero is busy "
+                f"({ _busy.get('reason') or _busy.get('owner') }); deferring invoice fetch",
+                flush=True,
+            )
+            trigger_poll()
+            return "", 200
 
         creds = load_admin_credentials(config)
         sheet_target = get_sheet_target(config.admin_db_file)
@@ -6135,7 +6145,11 @@ function toggleReceiptsEnabled(requested) {{
 
         def _fetch_invoice(invoice_id: str):
             nonlocal xero_at, xero_tok, _webhook_429
-            if xero_is_disabled() or xero_lockout_is_active(config):
+            if (
+                xero_is_disabled()
+                or xero_lockout_is_active(config)
+                or xero_busy_status(config.admin_db_file).get("active")
+            ):
                 return None
             if not (xero_at and xero_tenant):
                 return None
@@ -9551,6 +9565,7 @@ function toggleReceiptsEnabled(requested) {{
             "updated_at": now_iso,
             "preview_id": str(preview.get("preview_id") or ""),
         }
+        busy_owner = f"cashflows_csv:{job_id}"
 
         def _persist_job(state: dict) -> None:
             state["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -9564,6 +9579,11 @@ function toggleReceiptsEnabled(requested) {{
         def _run_submit_job() -> None:
             state = _cf_submit_job.get(job_id) or job_state
             try:
+                mark_xero_busy(
+                    config.admin_db_file,
+                    owner=busy_owner,
+                    reason="Cashflows CSV submission is preparing Xero reconciliation",
+                )
                 for plan in state["plans"]:
                     bid = plan.get("batch_id")
                     if bid in state["completed_batch_ids"]:
@@ -9591,6 +9611,14 @@ function toggleReceiptsEnabled(requested) {{
                     state["message"] = (
                         f"Reconciling batch {state['completed'] + 1} of "
                         f"{state['total']} ({state['current_batch_ref']})…"
+                    )
+                    mark_xero_busy(
+                        config.admin_db_file,
+                        owner=busy_owner,
+                        reason=(
+                            f"Cashflows CSV submission batch {state['completed'] + 1} "
+                            f"of {state['total']} ({state['current_batch_ref']})"
+                        ),
                     )
                     _persist_job(state)
                     # Execute exactly once. On failure we do NOT replay this batch,
@@ -9649,6 +9677,11 @@ function toggleReceiptsEnabled(requested) {{
                         f"Problem: {state['error']}"
                     )
                 _persist_job(state)
+            finally:
+                try:
+                    clear_xero_busy(config.admin_db_file, owner=busy_owner)
+                except Exception:
+                    pass
 
         with _cf_submit_lock:
             existing = next(
@@ -9670,6 +9703,11 @@ function toggleReceiptsEnabled(requested) {{
                 )
             _cf_submit_job.clear()
             _cf_submit_job[job_id] = job_state
+            mark_xero_busy(
+                config.admin_db_file,
+                owner=busy_owner,
+                reason="Cashflows CSV submission is starting",
+            )
             _persist_job(job_state)
             threading.Thread(
                 target=_run_submit_job, name="cashflows-submit", daemon=True
