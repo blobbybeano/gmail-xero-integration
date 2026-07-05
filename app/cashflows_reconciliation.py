@@ -154,6 +154,7 @@ class XeroInvoiceCandidate:
     id: str
     number: str
     contact_name: str
+    contact_id: str
     date: dt.date | None
     due_date: dt.date | None
     amount_due: Decimal
@@ -174,6 +175,7 @@ class XeroInvoiceCandidate:
             "id": self.id,
             "number": self.number,
             "contact_name": self.contact_name,
+            "contact_id": self.contact_id,
             "date": _date_text(self.date),
             "due_date": _date_text(self.due_date),
             "amount_due": _money_float(self.amount_due),
@@ -459,6 +461,7 @@ def parse_xero_invoices(data: Any) -> list[XeroInvoiceCandidate]:
                 id=str(raw.get("InvoiceID") or raw.get("ID") or f"invoice-{idx}"),
                 number=str(raw.get("InvoiceNumber") or raw.get("Reference") or f"Invoice {idx}"),
                 contact_name=str(contact.get("Name") or raw.get("ContactName") or ""),
+                contact_id=str(contact.get("ContactID") or raw.get("ContactID") or ""),
                 date=_date(raw.get("Date")),
                 due_date=_date(raw.get("DueDate")),
                 amount_due=amount_due,

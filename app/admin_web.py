@@ -58,6 +58,7 @@ from .admin_store import (
     set_expense_settings,
     get_cashflows_settings,
     set_cashflows_settings,
+    add_cashflows_reconciled_refs,
     create_expense_test_session,
     get_expense_test_session,
     set_expense_test_result,
@@ -89,6 +90,7 @@ from .xero_client import (
     build_xero_client,
     xero_is_disabled,
     xero_lockout_is_active,
+    get_xero_rate_limit_until_ts,
 )
 from .google_sheets import backfill_submitter_in_sheet, update_invoice_paid_in_sheet
 from .google_sheets import ensure_header, append_stats_row
@@ -118,12 +120,13 @@ from .trigger import (
 )
 from .state import (
     load_state,
-    save_state,
+    save_state_merged,
     get_last_sync,
     get_sales_log_marker,
     set_sales_log_marker,
     mark_invoice_sent,
     mark_invoice_paid,
+    mark_recent_xero_webhook,
     get_invoice_for_event,
 )
 from .log_feed import feed as _feed
@@ -235,6 +238,22 @@ window.addEventListener('error', function(e) {{
 # In-memory only — jobs are short-lived (seconds), so no DB needed.
 _receipt_jobs: dict[str, dict] = {}
 _receipt_jobs_lock = threading.Lock()
+
+# ── Cashflows CSV bulk-submit background job ──────────────────────────────────
+# A large CSV can involve dozens of Xero writes.  Doing them inside the HTTP
+# request risks (a) the gunicorn worker timeout, (b) Xero's ~60 calls/min rate
+# limit, and (c) the browser closing mid-run leaving half-written batches.
+# Instead we run the whole submission in ONE daemon thread, paced under the
+# rate limit, persisting progress after every batch so the Cashflows page can
+# reattach a live progress screen after a reload and so a resume never
+# re-writes a batch that already succeeded.
+_cf_submit_lock = threading.Lock()          # guards start/registry access
+_cf_submit_job: dict[str, dict] = {}        # single live job, keyed by job_id
+# DB key (admin settings) mirroring the live job for durability across restarts.
+_CF_SUBMIT_JOB_KEY = "cashflows_csv_submit_job"
+# Minimum spacing between Xero write calls (seconds).  ~1.1s => <55 calls/min,
+# comfortably under Xero's 60/min ceiling so we essentially never trip a 429.
+_CF_SUBMIT_PACE_SECONDS = 1.1
 
 
 # ── Field Expenses helpers ────────────────────────────────────────────────────
@@ -6112,10 +6131,11 @@ function toggleReceiptsEnabled(requested) {{
                 )
         xero_at = (xero_tok or {}).get("access_token", "")
         xero_tenant = (xero_tok or {}).get("tenant_id", "")
+        _webhook_429 = False  # set True if a Xero 429 is hit mid-batch
 
         def _fetch_invoice(invoice_id: str):
-            nonlocal xero_at, xero_tok
-            if xero_is_disabled():
+            nonlocal xero_at, xero_tok, _webhook_429
+            if xero_is_disabled() or xero_lockout_is_active(config):
                 return None
             if not (xero_at and xero_tenant):
                 return None
@@ -6138,6 +6158,27 @@ function toggleReceiptsEnabled(requested) {{
                         resp = requests.get(url, headers=headers, timeout=10)
                 except Exception as exc:
                     print(f"[webhook] Xero token refresh failed while fetching invoice: {exc}", flush=True)
+            if resp.status_code == 429:
+                retry_after_s = 300
+                raw_retry = str(resp.headers.get("Retry-After") or "").strip()
+                if raw_retry.isdigit():
+                    try:
+                        retry_after_s = max(60, int(raw_retry))
+                    except Exception:
+                        retry_after_s = 300
+                _lockout_until = time.time() + retry_after_s
+                _ls = load_state(config.state_file)
+                _ls["xero_lockout_until_ts"] = _lockout_until
+                _ls["xero_lockout_reason"] = "Xero API rate limit (429) during webhook batch"
+                _ls["xero_lockout_updated_at_ts"] = time.time()
+                save_state_merged(config.state_file, _ls)
+                print(
+                    f"[webhook] Xero 429 — persisted lockout for {retry_after_s}s, "
+                    "halting further webhook Xero calls this batch",
+                    flush=True,
+                )
+                _webhook_429 = True
+                return None
             if not resp.ok:
                 return None
             invoices = resp.json().get("Invoices", [])
@@ -6154,6 +6195,7 @@ function toggleReceiptsEnabled(requested) {{
             # Treat fully settled invoices as paid even if status text lags.
             return status_raw == "PAID" or amount_due <= 0.0001
 
+        _invoice_cache: dict = {}  # one Xero API call per unique invoice ID per batch
         for ev in events:
             if ev.get("eventCategory") != "INVOICE":
                 continue
@@ -6163,7 +6205,16 @@ function toggleReceiptsEnabled(requested) {{
             print(f"[webhook] Xero invoice event: {ev.get('eventType')} {invoice_id}", flush=True)
 
             try:
-                invoice = _fetch_invoice(invoice_id)
+                if invoice_id not in _invoice_cache:
+                    _invoice_cache[invoice_id] = _fetch_invoice(invoice_id)
+                if _webhook_429:
+                    print(
+                        "[webhook] Xero rate-limited mid-batch — stopping; "
+                        "remaining events will be picked up by the background poller",
+                        flush=True,
+                    )
+                    break
+                invoice = _invoice_cache[invoice_id]
                 status_raw = str((invoice or {}).get("Status") or "").upper()
                 is_paid_or_settled = _is_invoice_paid(invoice)
                 is_sent_or_authorised = status_raw in {"AUTHORISED", "PAID"}
@@ -6216,7 +6267,8 @@ function toggleReceiptsEnabled(requested) {{
                             app_state = mark_invoice_sent(app_state, event_key)
                         if is_paid_or_settled:
                             app_state = mark_invoice_paid(app_state, event_key)
-                        save_state(config.state_file, app_state)
+                        app_state = mark_recent_xero_webhook(app_state, event_key, invoice_id)
+                        app_state = save_state_merged(config.state_file, app_state)
                     except Exception as exc:
                         print(f"[webhook] Calendar sync failed for {event_key}: {exc}", flush=True)
 
@@ -6386,7 +6438,7 @@ function toggleReceiptsEnabled(requested) {{
                                                     update_existing=True,
                                                 )
                                                 app_state = set_sales_log_marker(app_state, event_key, sales_marker)
-                                                save_state(config.state_file, app_state)
+                                                app_state = save_state_merged(config.state_file, app_state)
                                                 print(f"[webhook] Sales rows upserted for paid invoice {inv_number}", flush=True)
                                                 _feed.push(
                                                     f"Sales logged after payment: {inv_number or event_id}",
@@ -6526,7 +6578,7 @@ function toggleReceiptsEnabled(requested) {{
             if is_paid:
                 app_state = mark_invoice_paid(app_state, event_key)
 
-        save_state(config.state_file, app_state)
+        app_state = save_state_merged(config.state_file, app_state)
         trigger_poll()
         session["save_notice"] = (
             f"success:Today Xero sync checked {scanned} event(s), "
@@ -6682,6 +6734,20 @@ function toggleReceiptsEnabled(requested) {{
                 <h1 class="text-lg font-semibold text-gray-950">Cashflows Sync</h1>
                 <p class="text-xs text-gray-500">CFE SETT bank-line matching and settlement preview</p>
               </div>
+              <div class="flex items-center gap-2">
+                <details class="relative">
+                  <summary class="list-none cursor-pointer w-8 h-8 rounded-full border border-gray-300 bg-white hover:bg-gray-50 text-gray-700 text-sm font-semibold flex items-center justify-center" title="Cashflows Sync information">i</summary>
+                  <div class="absolute right-0 mt-2 w-80 max-w-[calc(100vw-2rem)] rounded-xl border border-gray-200 bg-white shadow-lg p-4 z-30 text-xs text-gray-600 space-y-2">
+                    <p class="font-semibold text-gray-900">How to use this page</p>
+                    <p>Download the merchant-account statement CSV from Cashflows for the recommended date range, then upload it here.</p>
+                    <p>The preview reads Xero and the CSV, but it does not write to Xero while test mode is active.</p>
+                  </div>
+                </details>
+                <a href="https://secure.cashflows.com/admin/login" target="_blank" rel="noopener noreferrer"
+                  class="h-8 px-3 rounded-lg border border-gray-300 bg-white hover:bg-gray-50 text-gray-800 text-xs font-semibold inline-flex items-center">
+                  Open Cashflows login
+                </a>
+              </div>
             </div>
           </header>
 
@@ -6717,15 +6783,28 @@ function toggleReceiptsEnabled(requested) {{
               <div class="flex items-start justify-between gap-4 flex-wrap">
                 <div>
                   <h2 class="text-sm font-semibold text-gray-900">Reconcile from Cashflows CSV</h2>
-                  <p class="text-sm text-gray-600 mt-1">Upload the merchant-account statement you downloaded from Cashflows. This reads your live Xero and shows a full preview &mdash; <strong>nothing is written to Xero</strong> (Phase&nbsp;1 test mode).</p>
+                  <p class="text-sm text-gray-600 mt-1">Upload the merchant-account statement you downloaded from Cashflows. Preview is read-only. Ticked batches can then be submitted from this page; by default submission runs in test mode and shows the Xero payloads without writing anything.</p>
                 </div>
-                <span class="px-2 py-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-semibold whitespace-nowrap">Test mode &middot; no writes</span>
+                <span class="px-2 py-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-semibold whitespace-nowrap">Submit guarded &middot; test mode unless enabled</span>
               </div>
 
               <div id="recommended-range" class="hidden rounded-lg border border-indigo-100 bg-indigo-50 p-3 text-xs text-indigo-900">
                 <span class="font-semibold">Recommended Cashflows export range:</span>
                 <span id="rec-range-text"></span>
                 <span id="rec-range-reason" class="block text-indigo-700 mt-0.5"></span>
+              </div>
+
+              <div class="rounded-lg border border-gray-200 bg-gray-50 p-4 space-y-2">
+                <div class="flex items-start justify-between gap-3 flex-wrap">
+                  <div>
+                    <div class="text-xs font-semibold text-gray-700">Cashflows CSV export</div>
+                    <p class="text-xs text-gray-500 mt-1">Log in to Cashflows, export the merchant-account statement CSV for the date range above, then upload it below.</p>
+                  </div>
+                  <a href="https://secure.cashflows.com/admin/login" target="_blank" rel="noopener noreferrer"
+                    class="h-8 px-3 rounded-lg bg-white border border-gray-300 hover:bg-gray-50 text-gray-800 text-xs font-semibold inline-flex items-center whitespace-nowrap">
+                    Open Cashflows
+                  </a>
+                </div>
               </div>
 
               <div class="rounded-lg border border-gray-200 bg-gray-50 p-4 space-y-2">
@@ -6757,6 +6836,37 @@ function toggleReceiptsEnabled(requested) {{
 
               <div id="csv-totals" class="hidden grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3"></div>
               <div id="csv-error" class="hidden rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800"></div>
+            </div>
+
+            <div id="csv-submit-panel" class="hidden rounded-xl border border-emerald-200 bg-white p-4 space-y-3">
+              <div class="flex items-start justify-between gap-3 flex-wrap">
+                <div>
+                  <h2 class="text-sm font-semibold text-gray-900">Submit approved batches to Xero</h2>
+                  <p id="csv-submit-help" class="text-xs text-gray-500 mt-1">Tick the batches you are happy with, then submit only those selected batches.</p>
+                </div>
+                <button id="submit-csv-btn" type="button" class="h-9 px-4 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold shadow-sm disabled:opacity-50">
+                  Submit selected to Xero
+                </button>
+              </div>
+              <div id="csv-submit-status" class="text-xs text-gray-500"></div>
+              <div id="csv-submit-progress" class="hidden rounded-xl border border-emerald-200 bg-emerald-50/60 p-4">
+                <div class="flex items-center gap-3">
+                  <svg id="csv-progress-spinner" class="animate-spin h-5 w-5 text-emerald-600 shrink-0" viewBox="0 0 24 24" fill="none">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+                  </svg>
+                  <div class="min-w-0 flex-1">
+                    <div id="csv-progress-title" class="text-sm font-semibold text-emerald-900">Reconciling with Xero…</div>
+                    <div id="csv-progress-msg" class="text-xs text-emerald-800/90 mt-0.5 truncate"></div>
+                  </div>
+                  <div id="csv-progress-count" class="text-sm font-bold text-emerald-800 tabular-nums shrink-0">0 / 0</div>
+                </div>
+                <div class="mt-3 h-2.5 w-full rounded-full bg-emerald-100 overflow-hidden">
+                  <div id="csv-progress-bar" class="h-full bg-emerald-600 transition-all duration-500 ease-out" style="width:0%"></div>
+                </div>
+                <p class="mt-2 text-[11px] text-emerald-700/80">You can safely close this page — the submission keeps running on the server and will pick up where it left off when you come back.</p>
+              </div>
+              <div id="csv-submit-output" class="hidden text-xs text-gray-700 bg-gray-50 border border-gray-200 rounded-lg p-3 overflow-x-auto"></div>
             </div>
 
             <div id="csv-results" class="hidden space-y-3"></div>
@@ -7043,15 +7153,92 @@ function toggleReceiptsEnabled(requested) {{
         const csvError = document.getElementById('csv-error');
         const csvTotals = document.getElementById('csv-totals');
         const csvResults = document.getElementById('csv-results');
+        const csvSubmitPanel = document.getElementById('csv-submit-panel');
+        const csvSubmitBtn = document.getElementById('submit-csv-btn');
+        const csvSubmitStatus = document.getElementById('csv-submit-status');
+        const csvSubmitOutput = document.getElementById('csv-submit-output');
+        const csvProgress = document.getElementById('csv-submit-progress');
+        const csvProgressTitle = document.getElementById('csv-progress-title');
+        const csvProgressMsg = document.getElementById('csv-progress-msg');
+        const csvProgressCount = document.getElementById('csv-progress-count');
+        const csvProgressBar = document.getElementById('csv-progress-bar');
+        const csvProgressSpinner = document.getElementById('csv-progress-spinner');
         const recRange = document.getElementById('recommended-range');
         const recRangeText = document.getElementById('rec-range-text');
         const recRangeReason = document.getElementById('rec-range-reason');
+        let _csvPreviewData = null;
+        let _submitPollTimer = null;
+
+        function renderSubmitProgress(p) {{
+          if (!csvProgress) return;
+          const total = p.total || 0;
+          const done = p.completed || 0;
+          const pct = p.percent != null ? p.percent : (total ? Math.round((done / total) * 100) : 0);
+          csvProgress.classList.remove('hidden');
+          csvProgressCount.textContent = done + ' / ' + total;
+          csvProgressBar.style.width = pct + '%';
+          csvProgressMsg.textContent = p.message || '';
+          if (p.status === 'paused') {{
+            csvProgressTitle.textContent = 'Paused — waiting for Xero';
+            csvProgressBar.className = 'h-full bg-amber-500 transition-all duration-500 ease-out';
+          }} else if (p.status === 'done') {{
+            csvProgressTitle.textContent = '✅ Reconciliation complete';
+            csvProgressBar.className = 'h-full bg-emerald-600 transition-all duration-500 ease-out';
+            if (csvProgressSpinner) csvProgressSpinner.classList.add('hidden');
+          }} else if (p.status === 'error') {{
+            csvProgressTitle.textContent = '⚠ Submission stopped';
+            csvProgressBar.className = 'h-full bg-red-500 transition-all duration-500 ease-out';
+            if (csvProgressSpinner) csvProgressSpinner.classList.add('hidden');
+          }} else {{
+            csvProgressTitle.textContent = 'Reconciling with Xero…';
+            csvProgressBar.className = 'h-full bg-emerald-600 transition-all duration-500 ease-out';
+            if (csvProgressSpinner) csvProgressSpinner.classList.remove('hidden');
+          }}
+        }}
+
+        function _markProgressBatchesSubmitted(p) {{
+          (p.completed_batch_ids || []).forEach(function(bid) {{
+            _setSubmitted(bid, true);
+            _setChecked(bid, false);
+          }});
+          if (_csvPreviewData) renderCsvResults(_csvPreviewData);
+          updateCsvSubmitPanel();
+        }}
+
+        async function pollSubmitProgress(showControls) {{
+          try {{
+            const resp = await fetch('/cashflows-sync/submit-progress');
+            const p = await resp.json();
+            if (!p || (p.active === false && !p.status)) {{
+              if (csvProgress) csvProgress.classList.add('hidden');
+              return;
+            }}
+            renderSubmitProgress(p);
+            if (p.status === 'running' || p.status === 'paused') {{
+              if (csvSubmitBtn) csvSubmitBtn.disabled = true;
+              if (csvSubmitStatus) csvSubmitStatus.textContent = '';
+              _submitPollTimer = setTimeout(function() {{ pollSubmitProgress(false); }}, 2000);
+            }} else {{
+              // done or error — finalise
+              if (_submitPollTimer) {{ clearTimeout(_submitPollTimer); _submitPollTimer = null; }}
+              _markProgressBatchesSubmitted(p);
+              if (p.status === 'done') {{
+                csvSubmitStatus.textContent = p.message || 'Reconciliation complete.';
+              }} else {{
+                csvShowError(p.message || p.error || 'Submission stopped.');
+              }}
+            }}
+          }} catch (err) {{
+            _submitPollTimer = setTimeout(function() {{ pollSubmitProgress(false); }}, 4000);
+          }}
+        }}
 
         const STATUS_META = {{
           ready: {{label: '✅ Invoices add up — ready to reconcile', cls: 'border-emerald-200 bg-emerald-50 text-emerald-800'}},
           needs_review: {{label: '🔎 Worth a quick check', cls: 'border-orange-200 bg-orange-50 text-orange-800'}},
           waiting_invoices: {{label: '⏳ An invoice is still missing', cls: 'border-amber-200 bg-amber-50 text-amber-800'}},
           no_bank_line: {{label: 'Not in your Xero bank feed yet', cls: 'border-gray-200 bg-gray-50 text-gray-700'}},
+          prepared_in_xero: {{label: 'Prepared in Xero — press OK in bank reconciliation', cls: 'border-sky-200 bg-sky-50 text-sky-800'}},
           already_reconciled: {{label: '☑️ Already reconciled in Xero', cls: 'border-gray-200 bg-gray-50 text-gray-500'}}
         }};
 
@@ -7087,10 +7274,27 @@ function toggleReceiptsEnabled(requested) {{
           if (v) localStorage.setItem(_checkedKey(batchId), '1');
           else localStorage.removeItem(_checkedKey(batchId));
         }}
+        function _submittedKey(batchId) {{ return 'cf_submitted_' + _previewId + '_' + batchId; }}
+        function _isSubmitted(batchId) {{ return localStorage.getItem(_submittedKey(batchId)) === '1'; }}
+        function _setSubmitted(batchId, v) {{
+          if (v) localStorage.setItem(_submittedKey(batchId), '1');
+          else localStorage.removeItem(_submittedKey(batchId));
+        }}
+        function _batchHasPaidInvoices(batch) {{
+          if (!batch) return false;
+          if (batch.has_paid_invoices) return true;
+          return (batch.sales || []).some(function(s, idx) {{
+            const selected = _selectedInvoiceForSale(batch, s, idx);
+            return selected && selected.is_open === false;
+          }});
+        }}
+        function _batchCanSubmit(batch) {{
+          return batch && !['already_reconciled', 'prepared_in_xero'].includes(batch.status);
+        }}
 
         // Manual invoice picks for "missing" sales (scoped to this preview upload).
-        // TESTING ONLY — these never submit to Xero; they just let the user
-        // cross-reference which invoice covers a settlement line.
+        // These are included when the user submits a checked batch, so the UI
+        // must make the confirmed pick obvious before any Xero write happens.
         function _saleKey(batchId, sale, idx) {{
           // Always include the row index so duplicate sale_refs in one batch
           // can never collide and overwrite each other's manual pick.
@@ -7141,11 +7345,186 @@ function toggleReceiptsEnabled(requested) {{
           return map;
         }}
 
-        // Loose name match: any 3+ char word from a appears in b.
+        // Adjustment plans for rows where the card payment does not equal the
+        // selected invoice total. TESTING ONLY for now: this changes preview
+        // totals and instructions, but does not write to Xero.
+        function _adjKey(saleKey) {{ return 'cf_adjust_' + _previewId + '_' + saleKey; }}
+        function _getAdjustment(saleKey) {{
+          try {{ return JSON.parse(localStorage.getItem(_adjKey(saleKey)) || 'null'); }}
+          catch (e) {{ return null; }}
+        }}
+        function _setAdjustment(saleKey, adj) {{
+          if (adj) localStorage.setItem(_adjKey(saleKey), JSON.stringify(adj));
+          else localStorage.removeItem(_adjKey(saleKey));
+        }}
+        function _invAmount(inv) {{
+          if (!inv) return 0;
+          const raw = inv.total ?? inv.amount_due ?? 0;
+          const val = Number(raw);
+          return Number.isFinite(val) ? val : 0;
+        }}
+        function _expectedAdjustment(saleGross, invAmount) {{
+          const diff = Number((Number(saleGross || 0) - Number(invAmount || 0)).toFixed(2));
+          if (Math.abs(diff) < 0.02) return null;
+          if (diff < 0) return {{type: 'discount', amount: Math.abs(diff)}};
+          return {{type: 'extra_invoice', amount: diff}};
+        }}
+        function _adjustmentMatches(expected, actual) {{
+          if (!expected) return true;
+          if (!actual || actual.type !== expected.type) return false;
+          return Math.abs(Number(actual.amount || 0) - Number(expected.amount || 0)) < 0.02;
+        }}
+        function _adjustmentLabel(adj) {{
+          if (!adj) return '';
+          if (adj.type === 'discount') return 'discount / credit adjustment ' + money(adj.amount);
+          if (adj.type === 'extra_invoice') return 'extra Parking invoice ' + money(adj.amount);
+          return 'adjustment ' + money(adj.amount);
+        }}
+        function _selectedInvoiceForSale(batch, sale, idx) {{
+          const saleKey = _saleKey(batch.id, sale, idx);
+          if (sale.invoice) return _getTiedSwap(batch.id, idx) || sale.invoice;
+          return _getMatch(saleKey) || sale.quick_invoice || null;
+        }}
+        function _submissionSale(batch, sale, idx) {{
+          const saleKey = _saleKey(batch.id, sale, idx);
+          const selected = _selectedInvoiceForSale(batch, sale, idx);
+          const adjustment = _getAdjustment(saleKey);
+          return {{
+            sale_ref: sale.sale_ref || '',
+            sale_index: idx,
+            selected_invoice_id: selected ? (selected.id || '') : '',
+            selected_invoice_number: selected ? (selected.number || '') : '',
+            adjustment: adjustment || null,
+          }};
+        }}
+        function updateCsvSubmitPanel() {{
+          if (!_csvPreviewData || !_csvPreviewData.batches) {{
+            csvSubmitPanel.classList.add('hidden');
+            return;
+          }}
+          const active = (_csvPreviewData.batches || []).filter(b => _batchCanSubmit(b) && !_isSubmitted(b.id));
+          const checked = active.filter(b => _isChecked(b.id));
+          csvSubmitPanel.classList.remove('hidden');
+          csvSubmitStatus.textContent = checked.length
+            ? checked.length + ' batch' + (checked.length === 1 ? '' : 'es') + ' selected. Submit will only process those selected rows.'
+            : 'No batches selected yet.';
+          csvSubmitBtn.disabled = checked.length === 0;
+        }}
+        function collectCsvSubmission() {{
+          if (!_csvPreviewData || !_csvPreviewData.batches) return [];
+          return (_csvPreviewData.batches || [])
+            .filter(b => _isChecked(b.id))
+            .filter(b => _batchCanSubmit(b))
+            .filter(b => !_isSubmitted(b.id))
+            .map(b => ({{
+              batch_id: b.id,
+              payout_ref: (b.payout || {{}}).csv_ref || '',
+              sales: (b.sales || []).map((s, idx) => _submissionSale(b, s, idx)),
+            }}));
+        }}
+        async function refreshCsvPreview(focusBatchId) {{
+          if (!_csvPreviewData || !_previewId) {{
+            csvShowError('Upload the CSV first, then refresh the batch.');
+            return;
+          }}
+          csvError.classList.add('hidden');
+          csvStatus.textContent = 'Refreshing Xero and calendar matches…';
+          const buttons = Array.from(document.querySelectorAll('.batch-refresh-btn'));
+          buttons.forEach(btn => btn.disabled = true);
+          try {{
+            const resp = await fetch('/cashflows-sync/refresh-csv-preview', {{
+              method: 'POST',
+              headers: {{'Content-Type': 'application/json'}},
+              body: JSON.stringify({{preview_id: _previewId, focus_batch_id: focusBatchId || ''}}),
+            }});
+            const data = await resp.json();
+            if (!resp.ok || data.error) throw new Error(data.error || 'Refresh failed');
+            _previewId = data.preview_id || _previewId;
+            renderCsvTotals(data.totals || {{}});
+            renderCsvResults(data);
+            csvStatus.textContent = 'Preview refreshed from Xero and calendar.';
+          }} catch (err) {{
+            csvShowError(err.message || String(err));
+            csvStatus.textContent = '';
+          }} finally {{
+            buttons.forEach(btn => btn.disabled = false);
+            updateCsvSubmitPanel();
+          }}
+        }}
+        function renderCsvSubmitSummary(data) {{
+          const plans = data.plans || [];
+          const blockers = data.production_blockers || [];
+          const mode = data.mode === 'production' ? 'Production write' : 'Test mode';
+          const modeCls = data.mode === 'production'
+            ? 'bg-red-50 border-red-200 text-red-800'
+            : 'bg-emerald-50 border-emerald-200 text-emerald-800';
+          const planRows = plans.map(function(p) {{
+            const invs = (p.chosen_invoices || []).map(function(i) {{
+              return esc(i.number || i.id || 'invoice') + (i.contact_name ? ' · ' + esc(i.contact_name) : '');
+            }}).join('<br>');
+            const extra = (p.extra_invoice_payloads || []).length
+              ? '<div class="mt-1 text-indigo-700 font-semibold">Extra invoice plan: ' + (p.extra_invoice_payloads || []).map(x => esc(x.contact_name || 'Parking') + ' ' + money(x.amount)).join(', ') + '</div>'
+              : '';
+            const discounts = (p.discount_actions_required || []).length
+              ? '<div class="mt-1 text-amber-700 font-semibold">Credit note plan: ' + (p.discount_actions_required || []).map(x => money(x.amount)).join(', ') + '</div>'
+              : '';
+            const paid = (p.already_paid_invoices || []).length
+              ? '<div class="mt-1 text-emerald-700 font-semibold">Already paid in Xero: app will move the payment into Cashflow reconciliation and create one net Cashflows bank match.</div>'
+              : '';
+            const matchPack = p.paid_matching_adjustment
+              ? '<div class="mt-1 text-emerald-700 font-semibold">Match pack: one net Cashflows bank transaction will be ready for Xero bank reconciliation.</div>'
+              : '';
+            const clearing = p.clearing_receipt
+              ? '<div class="mt-1 text-emerald-700 font-semibold">Clearing receipt: bank deposit coded to Cashflow reconciliation account.</div>'
+              : '';
+            return `<tr class="border-t border-gray-200">
+              <td class="px-3 py-2 font-mono text-[11px]">${{esc(p.payout_ref || p.batch_id || '')}}</td>
+              <td class="px-3 py-2 text-right font-semibold">${{money(p.gross)}}</td>
+              <td class="px-3 py-2 text-right text-gray-500">${{money(p.fee_or_charge_total)}}</td>
+              <td class="px-3 py-2 text-right font-semibold">${{money(p.net)}}</td>
+              <td class="px-3 py-2">${{invs || '<span class="text-amber-700">No invoices selected</span>'}}${{extra}}${{discounts}}${{paid}}${{matchPack}}${{clearing}}</td>
+            </tr>`;
+          }}).join('');
+          const blockerHtml = blockers.length
+            ? '<div class="rounded-lg border border-amber-200 bg-amber-50 text-amber-800 p-3 mt-3"><div class="font-semibold mb-1">Production blockers</div><ul class="list-disc pl-5 space-y-1">' + blockers.map(b => '<li>' + esc(b) + '</li>').join('') + '</ul></div>'
+            : '';
+          csvSubmitOutput.innerHTML = `
+            <div class="inline-flex px-2 py-1 rounded-full border text-[11px] font-semibold ${{modeCls}}">${{esc(mode)}}</div>
+            <div class="mt-2 text-sm font-semibold text-gray-900">${{esc(data.message || 'Submission prepared.')}}</div>
+            <div class="mt-3 overflow-x-auto rounded-lg border border-gray-200 bg-white">
+              <table class="w-full text-xs">
+                <thead>
+                  <tr class="bg-gray-50 text-[11px] uppercase tracking-wide text-gray-400 text-left">
+                    <th class="px-3 py-2">Payout</th>
+                    <th class="px-3 py-2 text-right">Gross</th>
+                    <th class="px-3 py-2 text-right">Fees</th>
+                    <th class="px-3 py-2 text-right">Bank net</th>
+                    <th class="px-3 py-2">Invoices / actions</th>
+                  </tr>
+                </thead>
+                <tbody>${{planRows}}</tbody>
+              </table>
+            </div>
+            ${{blockerHtml}}
+            <details class="mt-3 rounded-lg border border-gray-200 bg-white">
+              <summary class="cursor-pointer px-3 py-2 text-[11px] font-semibold text-gray-600">Technical Xero payload preview</summary>
+              <pre class="px-3 pb-3 whitespace-pre-wrap text-[11px] text-gray-600">${{esc(JSON.stringify(data, null, 2))}}</pre>
+            </details>`;
+          csvSubmitOutput.classList.remove('hidden');
+        }}
+
+        // Name match strict enough to avoid surname-only false positives:
+        // "Tim Johnson" must not match "Tracey Johnson" just because both
+        // contain Johnson.
         function _nameOverlap(a, b) {{
-          const wa = (a||'').toLowerCase().split(/\s+/).filter(function(w){{ return w.length >= 3; }});
-          const bl = (b||'').toLowerCase();
-          return wa.some(function(w){{ return bl.indexOf(w) >= 0; }});
+          const aw = (a||'').toLowerCase().split(/[^a-z0-9]+/).filter(function(w){{ return w.length >= 3; }});
+          const bw = (b||'').toLowerCase().split(/[^a-z0-9]+/).filter(function(w){{ return w.length >= 3; }});
+          if (!aw.length || !bw.length) return false;
+          const overlap = aw.filter(function(w){{ return bw.indexOf(w) >= 0; }});
+          if (!overlap.length) return false;
+          if (aw.length >= 2 && bw.length >= 2) return aw[0] === bw[0] || overlap.length >= 2;
+          if (aw.length === 1) return aw[0] === bw[0];
+          return bw[0] === aw[0];
         }}
         // Format a calendar entry as "5 May 2026, 09:00-10:30".
         function _fmtCalEntry(c) {{
@@ -7162,6 +7541,10 @@ function toggleReceiptsEnabled(requested) {{
 
         function renderBatch(b) {{
           const meta = STATUS_META[b.status] || STATUS_META.no_bank_line;
+          const batchHasPaidInvoices = _batchHasPaidInvoices(b);
+          const displayMeta = batchHasPaidInvoices && !['already_reconciled', 'prepared_in_xero'].includes(b.status)
+            ? {{label: 'Ready to prepare Xero match pack', cls: 'border-emerald-200 bg-emerald-50 text-emerald-800'}}
+            : meta;
           const payout = b.payout || {{}};
           const bank = b.bank_line;
 
@@ -7172,7 +7555,11 @@ function toggleReceiptsEnabled(requested) {{
 
           // Bank line confirmation pill
           let bankPill;
-          if (bank) {{
+          if (b.status === 'already_reconciled') {{
+            bankPill = `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 text-[11px] font-semibold">☑ Already reconciled in Xero</span>`;
+          }} else if (b.status === 'prepared_in_xero') {{
+            bankPill = `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-sky-50 border border-sky-200 text-sky-700 text-[11px] font-semibold">Prepared in Xero</span>`;
+          }} else if (bank) {{
             bankPill = `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 text-[11px] font-semibold">✅ Confirmed in Xero bank feed</span>`;
           }} else if (b.status === 'no_bank_line') {{
             bankPill = `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-gray-50 border border-gray-200 text-gray-500 text-[11px]">⏳ Not yet in Xero bank feed</span>`;
@@ -7182,16 +7569,25 @@ function toggleReceiptsEnabled(requested) {{
 
           // ── Invoice rows (right side of Xero reconciliation — "Find & select") ──
           const sales = b.sales || [];
-          // A sale counts toward the total if Xero auto-matched it OR the user
-          // has manually picked a candidate invoice for it (testing only).
-          const manualFor = sales.map((s, idx) => s.invoice ? null : _getMatch(_saleKey(b.id, s, idx)));
+          const rowStates = sales.map((s, idx) => {{
+            const saleKey = _saleKey(b.id, s, idx);
+            const selected = _selectedInvoiceForSale(b, s, idx);
+            const invTotal = _invAmount(selected);
+            const expectedAdj = selected ? _expectedAdjustment(Number(s.gross || 0), invTotal) : null;
+            const adjustment = _getAdjustment(saleKey);
+            const adjustmentOk = _adjustmentMatches(expectedAdj, adjustment);
+            const ready = !!selected && adjustmentOk;
+            return {{saleKey, selected, invTotal, expectedAdj, adjustment, adjustmentOk, ready}};
+          }});
+          // A sale counts toward the total only if it has a selected invoice and
+          // any under/over difference has an explicit adjustment plan.
           const matchedGrossEff = sales.reduce((sum, r, idx) =>
-            (r.invoice || manualFor[idx]) ? sum + Number(r.gross || 0) : sum, 0);
+            rowStates[idx].ready ? sum + Number(r.gross || 0) : sum, 0);
           // Cashflows deducts its fees before paying the bank, so the correct
           // check is: gross − fees − absorbed declines ≈ bank net (not gross ≈ net).
-          const allEffective = sales.every((s, idx) => s.invoice || manualFor[idx]);
+          const allEffective = sales.every((s, idx) => rowStates[idx].ready);
           const matchedFees = sales.reduce((sum, r, idx) =>
-            (r.invoice || manualFor[idx]) ? sum + Number(r.fee||0) : sum, 0);
+            rowStates[idx].ready ? sum + Number(r.fee||0) : sum, 0);
           const declineAbs = Number(b.decline_absorbed || 0);
           const netOfFees = matchedGrossEff - matchedFees - declineAbs;
           const netVariance = Math.abs(Number(b.net||0) - netOfFees);
@@ -7202,6 +7598,10 @@ function toggleReceiptsEnabled(requested) {{
             const sTime = s.time ? '<div class="text-[10px] text-gray-400">' + esc(s.time) + '</div>' : '';
             const isMissing = !s.invoice;
             const saleKey = _saleKey(b.id, s, idx);
+            const rowState = rowStates[idx];
+            const expectedAdj = rowState.expectedAdj;
+            const adjustment = rowState.adjustment;
+            const adjustmentOk = rowState.adjustmentOk;
 
             // Option list: matched -> [app pick, ...same-amount alts]; missing -> ranked candidates.
             const allOptions = isMissing
@@ -7255,11 +7655,6 @@ function toggleReceiptsEnabled(requested) {{
               }});
               if (best) {{ optCal[0] = best; _usedSugg.add(bestSgi); }}
             }}
-            // Shared fallback shown on all non-name-matched candidates as
-            // "proximity only" — so users can see the appointment exists and
-            // decide which candidate corresponds to it, rather than seeing blank.
-            const _sharedCalSugg = calSuggs.length > 0 ? calSuggs[0] : null;
-
             // Favoured option: app pick / top candidate, unless the user overrode it,
             // or a tied price is broken by the closest calendar appointment.
             let favIdx = 0;
@@ -7295,22 +7690,62 @@ function toggleReceiptsEnabled(requested) {{
             // still keeping the candidates below for manual cross-referencing.
             const favAmountMatch = !!(favoured && favoured.amount_match);
             const noAmountMatch = isMissing && !userChosen && !!favoured && !favAmountMatch;
+            const likelyCal = (s.calendar_suggestions || []).find(function(c) {{
+              const eventGross = Number(c.event_gross);
+              const saleGross = Number(s.gross || 0);
+              const amountOk = !isNaN(eventGross) && Math.abs(eventGross - saleGross) < 0.02;
+              return amountOk && Number(c.score || 0) >= 0.6;
+            }}) || null;
+            const likelyCalLine = likelyCal
+              ? '<div class="mt-1 rounded border border-teal-200 bg-teal-50 px-2 py-1.5 text-[11px] text-teal-800">'
+                  + '<div class="font-semibold">&#128197; Likely calendar job: ' + esc(likelyCal.customer || likelyCal.event_summary || 'Calendar entry') + '</div>'
+                  + '<div>' + esc(_fmtCalEntry(likelyCal))
+                    + ((likelyCal.event_gross !== null && likelyCal.event_gross !== undefined) ? ' <span class="font-bold">(\u00a3' + Number(likelyCal.event_gross).toFixed(2) + ')</span>' : '')
+                    + '</div>'
+                + '</div>'
+              : '';
 
             // Favoured candidate cell.
             const custName = noMatch
               ? '<span class="text-amber-700">No match found</span>'
               : noAmountMatch
-                ? '<span class="text-amber-700">' + money(s.gross) + ' card sale</span>'
+                ? (likelyCal
+                    ? '<span class="text-teal-800">' + esc(likelyCal.customer || 'Calendar job') + '</span>'
+                    : '<span class="text-amber-700">' + money(s.gross) + ' card sale</span>')
                 : esc(favoured.contact_name || favoured.number || '\u2014');
             const calLine = (favCal && !noAmountMatch)
               ? '<div class="text-[11px] text-teal-700 mt-0.5">&#128197; Calendar entry \u2014 ' + esc(_fmtCalEntry(favCal))
-                  + ((favCal.event_gross !== null && favCal.event_gross !== undefined) ? ' <span class="text-teal-500">(\u00a3' + favCal.event_gross.toFixed(2) + ')</span>' : '')
+                  + ((favCal.event_gross !== null && favCal.event_gross !== undefined) ? ' <span class="text-xs font-bold text-teal-700">(\u00a3' + favCal.event_gross.toFixed(2) + ')</span>' : '')
                   + '</div>'
               : '';
+            const suggestionLine = noAmountMatch && favoured
+              ? '<div class="mt-2 rounded border border-amber-200 bg-white px-2 py-2 text-[11px] text-gray-700">'
+                  + '<div class="flex items-start justify-between gap-3">'
+                    + '<div class="min-w-0">'
+                      + '<div class="text-[10px] uppercase tracking-widest text-amber-700 font-semibold">Top invoice suggestion</div>'
+                      + '<div class="mt-0.5"><span class="font-semibold text-gray-900">' + esc(favoured.contact_name || favoured.number || '') + '</span> '
+                        + '<span class="text-indigo-700 font-mono">' + esc(favoured.number || '') + '</span> '
+                        + '<span class="text-gray-400 font-mono">' + esc(favoured.reference || '') + '</span></div>'
+                      + (favCal
+                          ? '<div class="mt-0.5 text-teal-700">&#128197; ' + esc(_fmtCalEntry(favCal))
+                              + ((favCal.event_gross !== null && favCal.event_gross !== undefined) ? ' <span class="font-bold">(\u00a3' + Number(favCal.event_gross).toFixed(2) + ')</span>' : '')
+                              + '</div>'
+                          : '')
+                      + '<div class="mt-0.5 text-gray-500">Invoice total ' + money(favoured.total) + ' vs card payment ' + money(s.gross) + '. Confirming will show the adjustment needed.</div>'
+                    + '</div>'
+                    + '<button class="cf-cand-pick shrink-0 px-2 py-1 rounded bg-amber-600 text-white text-[11px] font-semibold hover:bg-amber-700" data-si="' + idx + '" data-ci="' + favIdx + '" data-cal-slot="' + esc((favCal && favCal.event_date && favCal.event_start) ? (favCal.event_date + 'T' + favCal.event_start) : '') + '">Confirm</button>'
+                  + '</div>'
+                + '</div>'
+              : '';
             // Quick-invoice control: for a stray card payment with no invoice,
-            // one click raises a tidy standalone invoice to a standard contact
-            // (default "Parking") so it reconciles cleanly in Xero.
+            // one click raises a tidy standalone invoice. It is intentionally
+            // shown after candidate review, because a real Xero match is safer
+            // than creating a new invoice.
             const qi = s.quick_invoice;
+            const qiContact = likelyCal && likelyCal.customer ? likelyCal.customer : '';
+            const qiDesc = likelyCal
+              ? ((likelyCal.event_summary || likelyCal.customer || 'Calendar card payment') + ' - card payment')
+              : 'Parking';
             const qiBtn = qi
               ? '<div class="mt-1 text-[11px] text-emerald-700 font-semibold">'
                   + (qi.dry_run
@@ -7318,43 +7753,66 @@ function toggleReceiptsEnabled(requested) {{
                       : '\u2713 Quick invoice created' + (qi.number ? ': <span class="font-mono">' + esc(qi.number) + '</span>' : ''))
                   + ' \u00b7 ' + esc(qi.contact_name || '') + ' \u00b7 ' + esc(qi.description || '')
                   + '</div>'
-              : '<button class="cf-quick-invoice mt-1 inline-flex items-center gap-1 px-2 py-1 rounded bg-emerald-600 text-white text-[11px] font-semibold hover:bg-emerald-700" data-ref="' + esc(s.sale_ref || '') + '" data-amt="' + (s.gross || 0) + '" data-date="' + esc(s.date || '') + '" data-si="' + idx + '">+ Quick invoice (' + money(s.gross) + ')</button>';
+              : '<button class="cf-quick-invoice mt-1 inline-flex items-center gap-1 px-2 py-1 rounded bg-emerald-600 text-white text-[11px] font-semibold hover:bg-emerald-700" data-ref="' + esc(s.sale_ref || '') + '" data-amt="' + (s.gross || 0) + '" data-date="' + esc(s.date || '') + '" data-si="' + idx + '" data-contact="' + esc(qiContact) + '" data-desc="' + esc(qiDesc) + '">+ Quick invoice (' + money(s.gross) + ')</button>';
 
             let invCell = noMatch
               ? '<span class="text-[11px] text-amber-600">create an invoice in Xero to reconcile this payment</span>'
               : noAmountMatch
-                ? '<span class="text-[11px] text-amber-700">No invoice for ' + money(s.gross) + ' in Xero'
-                    + (s.sale_ref ? ' \u00b7 <span class="font-mono text-gray-500">Sale ' + esc(s.sale_ref) + '</span>' : '')
-                    + '<div class="text-gray-500 mt-0.5">Genuine card payment, no matching invoice \u2014 create a ' + money(s.gross) + ' invoice in Xero, or check if it\u2019s a tip / deposit / part-payment / test charge.</div>'
-                    + '</span>'
+                ? suggestionLine
                 : '<span class="text-indigo-700 font-mono">' + esc(favoured.number || '') + '</span> '
                     + '<span class="text-gray-400 font-mono">' + esc(favoured.reference || '') + '</span>' + calLine;
-            if (noMatch || noAmountMatch) {{ invCell += '<div class="mt-1">' + qiBtn + '</div>'; }}
+            if (noMatch) {{ invCell += '<div class="mt-1">' + qiBtn + '</div>'; }}
+            if (favoured && expectedAdj) {{
+              const expLabel = _adjustmentLabel(expectedAdj);
+              const activeLabel = adjustmentOk ? '&#10003; ' + _adjustmentLabel(adjustment) : '';
+              const actionText = expectedAdj.type === 'discount'
+                ? 'Add discount plan'
+                : 'Add Parking invoice plan';
+              const helpText = expectedAdj.type === 'discount'
+                ? 'Card payment is lower than invoice total. Xero needs a discount/credit-style adjustment before this can fully match.'
+                : 'Card payment is higher than this invoice. Xero needs an extra invoice, normally to Parking, for the difference.';
+              invCell += '<div class="mt-2 rounded border ' + (adjustmentOk ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-amber-200 bg-amber-50 text-amber-800') + ' p-2">'
+                + '<div class="text-[11px] font-semibold">Adjustment needed: ' + expLabel + '</div>'
+                + '<div class="text-[10px] mt-0.5">' + helpText + '</div>'
+                + (adjustmentOk
+                    ? '<div class="mt-1 text-[11px] font-semibold">' + activeLabel + ' <button class="cf-adjust-clear ml-1 underline text-gray-500 hover:text-red-600" data-si="' + idx + '">clear</button></div>'
+                    : '<button class="cf-adjust-set mt-1 inline-flex px-2 py-1 rounded bg-amber-600 text-white text-[11px] font-semibold hover:bg-amber-700" data-si="' + idx + '" data-type="' + expectedAdj.type + '" data-amt="' + expectedAdj.amount.toFixed(2) + '">' + actionText + ' (' + money(expectedAdj.amount) + ')</button>')
+                + '</div>';
+            }}
 
             // Status badge.
             let statusBadge;
             if (noMatch) {{
               statusBadge = '<span class="text-amber-600 font-semibold">\u23f3 no matches found</span>';
             }} else if (userChosen) {{
-              statusBadge = '<span class="text-indigo-600 font-semibold">\u2713 your choice</span>'
+              statusBadge = expectedAdj && !adjustmentOk
+                ? '<span class="text-amber-700 font-semibold">\u26a0 adjustment needed</span>'
+                : '<span class="text-indigo-600 font-semibold">\u2713 your choice</span>'
                 + ' <button class="cf-row-reset ml-1 text-[10px] text-gray-400 hover:text-red-500 underline" data-si="' + idx + '" data-missing="' + (isMissing?'1':'0') + '">reset</button>';
             }} else if (noAmountMatch) {{
               statusBadge = '<span class="text-amber-700 font-semibold">\u26a0 no matching invoice</span>';
             }} else if (isMissing) {{
               statusBadge = '<span class="text-amber-700 font-semibold">\u23f3 suggested \u2014 confirm in Xero</span>';
+            }} else if (expectedAdj && !adjustmentOk) {{
+              statusBadge = '<span class="text-amber-700 font-semibold">\u26a0 adjustment needed</span>';
             }} else if (ambiguous) {{
               statusBadge = favCal
                 ? '<span class="text-teal-700 font-semibold">&#128197; calendar match</span>'
                 : '<span class="text-orange-600 font-semibold">\u26a0 tied on price</span>';
+            }} else if (favoured && favoured.is_open === false) {{
+              statusBadge = '<span class="text-amber-700 font-semibold">↳ already paid — match existing Xero payment</span>';
             }} else {{
               statusBadge = '<span class="text-emerald-600 font-semibold">\u2713 matched by app</span>';
             }}
 
             // "other options" dropdown toggle.
             const altCount = noMatch ? 0 : (allOptions.length - 1);
-            const toggle = altCount > 0
+            const hasSecondaryAction = noAmountMatch && !qi;
+            const showPanel = altCount > 0 || hasSecondaryAction;
+            const toggle = showPanel
               ? '<button class="cf-row-toggle ml-2 inline-flex items-center gap-1 text-[11px] text-gray-500 hover:text-gray-800" data-si="' + idx + '">'
-                  + altCount + ' other option' + (altCount===1?'':'s') + ' <span class="text-[9px]">\u25be</span></button>'
+                  + (altCount > 0 ? altCount + ' other option' + (altCount===1?'':'s') : 'review options')
+                  + ' <span class="text-[9px]">\u25be</span></button>'
               : '';
 
             // Options panel (favoured first).
@@ -7373,11 +7831,25 @@ function toggleReceiptsEnabled(requested) {{
               const openBadge = (opt.is_open === true)
                 ? '<span class="text-[10px] font-semibold text-indigo-700 bg-indigo-100 rounded px-1">unpaid \u2014 reconciling marks paid</span>'
                 : (opt.is_open === false ? '<span class="text-[10px] text-gray-400 bg-gray-100 rounded px-1">already paid</span>' : '');
+              const optTotal = Number(opt.total ?? opt.amount ?? opt.amount_due ?? 0);
+              const saleGross = Number(s.gross || 0);
+              const optDiff = optTotal - saleGross;
+              const optDiffAbs = Math.abs(optDiff);
+              const optDiffLabel = optDiffAbs < 0.005
+                ? 'exact'
+                : (optDiff > 0 ? 'invoice higher by ' : 'invoice lower by ') + money(optDiffAbs);
+              const priceLine = '<div class="mt-1 flex flex-wrap items-center gap-1.5 text-[11px]">'
+                + '<span class="font-semibold text-gray-900">Invoice ' + money(optTotal) + '</span>'
+                + '<span class="text-gray-400">vs card</span>'
+                + '<span class="font-semibold text-gray-900">' + money(saleGross) + '</span>'
+                + '<span class="' + (optDiffAbs < 0.005 ? 'text-emerald-700 bg-emerald-50 border-emerald-100' : 'text-amber-700 bg-amber-50 border-amber-100') + ' border rounded px-1">'
+                + esc(optDiffLabel) + '</span>'
+                + '</div>';
               const calConfirmed = _nameMatchedIdx.has(origIdx);
-              const displayCal = oc || _sharedCalSugg;
+              const displayCal = oc;
               const ocLine = displayCal
                 ? '<div class="text-[11px] mt-0.5 ' + (calConfirmed ? 'text-teal-700' : 'text-gray-400') + '">&#128197; ' + esc(_fmtCalEntry(displayCal))
-                    + ((displayCal.event_gross !== null && displayCal.event_gross !== undefined) ? ' <span class="' + (calConfirmed ? 'text-teal-500' : 'text-gray-400') + '">(\u00a3' + displayCal.event_gross.toFixed(2) + ')</span>' : '')
+                    + ((displayCal.event_gross !== null && displayCal.event_gross !== undefined) ? ' <span class="text-xs font-bold ' + (calConfirmed ? 'text-teal-700' : 'text-gray-500') + '">(\u00a3' + displayCal.event_gross.toFixed(2) + ')</span>' : '')
                     + (calConfirmed
                         ? ' <span class="text-[10px] text-teal-700 font-semibold bg-teal-50 rounded px-1">\u2713 name match</span>'
                         : ' <span class="text-[10px] text-gray-400 bg-gray-100 rounded px-1">? proximity only</span>')
@@ -7385,7 +7857,9 @@ function toggleReceiptsEnabled(requested) {{
                 : '';
               const slot = (displayCal && displayCal.event_date && displayCal.event_start) ? (displayCal.event_date + 'T' + displayCal.event_start) : '';
               const btn = isFav
-                ? '<span class="text-[11px] text-gray-400 italic shrink-0 self-center">currently shown</span>'
+                ? '<span class="text-[11px] text-gray-400 italic shrink-0 self-center">'
+                    + (noAmountMatch ? 'top suggestion' : 'currently shown')
+                  + '</span>'
                 : '<button class="' + (isMissing ? 'cf-cand-pick' : 'cf-tied-pick') + ' shrink-0 self-center px-2 py-1 rounded bg-indigo-600 text-white text-[11px] font-semibold hover:bg-indigo-700" data-si="' + idx + '" data-' + (isMissing?'ci':'oi') + '="' + origIdx + '" data-cal-slot="' + esc(slot) + '">Use this</button>';
               return '<div class="flex items-start justify-between gap-2 py-1.5 px-2 rounded border-b border-gray-100 last:border-0 hover:bg-white ' + (isFav?'bg-teal-50/40':'') + '">'
                 + '<div class="min-w-0">'
@@ -7393,15 +7867,26 @@ function toggleReceiptsEnabled(requested) {{
                 +     '<span class="text-indigo-700 font-mono">' + esc(opt.number||'') + '</span> '
                 +     '<span class="text-gray-400 font-mono">' + esc(opt.reference||'') + '</span>'
                 +     (isFav?' <span class="text-[10px] text-gray-400 italic">(favoured)</span>':'') + assigned + '</div>'
+                +   priceLine
                 +   '<div class="flex items-center gap-1.5 mt-0.5 flex-wrap">' + amtBadge + ' ' + dayTxt + ' ' + openBadge + '</div>' + ocLine
                 + '</div>' + btn + '</div>';
             }}).join('');
-            const panelRow = altCount > 0
+            const quickFallback = hasSecondaryAction
+              ? '<div class="mt-2 rounded border border-emerald-200 bg-white p-2">'
+                  + '<div class="text-[10px] uppercase tracking-widest text-emerald-700 font-semibold">Fallback if no Xero invoice is right</div>'
+                  + (likelyCal
+                      ? '<div class="text-[11px] text-gray-600 mt-1">Prefilled from calendar: <span class="font-semibold text-gray-900">' + esc(likelyCal.customer || '') + '</span> ' + esc(_fmtCalEntry(likelyCal)) + '</div>'
+                      : '<div class="text-[11px] text-gray-600 mt-1">Use only if this card payment really has no matching Xero invoice.</div>')
+                  + qiBtn
+                + '</div>'
+              : (qi ? '<div class="mt-2">' + qiBtn + '</div>' : '');
+            const panelRow = showPanel
               ? '<tr class="cf-row-panel hidden" id="cf-row-panel-' + b.id + '-' + idx + '"><td colspan="6" class="px-3 pb-3 pt-0 bg-gray-50/60">'
                   + '<div class="rounded-lg border border-gray-200 bg-gray-50 p-2">'
                   + '<div class="text-[10px] uppercase tracking-widest text-gray-400 font-semibold mb-1 px-1">Candidates \u00b7 best price &amp; calendar match first</div>'
                   + optionRows
                   + '<div class="text-[10px] text-gray-400 mt-1 px-1">Picking one is for cross-referencing only \u2014 nothing changes in Xero.</div>'
+                  + quickFallback
                   + '</div></td></tr>'
               : '';
 
@@ -7424,26 +7909,26 @@ function toggleReceiptsEnabled(requested) {{
           // The bank line is AFTER Cashflows deducts its fees, so "balanced"
           // means: gross matched − fees = bank net (not gross = bank net).
           const totalRowCls = balanced ? 'bg-emerald-50 text-emerald-800' : 'bg-amber-50 text-amber-800';
-          const missingCount = sales.filter((s, i) => !s.invoice && !manualFor[i]).length;
+          const missingCount = sales.filter((s, i) => !rowStates[i].ready).length;
           let missingGross = 0, missingFees = 0;
-          sales.forEach(function(s, i){{ if (!s.invoice && !manualFor[i]) {{ missingGross += Number(s.gross||0); missingFees += Number(s.fee||0); }} }});
+          sales.forEach(function(s, i){{ if (!rowStates[i].ready) {{ missingGross += Number(s.gross||0); missingFees += Number(s.fee||0); }} }});
           const missingRow = (missingCount > 0 && missingGross > 0.005)
             ? '<tr class="border-t border-dashed border-amber-300 bg-amber-50 text-xs text-amber-800">'
                 + '<td class="px-3 py-2.5" colspan="3">'
-                +   '<span class="font-semibold">&#128161; Invoice(s) needed to balance</span>'
+                +   '<span class="font-semibold">&#128161; Action needed to balance</span>'
                 +   ' <span class="text-[11px] text-amber-600">\u2014 '
-                +   missingCount + ' CSV payment' + (missingCount===1?'':'s') + ' with no matching Xero invoice</span>'
+                +   missingCount + ' CSV payment' + (missingCount===1?'':'s') + ' missing an invoice or adjustment plan</span>'
                 + '</td>'
                 + '<td class="px-3 py-2.5 text-right font-bold text-amber-900">' + money(missingGross) + '</td>'
                 + '<td class="px-3 py-2.5 text-right text-amber-700">' + money(missingFees) + '</td>'
-                + '<td class="px-3 py-2.5 text-[11px] text-amber-700">Create invoice(s) in Xero for this gross amount — after CF fees it will net to ' + money(missingGross - missingFees) + '</td>'
+                + '<td class="px-3 py-2.5 text-[11px] text-amber-700">Choose the right invoice, then add any required discount or extra-invoice plan.</td>'
                 + '</tr>'
             : '';
           const totalCheck = balanced
             ? `✅ Balanced — gross ${{money(matchedGrossEff)}} less CF fees ${{money(matchedFees)}} = net ${{money(Number(b.net||0))}}`
             : allEffective
               ? `⚠ Small discrepancy of £${{netVariance.toFixed(2)}} — check for absorbed declined payments`
-              : `⚠ ${{money(Math.abs(Number(b.net||0) - netOfFees))}} still unreconciled — ${{missingCount}} invoice${{missingCount===1?'':'s'}} missing`;
+              : `⚠ ${{money(Math.abs(Number(b.net||0) - netOfFees))}} still unreconciled — ${{missingCount}} row${{missingCount===1?'':'s'}} need action`;
           const totalRow = `<tr class="border-t-2 border-gray-200 ${{totalRowCls}} font-semibold text-xs">
             <td class="px-3 py-2" colspan="3">Total invoices matched</td>
             <td class="px-3 py-2 text-right">${{money(matchedGrossEff)}}</td>
@@ -7453,9 +7938,13 @@ function toggleReceiptsEnabled(requested) {{
 
           const checked = _isChecked(b.id);
           const checkBg = checked ? 'bg-emerald-50 border-emerald-300' : 'bg-gray-50 border-gray-200';
-          const checkLabel = checked
-            ? '<span class="text-emerald-700 font-semibold">✓ Confirmed — ready to reconcile in Xero</span>'
-            : '<span class="text-gray-600">Mark as confirmed — all invoices look correct</span>';
+          const checkLabel = batchHasPaidInvoices
+            ? (checked
+                ? '<span class="text-emerald-700 font-semibold">✓ Confirmed — prepare net Cashflows match in Xero</span>'
+                : '<span class="text-gray-600">Mark as confirmed — prepare net Cashflows match</span>')
+            : (checked
+                ? '<span class="text-emerald-700 font-semibold">✓ Confirmed — ready to reconcile in Xero</span>'
+                : '<span class="text-gray-600">Mark as confirmed — all invoices look correct</span>');
 
           const borderCls = b.status === 'ready' ? 'border-emerald-200'
                           : b.status === 'needs_review' ? 'border-orange-200'
@@ -7477,13 +7966,16 @@ function toggleReceiptsEnabled(requested) {{
                   ${{bankPill}}
                 </div>
               </div>
-              <span class="px-2 py-1 rounded-full border text-xs font-semibold ${{meta.cls}}">${{meta.label}}</span>
+              <div class="flex items-center gap-2">
+                <button type="button" class="batch-refresh-btn h-7 w-7 rounded-full border border-gray-200 bg-white hover:bg-gray-50 text-gray-500 text-sm leading-none disabled:opacity-50" data-batch-id="${{b.id}}" title="Refresh this batch after updating the calendar or Xero">↻</button>
+                <span class="px-2 py-1 rounded-full border text-xs font-semibold ${{displayMeta.cls}}">${{displayMeta.label}}</span>
+              </div>
             </div>
 
             <!-- Invoice list — mirrors Xero "Find & select" -->
             <div class="px-4 py-3">
               <div class="text-[10px] uppercase tracking-widest text-gray-400 font-semibold mb-0.5">Invoices to select in Xero (${{b.sale_count}} in this batch)</div>
-              <div class="text-[11px] text-gray-400 mb-2">These were matched by this app — Xero has <strong>not</strong> been changed yet. You still need to select and reconcile them manually in Xero.</div>
+              <div class="text-[11px] text-gray-400 mb-2">${{batchHasPaidInvoices ? 'These invoices are already paid in Xero. Submitting moves the invoice payment into Cashflow reconciliation and creates one net Cashflows bank transaction for the payout.' : 'These were matched by this app. Xero is not changed by preview or ticking; only the separate submit button prepares the selected batches for Xero.'}}</div>
               <div class="overflow-x-auto rounded-lg border border-gray-100">
                 <table class="w-full text-xs">
                   <thead>
@@ -7510,16 +8002,24 @@ function toggleReceiptsEnabled(requested) {{
             </label>`;
 
           // Checkbox behaviour
+          wrap.querySelector('.batch-refresh-btn').addEventListener('click', function() {{
+            refreshCsvPreview(b.id);
+          }});
           wrap.querySelector('.batch-confirm-cb').addEventListener('change', function() {{
             _setChecked(b.id, this.checked);
             const lbl = wrap.querySelector('label');
             if (this.checked) {{
               lbl.className = lbl.className.replace('bg-gray-50 border-gray-200', 'bg-emerald-50 border-emerald-300');
-              lbl.querySelector('span').outerHTML = '<span class="text-emerald-700 font-semibold">✓ Confirmed — ready to reconcile in Xero</span>';
+              lbl.querySelector('span').outerHTML = batchHasPaidInvoices
+                ? '<span class="text-emerald-700 font-semibold">✓ Confirmed — prepare net Cashflows match in Xero</span>'
+                : '<span class="text-emerald-700 font-semibold">✓ Confirmed — ready to reconcile in Xero</span>';
             }} else {{
               lbl.className = lbl.className.replace('bg-emerald-50 border-emerald-300', 'bg-gray-50 border-gray-200');
-              lbl.querySelector('span').outerHTML = '<span class="text-gray-600">Mark as confirmed — all invoices look correct</span>';
+              lbl.querySelector('span').outerHTML = batchHasPaidInvoices
+                ? '<span class="text-gray-600">Mark as confirmed — prepare net Cashflows match</span>'
+                : '<span class="text-gray-600">Mark as confirmed — all invoices look correct</span>';
             }}
+            updateCsvSubmitPanel();
           }});
 
           // Expand/collapse the "other options" panel for a transaction.
@@ -7541,6 +8041,7 @@ function toggleReceiptsEnabled(requested) {{
               if (!chosen) return;
               // Claim the calendar slot so it disappears from every other row.
               _setCalRowSlot(b.id, si, btn.dataset.calSlot || '');
+              _setAdjustment(_saleKey(b.id, sales[si], si), null);
               _setTiedSwap(b.id, si, chosen);
               wrap.replaceWith(renderBatch(b));
             }});
@@ -7555,6 +8056,7 @@ function toggleReceiptsEnabled(requested) {{
               const cand = (s.candidates || [])[ci];
               if (!cand) return;
               _setCalRowSlot(b.id, si, btn.dataset.calSlot || '');
+              _setAdjustment(_saleKey(b.id, s, si), null);
               _setMatch(_saleKey(b.id, s, si), cand);
               wrap.replaceWith(renderBatch(b));
             }});
@@ -7565,11 +8067,33 @@ function toggleReceiptsEnabled(requested) {{
             btn.addEventListener('click', () => {{
               const si = Number(btn.dataset.si);
               _setCalRowSlot(b.id, si, '');
+              _setAdjustment(_saleKey(b.id, sales[si], si), null);
               if (btn.dataset.missing === '1') {{
                 _setMatch(_saleKey(b.id, sales[si], si), null);
               }} else {{
                 _setTiedSwap(b.id, si, null);
               }}
+              wrap.replaceWith(renderBatch(b));
+            }});
+          }});
+
+          // Mark how a selected invoice/card mismatch should be made to balance.
+          wrap.querySelectorAll('.cf-adjust-set').forEach(btn => {{
+            btn.addEventListener('click', () => {{
+              const si = Number(btn.dataset.si);
+              const amount = Number(btn.dataset.amt || 0);
+              if (!amount || amount <= 0) return;
+              _setAdjustment(_saleKey(b.id, sales[si], si), {{
+                type: btn.dataset.type || '',
+                amount: amount,
+              }});
+              wrap.replaceWith(renderBatch(b));
+            }});
+          }});
+          wrap.querySelectorAll('.cf-adjust-clear').forEach(btn => {{
+            btn.addEventListener('click', () => {{
+              const si = Number(btn.dataset.si);
+              _setAdjustment(_saleKey(b.id, sales[si], si), null);
               wrap.replaceWith(renderBatch(b));
             }});
           }});
@@ -7582,10 +8106,13 @@ function toggleReceiptsEnabled(requested) {{
               const date = btn.dataset.date || '';
               const si = Number(btn.dataset.si);
               const s = sales[si];
+              const contact = (btn.dataset.contact || '').trim();
+              const defaultDesc = (btn.dataset.desc || 'Parking').trim() || 'Parking';
+              const targetContact = contact || 'Parking';
               if (!CF_DRY_RUN) {{
-                if (!window.confirm('This will create a REAL invoice in Xero for ' + money(amt) + ' to the standard "Parking" customer. Continue?')) return;
+                if (!window.confirm('This will create a REAL invoice in Xero for ' + money(amt) + ' to "' + targetContact + '". Continue?')) return;
               }}
-              const desc = (window.prompt('Description for this quick invoice (it will be raised to the standard "Parking" customer in Xero):', 'Parking') || '').trim();
+              const desc = (window.prompt('Description for this quick invoice:', defaultDesc) || '').trim();
               if (desc === '') return;
               const orig = btn.innerHTML;
               btn.disabled = true;
@@ -7594,11 +8121,11 @@ function toggleReceiptsEnabled(requested) {{
                 const resp = await fetch('/cashflows-sync/create-quick-invoice', {{
                   method: 'POST',
                   headers: {{ 'Content-Type': 'application/json' }},
-                  body: JSON.stringify({{ sale_ref: ref, amount: amt, date: date, description: desc }})
+                  body: JSON.stringify({{ sale_ref: ref, amount: amt, date: date, description: desc, contact_name: contact }})
                 }});
                 const data = await resp.json();
                 if (!resp.ok || data.error) {{ throw new Error(data.error || 'Request failed'); }}
-                if (s) s.quick_invoice = {{ number: data.number, contact_name: data.contact_name, description: data.description, amount: data.amount, dry_run: data.dry_run }};
+                if (s) s.quick_invoice = {{ id: data.id, number: data.number, contact_name: data.contact_name, description: data.description, amount: data.amount, dry_run: data.dry_run }};
                 wrap.replaceWith(renderBatch(b));
               }} catch (err) {{
                 btn.disabled = false;
@@ -7620,11 +8147,49 @@ function toggleReceiptsEnabled(requested) {{
           </div>`;
         }}
 
+        function renderBatchCompactSection(title, batches, note, tone) {{
+          if (!batches.length) return null;
+          const section = document.createElement('details');
+          section.open = true;
+          const toneCls = tone === 'submitted'
+            ? 'border-emerald-200 bg-emerald-50 text-emerald-900'
+            : 'border-gray-200 bg-gray-50 text-gray-800';
+          section.className = 'rounded-xl border ' + toneCls;
+          const rows = batches.map(function(b) {{
+            const payout = b.payout || {{}};
+            const names = (b.sales || []).map(function(s) {{
+              const inv = s.invoice || s.quick_invoice || {{}};
+              return inv.contact_name || inv.number || s.sale_ref || '';
+            }}).filter(Boolean).slice(0, 3).join(', ');
+            const date = gb((b.bank_line || {{}}).date || payout.date || '');
+            const label = tone === 'submitted' ? 'Submitted' : 'Reconciled in Xero';
+            return `<div class="grid grid-cols-12 gap-2 items-center px-3 py-2 border-t border-white/60 first:border-t-0 text-xs">
+              <div class="col-span-12 sm:col-span-3 font-semibold">${{esc(payout.csv_ref || b.id || '')}}</div>
+              <div class="col-span-6 sm:col-span-2">${{money(b.net || payout.amount || 0)}}</div>
+              <div class="col-span-6 sm:col-span-2 text-gray-500">${{esc(date)}}</div>
+              <div class="col-span-12 sm:col-span-3 truncate">${{esc(names || 'Cashflows batch')}}</div>
+              <div class="col-span-12 sm:col-span-2 text-right font-semibold">${{label}}</div>
+            </div>`;
+          }}).join('');
+          section.innerHTML = `
+            <summary class="cursor-pointer list-none px-4 py-3 flex items-center justify-between gap-3">
+              <span class="text-sm font-semibold">${{esc(title)}} <span class="text-xs font-normal opacity-70">(${{batches.length}})</span></span>
+              <span class="text-xs opacity-70">${{esc(note || '')}}</span>
+            </summary>
+            <div class="bg-white/70">${{rows}}</div>`;
+          return section;
+        }}
+
         function renderCsvResults(data) {{
+          _csvPreviewData = data;
           csvResults.innerHTML = '';
           const counts = data.status_counts || {{}};
           const alreadyDone = counts.already_reconciled || 0;
-          const activeBatches = (data.batches || []).filter(b => b.status !== 'already_reconciled');
+          const preparedInXero = counts.prepared_in_xero || 0;
+          const submittedBatches = (data.batches || []).filter(b => !['already_reconciled', 'prepared_in_xero'].includes(b.status) && _isSubmitted(b.id));
+          const reconciledBatches = (data.batches || []).filter(b => b.status === 'already_reconciled');
+          const preparedBatches = (data.batches || []).filter(b => b.status === 'prepared_in_xero');
+          const activeBatches = (data.batches || []).filter(b => !['already_reconciled', 'prepared_in_xero'].includes(b.status) && !_isSubmitted(b.id));
           const total = data.active_batch_count || activeBatches.length;
           const bankMatched = data.bank_matched_count || 0;
 
@@ -7698,9 +8263,34 @@ function toggleReceiptsEnabled(requested) {{
               <span class="px-2 py-1 rounded-full ${{STATUS_META.needs_review.cls}}">${{counts.needs_review||0}} worth a check</span>
               <span class="px-2 py-1 rounded-full ${{STATUS_META.waiting_invoices.cls}}">${{counts.waiting_invoices||0}} missing an invoice</span>
               <span class="px-2 py-1 rounded-full ${{STATUS_META.no_bank_line.cls}}">${{counts.no_bank_line||0}} not in Xero yet</span>
-              ${{alreadyDone ? `<span class="px-2 py-1 rounded-full border border-gray-200 bg-gray-50 text-gray-400">${{alreadyDone}} already reconciled in Xero &mdash; hidden</span>` : ''}}
+              ${{preparedInXero ? `<span class="px-2 py-1 rounded-full ${{STATUS_META.prepared_in_xero.cls}}">${{preparedInXero}} prepared in Xero</span>` : ''}}
+              ${{alreadyDone ? `<span class="px-2 py-1 rounded-full border border-gray-200 bg-gray-50 text-gray-400">${{alreadyDone}} already reconciled in Xero &mdash; shown above</span>` : ''}}
             </div>`;
           csvResults.appendChild(matchPanel);
+
+          const submittedSection = renderBatchCompactSection(
+            'Submitted this session',
+            submittedBatches.slice().reverse(),
+            'Prepared for Xero Find & Match',
+            'submitted'
+          );
+          if (submittedSection) csvResults.appendChild(submittedSection);
+
+          const preparedSection = renderBatchCompactSection(
+            'Prepared in Xero',
+            preparedBatches.slice().reverse(),
+            'Open Xero bank reconciliation and press OK',
+            'prepared'
+          );
+          if (preparedSection) csvResults.appendChild(preparedSection);
+
+          const reconciledSection = renderBatchCompactSection(
+            'Already reconciled in Xero',
+            reconciledBatches.slice().reverse(),
+            'Hidden from the active work list',
+            'reconciled'
+          );
+          if (reconciledSection) csvResults.appendChild(reconciledSection);
 
           // ── Batch list (skip already-reconciled, newest first) ────────────
           activeBatches.slice().reverse().forEach(b => csvResults.appendChild(renderBatch(b)));
@@ -7716,6 +8306,7 @@ function toggleReceiptsEnabled(requested) {{
             csvResults.appendChild(u);
           }}
           csvResults.classList.remove('hidden');
+          updateCsvSubmitPanel();
         }}
 
         async function loadRecommendedRange() {{
@@ -7762,6 +8353,52 @@ function toggleReceiptsEnabled(requested) {{
           }}
         }});
 
+        csvSubmitBtn.addEventListener('click', async () => {{
+          csvError.classList.add('hidden');
+          csvSubmitOutput.classList.add('hidden');
+          const batches = collectCsvSubmission();
+          if (!batches.length) {{
+            csvSubmitStatus.textContent = 'Tick at least one batch first.';
+            return;
+          }}
+          if (!window.confirm('Submit ' + batches.length + ' selected Cashflows batch' + (batches.length === 1 ? '' : 'es') + ' for Xero reconciliation preparation?')) {{
+            return;
+          }}
+          csvSubmitBtn.disabled = true;
+          csvSubmitStatus.textContent = 'Preparing Xero submission payloads…';
+          try {{
+            const resp = await fetch('/cashflows-sync/submit-csv-batches', {{
+              method: 'POST',
+              headers: {{'Content-Type': 'application/json'}},
+              body: JSON.stringify({{
+                preview_id: _previewId,
+                batches: batches,
+              }}),
+            }});
+            const data = await resp.json();
+            if (!resp.ok || data.error) throw new Error(data.error || 'Submit failed');
+            if (data.async) {{
+              // Background job started — switch to the live progress screen.
+              csvSubmitStatus.textContent = '';
+              renderSubmitProgress({{status: 'running', total: data.total || batches.length, completed: 0, percent: 0, message: data.message || 'Reconciling in the background…'}});
+              if (_submitPollTimer) clearTimeout(_submitPollTimer);
+              pollSubmitProgress(true);
+              return;
+            }}
+            // Test mode (no async) — show the payload summary as before.
+            csvSubmitStatus.textContent = data.message || 'Submission prepared.';
+            renderCsvSubmitSummary(data);
+          }} catch (err) {{
+            csvSubmitStatus.textContent = '';
+            csvShowError(err.message || String(err));
+          }} finally {{
+            updateCsvSubmitPanel();
+          }}
+        }});
+
+        // Reattach to any submission already running on the server (e.g. after
+        // the page was closed and reopened mid-run).
+        pollSubmitProgress(true);
         loadRecommendedRange();
 
         document.getElementById('save-correlation-sheet-btn').addEventListener('click', async () => {{
@@ -7972,13 +8609,57 @@ function toggleReceiptsEnabled(requested) {{
                 calendar_ids=cal_ids or None,
             )
             result["source_filename"] = (upload.filename or "").strip()
-            set_json_setting(config.admin_db_file, "cashflows_csv_preview", result)
+            cached_preview = {**result, "_source_csv_text": csv_text}
+            set_json_setting(config.admin_db_file, "cashflows_csv_preview", cached_preview)
             counts = result.get("status_counts", {})
             _feed.push(
                 "Cashflows CSV preview: "
                 f"{counts.get('ready', 0)} ready, "
                 f"{counts.get('waiting_invoices', 0)} waiting, "
                 f"{counts.get('no_bank_line', 0)} no bank line (test mode, no writes)",
+                "system",
+            )
+            return _flask.jsonify(result)
+        except CsvParseError as exc:
+            return _flask.jsonify({"error": str(exc)}), 400
+        except Exception as exc:
+            return _flask.jsonify({"error": str(exc).splitlines()[0][:300]}), 400
+
+    @app.post("/cashflows-sync/refresh-csv-preview")
+    @require_login
+    def cashflows_sync_refresh_csv_preview():
+        import flask as _flask
+
+        payload = request.get_json(silent=True) or {}
+        preview = get_json_setting(config.admin_db_file, "cashflows_csv_preview", {})
+        preview_id = str(payload.get("preview_id") or "").strip()
+        if not preview or not isinstance(preview, dict):
+            return _flask.jsonify({"error": "No Cashflows CSV preview is cached. Upload the CSV again first."}), 409
+        if preview_id and str(preview.get("preview_id") or "") and preview_id != str(preview.get("preview_id")):
+            return _flask.jsonify({"error": "This preview is out of date. Upload the CSV again before refreshing."}), 409
+        csv_text = str(preview.get("_source_csv_text") or "")
+        if not csv_text.strip():
+            return _flask.jsonify({"error": "The original CSV is not cached. Upload the CSV again first."}), 409
+        try:
+            from .admin_store import get_active_calendars as _get_active_cals
+            xero_client = build_xero_client(config)
+            sheet_id = get_cashflows_correlation_sheet_id(config.admin_db_file)
+            cal_ids = _get_active_cals(config.admin_db_file, config.google_calendar_id)
+            result = build_csv_reconciliation_preview(
+                config, csv_text,
+                xero_client=xero_client,
+                correlation_sheet_id=sheet_id,
+                calendar_ids=cal_ids or None,
+            )
+            result["source_filename"] = str(preview.get("source_filename") or "").strip()
+            cached_preview = {**result, "_source_csv_text": csv_text}
+            set_json_setting(config.admin_db_file, "cashflows_csv_preview", cached_preview)
+            counts = result.get("status_counts", {})
+            _feed.push(
+                "Cashflows CSV refreshed: "
+                f"{counts.get('ready', 0)} ready, "
+                f"{counts.get('prepared_in_xero', 0)} prepared, "
+                f"{counts.get('already_reconciled', 0)} reconciled",
                 "system",
             )
             return _flask.jsonify(result)
@@ -8056,15 +8737,20 @@ function toggleReceiptsEnabled(requested) {{
 
         dry = bool(isinstance(result, dict) and result.get("dry_run"))
         number = None
+        invoice_id = None
         if not dry:
             try:
-                number = ((result.get("Invoices") or [{}])[0]).get("InvoiceNumber")
+                created_invoice = ((result.get("Invoices") or [{}])[0])
+                number = created_invoice.get("InvoiceNumber")
+                invoice_id = created_invoice.get("InvoiceID")
             except Exception:
                 number = None
+                invoice_id = None
 
         # Reflect on the cached CSV preview so the row shows as resolved on re-render.
         try:
             target["quick_invoice"] = {
+                "id": invoice_id,
                 "number": number,
                 "contact_name": contact_name,
                 "description": description,
@@ -8085,10 +8771,884 @@ function toggleReceiptsEnabled(requested) {{
             {
                 "ok": True,
                 "dry_run": dry,
+                "id": invoice_id,
                 "number": number,
                 "contact_name": contact_name,
                 "description": description,
                 "amount": amount,
+            }
+        )
+
+    @app.post("/cashflows-sync/submit-csv-batches")
+    @require_login
+    def cashflows_sync_submit_csv_batches():
+        import flask as _flask
+
+        payload = request.get_json(silent=True) or {}
+        preview = get_json_setting(config.admin_db_file, "cashflows_csv_preview", {})
+        preview_id = str(payload.get("preview_id") or "").strip()
+        if not preview or not isinstance(preview, dict):
+            return _flask.jsonify({"error": "No Cashflows CSV preview is cached. Upload the CSV again first."}), 409
+        if preview_id and str(preview.get("preview_id") or "") and preview_id != str(preview.get("preview_id")):
+            return _flask.jsonify({"error": "This preview is out of date. Upload the CSV again before submitting."}), 409
+
+        requested_batches = payload.get("batches") or []
+        if not isinstance(requested_batches, list) or not requested_batches:
+            return _flask.jsonify({"error": "No checked batches were submitted."}), 400
+
+        xero_client = build_xero_client(config)
+        production_enabled = (
+            os.getenv("CASHFLOWS_CSV_SUBMIT_PRODUCTION", "false").strip().lower()
+            in ("1", "true", "yes", "on")
+            and not bool(config.dry_run)
+        )
+        if production_enabled and xero_client is None:
+            return _flask.jsonify({
+                "error": (
+                    "Xero is temporarily unavailable to the app. Refresh the page and try again first; "
+                    "only reconnect Xero if this keeps happening."
+                )
+            }), 503
+
+        payment_account = str(getattr(xero_client, "payment_account_code", "") or "").strip() if xero_client else ""
+        if not payment_account:
+            payment_account = "090"
+        clearing_account = (os.getenv("CASHFLOWS_CLEARING_ACCOUNT_CODE") or "780").strip()
+        bank_fees_account = (os.getenv("CASHFLOWS_BANK_FEES_ACCOUNT_CODE") or "404").strip()
+
+        def _money_value(value: object) -> float:
+            try:
+                return round(float(value or 0), 2)
+            except (TypeError, ValueError):
+                return 0.0
+
+        def _account_ref(value: str) -> dict[str, str]:
+            account_value = str(value or "").strip()
+            if account_value.lower().startswith("id:"):
+                return {"AccountID": account_value[3:].strip()}
+            if len(account_value) == 36 and account_value.count("-") == 4:
+                return {"AccountID": account_value}
+            return {"Code": account_value}
+
+        def _candidate_options(sale: dict) -> list[dict]:
+            options: list[dict] = []
+            for key in ("invoice", "quick_invoice"):
+                item = sale.get(key)
+                if isinstance(item, dict) and item:
+                    options.append(item)
+            for key in ("tied_candidates", "candidates"):
+                for item in sale.get(key) or []:
+                    if isinstance(item, dict) and item:
+                        options.append(item)
+            return options
+
+        def _find_candidate(sale: dict, invoice_id: str, invoice_number: str) -> dict | None:
+            invoice_id = str(invoice_id or "").strip()
+            invoice_number = str(invoice_number or "").strip()
+            for cand in _candidate_options(sale):
+                cand_id = str(cand.get("id") or "").strip()
+                cand_number = str(cand.get("number") or "").strip()
+                if invoice_id and cand_id == invoice_id:
+                    return cand
+                if invoice_number and cand_number == invoice_number:
+                    return cand
+            return None
+
+        def _existing_account_payments(invoice_id: str) -> list[dict]:
+            """Return Xero payments already posted to an account for this invoice.
+
+            If an already-paid invoice has an ACCRECPAYMENT posted to the bank
+            account, creating a clearing receipt would duplicate the bank/account
+            balance. In that case the user must match/reconcile the existing
+            payment or undo it first.
+            """
+            if not production_enabled or not xero_client or not invoice_id:
+                return []
+            try:
+                invoice = xero_client.get_invoice(invoice_id)
+            except Exception:
+                return []
+            found: list[dict] = []
+            for payment in invoice.get("Payments") or []:
+                payment_id = str(payment.get("PaymentID") or "").strip()
+                if not payment_id or not hasattr(xero_client, "_request"):
+                    continue
+                try:
+                    resp = xero_client._request("GET", f"{xero_client.base_url}/Payments/{payment_id}")
+                    if not resp.ok:
+                        continue
+                    payment_detail = ((resp.json() or {}).get("Payments") or [{}])[0]
+                except Exception:
+                    continue
+                account = payment_detail.get("Account") or {}
+                if payment_detail.get("HasAccount") and account:
+                    found.append(
+                        {
+                            "payment_id": payment_id,
+                            "amount": _money_value(payment_detail.get("Amount")),
+                            "status": payment_detail.get("Status"),
+                            "account_name": account.get("Name"),
+                            "account_id": account.get("AccountID"),
+                            "account_code": account.get("Code"),
+                            "is_reconciled": payment_detail.get("IsReconciled"),
+                        }
+                    )
+            return found
+
+        batch_map = {str(b.get("id") or ""): b for b in (preview.get("batches") or []) if isinstance(b, dict)}
+        submitted_by_id = {
+            str(b.get("batch_id") or ""): b
+            for b in requested_batches
+            if isinstance(b, dict)
+        }
+
+        plans: list[dict] = []
+        blocking_errors: list[str] = []
+        production_blockers: list[str] = []
+
+        for batch_id, req in submitted_by_id.items():
+            batch = batch_map.get(batch_id)
+            if not batch:
+                blocking_errors.append(f"Selected batch {batch_id} is no longer in the preview.")
+                continue
+            if batch.get("already_reconciled") or batch.get("status") == "already_reconciled":
+                blocking_errors.append(f"Batch {batch_id} has already been marked reconciled.")
+                continue
+            sales = batch.get("sales") or []
+            req_sales: dict[int, dict] = {}
+            for submitted_sale in req.get("sales") or []:
+                if not isinstance(submitted_sale, dict):
+                    continue
+                try:
+                    submitted_idx = int(submitted_sale.get("sale_index"))
+                except (TypeError, ValueError):
+                    continue
+                req_sales[submitted_idx] = submitted_sale
+            if len(req_sales) < len(sales):
+                blocking_errors.append(f"Batch {batch_id} was incomplete. Re-open the preview and submit again.")
+                continue
+
+            reference = f"Cashflows {((batch.get('payout') or {}).get('csv_ref') or batch_id)}"
+            payout_date = ((batch.get("payout") or {}).get("date") or dt.date.today().isoformat())
+            gross_total = _money_value(batch.get("gross"))
+            net_total = _money_value(batch.get("net"))
+            fee_total = round(max(0.0, gross_total - net_total), 2)
+            payments: list[dict] = []
+            chosen_invoices: list[dict] = []
+            extra_invoice_payloads: list[dict] = []
+            credit_note_payloads: list[dict] = []
+            discount_actions: list[dict] = []
+            already_paid: list[dict] = []
+            existing_account_payments: list[dict] = []
+            open_invoice_count = 0
+            paid_invoice_payment_total = 0.0
+            paid_invoice_discount_total = 0.0
+            paid_invoice_extra_total = 0.0
+
+            for idx, sale in enumerate(sales):
+                req_sale = req_sales.get(idx) or {}
+                selected = _find_candidate(
+                    sale,
+                    str(req_sale.get("selected_invoice_id") or ""),
+                    str(req_sale.get("selected_invoice_number") or ""),
+                )
+                sale_ref = str(sale.get("sale_ref") or "")
+                sale_gross = _money_value(sale.get("gross"))
+                if not selected:
+                    blocking_errors.append(
+                        f"Batch {batch_id} sale {sale_ref or idx + 1} has no selected invoice."
+                    )
+                    continue
+                selected_id = str(selected.get("id") or "").strip()
+                selected_total = _money_value(selected.get("total") or selected.get("amount") or selected.get("amount_due"))
+                selected_due = _money_value(selected.get("amount_due"))
+                payable_amount = selected_due if selected_due > 0 else selected_total
+                adjustment = req_sale.get("adjustment") if isinstance(req_sale.get("adjustment"), dict) else None
+                chosen_invoices.append(
+                    {
+                        "id": selected_id,
+                        "number": selected.get("number"),
+                        "contact_name": selected.get("contact_name"),
+                        "contact_id": selected.get("contact_id"),
+                        "total": selected_total,
+                        "amount_due": selected_due,
+                        "payable_amount": payable_amount,
+                        "is_open": selected.get("is_open"),
+                    }
+                )
+                is_open = selected.get("is_open")
+                if is_open is False:
+                    already_paid.append(selected)
+                    for payment in _existing_account_payments(selected_id):
+                        existing_account_payments.append(
+                            {
+                                **payment,
+                                "invoice_id": selected_id,
+                                "invoice_number": selected.get("number"),
+                                "contact_name": selected.get("contact_name"),
+                                "expected_amount": payable_amount,
+                                "payment_date": str(sale.get("date") or payout_date),
+                            }
+                        )
+                else:
+                    open_invoice_count += 1
+                if not selected_id:
+                    blocking_errors.append(
+                        f"Batch {batch_id} invoice {selected.get('number') or sale_ref or idx + 1} has no Xero InvoiceID."
+                    )
+                    continue
+
+                diff = round(sale_gross - payable_amount, 2)
+                if is_open is False:
+                    paid_invoice_payment_total = round(paid_invoice_payment_total + payable_amount, 2)
+                    if diff < -0.01:
+                        if not adjustment or adjustment.get("type") != "discount":
+                            blocking_errors.append(
+                                f"Batch {batch_id} invoice {selected.get('number') or selected_id} needs a discount/credit adjustment."
+                            )
+                            continue
+                        discount_amount = round(abs(diff), 2)
+                        paid_invoice_discount_total = round(paid_invoice_discount_total + discount_amount, 2)
+                        discount_actions.append(
+                            {
+                                "invoice": {"InvoiceID": selected_id, "InvoiceNumber": selected.get("number")},
+                                "amount": discount_amount,
+                                "reason": "Card payment is lower than an already-paid invoice; a matching-pack adjustment will be created.",
+                            }
+                        )
+                    elif diff > 0.01:
+                        if not adjustment or adjustment.get("type") != "extra_invoice":
+                            blocking_errors.append(
+                                f"Batch {batch_id} sale {sale_ref or idx + 1} needs an extra invoice/overpayment adjustment."
+                            )
+                            continue
+                        paid_invoice_extra_total = round(paid_invoice_extra_total + diff, 2)
+                    continue
+
+                if diff < -0.01:
+                    if not adjustment or adjustment.get("type") != "discount":
+                        blocking_errors.append(
+                            f"Batch {batch_id} invoice {selected.get('number') or selected_id} needs a discount/credit adjustment."
+                        )
+                        continue
+                    discount_amount = round(abs(diff), 2)
+                    discount_actions.append(
+                        {
+                            "invoice": {"InvoiceID": selected_id, "InvoiceNumber": selected.get("number")},
+                            "amount": discount_amount,
+                            "reason": "Card payment is lower than invoice total.",
+                        }
+                    )
+                    contact_id = str(selected.get("contact_id") or "").strip()
+                    contact_name = str(selected.get("contact_name") or "Customer").strip() or "Customer"
+                    contact_ref = {"ContactID": contact_id} if contact_id else {"Name": contact_name}
+                    credit_note_payloads.append(
+                        {
+                            "credit_note": {
+                                "CreditNotes": [
+                                    {
+                                        "Type": "ACCRECCREDIT",
+                                        "Contact": contact_ref,
+                                        "Date": payout_date,
+                                        "Reference": f"{reference} discount {selected.get('number') or sale_ref}"[:255],
+                                        "Status": "AUTHORISED",
+                                        "LineAmountTypes": "Inclusive",
+                                        "LineItems": [
+                                            {
+                                                "Description": f"Cashflows card underpayment adjustment for {selected.get('number') or sale_ref}"[:4000],
+                                                "Quantity": 1,
+                                                "UnitAmount": discount_amount,
+                                                "AccountCode": getattr(xero_client, "sales_account_code", "200") if xero_client else "200",
+                                            }
+                                        ],
+                                    }
+                                ]
+                            },
+                            "allocation": {
+                                "Allocations": [
+                                    {
+                                        "Invoice": {"InvoiceID": selected_id},
+                                        "Amount": discount_amount,
+                                        "Date": payout_date,
+                                    }
+                                ]
+                            },
+                            "invoice": {"InvoiceID": selected_id, "InvoiceNumber": selected.get("number")},
+                            "amount": discount_amount,
+                        }
+                    )
+                    payments.append(
+                        {
+                            "Invoice": {"InvoiceID": selected_id},
+                            "Amount": sale_gross,
+                        }
+                    )
+                else:
+                    payments.append(
+                        {
+                            "Invoice": {"InvoiceID": selected_id},
+                            "Amount": payable_amount if payable_amount > 0 else sale_gross,
+                        }
+                    )
+                    if diff > 0.01:
+                        if not adjustment or adjustment.get("type") != "extra_invoice":
+                            blocking_errors.append(
+                                f"Batch {batch_id} sale {sale_ref or idx + 1} needs an extra invoice for the overpayment."
+                            )
+                            continue
+                        extra_amount = round(diff, 2)
+                        extra_invoice_payloads.append(
+                            {
+                                "contact_name": "Parking",
+                                "description": f"Cashflows overpayment balance {sale_ref or selected.get('number') or batch_id}",
+                                "amount": extra_amount,
+                                "reference": f"{reference} extra {sale_ref}".strip()[:255],
+                                "invoice_date": str(sale.get("date") or payout_date),
+                            }
+                        )
+
+            paid_matching_adjustment = False
+            if already_paid:
+                names = ", ".join(
+                    str(inv.get("number") or inv.get("id") or "invoice")
+                    for inv in already_paid[:3]
+                )
+                if already_paid and open_invoice_count:
+                    blocking_errors.append(
+                        f"Batch {batch_id} mixes already-paid and unpaid invoices ({names}). Submit unpaid invoices only; already-paid invoices must be handled in Xero by matching the existing payment, not by creating another payment."
+                    )
+                    continue
+                if len(existing_account_payments) < len(already_paid):
+                    blocking_errors.append(
+                        f"Batch {batch_id} includes already-paid invoice(s): {names}, but Xero did not return enough existing bank-account payments to package a safe match."
+                    )
+                    continue
+                payment_account_ref = _account_ref(payment_account)
+                clearing_account_ref = _account_ref(clearing_account)
+
+                def _matches_account_ref(payment: dict, account_ref: dict) -> bool:
+                    if account_ref.get("AccountID"):
+                        return payment.get("account_id") == account_ref.get("AccountID")
+                    if account_ref.get("Code"):
+                        return str(payment.get("account_code") or "") == account_ref.get("Code")
+                    return False
+
+                payment_moves_to_clearing: list[dict] = []
+                payments_already_in_clearing: list[dict] = []
+                bad_existing_payments: list[dict] = []
+                for payment in existing_account_payments:
+                    basic_safe = (
+                        payment.get("status") == "AUTHORISED"
+                        and not payment.get("is_reconciled")
+                        and abs(_money_value(payment.get("amount")) - _money_value(payment.get("expected_amount"))) <= 0.01
+                    )
+                    if not basic_safe:
+                        bad_existing_payments.append(payment)
+                    elif _matches_account_ref(payment, payment_account_ref):
+                        payment_moves_to_clearing.append(payment)
+                    elif _matches_account_ref(payment, clearing_account_ref):
+                        payments_already_in_clearing.append(payment)
+                    else:
+                        bad_existing_payments.append(payment)
+                covered_invoice_ids = {
+                    str(payment.get("invoice_id") or "").strip()
+                    for payment in (payment_moves_to_clearing + payments_already_in_clearing)
+                    if str(payment.get("invoice_id") or "").strip()
+                }
+                expected_invoice_ids = {
+                    str(inv.get("id") or "").strip()
+                    for inv in already_paid
+                    if str(inv.get("id") or "").strip()
+                }
+                if bad_existing_payments:
+                    blocking_errors.append(
+                        f"Batch {batch_id} includes already-paid invoice(s): {names}, but one existing payment is already reconciled, moved, or no longer matches the invoice amount."
+                    )
+                    continue
+                if not expected_invoice_ids.issubset(covered_invoice_ids):
+                    blocking_errors.append(
+                        f"Batch {batch_id} includes already-paid invoice(s): {names}, but Xero did not return enough existing bank-account payments to package a safe match."
+                    )
+                    continue
+                if paid_invoice_extra_total > 0.01:
+                    blocking_errors.append(
+                        f"Batch {batch_id} has an overpayment adjustment on already-paid invoice(s): {names}. This needs manual review before production submission."
+                    )
+                    continue
+                expected_net = round(paid_invoice_payment_total - fee_total - paid_invoice_discount_total, 2)
+                if abs(expected_net - net_total) > 0.02:
+                    blocking_errors.append(
+                        f"Batch {batch_id} match pack would total £{expected_net:.2f}, not the bank amount £{net_total:.2f}."
+                    )
+                    continue
+                paid_matching_adjustment = True
+            if not payments and not paid_matching_adjustment:
+                blocking_errors.append(f"Batch {batch_id} has no payment lines to submit.")
+                continue
+
+            batch_payment_payload = None
+            if payments:
+                batch_payment_payload = {
+                    "BatchPayments": [
+                        {
+                            "Account": _account_ref(payment_account),
+                            "Date": payout_date,
+                            "Reference": reference[:255],
+                            "Payments": payments,
+                            "Details": f"Cashflows CSV settlement. Gross £{gross_total:.2f}; fees/adjustments £{fee_total:.2f}; net bank deposit £{net_total:.2f}.",
+                        }
+                    ]
+                }
+            bank_fee_payload = None
+            clearing_receive_payload = None
+            if paid_matching_adjustment:
+                clearing_lines = [
+                    {
+                        "Description": f"Cashflows gross card takings for {reference}"[:4000],
+                        "Quantity": 1,
+                        "UnitAmount": round(paid_invoice_payment_total, 2),
+                        "AccountCode": clearing_account,
+                        "TaxType": "NONE",
+                    }
+                ]
+                if fee_total > 0:
+                    clearing_lines.append(
+                        {
+                            "Description": f"Cashflows merchant fees for {reference}"[:4000],
+                            "Quantity": 1,
+                            "UnitAmount": -round(fee_total, 2),
+                            "AccountCode": bank_fees_account,
+                            "TaxType": "NONE",
+                        }
+                    )
+                if paid_invoice_discount_total > 0:
+                    clearing_lines.append(
+                        {
+                            "Description": f"Cashflows underpayment adjustment for {reference}"[:4000],
+                            "Quantity": 1,
+                            "UnitAmount": -round(paid_invoice_discount_total, 2),
+                            "AccountCode": getattr(xero_client, "sales_account_code", "200") if xero_client else "200",
+                            "TaxType": "NONE",
+                        }
+                    )
+                expected_receive_total = _money_value(sum(_money_value(line.get("UnitAmount")) for line in clearing_lines))
+                if abs(expected_receive_total - net_total) > 0.02:
+                    blocking_errors.append(
+                        f"Batch {batch_id} Cashflows clearing item would total £{expected_receive_total:.2f}, not the bank amount £{net_total:.2f}."
+                    )
+                    continue
+                clearing_receive_payload = {
+                    "BankTransactions": [
+                        {
+                            "Type": "RECEIVE",
+                            "Contact": {"Name": "Cashflows"},
+                            "Date": payout_date,
+                            "Reference": reference[:255],
+                            "BankAccount": _account_ref(payment_account),
+                            "LineAmountTypes": "NoTax",
+                            "LineItems": clearing_lines,
+                        }
+                    ]
+                }
+            elif fee_total > 0:
+                bank_fee_payload = {
+                    "BankTransactions": [
+                        {
+                            "Type": "SPEND",
+                            "Contact": {"Name": "Cashflows"},
+                            "Date": payout_date,
+                            "Reference": f"{reference} merchant fees"[:255],
+                            "BankAccount": _account_ref(payment_account),
+                            "LineItems": [
+                                {
+                                    "Description": f"Cashflows merchant fees for {reference}"[:4000],
+                                    "Quantity": 1,
+                                    "UnitAmount": fee_total,
+                                    "AccountCode": bank_fees_account,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            plans.append(
+                {
+                    "batch_id": batch_id,
+                    "payout_ref": (batch.get("payout") or {}).get("csv_ref"),
+                    "payout_date": payout_date,
+                    "bank_line": batch.get("bank_line"),
+                    "gross": gross_total,
+                    "net": net_total,
+                    "fee_or_charge_total": fee_total,
+                    "chosen_invoices": chosen_invoices,
+                    "already_paid_invoices": already_paid,
+                    "discount_actions_required": discount_actions,
+                    "credit_note_payloads": credit_note_payloads,
+                    "extra_invoice_payloads": extra_invoice_payloads,
+                    "paid_matching_adjustment": paid_matching_adjustment,
+                    "payment_moves_to_clearing": payment_moves_to_clearing if paid_matching_adjustment else [],
+                    "payments_already_in_clearing": payments_already_in_clearing if paid_matching_adjustment else [],
+                    "clearing_receipt": bool(clearing_receive_payload),
+                    "payloads": {
+                        "batch_payment": batch_payment_payload,
+                        "bank_fee": bank_fee_payload,
+                        "clearing_receive": clearing_receive_payload,
+                    },
+                }
+            )
+
+        if blocking_errors:
+            return _flask.jsonify({"error": " ".join(blocking_errors[:4])}), 400
+
+        if not production_enabled:
+            message = (
+                f"Test mode: prepared {len(plans)} selected batch(es). No Xero writes were sent."
+            )
+            if production_blockers:
+                message += " Some rows are blocked from production until reviewed."
+            print(
+                "[cashflows-csv-submit] TEST MODE payloads:\n"
+                + json.dumps({"plans": plans, "production_blockers": production_blockers}, indent=2, sort_keys=True),
+                flush=True,
+            )
+            return _flask.jsonify(
+                {
+                    "ok": True,
+                    "mode": "testing",
+                    "message": message,
+                    "production_enabled": False,
+                    "production_blockers": production_blockers,
+                    "plans": plans,
+                }
+            )
+
+        # ── Production writes run in a background daemon thread ───────────────
+        # This survives the browser closing and dodges the gunicorn worker
+        # timeout.  Calls are paced under Xero's rate limit; progress is
+        # persisted after each batch so the page can reattach a live progress
+        # screen and a resume never re-writes a completed batch.
+        def _lockout_until_ts() -> float:
+            # Combine BOTH lockout signals: the persisted state-file timestamp
+            # (set by the webhook/poll paths) AND the in-memory 429 cooldown set
+            # by xero_client._request when it actually sees a 429. Our own bulk
+            # posts trip the in-memory one, so relying on the state file alone
+            # would miss them and the pause/resume loop would never fire.
+            persisted = 0.0
+            try:
+                persisted = float(load_state(config.state_file).get("xero_lockout_until_ts") or 0.0)
+            except Exception:
+                persisted = 0.0
+            try:
+                in_memory = float(get_xero_rate_limit_until_ts() or 0.0)
+            except Exception:
+                in_memory = 0.0
+            return max(persisted, in_memory)
+
+        def _lockout_active() -> bool:
+            return _lockout_until_ts() > time.time()
+
+        _last_call_ts = {"t": 0.0}
+
+        def _pace() -> None:
+            wait = _CF_SUBMIT_PACE_SECONDS - (time.time() - _last_call_ts["t"])
+            if wait > 0:
+                time.sleep(wait)
+            _last_call_ts["t"] = time.time()
+
+        def _post_xero(path: str, payload: dict) -> dict:
+            if not xero_client or not hasattr(xero_client, "_request"):
+                raise RuntimeError("Xero client cannot post the required Cashflows adjustment.")
+            _pace()
+            resp = xero_client._request("POST", f"{xero_client.base_url}{path}", json=payload)
+            if not resp.ok:
+                raise RuntimeError(f"Xero post failed: {resp.status_code} {resp.text}")
+            return resp.json() if resp.text else {}
+
+        def _execute_plan(plan: dict) -> tuple[dict, tuple | None]:
+            created_extra: list[dict] = []
+            created_credit_notes: list[dict] = []
+            credit_note_allocations: list[dict] = []
+            moved_payments: list[dict] = []
+            for credit_plan in plan.get("credit_note_payloads") or []:
+                _pace()
+                credit_resp = xero_client.create_credit_note_payload(credit_plan["credit_note"])
+                created_credit = ((credit_resp.get("CreditNotes") or [{}])[0]) if isinstance(credit_resp, dict) else {}
+                credit_note_id = str(created_credit.get("CreditNoteID") or "").strip()
+                if not credit_note_id:
+                    raise RuntimeError("Xero created a credit note but did not return a CreditNoteID.")
+                _pace()
+                allocation_resp = xero_client.allocate_credit_note_payload(
+                    credit_note_id,
+                    credit_plan["allocation"],
+                )
+                created_credit_notes.append(created_credit)
+                credit_note_allocations.append(allocation_resp)
+            for inv_payload in plan.get("extra_invoice_payloads") or []:
+                _pace()
+                resp = xero_client.create_simple_invoice(**inv_payload)
+                created = ((resp.get("Invoices") or [{}])[0]) if isinstance(resp, dict) else {}
+                invoice_id = str(created.get("InvoiceID") or "").strip()
+                if not invoice_id:
+                    raise RuntimeError("Xero created an extra invoice but did not return an InvoiceID.")
+                amount = _money_value(created.get("AmountDue") or created.get("Total") or inv_payload.get("amount"))
+                batch = ((plan["payloads"]["batch_payment"].get("BatchPayments") or [{}])[0])
+                batch.setdefault("Payments", []).append(
+                    {"Invoice": {"InvoiceID": invoice_id}, "Amount": amount}
+                )
+                created_extra.append(created)
+            batch_resp = None
+            clearing_resp = None
+            if plan.get("paid_matching_adjustment"):
+                for payment_move in plan.get("payment_moves_to_clearing") or []:
+                    payment_id = str(payment_move.get("payment_id") or "").strip()
+                    invoice_id = str(payment_move.get("invoice_id") or "").strip()
+                    amount = _money_value(payment_move.get("amount"))
+                    if not payment_id or not invoice_id or amount <= 0:
+                        raise RuntimeError("Cashflows clearing move is missing a payment or invoice ID.")
+                    _post_xero(f"/Payments/{payment_id}", {"Status": "DELETED"})
+                    created_payment = _post_xero(
+                        "/Payments",
+                        {
+                            "Payments": [
+                                {
+                                    "Invoice": {"InvoiceID": invoice_id},
+                                    "Account": _account_ref(clearing_account),
+                                    "Date": str(payment_move.get("payment_date") or plan.get("payout_date") or dt.date.today().isoformat()),
+                                    "Amount": amount,
+                                }
+                            ]
+                        },
+                    )
+                    moved_payments.append(
+                        {
+                            "deleted_payment_id": payment_id,
+                            "created_payment": ((created_payment.get("Payments") or [{}])[0]),
+                            "invoice_number": payment_move.get("invoice_number"),
+                        }
+                    )
+            if plan["payloads"].get("batch_payment"):
+                _pace()
+                batch_resp = xero_client.create_batch_payment_payload(plan["payloads"]["batch_payment"])
+            if plan["payloads"].get("clearing_receive"):
+                _pace()
+                clearing_resp = xero_client.create_bank_transaction_payload(plan["payloads"]["clearing_receive"])
+            fee_resp = None
+            if plan["payloads"].get("bank_fee"):
+                _pace()
+                fee_resp = xero_client.create_bank_transaction_payload(plan["payloads"]["bank_fee"])
+            response = {
+                "batch_id": plan["batch_id"],
+                "created_credit_notes": created_credit_notes,
+                "credit_note_allocations": credit_note_allocations,
+                "created_extra_invoices": created_extra,
+                "moved_payments_to_clearing": moved_payments,
+                "batch_payment": batch_resp,
+                "clearing_receive": clearing_resp,
+                "bank_fee": fee_resp,
+            }
+            payout_ref = str(plan.get("payout_ref") or "").strip()
+            ref = None
+            if payout_ref and not plan.get("paid_matching_adjustment"):
+                ref = (
+                    payout_ref,
+                    {
+                        "date": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        "amount": plan.get("net"),
+                        "batch_id": plan["batch_id"],
+                    },
+                )
+            return response, ref
+
+        job_id = uuid.uuid4().hex
+        total = len(plans)
+        now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+        job_state = {
+            "job_id": job_id,
+            "status": "running",  # running | paused | done | error
+            "message": f"Starting reconciliation of {total} batch(es)…",
+            "total": total,
+            "completed": 0,
+            "completed_batch_ids": [],
+            "current_batch_ref": "",
+            "plans": plans,
+            "responses": [],
+            "error": "",
+            "resume_after_ts": 0.0,
+            "started_at": now_iso,
+            "updated_at": now_iso,
+            "preview_id": str(preview.get("preview_id") or ""),
+        }
+
+        def _persist_job(state: dict) -> None:
+            state["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+            try:
+                slim = {k: v for k, v in state.items() if k not in ("plans", "responses")}
+                slim["response_count"] = len(state.get("responses") or [])
+                set_json_setting(config.admin_db_file, _CF_SUBMIT_JOB_KEY, slim)
+            except Exception:
+                pass
+
+        def _run_submit_job() -> None:
+            state = _cf_submit_job.get(job_id) or job_state
+            try:
+                for plan in state["plans"]:
+                    bid = plan.get("batch_id")
+                    if bid in state["completed_batch_ids"]:
+                        continue
+                    # Pre-flight: wait out any active Xero cooldown BEFORE we make
+                    # a single write for this batch. A batch's plan performs several
+                    # dependent writes (credit note, payment move, batch payment,
+                    # bank txns); if we hit a 429 halfway through and blindly retried
+                    # the whole batch we would DUPLICATE the writes already committed.
+                    # So we only ever pause between batches, never mid-batch.
+                    while _lockout_active():
+                        until = _lockout_until_ts()
+                        secs = max(1, int(until - time.time()))
+                        state["status"] = "paused"
+                        state["resume_after_ts"] = until
+                        state["message"] = (
+                            f"Xero is taking a short breather — resuming "
+                            f"automatically in about {secs}s…"
+                        )
+                        _persist_job(state)
+                        time.sleep(min(10, max(1, secs)))
+                    state["status"] = "running"
+                    state["resume_after_ts"] = 0.0
+                    state["current_batch_ref"] = str(plan.get("payout_ref") or bid or "")
+                    state["message"] = (
+                        f"Reconciling batch {state['completed'] + 1} of "
+                        f"{state['total']} ({state['current_batch_ref']})…"
+                    )
+                    _persist_job(state)
+                    # Execute exactly once. On failure we do NOT replay this batch,
+                    # because partial Xero writes cannot be safely re-sent. The
+                    # already-completed batches stay saved and are skipped on resume.
+                    resp, ref = _execute_plan(plan)
+                    state["responses"].append(resp)
+                    if ref:
+                        try:
+                            add_cashflows_reconciled_refs(config.admin_db_file, {ref[0]: ref[1]})
+                        except Exception:
+                            pass
+                    state["completed_batch_ids"].append(bid)
+                    state["completed"] += 1
+                    _persist_job(state)
+                state["status"] = "done"
+                state["current_batch_ref"] = ""
+                state["message"] = (
+                    f"Submitted {state['completed']} batch(es) to Xero. Open Xero "
+                    "bank reconciliation and press OK on the matching Cashflows bank line."
+                )
+                _persist_job(state)
+                _feed.push(
+                    f"Cashflows CSV submitted {state['completed']} batch(es) to Xero reconciliation preparation.",
+                    "success",
+                )
+            except Exception as exc:
+                state["status"] = "error"
+                state["error"] = str(exc).splitlines()[0][:300]
+                _ref = state.get("current_batch_ref") or ""
+                state["message"] = (
+                    f"Stopped on batch {state['completed'] + 1} of {state['total']}"
+                    + (f" ({_ref})" if _ref else "")
+                    + ". The "
+                    f"{state['completed']} batch(es) already finished are saved and "
+                    "will NOT be resent. This batch may be part-done in Xero — please "
+                    "check it in Xero before re-running. "
+                    f"Problem: {state['error']}"
+                )
+                _persist_job(state)
+
+        with _cf_submit_lock:
+            existing = next(
+                (j for j in _cf_submit_job.values() if j.get("status") in ("running", "paused")),
+                None,
+            )
+            if existing:
+                return _flask.jsonify(
+                    {
+                        "ok": True,
+                        "mode": "production",
+                        "async": True,
+                        "already_running": True,
+                        "job_id": existing["job_id"],
+                        "total": existing.get("total"),
+                        "message": "A Cashflows submission is already running — showing its progress.",
+                        "production_enabled": True,
+                    }
+                )
+            _cf_submit_job.clear()
+            _cf_submit_job[job_id] = job_state
+            _persist_job(job_state)
+            threading.Thread(
+                target=_run_submit_job, name="cashflows-submit", daemon=True
+            ).start()
+
+        return _flask.jsonify(
+            {
+                "ok": True,
+                "mode": "production",
+                "async": True,
+                "job_id": job_id,
+                "total": total,
+                "message": (
+                    f"Reconciling {total} batch(es) in the background. You can safely "
+                    "leave this page — progress is saved and it keeps running."
+                ),
+                "production_enabled": True,
+            }
+        )
+
+    @app.get("/cashflows-sync/submit-progress")
+    @require_login
+    def cashflows_sync_submit_progress():
+        import flask as _flask
+
+        job = None
+        stale = False
+        with _cf_submit_lock:
+            live = [j for j in _cf_submit_job.values()]
+        if live:
+            job = live[-1]
+        else:
+            # Fall back to the persisted copy (e.g. after a worker restart).
+            job = get_json_setting(config.admin_db_file, _CF_SUBMIT_JOB_KEY, None)
+            # Single-worker app: a live job is always in memory. If the DB says a
+            # job is still running/paused but it is NOT in memory, its worker
+            # thread died (process restarted). Plans are not persisted so it
+            # cannot resume — report it as stopped so the UI re-enables submit.
+            if isinstance(job, dict) and str(job.get("status") or "") in ("running", "paused"):
+                stale = True
+        if not job or not isinstance(job, dict):
+            return _flask.jsonify({"active": False})
+        total = int(job.get("total") or 0)
+        completed = int(job.get("completed") or 0)
+        status = str(job.get("status") or "")
+        resume_after = float(job.get("resume_after_ts") or 0.0)
+        message = job.get("message") or ""
+        if stale:
+            status = "error"
+            message = (
+                f"The submission was interrupted by a server restart after "
+                f"{completed} of {total} batch(es). Completed batches are saved and "
+                "will not be resent — re-run to finish the rest."
+            )
+            resume_after = 0.0
+        return _flask.jsonify(
+            {
+                "active": status in ("running", "paused"),
+                "job_id": job.get("job_id"),
+                "status": status,
+                "message": message,
+                "total": total,
+                "completed": completed,
+                "percent": int(round((completed / total) * 100)) if total else 0,
+                "current_batch_ref": job.get("current_batch_ref") or "",
+                "completed_batch_ids": job.get("completed_batch_ids") or [],
+                "error": job.get("error") or "",
+                "resume_in": max(0, int(resume_after - time.time())) if resume_after else 0,
+                "preview_id": job.get("preview_id") or "",
+                "started_at": job.get("started_at") or "",
+                "updated_at": job.get("updated_at") or "",
             }
         )
 

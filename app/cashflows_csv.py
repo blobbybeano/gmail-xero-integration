@@ -72,6 +72,7 @@ BANK_TRANSFER_THEME_ID = "a1ed21dc-a147-4917-91cf-51555edab4cf"
 # are eligible for Cashflows card matching — Stripe invoices have no GC prefix
 # and must never be mistaken for card payments.
 CALENDAR_REF_PREFIX = "GC-"
+CALENDAR_REF_DATE_RE = re.compile(r"^GC-(\d{4})(\d{2})(\d{2})-")
 
 
 def _clean_cell(value: Any) -> str:
@@ -358,6 +359,70 @@ def _match_bank_line(
     return candidates[0]
 
 
+def _cashflows_receive_transactions(data: Any) -> list[dict[str, Any]]:
+    if isinstance(data, dict):
+        items = data.get("BankTransactions") or []
+    else:
+        items = data or []
+    out: list[dict[str, Any]] = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        status = str(raw.get("Status") or "").strip().upper()
+        tx_type = str(raw.get("Type") or "").strip().upper()
+        ref = str(raw.get("Reference") or "").strip()
+        if status == "DELETED" or tx_type != "RECEIVE" or not ref.startswith("Cashflows "):
+            continue
+        out.append(
+            {
+                "id": str(raw.get("BankTransactionID") or raw.get("ID") or raw.get("Id") or "").strip(),
+                "reference": ref,
+                "date": _date(raw.get("Date") or raw.get("DateString") or raw.get("date")),
+                "amount": _money(raw.get("Total") or raw.get("Amount")),
+                "status": status,
+                "is_reconciled": bool(raw.get("IsReconciled")),
+                "raw": raw,
+            }
+        )
+    return out
+
+
+def _match_cashflows_receive(
+    payout: CsvPayout,
+    receives: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    ref = f"Cashflows {payout.csv_ref}"
+    candidates = [
+        tx
+        for tx in receives
+        if tx.get("reference") == ref
+        and abs(abs(tx.get("amount") or Decimal("0.00")) - payout.amount) <= MONEY / 2
+    ]
+    if not candidates:
+        return None
+    if payout.date:
+        candidates.sort(
+            key=lambda tx: abs(((tx.get("date") or payout.date) - payout.date).days)
+        )
+    return candidates[0]
+
+
+def _invoice_service_date(inv: XeroInvoiceCandidate) -> dt.date | None:
+    """Prefer the calendar service date encoded in GC-YYYYMMDD references.
+
+    Xero's Invoice.Date can be the creation/payment date for some imported
+    invoices. Cashflows matching needs the job/card-service date, and this app's
+    calendar invoices carry that date in the GC reference.
+    """
+    m = CALENDAR_REF_DATE_RE.match(inv.reference or "")
+    if m:
+        try:
+            return dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+    return inv.date
+
+
 def _match_invoice_for_sale(
     sale: CsvSale,
     invoices: list[XeroInvoiceCandidate],
@@ -378,15 +443,40 @@ def _match_invoice_for_sale(
     if not candidates:
         return None, False
     if sale.date:
+        # Calendar-created invoices encode the service/job date in the GC
+        # reference. Cashflows card-sale dates are the dates the engineer took
+        # the card payment, so a GC invoice should only be auto-consumed by the
+        # sale on that same service date. Otherwise an earlier same-amount card
+        # payment can steal the right invoice from its real job day.
+        exact_gc_day = [
+            inv
+            for inv in candidates
+            if inv.reference.startswith(CALENDAR_REF_PREFIX)
+            and _invoice_service_date(inv) == sale.date
+        ]
+        if exact_gc_day:
+            exact_gc_day.sort(
+                key=lambda inv: (
+                    0 if str(inv.status or "").upper() == "PAID" else 1,
+                    inv.number,
+                )
+            )
+            return exact_gc_day[0], len(exact_gc_day) > 1
+
         dated = [
             inv
             for inv in candidates
-            if inv.date and abs((inv.date - sale.date).days) <= days
+            if not inv.reference.startswith(CALENDAR_REF_PREFIX)
+            and _invoice_service_date(inv)
+            and abs((_invoice_service_date(inv) - sale.date).days) <= days
         ]
-        pool = dated or candidates
+        if not dated:
+            return None, False
+        pool = dated
 
         def _dist(inv: XeroInvoiceCandidate) -> int:
-            return abs((inv.date - sale.date).days) if inv.date else 999
+            service_date = _invoice_service_date(inv)
+            return abs((service_date - sale.date).days) if service_date else 999
 
         pool.sort(key=_dist)
         best = pool[0]
@@ -400,17 +490,20 @@ def _match_invoice_for_sale(
 
 def _candidate_dict(inv: XeroInvoiceCandidate, sale: CsvSale) -> dict[str, Any]:
     inv_total = inv.total or inv.amount_due
+    service_date = _invoice_service_date(inv)
     days = (
-        abs((inv.date - sale.date).days)
-        if (inv.date and sale.date)
+        abs((service_date - sale.date).days)
+        if (service_date and sale.date)
         else None
     )
     return {
         "id": inv.id,
         "number": inv.number,
         "contact_name": inv.contact_name,
+        "contact_id": inv.contact_id,
         "reference": inv.reference,
-        "date": _date_text(inv.date),
+        "date": _date_text(service_date),
+        "xero_date": _date_text(inv.date),
         "total": _money_float(inv_total),
         "amount_due": _money_float(inv.amount_due),
         # An "open" (unpaid) invoice still has money due. Matching one of these
@@ -421,28 +514,124 @@ def _candidate_dict(inv: XeroInvoiceCandidate, sale: CsvSale) -> dict[str, Any]:
     }
 
 
+def _word_list(value: str) -> list[str]:
+    return [
+        w
+        for w in re.split(r"[^a-z0-9]+", (value or "").lower())
+        if len(w) >= 3
+    ]
+
+
+def _calendar_name_matches(customer: str, invoice_name: str) -> bool:
+    """Strict enough to avoid surname-only false positives.
+
+    "Tim Johnson" must not match "Tracey Johnson" just because both share a
+    surname. For two-part names, require the first name to match or at least two
+    meaningful words to overlap. Single-word calendar names can still match the
+    first word of the invoice name.
+    """
+    cal_words = _word_list(customer)
+    inv_words = _word_list(invoice_name)
+    if not cal_words or not inv_words:
+        return False
+    overlap = set(cal_words).intersection(inv_words)
+    if not overlap:
+        return False
+    if len(cal_words) >= 2 and len(inv_words) >= 2:
+        return cal_words[0] == inv_words[0] or len(overlap) >= 2
+    if len(cal_words) == 1:
+        return cal_words[0] == inv_words[0]
+    return inv_words[0] == cal_words[0]
+
+
+def _calendar_candidate_score(
+    inv: XeroInvoiceCandidate,
+    sale: CsvSale,
+    calendar_suggestions: list[dict[str, Any]] | None,
+) -> tuple[int, float, float]:
+    """Return calendar evidence for ranking manual Xero invoice candidates.
+
+    The human reconciliation flow is: card sale date -> CARD calendar entry on
+    that day -> amount/name -> Xero invoice. This score lets a same-day CARD
+    calendar name/amount match outrank an unrelated same-day Xero invoice.
+    """
+    if not calendar_suggestions:
+        return (0, 0.0, 999999.0)
+
+    inv_total = inv.total or inv.amount_due
+    best_rank = 0
+    best_score = 0.0
+    best_amount_diff = 999999.0
+
+    for suggestion in calendar_suggestions:
+        name_hit = _calendar_name_matches(
+            str(suggestion.get("customer") or ""),
+            str(inv.contact_name or ""),
+        )
+        try:
+            event_gross = (
+                Decimal(str(suggestion.get("event_gross")))
+                if suggestion.get("event_gross") is not None
+                else None
+            )
+        except Exception:
+            event_gross = None
+        event_amount_diff = (
+            float(abs(inv_total - event_gross))
+            if event_gross is not None
+            else 999999.0
+        )
+        sale_amount_diff = float(abs(inv_total - sale.gross))
+        same_day = str(suggestion.get("event_date") or "") == _date_text(sale.date)
+
+        rank = 0
+        if same_day and name_hit:
+            rank = 4
+        elif name_hit:
+            rank = 3
+        elif same_day and event_amount_diff <= 1.01:
+            rank = 2
+        elif same_day:
+            rank = 1
+
+        score = float(suggestion.get("score") or 0)
+        amount_diff = min(event_amount_diff, sale_amount_diff)
+        if (rank, score, -amount_diff) > (best_rank, best_score, -best_amount_diff):
+            best_rank = rank
+            best_score = score
+            best_amount_diff = amount_diff
+
+    return (best_rank, best_score, best_amount_diff)
+
+
 def _rank_candidate_invoices(
     sale: CsvSale,
     pool: list[XeroInvoiceCandidate],
+    calendar_suggestions: list[dict[str, Any]] | None = None,
     *,
     limit: int = 8,
 ) -> list[dict[str, Any]]:
     """Rank unaccounted invoices as manual-match suggestions for a missing sale.
 
-    All unaccounted invoices are considered — the `amount_match` flag in each
-    candidate dict already tells the user whether the amount is exact, and the
-    sort order (exact amount first, then closest date) surfaces the most-likely
-    matches at the top. A hard `limit` keeps the list compact.
+    All unaccounted invoices are considered. Calendar-backed evidence is ranked
+    first because Cashflows card sales are most reliably identified by the CARD
+    diary entry on the sale date. Exact amount/date still matters, but it should
+    not put an unrelated invoice above the actual same-day calendar customer.
     """
-    def _key(inv: XeroInvoiceCandidate) -> tuple[int, int]:
+    def _key(inv: XeroInvoiceCandidate) -> tuple[int, float, int, int, float]:
         inv_total = inv.total or inv.amount_due
+        amount_diff = float(abs(inv_total - sale.gross))
         amount_rank = 0 if abs(inv_total - sale.gross) <= (MONEY / 2) else 1
+        service_date = _invoice_service_date(inv)
         days = (
-            abs((inv.date - sale.date).days)
-            if (inv.date and sale.date)
+            abs((service_date - sale.date).days)
+            if (service_date and sale.date)
             else 9999
         )
-        return (amount_rank, days)
+        cal_rank, cal_score, cal_amount_diff = _calendar_candidate_score(
+            inv, sale, calendar_suggestions
+        )
+        return (-cal_rank, -cal_score, amount_rank, days, min(amount_diff, cal_amount_diff))
 
     ranked = sorted(pool, key=_key)
     return [_candidate_dict(inv, sale) for inv in ranked[:limit]]
@@ -475,6 +664,7 @@ def build_csv_reconciliation_preview(
             sheet_status = f"Sheet fetch failed: {str(sheet_exc)[:120]}"
 
     bank_lines: list[XeroBankLine] = []
+    cashflows_receives: list[dict[str, Any]] = []
     invoices: list[XeroInvoiceCandidate] = []
     xero_connected = bool(xero_client)
     xero_error = ""
@@ -491,6 +681,7 @@ def build_csv_reconciliation_preview(
             try:
                 bank_payload = xero_client.get_bank_transactions(start_date=start, end_date=end)
                 bank_lines = parse_xero_bank_lines(bank_payload)
+                cashflows_receives = _cashflows_receive_transactions(bank_payload)
             except Exception as exc:  # pragma: no cover
                 msg = str(exc)
                 if "401" in msg or "AuthorizationUnsuccessful" in msg or "Unauthorized" in msg:
@@ -528,8 +719,11 @@ def build_csv_reconciliation_preview(
                 #   GC Event ID or Invoice Number appearing in its CARD rows is
                 #   ground truth that the invoice was paid by card.
                 #
-                # Priority 2 — fallback heuristic / sheet-miss safety net:
-                #   a GC- reference marks a calendar booking taken by card.
+                # Priority 2 — sheet-miss recovery:
+                #   the helper sheet can lag behind Google Calendar/Xero. A GC-
+                #   reference is still allowed into the candidate pool so exact
+                #   amount/date matching plus the CARD calendar suggestion can
+                #   recover real card payments that the sheet has not logged yet.
                 #
                 # The GC- reference (and correlation-sheet CARD rows) are the
                 # authoritative signal that an invoice is a calendar-booked job
@@ -544,8 +738,9 @@ def build_csv_reconciliation_preview(
                             return True
                         if inv.number in card_lookup.inv_numbers:
                             return True
-                    # Fallback heuristic (and sheet-miss safety net): a GC-
-                    # reference marks a calendar booking taken by card.
+                        return inv.reference.startswith(CALENDAR_REF_PREFIX)
+                    # Fallback heuristic: a GC- reference marks a calendar
+                    # booking that may have been taken by card.
                     return inv.reference.startswith(CALENDAR_REF_PREFIX)
 
                 # Open invoices: keep everything except invoices that are BOTH
@@ -576,6 +771,7 @@ def build_csv_reconciliation_preview(
         "needs_review": 0,
         "waiting_invoices": 0,
         "no_bank_line": 0,
+        "prepared_in_xero": 0,
         "already_reconciled": 0,
     }
 
@@ -591,10 +787,15 @@ def build_csv_reconciliation_preview(
         gross = sum((s.gross for s in batch_sales), Decimal("0.00")).quantize(MONEY)
         fees = sum((s.fee for s in batch_sales), Decimal("0.00")).quantize(MONEY)
 
-        already_reconciled = str(payout.csv_ref) in reconciled_refs
+        existing_receive = _match_cashflows_receive(payout, cashflows_receives)
+        already_reconciled = (
+            str(payout.csv_ref) in reconciled_refs
+            or bool(existing_receive and existing_receive.get("is_reconciled"))
+        )
+        prepared_in_xero = bool(existing_receive and not existing_receive.get("is_reconciled"))
 
         bank_line = None
-        if xero_connected and not already_reconciled:
+        if xero_connected and not already_reconciled and not prepared_in_xero:
             bank_line = _match_bank_line(payout, bank_lines, used_bank_ids)
             if bank_line:
                 used_bank_ids.add(bank_line.id)
@@ -605,7 +806,7 @@ def build_csv_reconciliation_preview(
         for sale in batch_sales:
             invoice = None
             ambiguous = False
-            if xero_connected and not already_reconciled:
+            if xero_connected and not already_reconciled and not prepared_in_xero:
                 invoice, ambiguous = _match_invoice_for_sale(
                     sale, invoices, used_invoice_ids
                 )
@@ -617,7 +818,7 @@ def build_csv_reconciliation_preview(
             sale_rows.append(
                 {
                     **sale.to_dict(),
-                    "invoice": invoice.to_dict() if invoice else None,
+                    "invoice": _candidate_dict(invoice, sale) if invoice else None,
                     "ambiguous": bool(ambiguous),
                     # Shown in UI for unmatched sales so the user knows
                     # exactly what invoice to create/mark paid in Xero.
@@ -630,8 +831,15 @@ def build_csv_reconciliation_preview(
                 }
             )
 
+        has_paid_invoices = any(
+            bool((row.get("invoice") or {}).get("is_open") is False)
+            for row in sale_rows
+        )
+
         if already_reconciled:
             status = "already_reconciled"
+        elif prepared_in_xero:
+            status = "prepared_in_xero"
         elif not bank_line:
             status = "no_bank_line"
         elif not batch_sales or matched_count < len(batch_sales):
@@ -665,9 +873,17 @@ def build_csv_reconciliation_preview(
                 "net": _money_float(payout.amount),
                 "group_variance": _money_float(variance),
                 "bank_line": bank_line.to_dict() if bank_line else None,
+                "xero_cashflows_receive": {
+                    "id": existing_receive.get("id"),
+                    "reference": existing_receive.get("reference"),
+                    "date": _date_text(existing_receive.get("date")),
+                    "amount": _money_float(existing_receive.get("amount")),
+                    "is_reconciled": bool(existing_receive.get("is_reconciled")),
+                } if existing_receive else None,
                 "sales": sale_rows,
                 "sale_count": len(batch_sales),
                 "matched_invoice_count": matched_count,
+                "has_paid_invoices": has_paid_invoices,
                 "missing_invoice_count": len(batch_sales) - matched_count,
                 "ambiguous_count": ambiguous_count,
                 "already_reconciled": already_reconciled,
@@ -723,7 +939,11 @@ def build_csv_reconciliation_preview(
             row["calendar_suggestions"] = _calendar_suggestions(sale_obj)
             if row.get("invoice") is None:
                 # Missing sale: offer ranked nearby invoices as manual picks.
-                cands = _rank_candidate_invoices(sale_obj, unaccounted)
+                cands = _rank_candidate_invoices(
+                    sale_obj,
+                    unaccounted,
+                    row.get("calendar_suggestions") or [],
+                )
                 row["candidates"] = cands
                 missing_candidate_count += len(cands)
             elif row.get("ambiguous"):
@@ -778,7 +998,9 @@ def build_csv_reconciliation_preview(
         + status_counts["waiting_invoices"]
     )
     active_batch_count = sum(
-        v for k, v in status_counts.items() if k != "already_reconciled"
+        v
+        for k, v in status_counts.items()
+        if k not in {"already_reconciled", "prepared_in_xero"}
     )
 
     preview_id = uuid.uuid4().hex

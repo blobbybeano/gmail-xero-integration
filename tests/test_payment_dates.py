@@ -1,7 +1,9 @@
 import datetime as dt
+import os
 import unittest
+from unittest.mock import patch
 
-from app.main import _event_start_date_iso
+from app.main import _card_payment_account_code, _event_start_date_iso
 
 
 class PaymentDateTests(unittest.TestCase):
@@ -20,6 +22,14 @@ class PaymentDateTests(unittest.TestCase):
             _event_start_date_iso({}, fallback=dt.date(2026, 6, 12)),
             "2026-06-12",
         )
+
+    def test_card_payment_defaults_to_cashflows_clearing_account(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_card_payment_account_code(), "780")
+
+    def test_card_payment_can_use_custom_cashflows_clearing_account(self):
+        with patch.dict(os.environ, {"CASHFLOWS_CLEARING_ACCOUNT_CODE": "id:abc"}):
+            self.assertEqual(_card_payment_account_code(), "id:abc")
 
 
 if __name__ == "__main__":

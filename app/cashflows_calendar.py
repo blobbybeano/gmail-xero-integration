@@ -22,7 +22,7 @@ from typing import Any
 import requests
 
 from .google_calendar import build_calendar_service
-from .event_processor import extract_invoice_lines, parse_customer_fields
+from .event_processor import extract_invoice_lines, parse_customer_fields, payment_choice
 
 log = logging.getLogger(__name__)
 
@@ -132,6 +132,15 @@ def _parse_event_structured(event: dict) -> dict:
         )
 
     return {"customer": customer, "event_gross": event_gross}
+
+
+def _is_explicit_card_event(event: dict) -> bool:
+    """
+    Cashflows CSV sales are card-terminal payments. Calendar suggestions should
+    therefore only use diary entries explicitly marked as CARD; INVOICE/CASH or
+    unmarked entries are not evidence for a Cashflows card settlement.
+    """
+    return payment_choice(event.get("description") or "") == "card"
 
 
 # ---------------------------------------------------------------------------
@@ -438,8 +447,12 @@ def build_calendar_pool(
         except Exception as exc:
             log.debug("Calendar %s fetch failed: %s", cal_id, exc)
 
-    # Only timed events can be scored on proximity / dated.
-    events = [e for e in raw_events if "dateTime" in (e.get("start") or {})]
+    # Only timed, explicitly-CARD events can be scored on proximity / dated.
+    events = [
+        e
+        for e in raw_events
+        if "dateTime" in (e.get("start") or {}) and _is_explicit_card_event(e)
+    ]
     if not events:
         return CalendarPool([])
 

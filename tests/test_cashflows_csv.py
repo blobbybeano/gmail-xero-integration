@@ -64,6 +64,18 @@ def _bank_line(ref, date, amount):
     }
 
 
+def _cashflows_receive(ref, date, amount, *, reconciled):
+    return {
+        "BankTransactionID": f"cashflows-{ref}",
+        "Type": "RECEIVE",
+        "Date": date,
+        "Reference": f"Cashflows {ref}",
+        "Total": amount,
+        "Status": "AUTHORISED",
+        "IsReconciled": reconciled,
+    }
+
+
 def _invoice(inv_id, number, date, total, contact="Customer", reference=None):
     raw = {
         "InvoiceID": inv_id,
@@ -233,7 +245,41 @@ class PreviewTests(unittest.TestCase):
         result = build_csv_reconciliation_preview(self.config, text, xero_client=xero)
         self.assertTrue(result["xero_connected"])
         self.assertEqual(result["status_counts"]["ready"], 1)
-        self.assertEqual(result["batches"][0]["status"], "ready")
+
+    def test_exact_reconciled_cashflows_receive_marks_batch_done(self):
+        text = _csv(
+            [
+                _sale("1", "2026-05-01", "AAA", "100.00"),
+                _fee("2", "2026-05-01", "AAA", "1.00"),
+                _remit("3", "2026-05-02", "99.00"),
+            ]
+        )
+        xero = _FakeXero(
+            bank={"BankTransactions": [_cashflows_receive("3", "2026-05-02", "99.00", reconciled=True)]},
+        )
+        result = build_csv_reconciliation_preview(self.config, text, xero_client=xero)
+
+        self.assertEqual(result["batches"][0]["status"], "already_reconciled")
+        self.assertTrue(result["batches"][0]["already_reconciled"])
+        self.assertEqual(result["status_counts"]["already_reconciled"], 1)
+        self.assertEqual(result["active_batch_count"], 0)
+
+    def test_exact_unreconciled_cashflows_receive_marks_batch_prepared(self):
+        text = _csv(
+            [
+                _sale("1", "2026-05-01", "AAA", "100.00"),
+                _fee("2", "2026-05-01", "AAA", "1.00"),
+                _remit("3", "2026-05-02", "99.00"),
+            ]
+        )
+        xero = _FakeXero(
+            bank={"BankTransactions": [_cashflows_receive("3", "2026-05-02", "99.00", reconciled=False)]},
+        )
+        result = build_csv_reconciliation_preview(self.config, text, xero_client=xero)
+
+        self.assertEqual(result["batches"][0]["status"], "prepared_in_xero")
+        self.assertEqual(result["status_counts"]["prepared_in_xero"], 1)
+        self.assertEqual(result["active_batch_count"], 0)
 
     def test_ambiguous_match_is_needs_review_not_ready(self):
         # Two open invoices share the same amount AND the same date -> ambiguous.
@@ -319,10 +365,11 @@ class PreviewTests(unittest.TestCase):
         labelled = [c.get("assigned_to") for c in tied if c.get("assigned_to")]
         self.assertTrue(labelled)
 
-    def test_sheet_configured_gc_fallback_accepts_paid_invoice(self):
-        # The correlation sheet is configured but does NOT contain this booking.
-        # A GC-referenced PAID invoice must still be accepted via the fallback,
-        # rather than being dropped (which previously hid genuine card payments).
+    def test_sheet_miss_still_allows_gc_paid_invoice_recovery(self):
+        # The correlation sheet is useful, but it can lag behind Google
+        # Calendar/Xero. A GC-referenced PAID invoice must still be allowed into
+        # the pool so exact amount/date matching and the CARD calendar suggestion
+        # can recover genuine card payments.
         from unittest.mock import patch
 
         text = _csv(
@@ -353,6 +400,162 @@ class PreviewTests(unittest.TestCase):
         row = result["batches"][0]["sales"][0]
         self.assertIsNotNone(row["invoice"])
         self.assertEqual(row["invoice"]["reference"], "GC-900")
+
+    def test_sheet_configured_blocks_non_calendar_paid_invoice(self):
+        from unittest.mock import patch
+
+        text = _csv(
+            [
+                _sale("1", "2026-05-01", "AAA", "100.00"),
+                _fee("2", "2026-05-01", "AAA", "1.00"),
+                _remit("3", "2026-05-02", "99.00"),
+            ]
+        )
+        xero = _FakeXero(
+            invoices={"Invoices": []},
+            bank={"BankTransactions": [_bank_line("b1", "2026-05-02", "99.00")]},
+            paid={
+                "Invoices": [
+                    _invoice("p1", "INV-900", "2026-05-01", "100.00", reference="")
+                ]
+            },
+        )
+        empty_lookup = SimpleNamespace(
+            gc_refs=set(), inv_numbers=set(), total_card=0, total_rows=0
+        )
+        with patch(
+            "app.cashflows_csv.fetch_card_lookup", return_value=empty_lookup
+        ):
+            result = build_csv_reconciliation_preview(
+                self.config, text, xero_client=xero, correlation_sheet_id="sheet-1"
+            )
+        row = result["batches"][0]["sales"][0]
+        self.assertIsNone(row["invoice"])
+
+    def test_sheet_configured_accepts_card_paid_invoice(self):
+        from unittest.mock import patch
+
+        text = _csv(
+            [
+                _sale("1", "2026-05-01", "AAA", "100.00"),
+                _fee("2", "2026-05-01", "AAA", "1.00"),
+                _remit("3", "2026-05-02", "99.00"),
+            ]
+        )
+        xero = _FakeXero(
+            invoices={"Invoices": []},
+            bank={"BankTransactions": [_bank_line("b1", "2026-05-02", "99.00")]},
+            paid={
+                "Invoices": [
+                    _invoice("p1", "INV-900", "2026-05-01", "100.00", reference="GC-900")
+                ]
+            },
+        )
+        card_lookup = SimpleNamespace(
+            gc_refs={"GC-900"}, inv_numbers=set(), total_card=1, total_rows=1
+        )
+        with patch("app.cashflows_csv.fetch_card_lookup", return_value=card_lookup):
+            result = build_csv_reconciliation_preview(
+                self.config, text, xero_client=xero, correlation_sheet_id="sheet-1"
+            )
+        row = result["batches"][0]["sales"][0]
+        self.assertIsNotNone(row["invoice"])
+        self.assertEqual(row["invoice"]["reference"], "GC-900")
+
+    def test_gc_reference_date_prevents_same_amount_wrong_sale_consumption(self):
+        from unittest.mock import patch
+
+        text = _csv(
+            [
+                _sale("1", "2026-06-12", "OLD", "150.00"),
+                _fee("2", "2026-06-12", "OLD", "1.00"),
+                _remit("3", "2026-06-13", "149.00"),
+                _sale("4", "2026-06-30", "SHAUN", "150.00"),
+                _fee("5", "2026-06-30", "SHAUN", "1.30"),
+                _remit("6", "2026-07-01", "148.70"),
+            ]
+        )
+        xero = _FakeXero(
+            invoices={"Invoices": []},
+            bank={
+                "BankTransactions": [
+                    _bank_line("b1", "2026-06-13", "149.00"),
+                    _bank_line("b2", "2026-07-01", "148.70"),
+                ]
+            },
+            paid={
+                "Invoices": [
+                    _invoice(
+                        "shaun",
+                        "INV-5719",
+                        "2026-07-02",
+                        "150.00",
+                        contact="Shaun Farrell",
+                        reference="GC-20260630-b1ei",
+                    )
+                ]
+            },
+        )
+        lookup = SimpleNamespace(
+            gc_refs=set(), inv_numbers=set(), total_card=0, total_rows=0
+        )
+        with patch("app.cashflows_csv.fetch_card_lookup", return_value=lookup):
+            result = build_csv_reconciliation_preview(
+                self.config, text, xero_client=xero, correlation_sheet_id="sheet-1"
+            )
+        old_row = result["batches"][0]["sales"][0]
+        shaun_row = result["batches"][1]["sales"][0]
+        self.assertIsNone(old_row["invoice"])
+        self.assertEqual(shaun_row["invoice"]["number"], "INV-5719")
+        self.assertEqual(shaun_row["invoice"]["date"], "2026-06-30")
+
+    def test_gc_invoice_does_not_get_consumed_by_earlier_same_amount_sale(self):
+        from unittest.mock import patch
+
+        text = _csv(
+            [
+                _sale("1", "2026-06-22", "OLD", "114.00"),
+                _fee("2", "2026-06-22", "OLD", "0.50"),
+                _remit("3", "2026-06-23", "113.50"),
+                _sale("4", "2026-06-26", "RACHEL", "114.00"),
+                _fee("5", "2026-06-26", "RACHEL", "0.50"),
+                _remit("6", "2026-06-27", "113.50"),
+            ]
+        )
+        xero = _FakeXero(
+            invoices={"Invoices": []},
+            bank={
+                "BankTransactions": [
+                    _bank_line("b1", "2026-06-23", "113.50"),
+                    _bank_line("b2", "2026-06-27", "113.50"),
+                ]
+            },
+            paid={
+                "Invoices": [
+                    _invoice(
+                        "rachel",
+                        "INV-5699",
+                        "2026-06-26",
+                        "114.00",
+                        contact="Rachel Gray",
+                        reference="GC-20260626-aje4",
+                    )
+                ]
+            },
+        )
+        lookup = SimpleNamespace(
+            gc_refs=set(), inv_numbers=set(), total_card=0, total_rows=0
+        )
+        with patch("app.cashflows_csv.fetch_card_lookup", return_value=lookup):
+            result = build_csv_reconciliation_preview(
+                self.config, text, xero_client=xero, correlation_sheet_id="sheet-1"
+            )
+
+        old_row = result["batches"][0]["sales"][0]
+        rachel_row = result["batches"][1]["sales"][0]
+        self.assertIsNone(old_row["invoice"])
+        self.assertEqual(rachel_row["invoice"]["number"], "INV-5699")
+        self.assertEqual(rachel_row["invoice"]["contact_name"], "Rachel Gray")
 
     def test_missing_invoice_is_waiting(self):
         text = _csv(
@@ -403,6 +606,81 @@ class PreviewTests(unittest.TestCase):
         self.assertEqual([c["number"] for c in cands], ["GC-NEAR", "GC-MID", "GC-FAR"])
         self.assertEqual(cands[0]["days_apart"], 1)
         self.assertEqual(batch["missing_candidate_count"], 3)
+
+    def test_card_calendar_evidence_ranks_candidate_above_same_day_wrong_invoice(self):
+        from unittest.mock import patch
+
+        # This mirrors the real workflow: look at the card sale date, then the
+        # CARD diary entry on that day. A same-day calendar customer/amount clue
+        # should rank above another unrelated same-day Xero invoice.
+        text = _csv(
+            [
+                '"1","2026-06-30","09:07:58","Sale TIM","Sale Settlement","","155.98","0.00"',
+                '"2","2026-06-30","09:07:58","Merchant Service Charge Sale Ref: TIM",'
+                '"Merchant Service Charge","1.30","","0.00"',
+                _remit("3", "2026-07-01", "154.68"),
+            ]
+        )
+        xero = _FakeXero(
+            invoices={
+                "Invoices": [
+                    _invoice(
+                        "tracey",
+                        "INV-5597",
+                        "2026-06-04",
+                        "156.00",
+                        contact="Tracey Johnson",
+                        reference="GC-20260602-kfq3",
+                    ),
+                    _invoice(
+                        "ingmar",
+                        "INV-5718",
+                        "2026-06-30",
+                        "204.00",
+                        contact="Ingmar Grebien",
+                        reference="GC-20260630-2ftf",
+                    ),
+                    _invoice(
+                        "tim",
+                        "INV-5697",
+                        "2026-06-30",
+                        "157.18",
+                        contact="Tim Johnson",
+                        reference="GC-20260630-pm3c",
+                    ),
+                ]
+            },
+            bank={"BankTransactions": [_bank_line("b1", "2026-07-01", "154.68")]},
+        )
+
+        class _Pool:
+            def suggest_for_sale(self, *_args, **_kwargs):
+                return [
+                    {
+                        "customer": "Tim Johnson",
+                        "event_gross": 157.18,
+                        "event_summary": "CARD Tim Johnson",
+                        "event_date": "2026-06-30",
+                        "score": 0.95,
+                        "source": "structured",
+                    }
+                ]
+
+        with patch("app.cashflows_csv.build_calendar_pool", return_value=_Pool()):
+            result = build_csv_reconciliation_preview(
+                self.config,
+                text,
+                xero_client=xero,
+                calendar_ids=["cal-1"],
+            )
+
+        row = result["batches"][0]["sales"][0]
+        self.assertIsNone(row["invoice"])
+        self.assertEqual(
+            [c["number"] for c in row["candidates"][:3]],
+            ["INV-5697", "INV-5718", "INV-5597"],
+        )
+        self.assertFalse(row["candidates"][0]["amount_match"])
 
     def test_candidate_is_open_flag_reflects_amount_due(self):
         # A missing sale (no exact-amount invoice to auto-match) is offered two

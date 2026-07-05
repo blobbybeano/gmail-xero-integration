@@ -23,6 +23,39 @@ If you change logic in the files referenced below, update this document in the s
 
 ## Incident Register
 
+### 2026-07-03 Xero Webhook / Poller State Race
+
+Observed incident:
+- Xero marked `SW19 WC Mia` / `INV-5725` as paid.
+- The Xero webhook synced the Calendar entry to green/paid.
+- That Calendar write triggered a Google Calendar webhook, waking the poller.
+- The poller still had an older in-memory state copy where the event was sent
+  but not paid. Its later state save could overwrite the webhook's paid flag.
+- Once local state forgot `paid`, the poller could ask Xero again on later
+  targeted/hourly paid-status checks, contributing to 429 lockout risk.
+
+Permanent rules:
+- Webhook and poller state saves must use merge-safe persistence. A later
+  poller save must never remove a newer webhook `invoice_paid_event_ids` or
+  `invoice_sent_event_ids` fact.
+- Payment truth from Xero webhook wins over older local poller memory.
+- When a Xero webhook handles an invoice/event, store a short-lived
+  `recent_xero_webhook_events` marker.
+- Google webhook echoes caused by app-owned Calendar updates must not
+  immediately re-query Xero for the same invoice/event.
+- Background paid-status checks must have the same failure discipline as
+  draft/send actions: repeated failures for the same unchanged event/invoice
+  are capped, then paused until the calendar entry is changed/re-saved.
+- Do not replace merge-safe state saving with whole-file overwrites in poller
+  or webhook paths.
+
+Regression tests that must keep passing:
+- `StateMergeTests.test_polling_save_preserves_webhook_paid_state`
+- `StateMergeTests.test_merge_keeps_sent_paid_invoice_mapping_and_webhook_marker`
+- `SafetySimulatorTests.test_default_suite_passes`
+  - includes `xero_webhook_echo_does_not_recheck_xero`
+  - includes `paid_sync_failures_stop_until_resave`
+
 ### 2026-06-16 Xero 429 Lockout
 
 Observed incident:
@@ -256,6 +289,13 @@ These invariants exist specifically to prevent formatter loops and duplicate dra
     re-authorise it.
   - `CARD` payment writes to Xero must use the calendar appointment date as the
     payment date, not the date the app happened to process the entry.
+  - `CARD` payment writes from the Google Calendar/Xero flow must post to the
+    Cashflows clearing account (`CASHFLOWS_CLEARING_ACCOUNT_CODE`, default
+    `780 - Cashflow reconciliation`), not the real `Pow Wash` bank account. The
+    Cashflows CSV reconciliation then creates the single net bank deposit that
+    matches the `CFE SETT` bank-feed line. Keep the CSV reconciliation fallback
+    that can move older CARD payments from `Pow Wash` into this clearing account,
+    because historical invoices may still have been paid under the old design.
 
 If any of the above is changed, run a targeted regression against:
 - one line with hyphenated description (`A - B = £x+VAT`)
@@ -345,16 +385,26 @@ Key files:
   `create_*_payload` helpers)
 - `app/admin_web.py` (`/cashflows-sync` routes)
 
-## Cashflows CSV Reconciliation Safety Contract (Phase 1)
+## Cashflows CSV Reconciliation Safety Contract
 
 The live Cashflows settlement API has no usable public endpoint, so
 reconciliation is driven by a manually-downloaded merchant-account statement
-CSV that the user uploads. Phase 1 is preview/test only.
+CSV that the user uploads. Preview is read-only. Submission is explicit: the
+user must tick approved batches and press the submit button.
 
 Current contract:
 - `/cashflows-sync/upload-csv` parses the uploaded CSV and reads Xero
   (`get_bank_transactions`, `get_open_invoices`) to build a preview. It MUST
-  NOT write to Xero. There is no confirm/write route in Phase 1.
+  NOT write to Xero.
+- `/cashflows-sync/submit-csv-batches` accepts only checked batch IDs from the
+  latest cached preview. It must rebuild money amounts from the server-side
+  preview, not trust browser-submitted totals. By default it is test mode and
+  prints/returns the Xero payloads without writing.
+- CSV production writes require `DRY_RUN=false` AND
+  `CASHFLOWS_CSV_SUBMIT_PRODUCTION=true`. Do not use the old API-flow
+  `CASHFLOWS_RECONCILE_PRODUCTION` flag to enable CSV writes.
+- A CSV batch checkbox means "approved for the submit button"; it must not
+  itself call Xero.
 - If Xero is unreachable (e.g. token expired → 403), the preview degrades
   gracefully: `xero_connected=false`, matching is skipped, parsed CSV totals
   and batch structure are still shown. Never fail the whole upload on a Xero
@@ -384,9 +434,20 @@ Current contract:
   is `needs_review` (ambiguity) or `waiting_invoices` (missing invoice). Each Xero
   bank line / invoice is consumed at most once per preview. AI tie-break for
   ambiguous sales is a Phase-2 enhancement; Phase 1 flags them for human review.
-- Xero writes for CSV reconciliation remain gated behind the same flags as the
-  API path (`DRY_RUN=false` AND `CASHFLOWS_RECONCILE_PRODUCTION=true`) and must
-  not be enabled until a Phase 2 confirm path is built and reviewed.
+- Production CSV submission must not duplicate-pay invoices already marked paid
+  in Xero. For an already-paid-only batch, the safe production write is a
+  negative bank-side `SPEND` match-pack item for Cashflows merchant fees and any
+  reviewed underpayment adjustment. The user then uses Xero `Find & Match` to
+  select the existing invoice payment(s) plus that fee/adjustment item and press
+  OK. Do not create a `RECEIVE`/clearing receipt for the gross or net Cashflows
+  payout; that duplicates bank-account movement when invoice payments already
+  exist.
+- Underpayments/discounts must be handled by creating an `ACCRECCREDIT` sales
+  credit note for the shortfall and allocating it to the selected invoice before
+  the batch payment is posted. Do not silently rewrite original invoice line
+  items to force a match.
+- Overpayments may be represented as a separate "Parking" invoice only through
+  the guarded submit flow.
 - The CSV flow must stay outside the calendar worker and must not consume the
   calendar event Xero processing slot or alter calendar event state.
 

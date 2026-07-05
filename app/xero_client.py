@@ -845,6 +845,31 @@ class XeroClient:
             )
         return response.json()
 
+    def create_credit_note_payload(self, payload: Dict) -> Dict:
+        if self.dry_run:
+            return {"dry_run": True, "payload": payload}
+        url = f"{self.base_url}/CreditNotes"
+        response = self._request("POST", url, json=payload)
+        if not response.ok:
+            raise RuntimeError(
+                f"Xero credit note post failed: {response.status_code} {response.text}"
+            )
+        return response.json()
+
+    def allocate_credit_note_payload(self, credit_note_id: str, payload: Dict) -> Dict:
+        if self.dry_run:
+            return {"dry_run": True, "credit_note_id": credit_note_id, "payload": payload}
+        credit_note_id = str(credit_note_id or "").strip()
+        if not credit_note_id:
+            raise RuntimeError("Missing Xero CreditNoteID for allocation.")
+        url = f"{self.base_url}/CreditNotes/{credit_note_id}/Allocations"
+        response = self._request("PUT", url, json=payload)
+        if not response.ok:
+            raise RuntimeError(
+                f"Xero credit note allocation failed: {response.status_code} {response.text}"
+            )
+        return response.json()
+
     def find_contacts_by_name(self, name: str) -> Dict:
         url = f"{self.base_url}/Contacts"
         params = {"where": f'Name=="{name}"'}
