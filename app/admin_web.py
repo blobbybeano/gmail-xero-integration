@@ -6899,7 +6899,7 @@ function toggleReceiptsEnabled(requested) {{
                 <div class="mt-3 h-2.5 w-full rounded-full bg-emerald-100 overflow-hidden">
                   <div id="csv-progress-bar" class="h-full bg-emerald-600 transition-all duration-500 ease-out" style="width:0%"></div>
                 </div>
-                <p class="mt-2 text-[11px] text-emerald-700/80">You can safely close this page — the submission keeps running on the server and will pick up where it left off when you come back.</p>
+                <p id="csv-progress-note" class="mt-2 text-[11px] text-emerald-700/80">You can safely close this page — the submission keeps running on the server and will pick up where it left off when you come back.</p>
               </div>
               <div id="csv-submit-output" class="hidden text-xs text-gray-700 bg-gray-50 border border-gray-200 rounded-lg p-3 overflow-x-auto"></div>
             </div>
@@ -7199,11 +7199,13 @@ function toggleReceiptsEnabled(requested) {{
         const csvProgressCount = document.getElementById('csv-progress-count');
         const csvProgressBar = document.getElementById('csv-progress-bar');
         const csvProgressSpinner = document.getElementById('csv-progress-spinner');
+        const csvProgressNote = document.getElementById('csv-progress-note');
         const recRange = document.getElementById('recommended-range');
         const recRangeText = document.getElementById('rec-range-text');
         const recRangeReason = document.getElementById('rec-range-reason');
         let _csvPreviewData = null;
         let _submitPollTimer = null;
+        let _submitProgressStatus = '';
 
         function renderSubmitProgress(p) {{
           if (!csvProgress) return;
@@ -7211,24 +7213,41 @@ function toggleReceiptsEnabled(requested) {{
           const done = p.completed || 0;
           const pct = p.percent != null ? p.percent : (total ? Math.round((done / total) * 100) : 0);
           csvProgress.classList.remove('hidden');
+          _submitProgressStatus = p.status || '';
           csvProgressCount.textContent = done + ' / ' + total;
           csvProgressBar.style.width = pct + '%';
           csvProgressMsg.textContent = p.message || '';
           if (p.status === 'paused') {{
             csvProgressTitle.textContent = 'Paused — waiting for Xero';
             csvProgressBar.className = 'h-full bg-amber-500 transition-all duration-500 ease-out';
+            if (csvProgressNote) {{
+              csvProgressNote.textContent = 'This is waiting for Xero to cool down. Leave the page open or come back later; it will continue when Xero allows it.';
+              csvProgressNote.className = 'mt-2 text-[11px] text-amber-700/90';
+            }}
           }} else if (p.status === 'done') {{
             csvProgressTitle.textContent = '✅ Reconciliation complete';
             csvProgressBar.className = 'h-full bg-emerald-600 transition-all duration-500 ease-out';
             if (csvProgressSpinner) csvProgressSpinner.classList.add('hidden');
+            if (csvProgressNote) {{
+              csvProgressNote.textContent = 'Finished batches are saved and will not be resent.';
+              csvProgressNote.className = 'mt-2 text-[11px] text-emerald-700/80';
+            }}
           }} else if (p.status === 'error') {{
             csvProgressTitle.textContent = '⚠ Submission stopped';
             csvProgressBar.className = 'h-full bg-red-500 transition-all duration-500 ease-out';
             if (csvProgressSpinner) csvProgressSpinner.classList.add('hidden');
+            if (csvProgressNote) {{
+              csvProgressNote.textContent = 'This is stopped. It will not retry by itself; refresh the preview, check the unfinished batch, then submit only the remaining batch.';
+              csvProgressNote.className = 'mt-2 text-[11px] text-red-700/90';
+            }}
           }} else {{
             csvProgressTitle.textContent = 'Reconciling with Xero…';
             csvProgressBar.className = 'h-full bg-emerald-600 transition-all duration-500 ease-out';
             if (csvProgressSpinner) csvProgressSpinner.classList.remove('hidden');
+            if (csvProgressNote) {{
+              csvProgressNote.textContent = 'You can safely close this page — the submission keeps running on the server and will pick up where it left off when you come back.';
+              csvProgressNote.className = 'mt-2 text-[11px] text-emerald-700/80';
+            }}
           }}
         }}
 
@@ -8375,6 +8394,9 @@ function toggleReceiptsEnabled(requested) {{
             _previewId = data.preview_id || Date.now().toString();
             renderCsvTotals(data.totals || {{}});
             renderCsvResults(data);
+            if (!['running', 'paused'].includes(_submitProgressStatus) && csvProgress) {{
+              csvProgress.classList.add('hidden');
+            }}
             const sheetEl = document.getElementById('correlation-sheet-status');
             if (sheetEl && data.sheet_status) {{
               sheetEl.textContent = data.sheet_status;
