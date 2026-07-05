@@ -6628,6 +6628,11 @@ function toggleReceiptsEnabled(requested) {{
             os.getenv("CASHFLOWS_RECONCILE_PRODUCTION", "false").lower() == "true"
             and not bool(config.dry_run)
         )
+        csv_submit_production_enabled = (
+            os.getenv("CASHFLOWS_CSV_SUBMIT_PRODUCTION", "false").strip().lower()
+            in {"1", "true", "yes", "on"}
+            and not bool(config.dry_run)
+        )
         cashflows_ready = bool(
             str(cset.get("base_url") or "").strip()
             and str(cset.get("api_key") or "").strip()
@@ -6636,6 +6641,16 @@ function toggleReceiptsEnabled(requested) {{
             '<span class="px-2 py-1 rounded-full bg-red-50 text-red-700 border border-red-200 text-xs font-semibold">Production writes enabled</span>'
             if production_enabled
             else '<span class="px-2 py-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-semibold">Testing mode</span>'
+        )
+        csv_submit_badge = (
+            '<span class="px-2 py-1 rounded-full bg-red-50 text-red-700 border border-red-200 text-xs font-semibold whitespace-nowrap">Submit guarded &middot; production writes enabled</span>'
+            if csv_submit_production_enabled
+            else '<span class="px-2 py-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-semibold whitespace-nowrap">Submit guarded &middot; test mode</span>'
+        )
+        csv_submit_help = (
+            "Upload the merchant-account statement you downloaded from Cashflows. Preview is read-only. Ticked batches can then be submitted from this page; selected batches will write to Xero when you press Submit selected to Xero."
+            if csv_submit_production_enabled
+            else "Upload the merchant-account statement you downloaded from Cashflows. Preview is read-only. Ticked batches can then be submitted from this page; test mode shows the Xero payloads without writing anything."
         )
         cashflows_badge = (
             '<span class="px-2 py-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-semibold">Cashflows configured</span>'
@@ -6783,9 +6798,9 @@ function toggleReceiptsEnabled(requested) {{
               <div class="flex items-start justify-between gap-4 flex-wrap">
                 <div>
                   <h2 class="text-sm font-semibold text-gray-900">Reconcile from Cashflows CSV</h2>
-                  <p class="text-sm text-gray-600 mt-1">Upload the merchant-account statement you downloaded from Cashflows. Preview is read-only. Ticked batches can then be submitted from this page; by default submission runs in test mode and shows the Xero payloads without writing anything.</p>
+                  <p class="text-sm text-gray-600 mt-1">{csv_submit_help}</p>
                 </div>
-                <span class="px-2 py-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-semibold whitespace-nowrap">Submit guarded &middot; test mode unless enabled</span>
+                {csv_submit_badge}
               </div>
 
               <div id="recommended-range" class="hidden rounded-lg border border-indigo-100 bg-indigo-50 p-3 text-xs text-indigo-900">
