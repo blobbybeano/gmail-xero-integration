@@ -7478,7 +7478,7 @@ function toggleReceiptsEnabled(requested) {{
           const blockers = data.production_blockers || [];
           const mode = data.mode === 'production' ? 'Production write' : 'Test mode';
           const modeCls = data.mode === 'production'
-            ? 'bg-red-50 border-red-200 text-red-800'
+            ? 'bg-sky-50 border-sky-200 text-sky-800'
             : 'bg-emerald-50 border-emerald-200 text-emerald-800';
           const planRows = plans.map(function(p) {{
             const invs = (p.chosen_invoices || []).map(function(i) {{
@@ -7489,6 +7489,9 @@ function toggleReceiptsEnabled(requested) {{
               : '';
             const discounts = (p.discount_actions_required || []).length
               ? '<div class="mt-1 text-amber-700 font-semibold">Credit note plan: ' + (p.discount_actions_required || []).map(x => money(x.amount)).join(', ') + '</div>'
+              : '';
+            const paidExtras = (p.paid_overpayment_adjustments || []).length
+              ? '<div class="mt-1 text-indigo-700 font-semibold">Already-paid overpayment adjustment: ' + (p.paid_overpayment_adjustments || []).map(x => esc(x.invoice_number || x.sale_ref || 'sale') + ' +' + money(x.amount)).join(', ') + '</div>'
               : '';
             const paid = (p.already_paid_invoices || []).length
               ? '<div class="mt-1 text-emerald-700 font-semibold">Already paid in Xero: app will move the payment into Cashflow reconciliation and create one net Cashflows bank match.</div>'
@@ -7504,7 +7507,7 @@ function toggleReceiptsEnabled(requested) {{
               <td class="px-3 py-2 text-right font-semibold">${{money(p.gross)}}</td>
               <td class="px-3 py-2 text-right text-gray-500">${{money(p.fee_or_charge_total)}}</td>
               <td class="px-3 py-2 text-right font-semibold">${{money(p.net)}}</td>
-              <td class="px-3 py-2">${{invs || '<span class="text-amber-700">No invoices selected</span>'}}${{extra}}${{discounts}}${{paid}}${{matchPack}}${{clearing}}</td>
+              <td class="px-3 py-2">${{invs || '<span class="text-amber-700">No invoices selected</span>'}}${{extra}}${{discounts}}${{paidExtras}}${{paid}}${{matchPack}}${{clearing}}</td>
             </tr>`;
           }}).join('');
           const blockerHtml = blockers.length
@@ -8971,6 +8974,7 @@ function toggleReceiptsEnabled(requested) {{
             paid_invoice_payment_total = 0.0
             paid_invoice_discount_total = 0.0
             paid_invoice_extra_total = 0.0
+            paid_overpayment_adjustments: list[dict] = []
 
             for idx, sale in enumerate(sales):
                 req_sale = req_sales.get(idx) or {}
@@ -9046,10 +9050,22 @@ function toggleReceiptsEnabled(requested) {{
                     elif diff > 0.01:
                         if not adjustment or adjustment.get("type") != "extra_invoice":
                             blocking_errors.append(
-                                f"Batch {batch_id} sale {sale_ref or idx + 1} needs an extra invoice/overpayment adjustment."
+                                f"Batch {batch_id} sale {sale_ref or idx + 1} is £{diff:.2f} higher than already-paid invoice {selected.get('number') or selected_id} (£{payable_amount:.2f} paid vs £{sale_gross:.2f} card sale). Confirm the overpayment adjustment or refresh after editing the invoice in Xero."
                             )
                             continue
                         paid_invoice_extra_total = round(paid_invoice_extra_total + diff, 2)
+                        paid_overpayment_adjustments.append(
+                            {
+                                "sale_ref": sale_ref,
+                                "invoice_id": selected_id,
+                                "invoice_number": selected.get("number"),
+                                "contact_name": selected.get("contact_name"),
+                                "amount": diff,
+                                "invoice_paid_amount": payable_amount,
+                                "card_sale_amount": sale_gross,
+                                "reason": "Card sale is higher than an already-paid Xero invoice; the app will add a positive Cashflows adjustment line to the match pack.",
+                            }
+                        )
                     continue
 
                 if diff < -0.01:
@@ -9197,12 +9213,7 @@ function toggleReceiptsEnabled(requested) {{
                         f"Batch {batch_id} includes already-paid invoice(s): {names}, but Xero did not return enough existing bank-account payments to package a safe match."
                     )
                     continue
-                if paid_invoice_extra_total > 0.01:
-                    blocking_errors.append(
-                        f"Batch {batch_id} has an overpayment adjustment on already-paid invoice(s): {names}. This needs manual review before production submission."
-                    )
-                    continue
-                expected_net = round(paid_invoice_payment_total - fee_total - paid_invoice_discount_total, 2)
+                expected_net = round(paid_invoice_payment_total + paid_invoice_extra_total - fee_total - paid_invoice_discount_total, 2)
                 if abs(expected_net - net_total) > 0.02:
                     blocking_errors.append(
                         f"Batch {batch_id} match pack would total £{expected_net:.2f}, not the bank amount £{net_total:.2f}."
@@ -9258,6 +9269,20 @@ function toggleReceiptsEnabled(requested) {{
                             "TaxType": "NONE",
                         }
                     )
+                if paid_invoice_extra_total > 0:
+                    detail = ", ".join(
+                        f"{item.get('invoice_number') or item.get('sale_ref') or 'sale'} +£{_money_value(item.get('amount')):.2f}"
+                        for item in paid_overpayment_adjustments[:4]
+                    )
+                    clearing_lines.append(
+                        {
+                            "Description": f"Cashflows overpayment adjustment for {reference}: {detail}"[:4000],
+                            "Quantity": 1,
+                            "UnitAmount": round(paid_invoice_extra_total, 2),
+                            "AccountCode": getattr(xero_client, "sales_account_code", "200") if xero_client else "200",
+                            "TaxType": "NONE",
+                        }
+                    )
                 expected_receive_total = _money_value(sum(_money_value(line.get("UnitAmount")) for line in clearing_lines))
                 if abs(expected_receive_total - net_total) > 0.02:
                     blocking_errors.append(
@@ -9309,6 +9334,7 @@ function toggleReceiptsEnabled(requested) {{
                     "chosen_invoices": chosen_invoices,
                     "already_paid_invoices": already_paid,
                     "discount_actions_required": discount_actions,
+                    "paid_overpayment_adjustments": paid_overpayment_adjustments,
                     "credit_note_payloads": credit_note_payloads,
                     "extra_invoice_payloads": extra_invoice_payloads,
                     "paid_matching_adjustment": paid_matching_adjustment,

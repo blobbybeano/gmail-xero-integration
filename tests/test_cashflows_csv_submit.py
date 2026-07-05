@@ -565,6 +565,89 @@ class CashflowsCsvSubmitTests(unittest.TestCase):
         self.assertEqual(tx["LineItems"][1]["UnitAmount"], -1.5)
         self.assertEqual(progress["completed"], 1)
 
+    def test_production_paid_invoice_overpayment_adds_cashflows_adjustment_line(self):
+        preview = {
+            "preview_id": "preview-1",
+            "batches": [
+                {
+                    "id": "batch-1",
+                    "status": "ready",
+                    "payout": {"csv_ref": "pay-1", "date": "2026-06-25"},
+                    "gross": 164.0,
+                    "net": 162.58,
+                    "sales": [
+                        {
+                            "sale_ref": "08S1C9EAE4B",
+                            "date": "2026-06-24",
+                            "gross": 164.0,
+                            "fee": 1.42,
+                            "invoice": {
+                                "id": "inv-paid",
+                                "number": "INV-5705",
+                                "contact_name": "Maggie Mchale",
+                                "total": 162.0,
+                                "amount_due": 0.0,
+                                "is_open": False,
+                            },
+                            "candidates": [],
+                            "tied_candidates": [],
+                        }
+                    ],
+                }
+            ],
+        }
+        app = self._app_with_preview(preview, dry_run=False, production=True)
+        fake = FakeXeroClient()
+        fake.dry_run = False
+        fake.invoice_payments["inv-paid"] = [{"PaymentID": "pay-1"}]
+        fake.payment_details["pay-1"] = {
+            "PaymentID": "pay-1",
+            "HasAccount": True,
+            "Status": "AUTHORISED",
+            "IsReconciled": False,
+            "Amount": 162.0,
+            "Account": {"Code": "090", "Name": "Pow Wash"},
+        }
+        with app.test_client() as client:
+            with client.session_transaction() as session:
+                session["logged_in"] = True
+            with patch("app.admin_web.build_xero_client", return_value=fake), patch(
+                "app.admin_web._CF_SUBMIT_PACE_SECONDS", 0
+            ):
+                resp = client.post(
+                    "/cashflows-sync/submit-csv-batches",
+                    json={
+                        "preview_id": "preview-1",
+                        "batches": [
+                            {
+                                "batch_id": "batch-1",
+                                "sales": [
+                                    {
+                                        "sale_index": 0,
+                                        "selected_invoice_id": "inv-paid",
+                                        "selected_invoice_number": "INV-5705",
+                                        "adjustment": {"type": "extra_invoice", "amount": 2.0},
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                )
+                progress = self._wait_for_submit_job(client)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["async"], True)
+        self.assertEqual(progress["status"], "done")
+        self.assertEqual(len(fake.batch_payments), 0)
+        self.assertEqual(len(fake.deleted_payments), 1)
+        self.assertEqual(len(fake.created_payments), 1)
+        self.assertEqual(len(fake.bank_transactions), 1)
+        tx = fake.bank_transactions[0]["BankTransactions"][0]
+        self.assertEqual(tx["Type"], "RECEIVE")
+        self.assertEqual(tx["LineItems"][0]["UnitAmount"], 162.0)
+        self.assertEqual(tx["LineItems"][1]["UnitAmount"], -1.42)
+        self.assertEqual(tx["LineItems"][2]["UnitAmount"], 2.0)
+        self.assertEqual(tx["LineItems"][2]["AccountCode"], "200")
+
     def test_invented_invoice_id_is_rejected(self):
         preview = {
             "preview_id": "preview-1",
