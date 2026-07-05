@@ -6643,7 +6643,7 @@ function toggleReceiptsEnabled(requested) {{
             else '<span class="px-2 py-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-semibold">Testing mode</span>'
         )
         csv_submit_badge = (
-            '<span class="px-2 py-1 rounded-full bg-red-50 text-red-700 border border-red-200 text-xs font-semibold whitespace-nowrap">Submit guarded &middot; production writes enabled</span>'
+            '<span class="px-2 py-1 rounded-full bg-sky-50 text-sky-700 border border-sky-200 text-xs font-semibold whitespace-nowrap">Live submit enabled</span>'
             if csv_submit_production_enabled
             else '<span class="px-2 py-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-semibold whitespace-nowrap">Submit guarded &middot; test mode</span>'
         )
@@ -6776,15 +6776,15 @@ function toggleReceiptsEnabled(requested) {{
               </div>
               <div class="flex flex-wrap items-end gap-3">
                 <label class="block">
-                  <span class="block text-xs font-medium text-gray-600 mb-1">From</span>
+                  <span class="block text-xs font-medium text-gray-600 mb-1">API scan from</span>
                   <input id="date-from" type="date" value="{start.isoformat()}" class="h-9 rounded-lg border border-gray-300 px-3 text-sm">
                 </label>
                 <label class="block">
-                  <span class="block text-xs font-medium text-gray-600 mb-1">To</span>
+                  <span class="block text-xs font-medium text-gray-600 mb-1">API scan to</span>
                   <input id="date-to" type="date" value="{end.isoformat()}" class="h-9 rounded-lg border border-gray-300 px-3 text-sm">
                 </label>
                 <button id="scan-btn" type="button" class="h-9 px-4 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold shadow-sm">
-                  Scan &amp; Preview Matches
+                  API scan only
                 </button>
                 <button id="diagnostics-btn" type="button" class="h-9 px-4 rounded-lg border border-gray-300 bg-white hover:bg-gray-50 text-gray-800 text-sm font-semibold">
                   Test API Reads
@@ -6844,7 +6844,7 @@ function toggleReceiptsEnabled(requested) {{
               <div class="flex flex-wrap items-center gap-3">
                 <input id="csv-file" type="file" accept=".csv,text/csv" class="block text-sm text-gray-700 file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-indigo-600 file:text-white hover:file:bg-indigo-700">
                 <button id="upload-csv-btn" type="button" class="h-9 px-4 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold shadow-sm disabled:opacity-50">
-                  Upload &amp; Preview
+                  Upload CSV &amp; preview
                 </button>
                 <span id="csv-status" class="text-xs text-gray-500"></span>
               </div>
@@ -6859,9 +6859,15 @@ function toggleReceiptsEnabled(requested) {{
                   <h2 class="text-sm font-semibold text-gray-900">Submit approved batches to Xero</h2>
                   <p id="csv-submit-help" class="text-xs text-gray-500 mt-1">Tick the batches you are happy with, then submit only those selected batches.</p>
                 </div>
-                <button id="submit-csv-btn" type="button" class="h-9 px-4 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold shadow-sm disabled:opacity-50">
-                  Submit selected to Xero
-                </button>
+                <div class="flex items-center gap-3 flex-wrap justify-end">
+                  <label class="inline-flex items-center gap-2 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-xs font-semibold text-gray-700">
+                    <input id="csv-preview-mode" type="checkbox" class="h-4 w-4 rounded border-gray-300 text-indigo-600">
+                    Preview mode
+                  </label>
+                  <button id="submit-csv-btn" type="button" class="h-9 px-4 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold shadow-sm disabled:opacity-50">
+                    Submit selected to Xero
+                  </button>
+                </div>
               </div>
               <div id="csv-submit-status" class="text-xs text-gray-500"></div>
               <div id="csv-submit-progress" class="hidden rounded-xl border border-emerald-200 bg-emerald-50/60 p-4">
@@ -7173,6 +7179,7 @@ function toggleReceiptsEnabled(requested) {{
         const csvSubmitStatus = document.getElementById('csv-submit-status');
         const csvSubmitOutput = document.getElementById('csv-submit-output');
         const csvProgress = document.getElementById('csv-submit-progress');
+        const csvPreviewMode = document.getElementById('csv-preview-mode');
         const csvProgressTitle = document.getElementById('csv-progress-title');
         const csvProgressMsg = document.getElementById('csv-progress-msg');
         const csvProgressCount = document.getElementById('csv-progress-count');
@@ -8380,7 +8387,9 @@ function toggleReceiptsEnabled(requested) {{
             return;
           }}
           csvSubmitBtn.disabled = true;
-          csvSubmitStatus.textContent = 'Preparing Xero submission payloads…';
+          csvSubmitStatus.textContent = csvPreviewMode && csvPreviewMode.checked
+            ? 'Preview mode: preparing payloads without Xero writes...'
+            : 'Preparing Xero submission payloads...';
           try {{
             const resp = await fetch('/cashflows-sync/submit-csv-batches', {{
               method: 'POST',
@@ -8388,6 +8397,7 @@ function toggleReceiptsEnabled(requested) {{
               body: JSON.stringify({{
                 preview_id: _previewId,
                 batches: batches,
+                preview_mode: !!(csvPreviewMode && csvPreviewMode.checked),
               }}),
             }});
             const data = await resp.json();
@@ -8812,10 +8822,12 @@ function toggleReceiptsEnabled(requested) {{
             return _flask.jsonify({"error": "No checked batches were submitted."}), 400
 
         xero_client = build_xero_client(config)
+        preview_mode = bool(payload.get("preview_mode"))
         production_enabled = (
             os.getenv("CASHFLOWS_CSV_SUBMIT_PRODUCTION", "false").strip().lower()
             in ("1", "true", "yes", "on")
             and not bool(config.dry_run)
+            and not preview_mode
         )
         if production_enabled and xero_client is None:
             return _flask.jsonify({
