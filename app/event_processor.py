@@ -7,6 +7,7 @@ PAYMENT_TYPE_PROMPT = "PAYMENT TYPE (CARD/INVOICE) ="
 SEND_PROMPT = "SEND NOW (Y/N) ="
 APP_LEDGER_START = "[app]"
 APP_LEDGER_END = "[/app]"
+RECEIPT_LINK_LABEL = "Submit transaction receipt:"
 
 # Engineering note:
 # This file defines parsing and formatting invariants used by live automation.
@@ -235,7 +236,7 @@ def normalize_user_sections(description: str | None) -> str:
             elif low.startswith("customer contact number:"):
                 val = line.split(":", 1)[1].strip() if ":" in line else ""
                 out.append(f"Customer contact number: {val}".rstrip())
-            elif low.startswith("invoice profile:"):
+            elif low.startswith("invoice profile:") or low.startswith("invoce profile:"):
                 val = line.split(":", 1)[1].strip() if ":" in line else ""
                 out.append(f"Invoice profile: {val}".rstrip())
             elif low.startswith("invoice name:"):
@@ -278,6 +279,43 @@ def normalize_user_sections(description: str | None) -> str:
     def _norm_invoice(block: str) -> str:
         out: list[str] = []
         amount_re = r"£?\s*\d+(?:\.\d+)?\s*(?:\+?\s*vat)?"
+
+        def _line_sig(value: str) -> tuple[str, str] | None:
+            m_sig = re.match(r"^(.+?)\s*=\s*£?\s*(\d+(?:\.\d+)?)", value.strip(), flags=re.I)
+            if not m_sig:
+                return None
+            return (" ".join(m_sig.group(1).split()).lower(), str(round(float(m_sig.group(2)), 2)))
+
+        def _is_sales_marker(value: str) -> bool:
+            return bool(re.fullmatch(r"\s*[⬇↓]?\s*sales\s*[⬇↓]?\s*", value.strip(), flags=re.I))
+
+        def _remove_mirrored_sales(lines: list[str]) -> list[str]:
+            marker_idx = next((i for i, value in enumerate(lines) if _is_sales_marker(value)), -1)
+            before = lines if marker_idx < 0 else lines[:marker_idx]
+            after = [] if marker_idx < 0 else lines[marker_idx + 1 :]
+            after_sigs = {sig for sig in (_line_sig(value) for value in after) if sig}
+            seen_before: set[tuple[str, str]] = set()
+            cleaned_before: list[str] = []
+            for value in before:
+                sig = _line_sig(value)
+                if sig:
+                    if sig in after_sigs or sig in seen_before:
+                        continue
+                    seen_before.add(sig)
+                cleaned_before.append(value)
+            if marker_idx < 0:
+                return cleaned_before
+            cleaned_after: list[str] = []
+            seen_after: set[tuple[str, str]] = set()
+            for value in after:
+                sig = _line_sig(value)
+                if sig:
+                    if sig in seen_after:
+                        continue
+                    seen_after.add(sig)
+                cleaned_after.append(value)
+            return cleaned_before + [lines[marker_idx]] + cleaned_after
+
         for raw in block.splitlines():
             line = raw.strip()
             if not line:
@@ -317,7 +355,7 @@ def normalize_user_sections(description: str | None) -> str:
                 out.append(f"{desc} = {rhs}")
                 continue
             out.append(raw.rstrip())
-        return "\n".join(out)
+        return "\n".join(_remove_mirrored_sales(out))
 
     def _wrap_block(open_tag: str, content: str, close_tag: str) -> str:
         return f"{open_tag}\n{content}\n{close_tag}" if content else f"{open_tag}\n{close_tag}"
@@ -395,9 +433,10 @@ def upsert_invoice_profile_missing_hint(description: str | None, *, missing: boo
     for raw in (m.group(2) or "").splitlines():
         line = raw.rstrip()
         plain = re.sub(r"<[^>]+>", "", line).strip().lower()
-        if plain.startswith("invoice profile:"):
-            base = re.sub(r"\s*❌\s*customer does not exist\s*$", "", line, flags=re.I).rstrip()
-            base = re.sub(r"\s*✅\s*existing xero customer\s*$", "", base, flags=re.I).rstrip()
+        if plain.startswith("invoice profile:") or plain.startswith("invoce profile:"):
+            profile_value = line.split(":", 1)[1].strip() if ":" in line else ""
+            profile_value = _strip_error_hint(profile_value).strip()
+            base = f"Invoice profile: {profile_value}".rstrip()
             if missing:
                 if warning.lower() not in plain:
                     line = f"{base} {warning}".rstrip()
@@ -405,9 +444,6 @@ def upsert_invoice_profile_missing_hint(description: str | None, *, missing: boo
                 else:
                     line = base + " " + warning
             else:
-                profile_value = ""
-                if ":" in base:
-                    profile_value = base.split(":", 1)[1].strip()
                 target = f"{base} {success}".rstrip() if profile_value else base
                 if target != line:
                     changed = True
@@ -938,7 +974,7 @@ def parse_invoice_contact_overrides(description: str | None) -> Dict:
         if ":" not in line:
             continue
         value = line.split(":", 1)[1].strip()
-        if lower.startswith("invoice profile:"):
+        if lower.startswith("invoice profile:") or lower.startswith("invoce profile:"):
             result["invoice_profile"] = _strip_error_hint(value).strip()
         elif lower.startswith("invoice name:"):
             result["invoice_name"] = _strip_error_hint(value).strip()
@@ -1215,20 +1251,24 @@ def extract_invoice_lines(description: str | None) -> list[dict]:
     # If the same line appears both above and below the sales marker,
     # treat it as one customer invoice line to avoid accidental duplication
     # caused by layout/sync churn.
-    seen = {
-        (
-            str((li or {}).get("Description") or "").strip(),
+    def _line_sig(li: dict) -> tuple[str, float]:
+        return (
+            str((li or {}).get("Description") or "").strip().lower(),
             float((li or {}).get("UnitAmount") or 0),
-            str((li or {}).get("TaxType") or "").strip().upper(),
         )
-        for li in invoice_items
-    }
+
+    sales_seen = {_line_sig(li) for li in sales_items}
+    deduped_invoice_items: list[dict] = []
+    seen: set[tuple[str, float]] = set()
+    for li in invoice_items:
+        sig = _line_sig(li)
+        if sig in seen or sig in sales_seen:
+            continue
+        deduped_invoice_items.append(li)
+        seen.add(sig)
+    invoice_items = deduped_invoice_items
     for li in sales_items:
-        sig = (
-            str((li or {}).get("Description") or "").strip(),
-            float((li or {}).get("UnitAmount") or 0),
-            str((li or {}).get("TaxType") or "").strip().upper(),
-        )
+        sig = _line_sig(li)
         if sig in seen:
             continue
         invoice_items.append(li)
@@ -1378,9 +1418,8 @@ def _parse_line_items(block: str, *, force_no_vat: bool = False) -> list[dict]:
             "Description": desc,
             "Quantity": 1,
             "UnitAmount": amount,
+            "TaxType": "OUTPUT2" if vat_flag and not force_no_vat else "NONE",
         }
-        if vat_flag and not force_no_vat:
-            line_item["TaxType"] = "OUTPUT2"
         lines.append(line_item)
 
     return lines
@@ -1417,15 +1456,14 @@ def sync_invoice_block_from_xero(
     # Keep sales lines visually below the marker only.
     # They are still part of the Xero invoice total, but should not be mirrored
     # into the customer-facing section above ⬇Sales⬇ in calendar notes.
-    sales_signatures: set[tuple[str, float, str]] = set()
+    sales_signatures: set[tuple[str, float]] = set()
     for s_li in _parse_line_items(sales_part):
         try:
             s_total = round(float((s_li or {}).get("UnitAmount") or 0.0), 2)
         except Exception:
             s_total = 0.0
         s_desc = " ".join(str((s_li or {}).get("Description") or "").split()).lower()
-        s_tax = str((s_li or {}).get("TaxType") or "").upper()
-        sales_signatures.add((s_desc, s_total, s_tax))
+        sales_signatures.add((s_desc, s_total))
 
     rendered: list[str] = []
     for li in line_items:
@@ -1453,7 +1491,7 @@ def sync_invoice_block_from_xero(
         except Exception:
             line_total = qty * unit
         tax_type = str((li or {}).get("TaxType") or "").upper()
-        if (" ".join(desc.split()).lower(), round(float(line_total), 2), tax_type) in sales_signatures:
+        if (" ".join(desc.split()).lower(), round(float(line_total), 2)) in sales_signatures:
             continue
         tax_suffix = (
             "+VAT" if tax_type == "OUTPUT2" else ""
@@ -1670,6 +1708,18 @@ def upsert_send_failure(
     cleaned = [_format_process_prompt_line(l) for l in cleaned]
     totals = _extract_existing_totals(description)
     payment = _extract_existing_payment_type(description)
+    reason_text = reason or ""
+    temporary_xero_failure = any(
+        token in reason_text.lower()
+        for token in (
+            "503",
+            "upstream connect",
+            "overflow",
+            "timeout",
+            "temporarily unavailable",
+            "disconnect/reset",
+        )
+    )
     summary_lines: list[str] = []
     summary_lines.append(STATUS_START)
     if totals[0]:
@@ -1678,14 +1728,19 @@ def upsert_send_failure(
         summary_lines.append(_format_status_total_line(totals[1]))
     if payment:
         summary_lines.append(_format_status_prompt_line(payment))
-    summary_lines.append("Invoice send failed ❌")
+    if temporary_xero_failure:
+        summary_lines.append("Xero send temporarily failed ⚠️")
+        summary_lines.append("Temporary Xero/API issue - retry SEND NOW after a few minutes.")
+    else:
+        summary_lines.append("Invoice send failed ❌")
     if reason:
         summary_lines.append(f"Reason: {reason}")
     if invoice_url:
         summary_lines.append(f"Invoice link: {invoice_url}")
     else:
         summary_lines.append("Invoice link: unavailable (retry in a moment).")
-    summary_lines.append("Check customer e-mail, Update if needed then retry below:")
+    if not temporary_xero_failure:
+        summary_lines.append("Check customer e-mail, Update if needed then retry below:")
     summary_lines.append(_format_status_prompt_line(SEND_PROMPT))
     summary_lines.append(STATUS_END)
     while cleaned and not cleaned[-1].strip():
@@ -1735,6 +1790,28 @@ def _status_base_lines(description: str) -> list[str]:
             continue
         cleaned.append(line)
     return cleaned
+
+
+def upsert_receipt_submit_link(description: str, upload_url: str | None) -> str:
+    import re
+
+    if not description:
+        return description
+    m = re.search(r"\[app-status\](.*?)\[/app-status\]", description, flags=re.I | re.S)
+    if not m:
+        return description
+    inner = m.group(1)
+    lines = inner.splitlines()
+    kept: list[str] = []
+    for line in lines:
+        if line.strip().lower().startswith(RECEIPT_LINK_LABEL.lower()):
+            continue
+        kept.append(line)
+    if upload_url:
+        kept.append(f"{RECEIPT_LINK_LABEL} {upload_url}")
+    new_inner = "\n".join(kept).strip("\n")
+    new_block = f"[app-status]\n{new_inner}\n[/app-status]"
+    return description[: m.start()] + new_block + description[m.end() :]
 
 
 def parse_app_ledger(description: str | None) -> dict[str, str]:

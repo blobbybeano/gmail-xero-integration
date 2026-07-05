@@ -18,8 +18,15 @@ def _start_poller():
             time.sleep(delay)
             delay = min(delay * 2, 60)
 
-poller_thread = threading.Thread(target=_start_poller, name="calendar-poller", daemon=True)
+# The background poller always starts.  It handles the email invoice scanner,
+# Google Calendar watch management, and (when the Calendar→Xero sync toggle is
+# ON in Live View) calendar event → Xero invoice creation.
+# Xero API connectivity is now fully independent of this thread.
+poller_thread = threading.Thread(
+    target=_start_poller, name="calendar-poller", daemon=True
+)
 poller_thread.start()
+print("[poller] background poller started (Calendar→Xero sync controlled by Live View toggle)", flush=True)
 
 app = create_app()
 

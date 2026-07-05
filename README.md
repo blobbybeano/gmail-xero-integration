@@ -28,7 +28,7 @@ Fill in your values in `.env`.
 
 Important for Xero granular scopes (newer apps):
 ```env
-XERO_SCOPES=offline_access accounting.invoices accounting.payments accounting.contacts accounting.settings
+XERO_SCOPES=offline_access accounting.invoices accounting.payments accounting.contacts accounting.settings accounting.attachments accounting.banktransactions
 ```
 
 3. Google Calendar auth:
@@ -87,6 +87,7 @@ python scripts/test_xero.py
 - `app/xero_client.py` Xero REST wrapper
 - `app/state.py` last sync tracking
 - `app/receipts/` receipt-processing scaffold (feature-flagged, isolated)
+- `app/cashflows_reconciliation.py` Cashflows settlement/Xero invoice matching engine
 
 ## Engineering Guardrails
 - Read `docs/ENGINEERING_LOGIC_GUARDRAILS.md` before editing core logic.
@@ -100,6 +101,23 @@ python scripts/test_xero.py
 - It polls for new/updated events every `POLL_SECONDS` (default 30s). Set `RUN_ONCE=true` to run a single pass.
 - When `DONE` is present, it creates/updates a Xero Contact from the customer fields.
 - If an `<invoice>...</invoice>` block is present, it creates a draft invoice from those lines.
+
+## Cashflows Sync
+- Admin route: `/cashflows-sync`
+- Scans Xero `CFE SETT` bank lines, Cashflows settlements, and open Xero invoices.
+- Use `Test API Reads` first after deployment. It reports Xero read counts and
+  Cashflows settlement-read status without writing to Xero.
+- If Cashflows settlement reads return 404 while the endpoint/action is being
+  corrected, paste sample/manual settlement JSON into the page to test matching,
+  review modals, and Xero submission payload previews without Cashflows API reads.
+- Preview mode is read-only.
+- Confirm is test-mode by default and prints the intended Xero payloads to the server log.
+- The Review modal also shows the exact submission payload preview before confirm.
+- Production writes require both:
+  - `DRY_RUN=false`
+  - `CASHFLOWS_RECONCILE_PRODUCTION=true`
+- AI matching is off unless `CASHFLOWS_RECONCILE_AI_ENABLED=true`.
+- Merchant fees use `CASHFLOWS_BANK_FEES_ACCOUNT_CODE`.
 
 ## Current Production Flow (Do Not Change)
 - Trigger: event is processed when `Y/N =Y` is present in the notes body.
@@ -127,17 +145,18 @@ Customer contact number:
 [/contact]
 
 [invoice]
+job line = £35+VAT
 
 ⬇sales⬇
-example = £35+VAT
+field upsell = £10+VAT
 
 [/invoice]
 
 Y/N =Y
 
 [app-status]
-Invoice total (ex VAT): £35.00
-Invoice total (inc VAT): £42.00
+Invoice total (ex VAT): £45.00
+Invoice total (inc VAT): £54.00
 Entry complete ✅
 [/app-status]
 ```

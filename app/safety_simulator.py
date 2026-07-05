@@ -28,11 +28,14 @@ from .state import (
     get_invoice_for_event,
     get_processed_update_marker,
     get_xero_action_attempts,
+    is_invoice_paid,
     is_invoice_sent,
     mark_invoice_paid,
     mark_invoice_sent,
+    mark_recent_xero_webhook,
     set_invoice_for_event,
     set_processed_update_marker,
+    was_recent_xero_webhook,
 )
 
 LONDON_TZ = ZoneInfo("Europe/London")
@@ -250,6 +253,10 @@ class FakeXero:
         invoice["AmountDue"] = 0.0
         self.externally_paid_invoices.add(invoice_id)
 
+    def get_invoice(self, *, event_key: str, invoice_id: str) -> dict:
+        self._call("get_invoice", event_key=event_key, invoice_id=invoice_id)
+        return copy.deepcopy(self.invoices[invoice_id])
+
     def online_url(self, invoice_id: str) -> str:
         return f"https://fake.xero.test/{invoice_id}"
 
@@ -278,11 +285,22 @@ class SafetySimulator:
             if not webhooks:
                 return
             calendar_ids = sorted({calendar_id for calendar_id, _event_id in webhooks})
+            targeted_by_calendar: dict[str, set[str]] = {}
+            for calendar_id, event_id in webhooks:
+                targeted_by_calendar.setdefault(calendar_id, set()).add(event_id)
             for calendar_id in calendar_ids:
+                seen: set[str] = set()
+                for event_id in sorted(targeted_by_calendar.get(calendar_id, set())):
+                    event_obj = self.calendar.events.get(FakeGoogleCalendar.key(calendar_id, event_id))
+                    if event_obj:
+                        seen.add(event_id)
+                        self.process_event(copy.deepcopy(event_obj.to_google()), targeted=True)
                 for event in sorted(
                     self.calendar.list_updated_since(calendar_id, self.last_sync),
                     key=lambda item: str(item.get("updated") or ""),
                 ):
+                    if str(event.get("id") or "") in seen:
+                        continue
                     self.process_event(event, targeted=True)
             self.last_sync = self.clock.now
             self.clock.advance(5)
@@ -348,10 +366,49 @@ class SafetySimulator:
             return
 
         processed_marker = get_processed_update_marker(self.state, event_key)
+        invoice_id = get_invoice_for_event(self.state, event_key) or ""
+        if (
+            processed_marker == str(event.get("updated") or "")
+            and invoice_id
+            and is_invoice_sent(self.state, event_key)
+            and not is_invoice_paid(self.state, event_key)
+            and not was_recent_xero_webhook(
+                self.state,
+                event_key,
+                invoice_id,
+                now_ts=self.clock.now.timestamp(),
+                within_seconds=900,
+            )
+        ):
+            paid_sync_fp = self._fingerprint(
+                "paid_sync",
+                f"{event.get('updated') or ''}|{invoice_id}|{payment_choice(description)}",
+            )
+            attempts = get_xero_action_attempts(
+                self.state,
+                event_key,
+                "paid_sync",
+                paid_sync_fp,
+            )
+            if attempts >= MAX_XERO_ATTEMPTS:
+                return
+            try:
+                invoice = self.xero.get_invoice(event_key=event_key, invoice_id=invoice_id)
+            except FakeXeroError:
+                self.state, _attempts = bump_xero_action_attempts(
+                    self.state,
+                    event_key,
+                    "paid_sync",
+                    paid_sync_fp,
+                )
+                return
+            if str(invoice.get("Status") or "").upper() == "PAID":
+                self.state = mark_invoice_paid(self.state, event_key)
+                self.calendar.app_patch(event_key, summary=self._set_status(event["summary"], "green"))
+
         if processed_marker == str(event.get("updated") or "") and not self._has_pending_work(event_key, description):
             return
 
-        invoice_id = get_invoice_for_event(self.state, event_key) or ""
         draft_fp = self._fingerprint(
             "draft",
             json.dumps(
@@ -635,6 +692,8 @@ def run_default_suite() -> list[ScenarioResult]:
         scenario_xero_disconnect_does_not_red_flicker(),
         scenario_old_event_ignored_until_touched(),
         scenario_webhook_storm_no_duplicate_invoice(),
+        scenario_xero_webhook_echo_does_not_recheck_xero(),
+        scenario_paid_sync_failures_stop_until_resave(),
         scenario_fast_forward_current_diary_load(),
         scenario_long_running_mixed_diary_stress(),
     ]
@@ -931,6 +990,103 @@ def scenario_webhook_storm_no_duplicate_invoice() -> ScenarioResult:
         [
             f"create_calls={len(create_calls)}",
             f"app_updates={sim.calendar.events[key].app_update_count}",
+        ],
+        len(sim.xero.call_log),
+        sim.calendar.write_count,
+    )
+
+
+def scenario_xero_webhook_echo_does_not_recheck_xero() -> ScenarioResult:
+    sim = _new_sim()
+    event = _event(
+        event_id="xero-webhook-echo",
+        summary="🟡 SW19 WC Mia",
+        description=_draft_description(name="Mia Paid", price=78),
+        clock=sim.clock,
+        days_from_now=-1,
+    )
+    key = FakeGoogleCalendar.key(event.calendar_id, event.id)
+    sim.calendar.add_event(event)
+    sim.run_until_idle()
+    invoice_id = get_invoice_for_event(sim.state, key) or ""
+    sim.state = mark_invoice_sent(sim.state, key)
+    sim.xero.mark_invoice_paid_external(invoice_id)
+    sim.state = mark_invoice_paid(sim.state, key)
+    sim.state = mark_recent_xero_webhook(
+        sim.state,
+        key,
+        invoice_id,
+        when_ts=sim.clock.now.timestamp(),
+    )
+    sim.calendar.app_patch(key, summary="🟢 SW19 WC Mia")
+    updated = sim.calendar.events[key].updated.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    sim.state = set_processed_update_marker(sim.state, key, updated)
+    before = len(sim.xero.call_log)
+    sim.run_until_idle()
+    new_calls = sim.xero.call_log[before:]
+    passed = not [row for row in new_calls if row["action"] == "get_invoice"]
+    return ScenarioResult(
+        "xero_webhook_echo_does_not_recheck_xero",
+        passed,
+        [f"new_calls={new_calls}", f"recent={sim.state.get('recent_xero_webhook_events', {}).get(key)}"],
+        len(sim.xero.call_log),
+        sim.calendar.write_count,
+    )
+
+
+def scenario_paid_sync_failures_stop_until_resave() -> ScenarioResult:
+    sim = _new_sim({"get_invoice": ["429", "429", "429", "429"]})
+    event = _event(
+        event_id="paid-sync-fails",
+        summary="🟡 SW15 G.C Payment Pending",
+        description=_draft_description(name="Payment Pending", price=120),
+        clock=sim.clock,
+        days_from_now=-1,
+    )
+    key = FakeGoogleCalendar.key(event.calendar_id, event.id)
+    sim.calendar.add_event(event)
+    sim.run_until_idle()
+    invoice_id = get_invoice_for_event(sim.state, key) or ""
+    sim.state = mark_invoice_sent(sim.state, key)
+    final = sim.calendar.events[key]
+    sim.state = set_processed_update_marker(
+        sim.state,
+        key,
+        final.updated.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+    )
+
+    for _ in range(6):
+        sim.calendar.webhook_queue.append((final.calendar_id, final.id))
+        sim.run_until_idle()
+        sim.clock.advance(60)
+
+    get_calls_before_resave = [
+        row for row in sim.xero.call_log if row["action"] == "get_invoice"
+    ]
+    sim.calendar.user_edit(key, lambda ev: setattr(ev, "description", ev.description + "\nStaff checked"))
+    sim.run_until_idle()
+    final = sim.calendar.events[key]
+    sim.state = set_processed_update_marker(
+        sim.state,
+        key,
+        final.updated.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+    )
+    sim.calendar.webhook_queue.append((final.calendar_id, final.id))
+    sim.run_until_idle()
+    get_calls_after_resave = [
+        row for row in sim.xero.call_log if row["action"] == "get_invoice"
+    ]
+    passed = (
+        len(get_calls_before_resave) == MAX_XERO_ATTEMPTS
+        and len(get_calls_after_resave) == MAX_XERO_ATTEMPTS + 1
+        and bool(invoice_id)
+    )
+    return ScenarioResult(
+        "paid_sync_failures_stop_until_resave",
+        passed,
+        [
+            f"before_resave={len(get_calls_before_resave)}",
+            f"after_resave={len(get_calls_after_resave)}",
         ],
         len(sim.xero.call_log),
         sim.calendar.write_count,

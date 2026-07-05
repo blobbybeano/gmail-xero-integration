@@ -22,8 +22,11 @@ def load_admin_credentials(config: AppConfig) -> Credentials | None:
         return None
     creds = Credentials.from_authorized_user_file(token_path.as_posix(), _scopes(config))
     if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        token_path.write_text(creds.to_json())
+        try:
+            creds.refresh(Request())
+            token_path.write_text(creds.to_json())
+        except Exception:
+            return None
     if creds and creds.valid:
         return creds
     return None

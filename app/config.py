@@ -76,6 +76,8 @@ class AppConfig:
     receipts_enabled: bool
     receipts_store_file: str
     receipts_require_write_confirmation: bool
+    receipts_upload_dir: str
+    receipts_link_ttl_seconds: int
 
 
 def load_config() -> AppConfig:
@@ -99,7 +101,8 @@ def load_config() -> AppConfig:
                 "GOOGLE_ADMIN_SCOPES",
                 "https://www.googleapis.com/auth/calendar "
                 "https://www.googleapis.com/auth/spreadsheets "
-                "https://www.googleapis.com/auth/drive.metadata.readonly",
+                "https://www.googleapis.com/auth/drive.metadata.readonly "
+                "https://www.googleapis.com/auth/gmail.readonly",
             )
         ),
         google_oauth_redirect_uri=os.getenv(
@@ -114,7 +117,8 @@ def load_config() -> AppConfig:
         xero_scopes=_split_csv(
             os.getenv(
                 "XERO_SCOPES",
-                "offline_access accounting.invoices accounting.contacts",
+                "offline_access accounting.invoices accounting.contacts "
+                "accounting.attachments accounting.banktransactions",
             )
         ),
         xero_access_token=os.getenv("XERO_ACCESS_TOKEN", ""),
@@ -139,4 +143,9 @@ def load_config() -> AppConfig:
             "RECEIPTS_REQUIRE_WRITE_CONFIRMATION", "true"
         ).lower()
         == "true",
+        receipts_upload_dir=os.getenv("RECEIPTS_UPLOAD_DIR", "receipt_uploads"),
+        receipts_link_ttl_seconds=max(
+            int(os.getenv("RECEIPTS_LINK_TTL_SECONDS", "172800") or "172800"),
+            300,
+        ),
     )

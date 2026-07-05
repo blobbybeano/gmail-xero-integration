@@ -204,11 +204,15 @@ def append_stats_row(
     payload: dict[str, Any],
     event_id_display: str = "",
     dedupe_signature: dict[str, Any] | None = None,
+    update_existing: bool = False,
 ) -> None:
     """
     Append a data row to the sheet, placing each value under its correct column
     header regardless of column order. New columns added later won't misalign
     existing rows.
+
+    When update_existing is true, a row matching dedupe_signature is updated in
+    place instead of skipped. Core calendar/Xero logging leaves this False.
     """
     service = build_sheets_service_from_creds(creds)
     resolved = _resolve_existing_sheet_name(service, spreadsheet_id, sheet_name)
@@ -242,10 +246,34 @@ def append_stats_row(
         if field in payload and field not in stats_fields:
             _set(label, payload[field])
 
+    safe = resolved.replace("'", "''")
+
+    def _update_existing_row(row_number: int, existing_row: list[Any]) -> None:
+        logged_at_idx = col_index.get("Logged At")
+        if logged_at_idx is not None and logged_at_idx < len(existing_row):
+            row[logged_at_idx] = str(existing_row[logged_at_idx])
+        padded_existing = [
+            str(existing_row[i]) if i < len(existing_row) else ""
+            for i in range(len(header))
+        ]
+        if padded_existing == row:
+            return
+        end_letter = _col_letter(len(header) - 1)
+        (
+            service.spreadsheets()
+            .values()
+            .update(
+                spreadsheetId=spreadsheet_id,
+                range=f"'{safe}'!A{row_number}:{end_letter}{row_number}",
+                valueInputOption="USER_ENTERED",
+                body={"values": [row]},
+            )
+            .execute()
+        )
+
     # Optional idempotency guard: if a row already exists with the same
-    # signature columns, skip append to prevent duplicate submissions.
+    # signature columns, skip or update it to prevent duplicate submissions.
     if dedupe_signature:
-        safe = resolved.replace("'", "''")
         existing_values = (
             service.spreadsheets()
             .values()
@@ -254,7 +282,7 @@ def append_stats_row(
             .get("values", [])
         )
         if existing_values:
-            for existing_row in existing_values[1:]:
+            for row_number, existing_row in enumerate(existing_values[1:], start=2):
                 matched = True
                 for label, expected in dedupe_signature.items():
                     idx = col_index.get(label)
@@ -266,9 +294,10 @@ def append_stats_row(
                         matched = False
                         break
                 if matched:
+                    if update_existing:
+                        _update_existing_row(row_number, existing_row)
                     return
 
-    safe = resolved.replace("'", "''")
     append_result = (
         service.spreadsheets()
         .values()

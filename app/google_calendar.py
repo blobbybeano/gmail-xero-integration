@@ -108,6 +108,97 @@ def list_updated_events(
     return items
 
 
+def list_events_in_window(
+    config: AppConfig,
+    time_min: dt.datetime,
+    time_max: dt.datetime,
+    calendar_id: str | None = None,
+) -> List[Dict]:
+    service = build_calendar_service(config)
+    items: list[dict] = []
+    page_token: str | None = None
+    while True:
+        events_result = (
+            service.events()
+            .list(
+                calendarId=calendar_id or config.google_calendar_id,
+                singleEvents=True,
+                orderBy="startTime",
+                timeMin=time_min.isoformat(),
+                timeMax=time_max.isoformat(),
+                maxResults=2500,
+                pageToken=page_token,
+            )
+            .execute()
+        )
+        items.extend(events_result.get("items", []))
+        page_token = events_result.get("nextPageToken")
+        if not page_token:
+            break
+    return items
+
+
+def list_incremental_events(
+    config: AppConfig,
+    sync_token: str,
+    calendar_id: str | None = None,
+) -> tuple[List[Dict], str | None]:
+    service = build_calendar_service(config)
+    items: list[dict] = []
+    page_token: str | None = None
+    next_sync_token: str | None = None
+    while True:
+        try:
+            events_result = (
+                service.events()
+                .list(
+                    calendarId=calendar_id or config.google_calendar_id,
+                    singleEvents=True,
+                    showDeleted=True,
+                    syncToken=sync_token,
+                    maxResults=2500,
+                    pageToken=page_token,
+                )
+                .execute()
+            )
+        except HttpError as exc:
+            if _is_sync_token_expired(exc):
+                raise CalendarSyncTokenExpired("Google Calendar sync token expired") from exc
+            raise
+        items.extend(events_result.get("items", []))
+        page_token = events_result.get("nextPageToken")
+        next_sync_token = events_result.get("nextSyncToken") or next_sync_token
+        if not page_token:
+            break
+    return items, next_sync_token
+
+
+def prime_calendar_sync_token(
+    config: AppConfig,
+    calendar_id: str | None = None,
+) -> str | None:
+    service = build_calendar_service(config)
+    page_token: str | None = None
+    next_sync_token: str | None = None
+    while True:
+        events_result = (
+            service.events()
+            .list(
+                calendarId=calendar_id or config.google_calendar_id,
+                singleEvents=True,
+                showDeleted=True,
+                maxResults=2500,
+                pageToken=page_token,
+            )
+            .execute()
+        )
+        page_token = events_result.get("nextPageToken")
+        next_sync_token = events_result.get("nextSyncToken") or next_sync_token
+        if not page_token:
+            break
+    return next_sync_token
+
+
 def update_event_description(
     config: AppConfig,
     event_id: str,
@@ -171,6 +262,14 @@ def stop_calendar_watch(config: AppConfig, channel_id: str, resource_id: str) ->
 
 class RateLimitError(RuntimeError):
     pass
+
+
+class CalendarSyncTokenExpired(RuntimeError):
+    pass
+
+
+def _is_sync_token_expired(exc: HttpError) -> bool:
+    return getattr(exc.resp, "status", None) == 410
 
 
 def _is_rate_limit_error(exc: HttpError) -> bool:

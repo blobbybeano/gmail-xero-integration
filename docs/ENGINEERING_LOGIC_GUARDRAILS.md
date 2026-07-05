@@ -10,7 +10,6 @@ If you change logic in the files referenced below, update this document in the s
 - `app/event_processor.py`: parsing/normalization of calendar notes, status-block rendering, title emoji semantics.
 - `app/google_sheets.py`: sheet writes, dedupe signatures, backlog flushing.
 - `app/state.py`: persistent markers for processed/sent/paid/draft-sync and retry cooldowns.
-- `app/safety_simulator.py`: offline fake Google/Xero simulator for webhook loops, Xero failures, and old-entry handling.
 - `app/receipts/*`: scaffold-only receipt module (feature-flagged, isolated, no live write-through yet).
 
 ## Critical Invariants
@@ -21,6 +20,100 @@ If you change logic in the files referenced below, update this document in the s
   - anti-loop protections (`processed`, `invoice_update_marker`, cooldown markers).
 - New features must be feature-flagged OFF by default until validated.
 - If a change touches event processing, check both webhook and poller paths.
+
+## Incident Register
+
+### 2026-07-03 Xero Webhook / Poller State Race
+
+Observed incident:
+- Xero marked `SW19 WC Mia` / `INV-5725` as paid.
+- The Xero webhook synced the Calendar entry to green/paid.
+- That Calendar write triggered a Google Calendar webhook, waking the poller.
+- The poller still had an older in-memory state copy where the event was sent
+  but not paid. Its later state save could overwrite the webhook's paid flag.
+- Once local state forgot `paid`, the poller could ask Xero again on later
+  targeted/hourly paid-status checks, contributing to 429 lockout risk.
+
+Permanent rules:
+- Webhook and poller state saves must use merge-safe persistence. A later
+  poller save must never remove a newer webhook `invoice_paid_event_ids` or
+  `invoice_sent_event_ids` fact.
+- Payment truth from Xero webhook wins over older local poller memory.
+- When a Xero webhook handles an invoice/event, store a short-lived
+  `recent_xero_webhook_events` marker.
+- Google webhook echoes caused by app-owned Calendar updates must not
+  immediately re-query Xero for the same invoice/event.
+- Background paid-status checks must have the same failure discipline as
+  draft/send actions: repeated failures for the same unchanged event/invoice
+  are capped, then paused until the calendar entry is changed/re-saved.
+- Do not replace merge-safe state saving with whole-file overwrites in poller
+  or webhook paths.
+
+Regression tests that must keep passing:
+- `StateMergeTests.test_polling_save_preserves_webhook_paid_state`
+- `StateMergeTests.test_merge_keeps_sent_paid_invoice_mapping_and_webhook_marker`
+- `SafetySimulatorTests.test_default_suite_passes`
+  - includes `xero_webhook_echo_does_not_recheck_xero`
+  - includes `paid_sync_failures_stop_until_resave`
+
+### 2026-06-16 Xero 429 Lockout
+
+Observed incident:
+- Xero entered a 429 cooldown until 2026-06-16 19:18 BST.
+- The triggering live event was `SW6 G.C Lily Gray`, which had
+  `Invoice profile: Lily Gray ❌ Customer does not exist`.
+- The app attempted a Xero contact lookup for that invoice profile and Xero
+  returned 429.
+- Calendar webhooks were noisy around the same period, so even small Xero-side
+  checks became dangerous.
+
+Root causes fixed:
+- The app previously allowed early lockout probes via `get_organisation()`
+  before Xero's stored Retry-After timestamp had passed.
+- Proactive Xero health checks were enabled by default, creating Xero traffic
+  even when no user action needed it.
+- An invoice profile already marked `❌ Customer does not exist` could still be
+  considered Xero-work and consume the per-cycle Xero budget after unlock.
+- Final green/completed entries were skipped before Xero calls, but the Xero
+  per-cycle slot was reserved before that green skip. With a one-event Xero
+  budget, old green entries could starve real pending Xero work without making
+  a visible API call.
+
+Permanent rules:
+- Never probe Xero during a stored 429 lockout. Wait until
+  `xero_lockout_until_ts` has expired.
+- Keep `XERO_HEALTH_CHECK_SECONDS=0` unless there is a deliberate, tested
+  reason to re-enable proactive checks.
+- An `Invoice profile` line that already contains
+  `❌ Customer does not exist` must not call Xero again or reserve Xero budget
+  until a human edits the profile value.
+- A final green title (`🟢`) must not reserve Xero budget. Green entries are
+  immutable except the explicit existing email retry path.
+- Calendar-level webhook noise must not imply event-level Xero intent.
+
+Regression tests that must keep passing:
+- `test_xero_health_check_disabled_when_interval_zero`
+- `test_xero_health_check_waits_for_retry_after`
+- `test_invoice_profile_missing_hint_detected`
+- `test_invoice_profile_missing_hint_absent_for_normal_profile`
+- `test_final_green_entry_blocks_xero_budget`
+- `test_non_green_entry_can_use_xero_budget`
+- `test_calendar_target_does_not_force_unpaid_invoice_check`
+- `test_calendar_target_does_not_bypass_future_draft_limit`
+
+Safe testing procedure:
+- Do not test Xero lockout behavior by intentionally exhausting the live Xero
+  tenant. Use unit tests or a fake Xero client that returns 429/Retry-After.
+- If a real Xero demo-company test is required, run it from a separate app
+  deployment with separate volume/state/admin DB/token files and separate
+  calendar watches. Do not share the production Fly app, production state file,
+  production Xero token, or production Google webhook targets.
+- A 429 in any tenant handled by the production app sets the app-level
+  `xero_lockout_until_ts` guard, so mixed demo/live testing inside production
+  can pause live processing even if Xero's tenant quotas are separate.
+- Before any Xero-related deployment, run:
+  - `.venv/bin/python -m py_compile app/main.py app/event_processor.py app/admin_web.py`
+  - `.venv/bin/python -m unittest discover -s tests`
 
 ## Title Light Semantics
 
@@ -53,75 +146,33 @@ Primary controls:
 - Global Xero cooldown/lockout timestamps in state.
 - Per-event Xero retry backoff and retry-after maps.
 - Limited Xero events processed per cycle.
+- Xero Retry-After must be respected literally: do not probe Xero before the
+  stored lockout timestamp expires, and keep proactive Xero health checks
+  disabled by default (`XERO_HEALTH_CHECK_SECONDS=0`).
+- Only reserve a per-cycle Xero event slot when the event genuinely needs a
+  create, changed-draft update, explicit send, or paid-status reconcile. An
+  unchanged event that already has a draft invoice must not consume the slot,
+  otherwise it can starve later pending drafts on the same calendar.
+- A calendar-level webhook target must not make every historical event on that
+  calendar eligible for a Xero self-heal probe. Limit self-heal probes to an
+  explicitly targeted event or a genuinely recent edit.
 - Hourly reconcile windows and bounded cleanup queues.
-- Xero health must be passive/event-driven:
-  - do not call Xero Organisation or other endpoints just to probe health,
-    clear lockout, or test whether a cooldown is over.
-  - once a 429 lockout is recorded, wait until the recorded timestamp expires;
-    the next real event-processing call may then proceed.
-  - this preserves Xero calls for customer work and keeps every rate-limit
-    event attributable to a real action where possible.
-- The admin dashboard must expose Xero pressure/lockout state from local app
-  state only. It may show lockout countdowns, event retry counts, and action
-  attempt counts, but must not call Xero just to populate a health meter.
-- A global Xero lockout must not freeze calendar-only formatting. Prefill,
-  normalization, title/status cleanup, and missing-line "(Check Formatting)"
-  updates may continue while Xero client work remains blocked.
 - Draft-sync fingerprints are persisted on attempted draft-create calls so
   unchanged events do not repeatedly re-submit drafts during transient Xero failures.
-- Each event may carry a compact app-owned ledger at the bottom of the notes:
-  - human line: `App status: ...`
-  - machine line: `[app]s=...;r=...;fp=...;x=...;w=...[/app]`
-  - users should not edit this block manually; it records the app state,
-    reason, input/action fingerprint, Xero attempt count, and wait condition.
-  - Xero draft/send actions are hard-budgeted by event/action/fingerprint
-    (`XERO_ACTION_MAX_ATTEMPTS`, default 2). Once the same unchanged action
-    reaches the budget, the app marks the entry as needing human input and
-    must stop before calling Xero again.
-- Google Calendar webhook feed messages are coalesced. A burst of webhook pings
-  must not create a misleading live-feed storm; the webhook may still queue the
-  exact changed calendar for incremental sync.
-- On webhook-targeted calendar cycles, the app reads recently updated events on
-  that calendar in addition to the normal date windows. This lets an old event
-  edited today be considered once without bringing all old untouched events
-  back into Xero processing.
-- Broad/hourly sweeps must not keep re-opening old unfinished jobs. Events more
-  than `PAST_EVENT_AUTO_XERO_HOURS` hours past their end time default to no
-  automatic Xero processing unless they are part of the current targeted
-  Google-calendar change. Staff can re-save a stale entry to make it eligible
-  again; otherwise it is manual.
-- `DONE` entries with no invoice line items must mark the current calendar
-  update as handled and then stop. A later staff re-save changes `event.updated`
-  and allows the app to check the entry again after line items are added.
-- Missing-line-item entries must not reserve a Xero processing slot. Mark the
-  title once with `(Check Formatting)` and do not retry until the entry is
-  re-saved. Once invoice lines exist, normal title updates must remove that
-  marker. This malformed-entry hold must run before integration issue marking,
-  title restamping, and Xero budget accounting.
-- Red title stamping is reserved for failures that make the diary state itself
-  untrustworthy: Google disconnected or calendar read failure. Xero token
-  refresh/disconnect failures are global health problems; they must be shown in
-  the app health/feed and recorded in the event ledger, but must not flicker
-  otherwise valid job titles red.
+- Xero draft/send actions have a compact per-event action ledger:
+  - human-readable line: `App status: ...`
+  - machine-readable line: `[app]s=...;r=...;fp=...;x=...;w=...[/app]`
+  - if the same draft/send fingerprint has failed enough times
+    (`XERO_ACTION_MAX_ATTEMPTS`, default `2`), the app must stop that Xero
+    action with `w=human_save` until a human saves changed content.
+  - the ledger is intentionally separate from `[app-status]`, which is used by
+    receipts/upload links on the receipts branch.
 - Draft update must be fingerprint-gated (not generic `event.updated` gated):
   - in `app/main.py`, both draft-update paths now compute:
     - `_draft_sync_fingerprint(...)`
     - `last_draft_fp = get_draft_sync_fingerprint(...)`
     - `should_try_update = (draft_fp != last_draft_fp) or (not last_draft_fp)`
   - this is intentional anti-loop protection against webhook/metadata churn.
-- Same-save submit/send is allowed only when safe:
-  - if staff enter `PROCESS DRAFT = Y`, a payment type, and `SEND NOW = Y`
-    together, the app may create the missing draft and then continue to send
-    in the same event processing pass.
-  - `SEND NOW = Y` is a one-shot command. After successful processing the
-    status block must show `Invoice sent ✅` rather than leaving a reusable send
-    command active; repeated sends are also gated by the app ledger/action
-    fingerprint budget.
-  - if the calendar notes already contain an `Invoice link:` but state has no
-    stored invoice id for the event, the app must stop with an explicit
-    duplicate-protection message instead of creating another Xero invoice.
-  - this guard must run before contact/invoice Xero lookups so rate limits do
-    not cause silent no-op behavior.
 
 Key files:
 - `app/main.py` (`_XERO_*` constants, per-event retry maps, hourly reconcile sections)
@@ -137,6 +188,10 @@ Primary controls:
 - State pruning via `prune_state` and marker-only persistence.
 - Backlog flush queues instead of unbounded in-memory retries.
 - Controlled polling windows (targeted, daily safety scan, hourly reconcile).
+- A bounded upcoming actionable sweep intentionally omits `updatedMin` so old
+  pre-filled `PROCESS DRAFT=Y` / `SEND=Y` entries are picked up when their job
+  date approaches. Keep its lookahead short/capped and continue relying on state
+  markers/Xero per-cycle limits for de-duplication.
 
 Key files:
 - `app/main.py` (scan window strategy and retry queue behavior)
@@ -157,22 +212,20 @@ The app depends on stable structured blocks:
 
 Rules:
 - Keep parser-tolerant but output-canonical.
+- Accept common staff typos only when they normalize back to canonical labels
+  (for example `Invoce profile:` -> `Invoice profile:`).
 - Preserve internal sales section under `⬇Sales⬇`.
 - Keep invoice totals/status lines in the expected formatting path.
 - Bold handling currently runs through `event_processor` helpers; do not move ad-hoc to random call sites.
-- Managed control prompts are explicit state, not defaults:
-  - `PAYMENT TYPE (CARD/INVOICE) =` must remain blank until staff enter
-    `CARD`, `INVOICE`, or `CASH`.
-  - Never infer `CARD` from the prompt options text itself.
-  - If Calendar/mobile editing places the answer on the next nonblank line
-    immediately after the prompt, collapse it to the canonical single-line
-    prompt before processing.
-  - Apply the same immediate-next-line tolerance to `SEND NOW (Y/N) =` and
-    `PROCESS DRAFT (Y/N) =`; do not scan arbitrary later notes for answers.
 - Invoice-line normalizer must not reinterpret hyphenated descriptions as value separators.
   - `Pressure washing - Driveway = £165+VAT` must stay one description line.
 - Repeated-separator corruption must be self-healed:
   - examples like `... = Driveway = = = £165+VAT` must normalize back to a single canonical line.
+- The `⬇Sales⬇` area is the upsell section:
+  - it must contribute to Xero invoice line items, invoice totals, and draft
+    fingerprints exactly once,
+  - it is also the source for the sales tracking spreadsheet,
+  - mirrored copies above the marker must be removed/ignored.
 
 Key files:
 - `app/event_processor.py` (`normalize_user_sections`, `extract_*`, `upsert_*`)
@@ -193,37 +246,65 @@ These invariants exist specifically to prevent formatter loops and duplicate dra
   - `sync_invoice_block_from_xero`:
     - self-heal historical corrupted descriptions from prior parser behavior.
     - never mirror lines from the `⬇Sales⬇` section into the customer-facing
-      section above the marker (prevents visible duplicates while still keeping
-      sales included in Xero totals).
+      section above the marker, even though those lines are chargeable.
+  - `extract_invoice_lines`:
+    - parse customer-facing rows above `⬇Sales⬇`.
+    - also parse rows below `⬇Sales⬇` as chargeable upsell invoice rows.
+    - ignore matching above-marker copies of sales rows so each upsell is
+      charged exactly once.
 
 - `app/main.py`:
+  - calendar-level Google webhooks must first use stored incremental sync tokens
+    to resolve exact changed event IDs; when that succeeds, fetch/process those
+    exact events and do not run a broader calendar scan for that notification;
+  - missing/expired Google sync tokens may use a bounded fallback scan for that
+    cycle, but token priming must not enqueue the historical result set as work;
+  - hourly paid-status reconcile must stay narrow (default 24 hours) and must
+    not run immediately on app resume; broad historical payment sweeps create
+    Xero pressure from old yellow/unpaid entries;
+  - fallback webhook-targeted calendar scans must include a bounded recent-past actionable
+    window (default 14 days) so unchanged `PROCESS DRAFT=Y` jobs are not missed
+    after their appointment date;
+  - the Xero per-cycle budget and fingerprint gates still apply to that lookback,
+    so the broader read window must not create repeated draft/update calls;
+  - a calendar-level webhook target is not event-level intent: it must not make
+    every future draft immediately eligible or make every historical unpaid
+    invoice consume the Xero slot; only an explicit event target, a recent event
+    edit, or the hourly reconcile cycle may bypass those time gates;
   - draft update decision in both flow branches must remain fingerprint-led:
     - around `should_try_update` blocks (both occurrences),
     - never revert to `event_updated != last_invoice_update` as a primary update trigger.
-- send path (`has_send`) must perform a final pre-send draft sync for
-  `CARD/INVOICE` payments:
-  - update mutable draft invoice with current parsed `invoice_lines` before
-    authorize/email/payment,
-  - fail send with explicit error note if pre-send sync fails.
-  - build its own send fingerprint from current invoice lines/contact/payment
-    mode, because existing-draft SEND paths may skip the draft-sync branch.
-- `CARD` payment posts to Xero must use the Google Calendar appointment start
-  date as the Xero payment date, not the machine/current date. This keeps late
-  edits and catch-up processing from recording card payments on the wrong day.
-- If the linked Xero invoice is already `PAID`, the send path must not call
-  authorise, email, or payment mutation endpoints again. Treat it as already
-  complete, sync the calendar/sheet state, clear retry attempts, and stop.
-  `AUTHORISED` invoices can be emailed/paid if needed, but must not be
-  re-authorised.
+  - send path (`has_send`) must perform a final pre-send draft sync for
+    `CARD/INVOICE` payments:
+    - update mutable draft invoice with current parsed `invoice_lines` before
+      authorize/email/payment,
+    - fail send with explicit error note if pre-send sync fails.
+  - send path must build a send action fingerprint from draft fingerprint,
+    invoice id, and payment mode before making Xero mutations. Do not remove
+    this guard; it is what prevents repeated send/email/payment loops.
+  - if Xero reports the invoice is already `PAID`, the app must mark the
+    calendar entry sent/paid, write the normal sheet/sales rows, clear the
+    action-attempt counter, and make no authorise/email/payment mutation.
+  - if Xero reports the invoice is already `AUTHORISED`, the app must not
+    re-authorise it.
+  - `CARD` payment writes to Xero must use the calendar appointment date as the
+    payment date, not the date the app happened to process the entry.
+  - `CARD` payment writes from the Google Calendar/Xero flow must post to the
+    Cashflows clearing account (`CASHFLOWS_CLEARING_ACCOUNT_CODE`, default
+    `780 - Cashflow reconciliation`), not the real `Pow Wash` bank account. The
+    Cashflows CSV reconciliation then creates the single net bank deposit that
+    matches the `CFE SETT` bank-feed line. Keep the CSV reconciliation fallback
+    that can move older CARD payments from `Pow Wash` into this clearing account,
+    because historical invoices may still have been paid under the old design.
 
 If any of the above is changed, run a targeted regression against:
 - one line with hyphenated description (`A - B = £x+VAT`)
 - one line with accidental extra equals (`A = B = = £x+VAT`)
-- blank `PAYMENT TYPE (CARD/INVOICE) =` staying blank after status rebuild
-- next-line control answers (`INVOICE` / `Y`) being collapsed and processed
-- repeated webhook/calendar sync events with unchanged invoice data
-- an already-paid linked invoice with `SEND NOW = Y` being synced without any
-  further Xero mutation calls.
+- one event where `⬇Sales⬇` has values that must appear in invoice totals once
+  and in sales tracking once
+- one historically corrupted event where sales rows were mirrored above
+  `⬇Sales⬇`
+- repeated webhook/calendar sync events with unchanged invoice data.
 
 ## Change Checklist (Required)
 
@@ -237,13 +318,7 @@ If you edit `app/main.py`, `app/event_processor.py`, or `app/admin_web.py`:
    - invoice draft update behavior for mutable vs non-mutable statuses
 3. Verify no extra Xero call loops were introduced.
 4. Specifically verify draft-update gating still depends on draft fingerprint delta (not metadata-only event update timestamps).
-5. For calendar/Xero lifecycle changes, run:
-   - `.venv/bin/python scripts/safety_simulation.py --json`
-   - include token-refresh and colour-flicker scenarios when Xero auth/title
-     behaviour changes.
-   - include the fast-forward diary scenario when scan-window, webhook, stale
-     event, or Xero pressure behaviour changes.
-6. Update this document if behavior changed.
+4. Update this document if behavior changed.
 
 ## Enforcement
 
@@ -269,10 +344,137 @@ python3 scripts/guardrail_check.py --staged --allow-missing-doc-update
 Current contract:
 - `RECEIPTS_ENABLED=false` => no receipt feature execution.
 - Receipt scaffold stores data only in `RECEIPTS_STORE_FILE`.
-- No writes to calendar, Xero, or sheets from receipt routes/services.
+- Runtime receipt settings are stored in admin DB key `receipts_settings`.
+- Signed receipt upload links are only injected for `PAYMENT TYPE = CARD` entries that show `Invoice sent ✅`.
+- Receipt upload flow can call Google Document AI when receipts are enabled and parser settings are filled.
 
 Key files:
 - `app/receipts/models.py`
 - `app/receipts/store.py`
 - `app/receipts/service.py`
 - `app/admin_web.py` (`/receipts` routes)
+
+## Cashflows Reconciliation Safety Contract
+
+Current contract:
+- `/cashflows-sync` is preview-first. `Scan & Preview Matches` may read Xero,
+  Cashflows, and OpenAI, but must not mutate Xero.
+- Confirmation is test-mode by default. Xero writes are blocked unless:
+  - `DRY_RUN=false`, and
+  - `CASHFLOWS_RECONCILE_PRODUCTION=true`.
+- Preview results are stored server-side in admin DB key
+  `cashflows_reconcile_preview`; confirm must reference that stored preview
+  by `preview_id` and `match_id`.
+- Browser-submitted match payloads must not be trusted for mutation.
+- Matching order must remain:
+  1. strict exact Cashflows net amount to `CFE SETT` bank amount within 5 days,
+  2. mathematical combination scan,
+  3. AI fuzzy fallback only for unresolved cases and only when
+     `CASHFLOWS_RECONCILE_AI_ENABLED=true`.
+- Production payloads must be inspectable in testing mode before enabling writes.
+- The `/cashflows-sync` review modal must show the submission payload preview
+  before confirmation, and `/cashflows-sync/diagnostics` must stay read-only.
+- Merchant fees must map to `CASHFLOWS_BANK_FEES_ACCOUNT_CODE`; do not hard-code
+  a different bank-fee account in route code.
+- The Cashflows sync must stay outside the calendar worker. It must not consume
+  the calendar event Xero processing slot or alter calendar event state.
+
+Key files:
+- `app/cashflows_reconciliation.py`
+- `app/xero_client.py` (`get_bank_transactions`, `get_open_invoices`,
+  `create_*_payload` helpers)
+- `app/admin_web.py` (`/cashflows-sync` routes)
+
+## Cashflows CSV Reconciliation Safety Contract
+
+The live Cashflows settlement API has no usable public endpoint, so
+reconciliation is driven by a manually-downloaded merchant-account statement
+CSV that the user uploads. Preview is read-only. Submission is explicit: the
+user must tick approved batches and press the submit button.
+
+Current contract:
+- `/cashflows-sync/upload-csv` parses the uploaded CSV and reads Xero
+  (`get_bank_transactions`, `get_open_invoices`) to build a preview. It MUST
+  NOT write to Xero.
+- `/cashflows-sync/submit-csv-batches` accepts only checked batch IDs from the
+  latest cached preview. It must rebuild money amounts from the server-side
+  preview, not trust browser-submitted totals. By default it is test mode and
+  prints/returns the Xero payloads without writing.
+- CSV production writes require `DRY_RUN=false` AND
+  `CASHFLOWS_CSV_SUBMIT_PRODUCTION=true`. Do not use the old API-flow
+  `CASHFLOWS_RECONCILE_PRODUCTION` flag to enable CSV writes.
+- A CSV batch checkbox means "approved for the submit button"; it must not
+  itself call Xero.
+- If Xero is unreachable (e.g. token expired → 403), the preview degrades
+  gracefully: `xero_connected=false`, matching is skipped, parsed CSV totals
+  and batch structure are still shown. Never fail the whole upload on a Xero
+  read error.
+- "Update basis" is enforced primarily by Xero state: only UNreconciled bank
+  lines (`parse_xero_bank_lines` already drops reconciled + non-`CFE SETT`
+  lines) and OPEN invoices (`parse_xero_invoices`) are considered. A secondary
+  local guard, admin DB key `cashflows_csv_reconciled`
+  (`get_cashflows_reconciled_refs` / `add_cashflows_reconciled_refs`), skips
+  payouts this app has already reconciled. Phase 1 only READS this store; only
+  a future Phase 2 write path may populate it.
+- Statement model: `Sale Settlement` (Credit = gross), `Merchant Service
+  Charge` (Debit = per-sale fee, keyed by `Sale Ref:`), `Decline Fee` (Debit),
+  `Transfer for Remittance` (Debit = net payout that lands as a `CFE SETT`
+  bank deposit). Amounts may contain comma thousands separators.
+- Batch grouping is FIFO over the statement in row order: matured sale nets
+  (gross − fee) and decline fees drain the running balance until a remittance
+  amount is reached within `GROUP_TOLERANCE` (absorbs the small ~£0.04 decline
+  fees / sub-penny rounding). Leftover un-drained sales are surfaced as
+  "not paid out yet" and are expected to reconcile on a later upload.
+- The bank-line match anchor is the EXACT payout amount (± half a penny) to an
+  unreconciled `CFE SETT` line, preferring nearest date. Per-sale invoice
+  matching is amount + date proximity. A sale is "ambiguous" only when more than
+  one open invoice is tied at the same closest date distance; an ambiguous sale
+  must NOT count toward a `ready` batch. A batch is `ready` only when a bank line
+  is matched, every sale has an invoice, and `ambiguous_count == 0`; otherwise it
+  is `needs_review` (ambiguity) or `waiting_invoices` (missing invoice). Each Xero
+  bank line / invoice is consumed at most once per preview. AI tie-break for
+  ambiguous sales is a Phase-2 enhancement; Phase 1 flags them for human review.
+- Production CSV submission must not duplicate-pay invoices already marked paid
+  in Xero. For an already-paid-only batch, the safe production write is a
+  negative bank-side `SPEND` match-pack item for Cashflows merchant fees and any
+  reviewed underpayment adjustment. The user then uses Xero `Find & Match` to
+  select the existing invoice payment(s) plus that fee/adjustment item and press
+  OK. Do not create a `RECEIVE`/clearing receipt for the gross or net Cashflows
+  payout; that duplicates bank-account movement when invoice payments already
+  exist.
+- Underpayments/discounts must be handled by creating an `ACCRECCREDIT` sales
+  credit note for the shortfall and allocating it to the selected invoice before
+  the batch payment is posted. Do not silently rewrite original invoice line
+  items to force a match.
+- Overpayments may be represented as a separate "Parking" invoice only through
+  the guarded submit flow.
+- The CSV flow must stay outside the calendar worker and must not consume the
+  calendar event Xero processing slot or alter calendar event state.
+
+Key files:
+- `app/cashflows_csv.py` (parser, FIFO allocation, matching, preview builder,
+  `recommend_export_range`)
+- `app/admin_store.py` (`get_cashflows_reconciled_refs`,
+  `add_cashflows_reconciled_refs`)
+- `app/admin_web.py` (`/cashflows-sync/upload-csv`,
+  `/cashflows-sync/recommended-range`, CSV upload UI on the `/cashflows-sync`
+  page)
+
+## Receipts Branch Main-Parity Rule
+
+The `feature/receipts-cashflows-sync` branch is allowed to add receipts,
+Cashflows, Plaid, admin routes, parser helpers, and Xero helper methods, but the
+calendar-to-Xero worker must behave like `main`.
+
+Current rule:
+- `app/main.py` must stay byte-for-byte identical to `main:app/main.py` on this
+  branch unless a deliberate Xero/calendar change is also made on `main`.
+- Receipt upload links, Cashflows reconciliation, email receipt scanning, and
+  Plaid/card-feed tools must stay outside the live calendar worker. They must
+  not change calendar colours, SEND/DONE handling, Xero draft/send/payment
+  decisions, Xero pressure budgeting, or retry/lockout behaviour.
+- Additive helpers are acceptable only when the core worker does not call them.
+  Examples: `app/xero_client.py` Cashflows read/write-preview helpers,
+  attachment helpers, and admin-only pause helpers.
+- Regression guard: `tests/test_main_parity.py` compares `app/main.py` to
+  `main:app/main.py`. Do not loosen that test to hide branch drift.

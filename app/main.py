@@ -109,8 +109,7 @@ from .state import (
     mark_invoice_sent,
     mark_invoice_paid,
     mark_processed,
-    prune_state,
-    save_state,
+    save_state_merged,
     set_contact_update_marker,
     set_contact_for_event,
     set_contact_fingerprint,
@@ -124,6 +123,7 @@ from .state import (
     set_processed_update_marker,
     set_sheet_log_marker,
     set_sales_log_marker,
+    was_recent_xero_webhook,
 )
 from .xero_client import XeroClient, build_xero_client, get_xero_rate_limit_until_ts
 from .log_feed import feed as _feed
@@ -133,6 +133,17 @@ LONDON_TZ = ZoneInfo("Europe/London")
 # Engineering note:
 # If you change polling/retry/title-state behavior in this module, update
 # docs/ENGINEERING_LOGIC_GUARDRAILS.md in the same commit.
+
+
+def _card_payment_account_code() -> str:
+    """Account used when marking terminal-card invoices paid in Xero.
+
+    Card terminal money settles later as a Cashflows payout, so individual CARD
+    invoice payments should sit in the Cashflows clearing account, not the real
+    bank account. The Cashflows CSV reconciliation then creates the net bank
+    deposit that matches the CFE SETT bank-feed line.
+    """
+    return (os.getenv("CASHFLOWS_CLEARING_ACCOUNT_CODE") or "780").strip() or "780"
 
 
 def _event_start_date_iso(event: dict, *, fallback: dt.date | None = None) -> str:
@@ -173,7 +184,7 @@ def run() -> None:
             state["event_xero_retry_backoff"] = {}
             _feed.push("Xero retry queue reset on startup", "system")
         state["xero_retry_queue_reset_at"] = run_started_at.isoformat()
-    save_state(config.state_file, state)
+    state = save_state_merged(config.state_file, state)
 
     has_saved_sync = "last_sync" in state
     if has_saved_sync:
@@ -695,7 +706,10 @@ def run() -> None:
 
         marker = (
             f"{invoice_id}:{payload_payment_method}:{spreadsheet_id}:{sheet_name}:"
-            f"{payload.get('job_cost_ex_vat','')}:{payload.get('job_cost_inc_vat','')}"
+            f"{payload.get('submitter','')}:{payload.get('customer','')}:"
+            f"{payload.get('invoice_number','')}:{payload.get('payment_datetime','')}:"
+            f"{payload.get('paid_status','')}:{payload.get('job_cost_ex_vat','')}:"
+            f"{payload.get('job_cost_inc_vat','')}"
         ).upper()
         if get_sheet_log_marker(state, event_key) == marker:
             return state
@@ -744,6 +758,8 @@ def run() -> None:
                 stats_fields=stats_fields,
                 payload=payload,
                 event_id_display=event_id_display,
+                dedupe_signature={"Event ID": event_id_display},
+                update_existing=True,
             )
             print(f"Sheets row appended for {event_key}")
             _feed.push(f"Sheet row logged: {event_key}", "success")
@@ -791,6 +807,8 @@ def run() -> None:
                     stats_fields=[str(s) for s in stats] or DEFAULT_STATS_FIELDS,
                     payload=payload,
                     event_id_display=event_id_display,
+                    dedupe_signature={"Event ID": event_id_display},
+                    update_existing=True,
                 )
                 if marker:
                     state = set_sheet_log_marker(state, event_key, marker)
@@ -1398,6 +1416,27 @@ def run() -> None:
         except Exception:
             return None
 
+    def _mark_event_xero_retry(state_obj: dict, event_key: str, exc: Exception | None = None) -> dict:
+        key = str(event_key or "").strip()
+        if not key:
+            return state_obj
+        retry_hint_seconds = _xero_retry_after_hint_seconds(exc) if exc else None
+        retry_map = dict(state_obj.get("event_xero_retry_after", {}) or {})
+        retry_backoff_map = dict(state_obj.get("event_xero_retry_backoff", {}) or {})
+        prev = int(retry_backoff_map.get(key) or 0)
+        next_backoff = max(
+            _XERO_EVENT_429_COOLDOWN_SECONDS,
+            prev * 2 if prev else 0,
+        )
+        if retry_hint_seconds:
+            next_backoff = max(next_backoff, retry_hint_seconds)
+        next_backoff = min(next_backoff, _XERO_EVENT_429_MAX_COOLDOWN_SECONDS)
+        retry_backoff_map[key] = next_backoff
+        retry_map[key] = time.time() + next_backoff
+        state_obj["event_xero_retry_after"] = retry_map
+        state_obj["event_xero_retry_backoff"] = retry_backoff_map
+        return state_obj
+
     def _event_end_utc(event: dict) -> dt.datetime | None:
         end_obj = (event.get("end") or {}) if isinstance(event, dict) else {}
         raw_dt = str(end_obj.get("dateTime") or "").strip()
@@ -1558,7 +1597,7 @@ def run() -> None:
                     "warn",
                 )
                 _xero_lock_notice_ts = _now_ts_for_xero
-            save_state(config.state_file, state)
+            state = save_state_merged(config.state_file, state)
         elif _persisted_lock_until:
             state["xero_lockout_until_ts"] = 0.0
             state["xero_lockout_reason"] = ""
@@ -2395,13 +2434,39 @@ def run() -> None:
                         _allow_invoice_paid_sync = bool(
                             pay_mode_hint == "invoice" and _allow_paid_reconcile
                         )
+                        _recent_xero_webhook = was_recent_xero_webhook(
+                            state,
+                            event_key,
+                            _sync_invoice_id or "",
+                            now_ts=time.time(),
+                            within_seconds=900,
+                        )
                         needs_invoice_paid_sync = bool(
                             has_done
                             and xero_client
                             and _sync_invoice_id
                             and (_allow_invoice_paid_sync or _allow_card_paid_sync)
                             and not (event.get("summary") or "").strip().startswith("🟢")
+                            and not _recent_xero_webhook
                         )
+                        _paid_sync_fp = _xero_action_fingerprint(
+                            action="paid_sync",
+                            draft_fp=event_updated,
+                            invoice_id=_sync_invoice_id or "",
+                            payment_mode=pay_mode_hint,
+                        )
+                        _paid_sync_attempts = _xero_attempts_for(
+                            event_key=event_key,
+                            action="paid_sync",
+                            fingerprint=_paid_sync_fp,
+                            description=_desc_now,
+                        )
+                        if needs_invoice_paid_sync and _paid_sync_attempts >= _XERO_ACTION_MAX_ATTEMPTS:
+                            _feed.push(
+                                f"Paid-status check paused for \"{event.get('summary', event_id)}\" — re-save the entry to retry",
+                                "warn",
+                            )
+                            needs_invoice_paid_sync = False
                         # Cleanup stale payment-type alert when invoice was already sent
                         # (or paid) and no resend action is pending.
                         if _stale_payment_alert and (sent_state or paid_state or _has_sent_marker):
@@ -2459,7 +2524,21 @@ def run() -> None:
                                 )
                                 state = mark_invoice_sent(state, event_key)
                                 state = mark_invoice_paid(state, event_key)
+                                state = clear_xero_action_attempts(state, event_key)
                         except Exception as _exc:
+                            state, _paid_sync_attempts = bump_xero_action_attempts(
+                                state,
+                                event_key,
+                                "paid_sync",
+                                _paid_sync_fp,
+                            )
+                            if _is_xero_429(_exc):
+                                state = _mark_event_xero_retry(state, event_key, _exc)
+                            if _paid_sync_attempts >= _XERO_ACTION_MAX_ATTEMPTS:
+                                _feed.push(
+                                    f"Paid-status check stopped for \"{event.get('summary', event_id)}\" after repeated Xero failures — re-save the entry to retry",
+                                    "warn",
+                                )
                             print(f"Event {event_id}: paid-sync check failed: {_exc}")
                         continue
                     if has_done and not invoice_lines:
@@ -2780,7 +2859,7 @@ def run() -> None:
                                             state = set_invoice_update_marker(
                                                 state, event_key, event_updated
                                             )
-                                            save_state(config.state_file, state)
+                                            state = save_state_merged(config.state_file, state)
                                         else:
                                             print(f"Event {event_id}: draft create returned no InvoiceID")
                                     else:
@@ -3384,6 +3463,7 @@ def run() -> None:
                                                 xero_client.record_invoice_payment(
                                                     invoice_id=invoice_id,
                                                     amount=amount_due,
+                                                    account_code=_card_payment_account_code(),
                                                     when=_event_start_date_iso(event),
                                                 )
                                         except Exception as exc:
@@ -3645,6 +3725,7 @@ def run() -> None:
                                                 xero_client.record_invoice_payment(
                                                     invoice_id=invoice_id_retry,
                                                     amount=amount_due,
+                                                    account_code=_card_payment_account_code(),
                                                     when=_event_start_date_iso(event),
                                                 )
                                                 invoice_data = xero_client.get_invoice(invoice_id_retry)
@@ -3954,7 +4035,7 @@ def run() -> None:
                                             state = set_invoice_update_marker(
                                                 state, event_key, event_updated
                                             )
-                                            save_state(config.state_file, state)
+                                            state = save_state_merged(config.state_file, state)
                                     subtotal, total = _extract_totals(result)
                                     if subtotal is not None and total is not None:
                                         updated_description = upsert_invoice_summary(
@@ -4535,6 +4616,7 @@ def run() -> None:
                                                 xero_client.record_invoice_payment(
                                                     invoice_id=invoice_id,
                                                     amount=amount_due,
+                                                    account_code=_card_payment_account_code(),
                                                     when=_event_start_date_iso(event),
                                                 )
                                         except Exception as exc:
@@ -4798,15 +4880,18 @@ def run() -> None:
                     break
             # Persist state after each event so Ctrl+C doesn't lose progress and
             # cause duplicate retries/drafts on restart.
-            save_state(config.state_file, state)
+            state = save_state_merged(config.state_file, state)
 
         if not calendar_fetch_failed:
             last_sync = now
             state = set_last_sync(state, now)
         else:
             print("[poll] Keeping last_sync unchanged because one or more calendars failed this cycle", flush=True)
-        state = prune_state(state, keep_recent_events=2000)
-        save_state(config.state_file, state)
+        state = save_state_merged(
+            config.state_file,
+            state,
+            prune_keep_recent_events=2000,
+        )
 
         if config.run_once:
             break

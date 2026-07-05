@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import secrets
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -91,6 +94,32 @@ def get_json_setting(db_path: str, key: str, default: Any) -> Any:
 
 def set_json_setting(db_path: str, key: str, value: Any) -> None:
     _set_raw(db_path, key, json.dumps(value))
+
+
+def get_cashflows_correlation_sheet_id(db_path: str) -> str:
+    """Public Google Sheet ID used to distinguish CARD from INVOICE payments."""
+    return str(get_json_setting(db_path, "cashflows_correlation_sheet_id", "")).strip()
+
+
+def set_cashflows_correlation_sheet_id(db_path: str, sheet_id: str) -> None:
+    set_json_setting(db_path, "cashflows_correlation_sheet_id", sheet_id.strip())
+
+
+def get_cashflows_reconciled_refs(db_path: str) -> dict[str, Any]:
+    """Map of Cashflows payout csv_ref -> {date, amount, reconciled_at}.
+
+    Secondary dedup guard for CSV reconciliation: payouts this app has already
+    reconciled are skipped on later uploads. Populated by Phase 2 (writes); read
+    by Phase 1 preview so re-uploaded files ignore already-done batches.
+    """
+    value = get_json_setting(db_path, "cashflows_csv_reconciled", {})
+    return value if isinstance(value, dict) else {}
+
+
+def add_cashflows_reconciled_refs(db_path: str, refs: dict[str, Any]) -> None:
+    existing = get_cashflows_reconciled_refs(db_path)
+    existing.update(refs)
+    set_json_setting(db_path, "cashflows_csv_reconciled", existing)
 
 
 def get_active_calendars(db_path: str, fallback_calendar: str) -> list[str]:
@@ -299,11 +328,263 @@ def set_xero_webhook_verified(db_path: str, verified: bool) -> None:
 
 
 def get_enabled(db_path: str) -> bool:
-    return bool(get_json_setting(db_path, "system_enabled", True))
+    # Default is False — Calendar→Xero sync must be explicitly turned ON in
+    # Live View.  This prevents accidental invoice creation when Xero is first
+    # connected.  Field Expenses, Email Invoices, and Cashflows work
+    # independently of this toggle.
+    return bool(get_json_setting(db_path, "system_enabled", False))
 
 
 def set_enabled(db_path: str, enabled: bool) -> None:
     set_json_setting(db_path, "system_enabled", enabled)
+
+
+def get_receipts_settings(db_path: str) -> dict[str, Any]:
+    raw = get_json_setting(
+        db_path,
+        "receipts_settings",
+        {
+            "enabled": False,
+            "document_ai_project_id": "",
+            "document_ai_location": "us",
+            "document_ai_processor_id": "",
+            "document_ai_project_name": "",
+            "google_service_account_file": "",
+            "retention_days": 2,
+            "sheet_spreadsheet_id": "",
+            "sheet_name": "Receipt_Reconciliation",
+        },
+    )
+    if not isinstance(raw, dict):
+        raw = {}
+    sa_file = str(raw.get("google_service_account_file", "")).strip()
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "document_ai_project_id": str(raw.get("document_ai_project_id", "")).strip(),
+        "document_ai_location": str(raw.get("document_ai_location", "us")).strip() or "us",
+        "document_ai_processor_id": str(raw.get("document_ai_processor_id", "")).strip(),
+        "document_ai_project_name": str(raw.get("document_ai_project_name", "")).strip(),
+        "google_service_account_file": sa_file,
+        "retention_days": max(int(raw.get("retention_days", 2) or 2), 1),
+        "sheet_spreadsheet_id": str(raw.get("sheet_spreadsheet_id", "")).strip(),
+        "sheet_name": str(raw.get("sheet_name", "Receipt_Reconciliation")).strip() or "Receipt_Reconciliation",
+    }
+
+
+def get_expense_settings(db_path: str) -> dict[str, Any]:
+    """Settings for the Field Expenses feature (separate from receipts_settings)."""
+    raw = get_json_setting(
+        db_path,
+        "expense_settings",
+        {
+            "default_expense_account": "",
+            "default_payment_account": "",
+            "vat_rate": 20.0,
+        },
+    )
+    if not isinstance(raw, dict):
+        raw = {}
+    try:
+        vat_rate = float(raw.get("vat_rate", 20.0))
+    except (TypeError, ValueError):
+        vat_rate = 20.0
+    if vat_rate < 0 or vat_rate > 100:
+        vat_rate = 20.0
+    return {
+        "default_expense_account": str(raw.get("default_expense_account", "")).strip(),
+        "default_payment_account": str(raw.get("default_payment_account", "")).strip(),
+        "vat_rate": vat_rate,
+    }
+
+
+def set_expense_settings(db_path: str, settings: dict[str, Any]) -> None:
+    current = get_expense_settings(db_path)
+    current.update(
+        {k: v for k, v in (settings or {}).items() if k in current}
+    )
+    set_json_setting(db_path, "expense_settings", current)
+
+
+def set_receipts_settings(db_path: str, settings: dict[str, Any]) -> None:
+    sa_file = str(settings.get("google_service_account_file", "")).strip()
+    cleaned = {
+        "enabled": bool(settings.get("enabled", False)),
+        "document_ai_project_id": str(settings.get("document_ai_project_id", "")).strip(),
+        "document_ai_location": str(settings.get("document_ai_location", "us")).strip() or "us",
+        "document_ai_processor_id": str(settings.get("document_ai_processor_id", "")).strip(),
+        "document_ai_project_name": str(settings.get("document_ai_project_name", "")).strip(),
+        "google_service_account_file": sa_file,
+        "retention_days": max(int(settings.get("retention_days", 2) or 2), 1),
+        "sheet_spreadsheet_id": str(settings.get("sheet_spreadsheet_id", "")).strip(),
+        "sheet_name": str(settings.get("sheet_name", "Receipt_Reconciliation")).strip() or "Receipt_Reconciliation",
+    }
+    set_json_setting(db_path, "receipts_settings", cleaned)
+
+
+def get_cashflows_settings(db_path: str) -> dict[str, Any]:
+    raw = get_json_setting(
+        db_path,
+        "cashflows_settings",
+        {
+            "enabled": False,
+            "environment": "integration",
+            "base_url": "https://gateway-int.cashflows.com/api/gateway",
+            "configuration_id": "",
+            "api_key": "",
+            "timeout_seconds": 15,
+            "settlements_action": "GetSettlementPayouts",
+        },
+    )
+    if not isinstance(raw, dict):
+        raw = {}
+    env = str(raw.get("environment", "integration")).strip().lower()
+    if env not in {"integration", "production"}:
+        env = "integration"
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "environment": env,
+        "base_url": str(raw.get("base_url", "")).strip(),
+        "configuration_id": str(raw.get("configuration_id", "")).strip(),
+        "api_key": str(raw.get("api_key", "")).strip(),
+        "timeout_seconds": max(int(raw.get("timeout_seconds", 15) or 15), 5),
+        "settlements_action": str(
+            raw.get("settlements_action")
+            or os.getenv("CASHFLOWS_SETTLEMENTS_ACTION")
+            or "GetSettlementPayouts"
+        ).strip()
+        or "GetSettlementPayouts",
+    }
+
+
+def set_cashflows_settings(db_path: str, settings: dict[str, Any]) -> None:
+    env = str(settings.get("environment", "integration")).strip().lower()
+    if env not in {"integration", "production"}:
+        env = "integration"
+    default_base = (
+        "https://gateway-int.cashflows.com/api/gateway"
+        if env == "integration"
+        else "https://gateway.cashflows.com/api/gateway"
+    )
+    cleaned = {
+        "enabled": bool(settings.get("enabled", False)),
+        "environment": env,
+        "base_url": str(settings.get("base_url", "")).strip() or default_base,
+        "configuration_id": str(settings.get("configuration_id", "")).strip(),
+        "api_key": str(settings.get("api_key", "")).strip(),
+        "timeout_seconds": max(int(settings.get("timeout_seconds", 15) or 15), 5),
+        "settlements_action": str(
+            settings.get("settlements_action")
+            or os.getenv("CASHFLOWS_SETTLEMENTS_ACTION")
+            or "GetSettlementPayouts"
+        ).strip()
+        or "GetSettlementPayouts",
+    }
+    set_json_setting(db_path, "cashflows_settings", cleaned)
+
+
+def get_openai_settings(db_path: str) -> dict[str, Any]:
+    raw = get_json_setting(db_path, "openai_settings", {})
+    if not isinstance(raw, dict):
+        raw = {}
+    return {
+        "api_key": str(raw.get("api_key", "")).strip(),
+        "model": str(raw.get("model", "")).strip() or "gpt-4o-mini",
+    }
+
+
+def set_openai_settings(db_path: str, settings: dict[str, Any]) -> None:
+    cleaned = {
+        "api_key": str(settings.get("api_key", "")).strip(),
+        "model": str(settings.get("model", "")).strip() or "gpt-4o-mini",
+    }
+    set_json_setting(db_path, "openai_settings", cleaned)
+
+
+# ---------------------------------------------------------------------------
+# Field Expenses — live parser test sessions
+#
+# A test session lets an admin generate a QR code; a tester opens it on their
+# phone, photographs a real receipt, and the app shows what the parser
+# extracted and which Xero account it WOULD choose — submitting NOTHING.
+# Sessions are short-lived and stored per-token so they survive across worker
+# processes (autoscale) without an in-memory store.
+# ---------------------------------------------------------------------------
+
+_EXPENSE_TEST_TTL = 1800  # seconds (30 minutes)
+_EXPENSE_TEST_PREFIX = "expense_test_session:"
+
+
+def _expense_test_prune(db_path: str, now: int) -> None:
+    """Best-effort removal of expired test sessions to keep the table tidy."""
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                "SELECT key, value FROM settings WHERE key LIKE ?",
+                (_EXPENSE_TEST_PREFIX + "%",),
+            ).fetchall()
+            stale: list[str] = []
+            for key, raw in rows:
+                try:
+                    created = int((json.loads(raw) or {}).get("created_at", 0))
+                except Exception:
+                    created = 0
+                if now - created > _EXPENSE_TEST_TTL:
+                    stale.append(key)
+            for key in stale:
+                conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+            if stale:
+                conn.commit()
+    except Exception:
+        pass
+
+
+def create_expense_test_session(
+    db_path: str, *, engineer_id: int | None = None
+) -> str:
+    """Create a new test session and return its opaque token."""
+    now = int(time.time())
+    _expense_test_prune(db_path, now)
+    token = secrets.token_urlsafe(9)
+    while _get_raw(db_path, _EXPENSE_TEST_PREFIX + token) is not None:
+        token = secrets.token_urlsafe(9)
+    set_json_setting(
+        db_path,
+        _EXPENSE_TEST_PREFIX + token,
+        {
+            "created_at": now,
+            "engineer_id": int(engineer_id) if engineer_id else None,
+            "status": "waiting",
+            "result": None,
+        },
+    )
+    return token
+
+
+def get_expense_test_session(db_path: str, token: str) -> dict[str, Any] | None:
+    """Return the session dict, or None if missing/expired."""
+    token = (token or "").strip()
+    if not token:
+        return None
+    raw = get_json_setting(db_path, _EXPENSE_TEST_PREFIX + token, None)
+    if not isinstance(raw, dict):
+        return None
+    if int(time.time()) - int(raw.get("created_at", 0)) > _EXPENSE_TEST_TTL:
+        return None
+    return raw
+
+
+def set_expense_test_result(
+    db_path: str, token: str, *, status: str, result: dict[str, Any] | None
+) -> bool:
+    """Update a session's status/result. Returns False if it has expired."""
+    session = get_expense_test_session(db_path, token)
+    if session is None:
+        return False
+    session["status"] = status
+    session["result"] = result
+    session["updated_at"] = int(time.time())
+    set_json_setting(db_path, _EXPENSE_TEST_PREFIX + token.strip(), session)
+    return True
 
 
 def get_xero_tenants(db_path: str) -> list[dict]:

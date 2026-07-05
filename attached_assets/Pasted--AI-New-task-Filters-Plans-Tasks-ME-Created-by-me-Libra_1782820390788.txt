@@ -1,0 +1,51 @@
+
+
+AI
+
+
+
+
+New task
+
+Filters
+
+Plans
+
+Tasks
+
+ME
+Created by me
+
+Library
+Search
+Other
+Start application
+Website
+
+
+#12 - Switch Card Feed to Enable Banking
+What & Why
+The card-feed bank connection currently uses Plaid, which has no free production tier — connecting the real company card(s) would cost money. Enable Banking offers a free "Restricted Production" tier that returns data from accounts you link yourself, which exactly fits this use case (the business connecting its own 1–2 company cards). Switch the card-feed data source from Plaid to Enable Banking so the feature stays fully automated and free for the user's own cards.
+
+Done looks like
+Admin can connect the company card's bank for free via Enable Banking on the card-feed page (no Plaid).
+After connecting, dump receipts match against the real card transactions exactly as before (price → ±1 month → name).
+A clear notice explains the connection needs re-approving roughly every 90 days.
+When not configured/connected, the page shows a graceful "not configured / not connected" state and Xero-dependent checks still degrade gracefully.
+No plaintext access token stored; credentials come from environment only.
+Out of scope
+Letting third parties / other people connect their own accounts (that would require Enable Banking's paid Unrestricted Production tier).
+Changing the matching algorithm, duplicate detection, or reconciliation logic — these are provider-agnostic and stay as-is.
+Supporting more than the user's own company cards.
+Steps
+Enable Banking client + encrypted token storage — Add a secure Enable Banking client mirroring the existing Plaid client's interface (connection status, cached transactions, sync, disconnect) using Enable Banking's JWT/REST auth and session/consent flow. Credentials from environment only; access/session token encrypted at rest, reusing the existing encryption pattern.
+Connect page + routes — Replace the Plaid Link page and routes with Enable Banking's redirect-based connect flow (start authorisation → bank redirect → callback resume → fetch linked accounts/transactions), all behind login, keeping the card-feed nav link and the 90-day re-approval notice.
+Repoint dump matching — Point the card-feed check and bank-feed reconciliation at the Enable Banking client instead of Plaid as the real card-transaction source, preserving the existing matcher, dedupe, and Xero fallback/gating behaviour.
+Remove/retire Plaid wiring — Remove the Plaid client, routes, and references once Enable Banking is in place, and update replit.md to document the Enable Banking card-feed connection (env vars, free restricted-production tier, 90-day reconsent).
+Secrets + security review — Request the Enable Banking application credentials as environment secrets and set the environment flag; run an architect security review (login-gating, no plaintext token, env-only creds) and fix any severe issues.
+Relevant files
+app/plaid_client.py
+app/plaid_match.py
+app/admin_web.py
+replit.md
+.agents/memory/plaid-card-feed.md

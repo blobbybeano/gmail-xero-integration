@@ -28,7 +28,7 @@ PROCESS DRAFT (Y/N) =
 
 ## 2) Add job lines
 
-Inside `[invoice]`, add one line per item:
+Inside `[invoice]`, add normal job lines above `⬇Sales⬇`:
 
 ```text
 Gutter cleaning = £125+VAT
@@ -39,6 +39,9 @@ Accepted forms:
 - `Item = £125+VAT`
 - `Item = £125`
 - `Item £125+VAT`
+
+Rows below `⬇Sales⬇` are field-agent upsells. They are added to the customer
+invoice and also written to the sales tracking spreadsheet.
 
 ## 3) Optional cash marker (no VAT mode)
 

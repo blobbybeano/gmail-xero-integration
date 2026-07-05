@@ -23,6 +23,11 @@ primary_region = "lhr"
   GOOGLE_TOKEN_FILE = "/data/google_token.json"
   GOOGLE_ADMIN_TOKEN_FILE = "/data/google_admin_token.json"
   GOOGLE_CREDENTIALS_FILE = "/data/credentials.json"
+  RECEIPTS_STORE_FILE = "/data/receipts_store.json"
+  RECEIPTS_UPLOAD_DIR = "/data/receipt_uploads"
+  RECEIPTS_REQUIRE_WRITE_CONFIRMATION = "true"
+  CASHFLOWS_RECONCILE_PRODUCTION = "false"
+  CASHFLOWS_RECONCILE_AI_ENABLED = "false"
 
 [processes]
   app = "gunicorn -b 0.0.0.0:8080 --workers 1 --threads 6 --timeout 120 run:app"

@@ -1,0 +1,6 @@
+- [Email importer attachment filtering](email-importer-scan.md) — Gmail invoice scan must filter by inline + size, not generic filename; status must update mid-run or it looks frozen.
+- [Email scan review safety](email-scan-review.md) — scans must never silently drop emails; every skip becomes a reviewable placeholder the admin can force-rescan (gates bypassed) or dismiss.
+- [Card recon chosen-card naming](card-recon-naming.md) — batch `card_account` must be the Xero bank account NAME (e.g. "Pow Wash"), not the statement account number; numbers keep 0 feed lines.
+- [Card-feed bank provider](card-feed-provider.md) — card feed is a manual CSV upload; every free automated route for a Lloyds account is dead (verified Jul 2026); invariants any feed source must satisfy.
+- [Silent try/except helpers](silent-except-helpers.md) — broad except in receipt image helpers once hid a missing import; smoke-test helpers directly, don't trust no-error.
+- [Deterministic business rules](deterministic-business-rules.md) — hard thresholds (fuel <£40 rule) must be code-enforced post-AI; prompt hints alone get ignored.

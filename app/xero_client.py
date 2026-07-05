@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import base64
 import json
+import os
 import threading
 import time
 from typing import Dict
@@ -18,6 +19,39 @@ DEFAULT_PAYMENT_ACCOUNT_CODE = "090"
 _TOKEN_REFRESH_LOCK = threading.Lock()
 _XERO_RATE_LIMIT_LOCK = threading.Lock()
 _XERO_RATE_LIMIT_UNTIL_TS = 0.0
+
+
+class XeroDisabledError(RuntimeError):
+    """Raised when a Xero request is attempted while Xero is paused."""
+
+
+def xero_is_disabled() -> bool:
+    """Global kill-switch. When the XERO_DISABLED env var is truthy, the app
+    makes NO outbound requests to Xero (API calls and token refreshes alike).
+    Used to fully pause Xero traffic, e.g. while rate-limited / locked out."""
+    return os.getenv("XERO_DISABLED", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def guard_xero(action: str = "Xero request") -> None:
+    if xero_is_disabled():
+        raise XeroDisabledError(
+            f"{action} blocked: Xero is paused (XERO_DISABLED is set). "
+            "No data is being sent to Xero."
+        )
+
+
+def persisted_xero_lockout_until(config: AppConfig) -> float:
+    """Return the persisted Xero lockout timestamp without making network calls."""
+    try:
+        with open(config.state_file, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        return float(state.get("xero_lockout_until_ts") or 0.0)
+    except Exception:
+        return 0.0
+
+
+def xero_lockout_is_active(config: AppConfig) -> bool:
+    return persisted_xero_lockout_until(config) > time.time()
 
 
 def get_xero_rate_limit_until_ts() -> float:
@@ -241,6 +275,91 @@ class XeroClient:
             )
         return response.json()
 
+    def create_simple_invoice(
+        self,
+        contact_name: str,
+        description: str,
+        amount: float,
+        reference: str = "",
+        invoice_date: str | None = None,
+        status: str = "AUTHORISED",
+    ) -> Dict:
+        """
+        Create a small standalone ACCREC invoice whose TOTAL equals `amount`
+        (tax inclusive), raised to a standard catch-all contact. Used by the
+        Cashflows reconciliation "quick invoice" action to give a stray card
+        payment (e.g. parking) something to reconcile against in Xero.
+        """
+        today = invoice_date or dt.date.today().isoformat()
+        payload = {
+            "Type": "ACCREC",
+            "Contact": {"Name": (contact_name or "Sundry")},
+            "Date": today,
+            "DueDate": today,
+            "LineAmountTypes": "Inclusive",
+            "LineItems": [
+                {
+                    "Description": description or "Card payment",
+                    "Quantity": 1,
+                    "UnitAmount": round(float(amount), 2),
+                    "AccountCode": self.sales_account_code,
+                }
+            ],
+            "Reference": reference or "",
+            "Status": status,
+        }
+        if self.dry_run:
+            return {"dry_run": True, "payload": payload}
+        url = f"{self.base_url}/Invoices"
+        response = self._request("POST", url, json=payload)
+        if not response.ok:
+            raise RuntimeError(
+                f"Xero quick invoice create failed: {response.status_code} {response.text}"
+            )
+        return response.json()
+
+    def create_bill(
+        self,
+        *,
+        contact: Dict,
+        line_items: list,
+        reference: str = "",
+        bill_date: str | None = None,
+        due_date: str | None = None,
+        status: str = "AUTHORISED",
+        line_amount_types: str = "Inclusive",
+    ) -> Dict:
+        """Create an ACCPAY purchase bill (money owed to a supplier, e.g. a
+        subcontractor). ``contact`` is a Xero contact ref ({"ContactID": ...} or
+        {"Name": ...}); ``line_items`` are pre-built Xero line dicts (Description,
+        Quantity, UnitAmount, AccountCode, optional TaxType). Returns the created
+        invoice dict (with InvoiceID) or, in dry-run, the payload.
+        """
+        today = bill_date or dt.date.today().isoformat()
+        payload = {
+            "Type": "ACCPAY",
+            "Contact": contact,
+            "Date": today,
+            "DueDate": due_date or today,
+            "LineAmountTypes": line_amount_types,
+            "LineItems": line_items,
+            "Reference": reference or "",
+            "Status": status,
+        }
+        if self.dry_run:
+            return {"dry_run": True, "payload": payload}
+        url = f"{self.base_url}/Invoices"
+        response = self._request("POST", url, json=payload)
+        if not response.ok:
+            raise RuntimeError(
+                f"Xero bill create failed: {response.status_code} {response.text}"
+            )
+        data = response.json()
+        invoices = data.get("Invoices") or []
+        if not invoices:
+            raise RuntimeError("Xero bill create returned empty invoice list")
+        return invoices[0]
+
     def _prepare_line_items(self, line_items: list | None) -> list:
         if not line_items:
             return []
@@ -251,6 +370,47 @@ class XeroClient:
                 line["AccountCode"] = self.sales_account_code
             prepared.append(line)
         return prepared
+
+    def _line_update_signature(self, line_item: Dict) -> tuple[str, float, float, str, str, str]:
+        desc = " ".join(str((line_item or {}).get("Description") or "").split()).lower()
+        try:
+            qty = round(float((line_item or {}).get("Quantity") or 1.0), 4)
+        except Exception:
+            qty = 1.0
+        try:
+            unit = round(float((line_item or {}).get("UnitAmount") or 0.0), 4)
+        except Exception:
+            unit = 0.0
+        tax_type = str((line_item or {}).get("TaxType") or "").strip().upper()
+        account_code = str((line_item or {}).get("AccountCode") or "").strip()
+        account_id = str((line_item or {}).get("AccountID") or "").strip()
+        return desc, qty, unit, tax_type, account_code, account_id
+
+    def _attach_existing_line_item_ids(
+        self, invoice_id: str, prepared_line_items: list[Dict]
+    ) -> list[Dict]:
+        try:
+            current = self.get_invoice(invoice_id)
+        except Exception:
+            return prepared_line_items
+
+        existing_by_signature: dict[tuple[str, float, float, str, str, str], list[str]] = {}
+        for line in current.get("LineItems") or []:
+            line_id = str((line or {}).get("LineItemID") or "").strip()
+            if not line_id:
+                continue
+            sig = self._line_update_signature(line)
+            existing_by_signature.setdefault(sig, []).append(line_id)
+
+        out: list[Dict] = []
+        for line in prepared_line_items:
+            next_line = dict(line)
+            if not next_line.get("LineItemID"):
+                ids = existing_by_signature.get(self._line_update_signature(next_line)) or []
+                if ids:
+                    next_line["LineItemID"] = ids.pop(0)
+            out.append(next_line)
+        return out
 
     def get_online_invoice_url(self, invoice_id: str) -> str | None:
         """
@@ -282,6 +442,118 @@ class XeroClient:
         if not invoices:
             raise RuntimeError("Xero invoice fetch returned empty invoice list")
         return invoices[0]
+
+    def get_payments_to_account(
+        self,
+        account_code: str,
+        *,
+        end_date: "dt.date | None" = None,
+    ) -> Dict:
+        """Fetch payments coded against a given account, up to ``end_date``.
+
+        Used by the Receipt Dump subcontractor-balancing feature to total what
+        has actually been paid to a recurring account. Returns
+        ``{"Payments": [...], "total": <float>}``. Subject to the global Xero
+        kill-switch via ``_request``.
+        """
+        code = str(account_code or "").strip()
+        if not code:
+            return {"Payments": [], "total": 0.0}
+        clauses = [f'Account.Code=="{code}"', 'Status=="AUTHORISED"']
+        if end_date is not None:
+            clauses.append(
+                f"Date<=DateTime({end_date.year},{end_date.month},{end_date.day})"
+            )
+        where = "&&".join(clauses)
+        all_items: list[Dict] = []
+        page = 1
+        while True:
+            response = self._request(
+                "GET",
+                f"{self.base_url}/Payments",
+                params={"where": where, "page": page},
+            )
+            if not response.ok:
+                raise RuntimeError(
+                    f"Xero payments fetch failed: {response.status_code} {response.text}"
+                )
+            items = (response.json() or {}).get("Payments") or []
+            all_items.extend(items)
+            if len(items) < 100:
+                break
+            page += 1
+        total = 0.0
+        for p in all_items:
+            try:
+                total += float(p.get("Amount") or 0)
+            except (TypeError, ValueError):
+                continue
+        return {"Payments": all_items, "total": round(total, 2)}
+
+    def get_attachments(self, endpoint: str, guid: str) -> list:
+        """List attachments on a Xero object (e.g. endpoint='BankTransactions'
+        or 'Invoices'). Returns the Attachments list (possibly empty)."""
+        if not (endpoint and guid):
+            return []
+        response = self._request(
+            "GET", f"{self.base_url}/{endpoint}/{guid}/Attachments"
+        )
+        if not response.ok:
+            raise RuntimeError(
+                f"Xero attachments list failed: {response.status_code} {response.text}"
+            )
+        return (response.json() or {}).get("Attachments") or []
+
+    def get_attachment_content(
+        self, endpoint: str, guid: str, filename: str
+    ) -> "tuple[bytes, str]":
+        """Download a single attachment's bytes from a Xero object.
+
+        Returns (content_bytes, mime_type). Used to retrieve a previously
+        submitted receipt image from Xero for cross-person duplicate checks.
+        """
+        response = self._request(
+            "GET",
+            f"{self.base_url}/{endpoint}/{guid}/Attachments/{filename}",
+            headers={**self._headers(), "Accept": "*/*"},
+        )
+        if not response.ok:
+            raise RuntimeError(
+                f"Xero attachment fetch failed: {response.status_code} {response.text}"
+            )
+        return response.content, response.headers.get("Content-Type", "")
+
+    def attach_file_to_invoice(
+        self, invoice_id: str, filename: str, content_type: str, data: bytes
+    ) -> dict:
+        """Attach a file to a Xero invoice via PUT /Invoices/{id}/Attachments/{name}.
+
+        Dry-run returns a preview dict without writing to Xero.
+        """
+        import re as _re
+
+        safe_name = (_re.sub(r"[^\w.\-]", "_", filename or "receipt.jpg")[:100] or "receipt.jpg")
+        if self.dry_run:
+            return {
+                "dry_run": True,
+                "invoice_id": invoice_id,
+                "filename": safe_name,
+                "content_type": content_type,
+                "size_bytes": len(data),
+            }
+        guard_xero("Xero attachment upload")
+        url = f"{self.base_url}/Invoices/{invoice_id}/Attachments/{safe_name}"
+        hdrs = {k: v for k, v in self._headers().items() if k != "Content-Type"}
+        hdrs["Content-Type"] = content_type
+        resp = requests.request("PUT", url, headers=hdrs, data=data, timeout=60)
+        if resp.status_code == 401 and self._refresh_access_token():
+            hdrs["Authorization"] = f"Bearer {self.access_token}"
+            resp = requests.request("PUT", url, headers=hdrs, data=data, timeout=60)
+        if not resp.ok:
+            raise RuntimeError(
+                f"Xero attachment failed ({resp.status_code}): {resp.text[:300]}"
+            )
+        return resp.json()
 
     def delete_draft_invoice(self, invoice_id: str) -> Dict:
         """
@@ -418,6 +690,183 @@ class XeroClient:
         if not response.ok:
             raise RuntimeError(
                 f"Xero payment create failed: {response.status_code} {response.text}"
+            )
+        return response.json()
+
+    def get_bank_transactions(
+        self,
+        *,
+        start_date: dt.date | None,
+        end_date: dt.date | None,
+    ) -> Dict:
+        """
+        Fetch Xero bank transactions in a bounded date range.
+        The Cashflows reconciliation layer filters these to `CFE SETT`.
+        Returns an empty result dict if either date is None.
+        """
+        if start_date is None or end_date is None:
+            return {}
+        all_items: list[Dict] = []
+        where = (
+            f'Date>=DateTime({start_date.year},{start_date.month},{start_date.day})'
+            f'&&Date<=DateTime({end_date.year},{end_date.month},{end_date.day})'
+        )
+        page = 1
+        while True:
+            url = f"{self.base_url}/BankTransactions"
+            response = self._request(
+                "GET",
+                url,
+                params={"where": where, "page": page},
+            )
+            if not response.ok:
+                raise RuntimeError(
+                    f"Xero bank transactions fetch failed: {response.status_code} {response.text}"
+                )
+            data = response.json() or {}
+            items = data.get("BankTransactions") or []
+            all_items.extend(items)
+            if len(items) < 100:
+                break
+            page += 1
+        return {"BankTransactions": all_items}
+
+    def get_bank_accounts(self) -> list[Dict]:
+        """List connected bank / card accounts (Account Type == BANK).
+
+        Used to let the user say which card a batch of receipts belongs to.
+        Returns a list of {"name", "id", "code"} dicts; empty on any error so
+        the upload form can fall back to a free-text field.
+        """
+        url = f"{self.base_url}/Accounts"
+        try:
+            response = self._request("GET", url, params={"where": 'Type=="BANK"'})
+            if not response.ok:
+                return []
+            data = response.json() or {}
+        except Exception:
+            return []
+        out: list[Dict] = []
+        for a in data.get("Accounts") or []:
+            out.append({
+                "name": str(a.get("Name") or "").strip() or "Bank account",
+                "id": str(a.get("AccountID") or ""),
+                "code": str(a.get("Code") or ""),
+            })
+        return out
+
+    def get_open_invoices(self) -> Dict:
+        """Fetch open receivable invoices that may be closed by a settlement."""
+        all_items: list[Dict] = []
+        where = 'Type=="ACCREC"&&Status=="AUTHORISED"&&AmountDue>0'
+        page = 1
+        while True:
+            url = f"{self.base_url}/Invoices"
+            response = self._request(
+                "GET",
+                url,
+                params={"where": where, "page": page},
+            )
+            if not response.ok:
+                raise RuntimeError(
+                    f"Xero open invoices fetch failed: {response.status_code} {response.text}"
+                )
+            data = response.json() or {}
+            items = data.get("Invoices") or []
+            all_items.extend(items)
+            if len(items) < 100:
+                break
+            page += 1
+        return {"Invoices": all_items}
+
+    def get_paid_invoices(self, start_date: dt.date, end_date: dt.date) -> Dict:
+        """Fetch PAID receivable invoices within a date window.
+
+        Card payments via Cashflows are marked PAID in Xero at the time of the
+        transaction — they will not appear in get_open_invoices(). Fetching
+        PAID invoices for the CSV date range is required to match them.
+        """
+        all_items: list[Dict] = []
+        where = (
+            'Type=="ACCREC"&&Status=="PAID"'
+            f'&&Date>=DateTime({start_date.year},{start_date.month},{start_date.day})'
+            f'&&Date<=DateTime({end_date.year},{end_date.month},{end_date.day})'
+        )
+        page = 1
+        while True:
+            url = f"{self.base_url}/Invoices"
+            response = self._request(
+                "GET",
+                url,
+                params={"where": where, "page": page},
+            )
+            if not response.ok:
+                raise RuntimeError(
+                    f"Xero paid invoices fetch failed: {response.status_code} {response.text}"
+                )
+            data = response.json() or {}
+            items = data.get("Invoices") or []
+            all_items.extend(items)
+            if len(items) < 100:
+                break
+            page += 1
+        return {"Invoices": all_items}
+
+    def create_invoice_payload(self, payload: Dict) -> Dict:
+        if self.dry_run:
+            return {"dry_run": True, "payload": payload}
+        url = f"{self.base_url}/Invoices"
+        response = self._request("POST", url, json=payload)
+        if not response.ok:
+            raise RuntimeError(
+                f"Xero invoice payload post failed: {response.status_code} {response.text}"
+            )
+        return response.json()
+
+    def create_batch_payment_payload(self, payload: Dict) -> Dict:
+        if self.dry_run:
+            return {"dry_run": True, "payload": payload}
+        url = f"{self.base_url}/BatchPayments"
+        response = self._request("POST", url, json=payload)
+        if not response.ok:
+            raise RuntimeError(
+                f"Xero batch payment post failed: {response.status_code} {response.text}"
+            )
+        return response.json()
+
+    def create_bank_transaction_payload(self, payload: Dict) -> Dict:
+        if self.dry_run:
+            return {"dry_run": True, "payload": payload}
+        url = f"{self.base_url}/BankTransactions"
+        response = self._request("POST", url, json=payload)
+        if not response.ok:
+            raise RuntimeError(
+                f"Xero bank transaction post failed: {response.status_code} {response.text}"
+            )
+        return response.json()
+
+    def create_credit_note_payload(self, payload: Dict) -> Dict:
+        if self.dry_run:
+            return {"dry_run": True, "payload": payload}
+        url = f"{self.base_url}/CreditNotes"
+        response = self._request("POST", url, json=payload)
+        if not response.ok:
+            raise RuntimeError(
+                f"Xero credit note post failed: {response.status_code} {response.text}"
+            )
+        return response.json()
+
+    def allocate_credit_note_payload(self, credit_note_id: str, payload: Dict) -> Dict:
+        if self.dry_run:
+            return {"dry_run": True, "credit_note_id": credit_note_id, "payload": payload}
+        credit_note_id = str(credit_note_id or "").strip()
+        if not credit_note_id:
+            raise RuntimeError("Missing Xero CreditNoteID for allocation.")
+        url = f"{self.base_url}/CreditNotes/{credit_note_id}/Allocations"
+        response = self._request("PUT", url, json=payload)
+        if not response.ok:
+            raise RuntimeError(
+                f"Xero credit note allocation failed: {response.status_code} {response.text}"
             )
         return response.json()
 
@@ -587,6 +1036,12 @@ def build_xero_client(config: AppConfig) -> XeroClient | None:
     Build a Xero client using the first enabled tenant from per-tenant config,
     falling back to the token's stored tenant_id if no per-tenant config exists.
     """
+    # This function is used by the poller, Xero webhooks, dashboard health
+    # checks, and receipt/cashflows tools. It must not refresh tokens or touch
+    # Xero while the global kill-switch or persisted 429 lockout is active.
+    if xero_is_disabled() or xero_lockout_is_active(config):
+        return None
+
     token = load_xero_token(config.xero_token_file)
 
     client_id = config.xero_client_id or str(
