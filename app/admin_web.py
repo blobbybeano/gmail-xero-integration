@@ -7447,7 +7447,7 @@ function toggleReceiptsEnabled(requested) {{
         function _adjustmentLabel(adj) {{
           if (!adj) return '';
           if (adj.type === 'discount') return 'discount / credit adjustment ' + money(adj.amount);
-          if (adj.type === 'extra_invoice') return 'invoice/card difference ' + money(adj.amount);
+          if (adj.type === 'extra_invoice') return 'extra Materials invoice ' + money(adj.amount);
           return 'adjustment ' + money(adj.amount);
         }}
         function _selectedInvoiceForSale(batch, sale, idx) {{
@@ -7828,7 +7828,7 @@ function toggleReceiptsEnabled(requested) {{
             const qiContact = likelyCal && likelyCal.customer ? likelyCal.customer : '';
             const qiDesc = likelyCal
               ? ((likelyCal.event_summary || likelyCal.customer || 'Calendar card payment') + ' - card payment')
-              : 'Parking';
+              : 'Materials';
             const qiBtn = qi
               ? '<div class="mt-1 text-[11px] text-emerald-700 font-semibold">'
                   + (qi.dry_run
@@ -7850,10 +7850,10 @@ function toggleReceiptsEnabled(requested) {{
               const activeLabel = adjustmentOk ? '&#10003; ' + _adjustmentLabel(adjustment) : '';
               const actionText = expectedAdj.type === 'discount'
                 ? 'Add discount plan'
-                : 'Confirm separate adjustment';
+                : 'Add Materials invoice plan';
               const helpText = expectedAdj.type === 'discount'
                 ? 'Card payment is lower than invoice total. Xero needs a discount/credit-style adjustment before this can fully match.'
-                : 'Card payment is higher than this invoice. First check whether the matched invoice is missing a line; if it is, amend the invoice and refresh this batch. Only use a separate adjustment if the extra money is genuinely not part of that customer invoice.';
+                : 'Card payment is higher than this invoice. If the invoice is missing a line, amend the invoice and refresh this batch. If you have checked it and the extra money is separate, add a Materials invoice plan for the difference.';
               invCell += '<div class="mt-2 rounded border ' + (adjustmentOk ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-amber-200 bg-amber-50 text-amber-800') + ' p-2">'
                 + '<div class="text-[11px] font-semibold">Adjustment needed: ' + expLabel + '</div>'
                 + '<div class="text-[10px] mt-0.5">' + helpText + '</div>'
@@ -8190,8 +8190,8 @@ function toggleReceiptsEnabled(requested) {{
               const si = Number(btn.dataset.si);
               const s = sales[si];
               const contact = (btn.dataset.contact || '').trim();
-              const defaultDesc = (btn.dataset.desc || 'Parking').trim() || 'Parking';
-              const targetContact = contact || 'Parking';
+              const defaultDesc = (btn.dataset.desc || 'Materials').trim() || 'Materials';
+              const targetContact = contact || 'Materials';
               if (!CF_DRY_RUN) {{
                 if (!window.confirm('This will create a REAL invoice in Xero for ' + money(amt) + ' to "' + targetContact + '". Continue?')) return;
               }}
@@ -8768,14 +8768,14 @@ function toggleReceiptsEnabled(requested) {{
         sale_ref = str(payload.get("sale_ref") or "").strip()
         if not sale_ref:
             return _flask.jsonify({"error": "Missing sale reference."}), 400
-        description = (str(payload.get("description") or "").strip() or "Parking")[:200]
+        description = (str(payload.get("description") or "").strip() or "Materials")[:200]
         contact_name = (
             str(payload.get("contact_name") or "").strip()
             or str(
                 get_json_setting(
-                    config.admin_db_file, "cashflows_quick_invoice_contact", "Parking"
+                    config.admin_db_file, "cashflows_quick_invoice_contact", "Materials"
                 )
-                or "Parking"
+                or "Materials"
             )
         )[:200]
 
@@ -9205,8 +9205,8 @@ function toggleReceiptsEnabled(requested) {{
                         extra_amount = round(diff, 2)
                         extra_invoice_payloads.append(
                             {
-                                "contact_name": "Parking",
-                                "description": f"Cashflows overpayment balance {sale_ref or selected.get('number') or batch_id}",
+                                "contact_name": "Materials",
+                                "description": f"Cashflows materials balance {sale_ref or selected.get('number') or batch_id}",
                                 "amount": extra_amount,
                                 "reference": f"{reference} extra {sale_ref}".strip()[:255],
                                 "invoice_date": str(sale.get("date") or payout_date),
