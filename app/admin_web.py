@@ -9402,16 +9402,41 @@ function toggleReceiptsEnabled(requested) {{
         _last_call_ts = {"t": 0.0}
 
         def _pace() -> None:
+            while _lockout_active():
+                wait = max(1, int(_lockout_until_ts() - time.time()))
+                time.sleep(min(10, wait))
             wait = _CF_SUBMIT_PACE_SECONDS - (time.time() - _last_call_ts["t"])
             if wait > 0:
                 time.sleep(wait)
             _last_call_ts["t"] = time.time()
 
+        def _xero_write(callable_obj):
+            last_exc = None
+            for _attempt in range(4):
+                try:
+                    _pace()
+                    return callable_obj()
+                except RuntimeError as exc:
+                    msg = str(exc)
+                    if "429" not in msg and "rate-limit" not in msg and "rate-limited" not in msg:
+                        raise
+                    last_exc = exc
+                    while _lockout_active():
+                        wait = max(1, int(_lockout_until_ts() - time.time()))
+                        time.sleep(min(10, wait))
+            if last_exc:
+                raise last_exc
+            raise RuntimeError("Xero write failed before it could be sent.")
+
         def _post_xero(path: str, payload: dict) -> dict:
             if not xero_client or not hasattr(xero_client, "_request"):
                 raise RuntimeError("Xero client cannot post the required Cashflows adjustment.")
-            _pace()
-            resp = xero_client._request("POST", f"{xero_client.base_url}{path}", json=payload)
+            def _send():
+                response = xero_client._request("POST", f"{xero_client.base_url}{path}", json=payload)
+                if response.status_code == 429:
+                    raise RuntimeError(f"Xero post failed: 429 {response.text}")
+                return response
+            resp = _xero_write(_send)
             if not resp.ok:
                 raise RuntimeError(f"Xero post failed: {resp.status_code} {resp.text}")
             return resp.json() if resp.text else {}
@@ -9422,22 +9447,21 @@ function toggleReceiptsEnabled(requested) {{
             credit_note_allocations: list[dict] = []
             moved_payments: list[dict] = []
             for credit_plan in plan.get("credit_note_payloads") or []:
-                _pace()
-                credit_resp = xero_client.create_credit_note_payload(credit_plan["credit_note"])
+                credit_resp = _xero_write(lambda: xero_client.create_credit_note_payload(credit_plan["credit_note"]))
                 created_credit = ((credit_resp.get("CreditNotes") or [{}])[0]) if isinstance(credit_resp, dict) else {}
                 credit_note_id = str(created_credit.get("CreditNoteID") or "").strip()
                 if not credit_note_id:
                     raise RuntimeError("Xero created a credit note but did not return a CreditNoteID.")
-                _pace()
-                allocation_resp = xero_client.allocate_credit_note_payload(
-                    credit_note_id,
-                    credit_plan["allocation"],
+                allocation_resp = _xero_write(
+                    lambda: xero_client.allocate_credit_note_payload(
+                        credit_note_id,
+                        credit_plan["allocation"],
+                    )
                 )
                 created_credit_notes.append(created_credit)
                 credit_note_allocations.append(allocation_resp)
             for inv_payload in plan.get("extra_invoice_payloads") or []:
-                _pace()
-                resp = xero_client.create_simple_invoice(**inv_payload)
+                resp = _xero_write(lambda: xero_client.create_simple_invoice(**inv_payload))
                 created = ((resp.get("Invoices") or [{}])[0]) if isinstance(resp, dict) else {}
                 invoice_id = str(created.get("InvoiceID") or "").strip()
                 if not invoice_id:
@@ -9479,15 +9503,12 @@ function toggleReceiptsEnabled(requested) {{
                         }
                     )
             if plan["payloads"].get("batch_payment"):
-                _pace()
-                batch_resp = xero_client.create_batch_payment_payload(plan["payloads"]["batch_payment"])
+                batch_resp = _xero_write(lambda: xero_client.create_batch_payment_payload(plan["payloads"]["batch_payment"]))
             if plan["payloads"].get("clearing_receive"):
-                _pace()
-                clearing_resp = xero_client.create_bank_transaction_payload(plan["payloads"]["clearing_receive"])
+                clearing_resp = _xero_write(lambda: xero_client.create_bank_transaction_payload(plan["payloads"]["clearing_receive"]))
             fee_resp = None
             if plan["payloads"].get("bank_fee"):
-                _pace()
-                fee_resp = xero_client.create_bank_transaction_payload(plan["payloads"]["bank_fee"])
+                fee_resp = _xero_write(lambda: xero_client.create_bank_transaction_payload(plan["payloads"]["bank_fee"]))
             response = {
                 "batch_id": plan["batch_id"],
                 "created_credit_notes": created_credit_notes,
@@ -9600,15 +9621,33 @@ function toggleReceiptsEnabled(requested) {{
                 state["status"] = "error"
                 state["error"] = str(exc).splitlines()[0][:300]
                 _ref = state.get("current_batch_ref") or ""
-                state["message"] = (
-                    f"Stopped on batch {state['completed'] + 1} of {state['total']}"
-                    + (f" ({_ref})" if _ref else "")
-                    + ". The "
-                    f"{state['completed']} batch(es) already finished are saved and "
-                    "will NOT be resent. This batch may be part-done in Xero — please "
-                    "check it in Xero before re-running. "
-                    f"Problem: {state['error']}"
+                is_xero_rate_limit = (
+                    "429" in state["error"]
+                    or "rate-limit" in state["error"]
+                    or "rate-limited" in state["error"]
                 )
+                if is_xero_rate_limit:
+                    state["message"] = (
+                        f"Xero asked the app to wait while processing batch "
+                        f"{state['completed'] + 1} of {state['total']}"
+                        + (f" ({_ref})" if _ref else "")
+                        + ". The "
+                        f"{state['completed']} batch(es) already finished are saved and "
+                        "will NOT be resent. This batch may have been partly prepared; "
+                        "refresh the Cashflows preview before retrying so the app reads "
+                        "the current Xero state. "
+                        f"Problem: {state['error']}"
+                    )
+                else:
+                    state["message"] = (
+                        f"Stopped on batch {state['completed'] + 1} of {state['total']}"
+                        + (f" ({_ref})" if _ref else "")
+                        + ". The "
+                        f"{state['completed']} batch(es) already finished are saved and "
+                        "will NOT be resent. This batch may be part-done in Xero — please "
+                        "check it in Xero before re-running. "
+                        f"Problem: {state['error']}"
+                    )
                 _persist_job(state)
 
         with _cf_submit_lock:
