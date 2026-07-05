@@ -44,6 +44,7 @@ from .event_processor import (
     done_choice_is_yes,
     ensure_notes_template,
     normalize_user_sections,
+    send_choice_is_no,
     send_choice_is_yes,
     extract_event_details,
     extract_invoice_lines,
@@ -60,6 +61,7 @@ from .event_processor import (
     upsert_send_failure,
     upsert_invoice_summary,
     upsert_cash_confirmation,
+    upsert_no_email_confirmation,
     upsert_send_confirmation,
     get_title_progress_dots,
     set_title_status_emoji,
@@ -2150,6 +2152,8 @@ def run() -> None:
                 # Only send when user explicitly answers Y/YES.
                 _desc_now = event.get("description") or ""
                 has_send = send_choice_is_yes(_desc_now)
+                has_send_no = send_choice_is_no(_desc_now)
+                has_send_action = has_send or has_send_no
                 sent_state = is_invoice_sent(state, event_key)
                 paid_state = is_invoice_paid(state, event_key)
                 # Self-heal: if mapped invoice was voided/deleted in Xero,
@@ -2201,7 +2205,7 @@ def run() -> None:
                     and _event_end < (now - dt.timedelta(hours=_PAST_EVENT_AUTO_XERO_HOURS))
                     and not _event_targeted
                 )
-                if _event_stale_for_automatic_xero and (has_done or has_send):
+                if _event_stale_for_automatic_xero and (has_done or has_send_action):
                     # Old unfinished jobs must not be re-scanned forever during
                     # broad/hourly calendar sweeps. Staff can re-save the entry
                     # to make it webhook-targeted, or Xero can update payment
@@ -2217,7 +2221,7 @@ def run() -> None:
                 )
                 _budget_description = (
                     normalize_user_sections(event.get("description") or "")
-                    if (has_done or has_send)
+                    if (has_done or has_send_action)
                     else (event.get("description") or "")
                 )
                 _pre_budget_invoice_lines = extract_invoice_lines(_budget_description)
@@ -2263,7 +2267,7 @@ def run() -> None:
                     continue
                 _needs_xero_event_work = bool(
                     (
-                        (has_done or has_send)
+                        (has_done or has_send_action)
                         and not sent_state
                         and len(_pre_budget_invoice_lines) > 0
                     )
@@ -2285,7 +2289,7 @@ def run() -> None:
                     expected_status = _expected_title_status(
                         event.get("description"),
                         has_done=has_done,
-                        has_send=has_send,
+                        has_send=has_send_action,
                         sent_state=sent_state,
                         paid_state=paid_state,
                         current_summary=current_summary,
@@ -2376,7 +2380,7 @@ def run() -> None:
                 # Only diary/Google failures should paint job titles red. Xero
                 # disconnect/refresh issues are global health problems and must
                 # not cause red-title flicker across otherwise valid jobs.
-                if _title_blocking_integration_issues and (has_done or has_send):
+                if _title_blocking_integration_issues and (has_done or has_send_action):
                     if not current_summary.startswith("🔴"):
                         updated = safe_update(
                             event_id=event.get("id"),
@@ -2398,7 +2402,7 @@ def run() -> None:
                     )
                     continue
                 # Keep blue until staff explicitly confirms PROCESS DRAFT = Y.
-                if (has_done or has_send) and event.get("id"):
+                if (has_done or has_send_action) and event.get("id"):
                     event_updated = event.get("updated") or ""
                     normalized_description = normalize_user_sections(
                         event.get("description") or ""
@@ -2438,7 +2442,7 @@ def run() -> None:
                         )
                         _has_sent_marker = "invoice sent ✅" in _desc_now.lower()
                         _has_send_intent = bool(
-                            has_send
+                            has_send_action
                             or "invoice sent ✅" in _desc_now.lower()
                             or "invoice send failed ❌" in _desc_now.lower()
                             or sent_state
@@ -2605,7 +2609,7 @@ def run() -> None:
                             )
                         state = set_processed_update_marker(state, event_key, event_updated)
                         continue
-                    if has_send and invoice_lines and not existing_invoice_id:
+                    if has_send_action and invoice_lines and not existing_invoice_id:
                         existing_invoice_link = _extract_existing_invoice_link(
                             event.get("description")
                         )
@@ -2761,7 +2765,7 @@ def run() -> None:
                                 and xero_client
                                 and existing_contact_id
                                 and not is_invoice_sent(state, event_key)
-                                and (not has_send or not get_invoice_for_event(state, event_key))
+                                and (not has_send_action or not get_invoice_for_event(state, event_key))
                             ):
                                 invoice_id = get_invoice_for_event(state, event_key)
                                 last_invoice_update = get_invoice_update_marker(
@@ -2790,7 +2794,7 @@ def run() -> None:
                                     existing_invoice_link = _extract_existing_invoice_link(
                                         event.get("description")
                                     )
-                                    if has_send and existing_invoice_link:
+                                    if has_send_action and existing_invoice_link:
                                         failed_description = upsert_send_failure(
                                             event.get("description") or "",
                                             "Existing invoice link found but the app has no stored invoice ID. Stopped to avoid creating a duplicate; relink/check Xero before retry.",
@@ -3121,14 +3125,14 @@ def run() -> None:
                                             state = set_invoice_update_marker(
                                                 state, event_key, event_updated
                                             )
-                            elif has_done and not has_send and not existing_contact_id:
+                            elif has_done and not has_send_action and not existing_contact_id:
                                 print(f"Event {event_id}: skipping invoice (no contact_id)")
-                            elif has_done and not has_send and not xero_client:
+                            elif has_done and not has_send_action and not xero_client:
                                 print(f"Event {event_id}: skipping invoice (xero not configured)")
 
                             # If SEND keyword is present, mark as sent in notes.
                             if (
-                                has_send
+                                has_send_action
                                 and invoice_lines
                                 and not is_invoice_sent(state, event_key)
                                 and (
@@ -3533,7 +3537,7 @@ def run() -> None:
                                             )
                                             state = set_processed_update_marker(state, event_key, event_updated)
                                             continue
-                                    emailed = xero_client.email_invoice(invoice_id)
+                                    emailed = True if has_send_no else xero_client.email_invoice(invoice_id)
                                     if not emailed:
                                         print(f"Event {event_id}: failed to email invoice {invoice_id}")
                                         _feed.push(
@@ -3602,7 +3606,9 @@ def run() -> None:
                                         state = set_processed_update_marker(state, event_key, event_updated)
                                         continue
                                     invoice_url = xero_client.get_online_invoice_url(invoice_id)
-                                updated_description = upsert_send_confirmation(
+                                updated_description = (
+                                    upsert_no_email_confirmation if has_send_no else upsert_send_confirmation
+                                )(
                                     event.get("description") or "",
                                     invoice_url=invoice_url,
                                     submitter=submitter_display,
@@ -3610,7 +3616,11 @@ def run() -> None:
                                 )
                                 updated_description = upsert_app_ledger(
                                     updated_description,
-                                    message=f"Sent - {invoice_id[:8]}",
+                                    message=(
+                                        f"Processed no email - {invoice_id[:8]}"
+                                        if has_send_no
+                                        else f"Sent - {invoice_id[:8]}"
+                                    ),
                                     state="sent",
                                     reason="ok",
                                     fingerprint=send_action_fp,
@@ -3622,7 +3632,7 @@ def run() -> None:
                                     updated = safe_update(
                                         event_id=event.get("id"),
                                         description=updated_description,
-                                        label="Invoice sent",
+                                        label="Invoice processed" if has_send_no else "Invoice sent",
                                         summary_status=("green" if pay_mode == "card" else "yellow"),
                                         current_summary=event.get("summary"),
                                         calendar_id=calendar_id,
@@ -3637,8 +3647,19 @@ def run() -> None:
                                 state = set_invoice_update_marker(
                                     state, event_key, event_updated
                                 )
-                                print(f"Invoice sent for event {event_id}: {invoice_id}")
-                                _feed.push(f"Invoice authorised & emailed: {invoice_id[:8]}… for \"{event.get('summary', event_id)}\"", "success")
+                                print(
+                                    f"Invoice processed without email for event {event_id}: {invoice_id}"
+                                    if has_send_no
+                                    else f"Invoice sent for event {event_id}: {invoice_id}"
+                                )
+                                _feed.push(
+                                    (
+                                        f"Invoice authorised; email skipped: {invoice_id[:8]}… for \"{event.get('summary', event_id)}\""
+                                        if has_send_no
+                                        else f"Invoice authorised & emailed: {invoice_id[:8]}… for \"{event.get('summary', event_id)}\""
+                                    ),
+                                    "success",
+                                )
                                 state = _append_sheet_stats_if_enabled(
                                     event=event,
                                     event_key=event_key,
@@ -3664,7 +3685,7 @@ def run() -> None:
                                         state=state,
                                     )
                             elif (
-                                has_send
+                                has_send_action
                                 and invoice_lines
                                 and is_invoice_sent(state, event_key)
                             ):
@@ -3940,7 +3961,7 @@ def run() -> None:
                                 and contact
                                 and contact.get("ContactID")
                                 and not is_invoice_sent(state, event_key)
-                                and (not has_send or not get_invoice_for_event(state, event_key))
+                                and (not has_send_action or not get_invoice_for_event(state, event_key))
                             ):
                                 event_updated = event.get("updated") or ""
                                 invoice_id = get_invoice_for_event(state, event_key)
@@ -3967,7 +3988,7 @@ def run() -> None:
                                     existing_invoice_link = _extract_existing_invoice_link(
                                         event.get("description")
                                     )
-                                    if has_send and existing_invoice_link:
+                                    if has_send_action and existing_invoice_link:
                                         failed_description = upsert_send_failure(
                                             event.get("description") or "",
                                             "Existing invoice link found but the app has no stored invoice ID. Stopped to avoid creating a duplicate; relink/check Xero before retry.",
@@ -4301,7 +4322,7 @@ def run() -> None:
                                             )
 
                             if (
-                                has_send
+                                has_send_action
                                 and invoice_lines
                                 and not is_invoice_sent(state, event_key)
                                 and (
@@ -4676,7 +4697,7 @@ def run() -> None:
                                             )
                                             state = set_processed_update_marker(state, event_key, event_updated)
                                             continue
-                                    emailed = xero_client.email_invoice(invoice_id)
+                                    emailed = True if has_send_no else xero_client.email_invoice(invoice_id)
                                     if not emailed:
                                         print(f"Event {event.get('id')}: failed to email invoice {invoice_id}")
                                         _feed.push(
@@ -4735,7 +4756,9 @@ def run() -> None:
                                         state = set_processed_update_marker(state, event_key, event_updated)
                                         continue
                                     invoice_url = xero_client.get_online_invoice_url(invoice_id)
-                                updated_description = upsert_send_confirmation(
+                                updated_description = (
+                                    upsert_no_email_confirmation if has_send_no else upsert_send_confirmation
+                                )(
                                     event.get("description") or "",
                                     invoice_url=invoice_url,
                                     submitter=submitter_display,
@@ -4743,7 +4766,11 @@ def run() -> None:
                                 )
                                 updated_description = upsert_app_ledger(
                                     updated_description,
-                                    message=f"Sent - {invoice_id[:8]}",
+                                    message=(
+                                        f"Processed no email - {invoice_id[:8]}"
+                                        if has_send_no
+                                        else f"Sent - {invoice_id[:8]}"
+                                    ),
                                     state="sent",
                                     reason="ok",
                                     fingerprint=send_action_fp,
@@ -4755,7 +4782,7 @@ def run() -> None:
                                     updated = safe_update(
                                         event_id=event.get("id"),
                                         description=updated_description,
-                                        label="Invoice sent",
+                                        label="Invoice processed" if has_send_no else "Invoice sent",
                                         summary_status=("green" if pay_mode == "card" else "yellow"),
                                         current_summary=event.get("summary"),
                                         calendar_id=calendar_id,
@@ -4770,8 +4797,19 @@ def run() -> None:
                                 state = set_invoice_update_marker(
                                     state, event_key, event_updated
                                 )
-                                print(f"Invoice sent for event {event.get('id')}: {invoice_id}")
-                                _feed.push(f"Invoice authorised & emailed: {invoice_id[:8]}… for \"{event.get('summary', '')}\"", "success")
+                                print(
+                                    f"Invoice processed without email for event {event.get('id')}: {invoice_id}"
+                                    if has_send_no
+                                    else f"Invoice sent for event {event.get('id')}: {invoice_id}"
+                                )
+                                _feed.push(
+                                    (
+                                        f"Invoice authorised; email skipped: {invoice_id[:8]}… for \"{event.get('summary', '')}\""
+                                        if has_send_no
+                                        else f"Invoice authorised & emailed: {invoice_id[:8]}… for \"{event.get('summary', '')}\""
+                                    ),
+                                    "success",
+                                )
                                 state = _append_sheet_stats_if_enabled(
                                     event=event,
                                     event_key=event_key,

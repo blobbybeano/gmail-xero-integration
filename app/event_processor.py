@@ -94,6 +94,31 @@ def send_choice_is_yes(description: str | None) -> bool:
     return False
 
 
+def send_choice_is_no(description: str | None) -> bool:
+    if not description:
+        return False
+    import re
+
+    text = _normalize_description(description)
+    text = _strip_bracket_blocks(text)
+    # Only an explicit N/NO counts. A blank SEND prompt must continue to mean
+    # "wait, do not process the send/authorise stage".
+    lines = [re.sub(r"<[^>]+>", "", raw).strip().lower() for raw in text.splitlines()]
+    for idx, line in enumerate(lines):
+        if not line.startswith("send"):
+            continue
+        if re.fullmatch(r"send(?:\s+now)?\s*(?:\(\s*y\s*/\s*n\s*\)|y\s*/\s*n)?\s*(?:=|:)\s*(n|no)\s*", line):
+            return True
+        if re.fullmatch(r"send\s+(n|no)\s*", line):
+            return True
+        if re.fullmatch(r"send(?:\s+now)?\s*(?:\(\s*y\s*/\s*n\s*\)|y\s*/\s*n)?\s*(?:=|:)\s*", line):
+            for next_line in lines[idx + 1 :]:
+                if not next_line:
+                    continue
+                return bool(re.fullmatch(r"n|no", next_line))
+    return False
+
+
 def payment_choice(description: str | None) -> str:
     """
     Parse payment type from notes outside [contact]/[invoice] blocks.
@@ -1667,6 +1692,45 @@ def upsert_send_confirmation(
     summary_lines.append(STATUS_END)
 
     # Keep all existing notes/details and append confirmation neatly at the end.
+    while cleaned and not cleaned[-1].strip():
+        cleaned.pop()
+    if cleaned:
+        summary_lines = [""] + summary_lines
+    updated = cleaned + summary_lines
+    pay_mode = payment_choice(description)
+    status = "green" if pay_mode in {"card", "cash"} else "yellow"
+    return _set_entry_status_emoji(_normalize_entry_layout("\n".join(updated)), status)
+
+
+def upsert_no_email_confirmation(
+    description: str,
+    invoice_url: str | None = None,
+    *,
+    submitter: str | None = None,
+    submitted_at: str | None = None,
+) -> str:
+    STATUS_START = "[app-status]"
+    STATUS_END = "[/app-status]"
+    cleaned = _status_base_lines(description)
+    cleaned = _set_notes_error_alert("\n".join(cleaned), None).splitlines()
+    cleaned = [_format_process_prompt_line(l) for l in cleaned]
+    totals = _extract_existing_totals(description)
+    payment = _extract_existing_payment_type(description)
+
+    summary_lines: list[str] = []
+    summary_lines.append(STATUS_START)
+    if totals[0]:
+        summary_lines.append(_format_status_total_line(totals[0]))
+    if totals[1]:
+        summary_lines.append(_format_status_total_line(totals[1]))
+    if payment:
+        summary_lines.append(_format_status_prompt_line(payment))
+    summary_lines.append("Invoice processed ✅")
+    summary_lines.append("Email skipped by SEND NOW = N")
+    if invoice_url:
+        summary_lines.append(f"Invoice link: {invoice_url}")
+    summary_lines.append(STATUS_END)
+
     while cleaned and not cleaned[-1].strip():
         cleaned.pop()
     if cleaned:

@@ -6,9 +6,12 @@ from app.event_processor import (
     extract_sales_lines,
     normalize_user_sections,
     parse_invoice_contact_overrides,
+    send_choice_is_no,
+    send_choice_is_yes,
     sync_invoice_block_from_xero,
     upsert_invoice_summary,
     upsert_invoice_profile_missing_hint,
+    upsert_no_email_confirmation,
     upsert_send_failure,
 )
 
@@ -133,6 +136,36 @@ class InvoiceSalesParsingTests(unittest.TestCase):
         updated = upsert_invoice_summary(description, 155.0, 186.0, sent=False)
 
         self.assertIn("PAYMENT TYPE (CARD/INVOICE) = CARD", updated)
+
+    def test_send_now_no_is_explicit_and_blank_is_not_no(self):
+        blank = "[app-status]\nSEND NOW (Y/N) =\n[/app-status]"
+        yes = "[app-status]\nSEND NOW (Y/N) = Y\n[/app-status]"
+        no = "[app-status]\nSEND NOW (Y/N) = N\n[/app-status]"
+
+        self.assertFalse(send_choice_is_yes(blank))
+        self.assertFalse(send_choice_is_no(blank))
+        self.assertTrue(send_choice_is_yes(yes))
+        self.assertFalse(send_choice_is_no(yes))
+        self.assertFalse(send_choice_is_yes(no))
+        self.assertTrue(send_choice_is_no(no))
+
+    def test_no_email_confirmation_does_not_claim_invoice_was_emailed(self):
+        description = (
+            "[app-status]\n"
+            "Invoice total (ex VAT): \u00a3100.00\n"
+            "Invoice total (inc VAT): \u00a3120.00\n"
+            "PAYMENT TYPE (CARD/INVOICE) = INVOICE\n"
+            "SEND NOW (Y/N) = N\n"
+            "[/app-status]"
+        )
+
+        updated = upsert_no_email_confirmation(description, invoice_url="https://xero.example/inv")
+
+        self.assertIn("Invoice processed \u2705", updated)
+        self.assertIn("Email skipped by SEND NOW = N", updated)
+        self.assertIn("Invoice link: https://xero.example/inv", updated)
+        self.assertNotIn("Invoice sent \u2705", updated)
+        self.assertNotIn("SEND NOW (Y/N)", updated)
 
     def test_xero_503_send_failure_gets_temporary_guidance(self):
         updated = upsert_send_failure(
