@@ -380,6 +380,8 @@ def get_expense_settings(db_path: str) -> dict[str, Any]:
             "default_expense_account": "",
             "default_payment_account": "",
             "vat_rate": 20.0,
+            "xero_submission_mode": "scheduled",
+            "xero_submission_time": "17:00",
         },
     )
     if not isinstance(raw, dict):
@@ -390,10 +392,16 @@ def get_expense_settings(db_path: str) -> dict[str, Any]:
         vat_rate = 20.0
     if vat_rate < 0 or vat_rate > 100:
         vat_rate = 20.0
+    mode = str(raw.get("xero_submission_mode", "scheduled")).strip().lower()
+    if mode not in {"scheduled", "manual", "immediate"}:
+        mode = "scheduled"
+    submit_time = _clean_hhmm(raw.get("xero_submission_time"), "17:00")
     return {
         "default_expense_account": str(raw.get("default_expense_account", "")).strip(),
         "default_payment_account": str(raw.get("default_payment_account", "")).strip(),
         "vat_rate": vat_rate,
+        "xero_submission_mode": mode,
+        "xero_submission_time": submit_time,
     }
 
 
@@ -402,7 +410,29 @@ def set_expense_settings(db_path: str, settings: dict[str, Any]) -> None:
     current.update(
         {k: v for k, v in (settings or {}).items() if k in current}
     )
+    mode = str(current.get("xero_submission_mode", "scheduled")).strip().lower()
+    if mode not in {"scheduled", "manual", "immediate"}:
+        mode = "scheduled"
+    current["xero_submission_mode"] = mode
+    current["xero_submission_time"] = _clean_hhmm(
+        current.get("xero_submission_time"), "17:00"
+    )
     set_json_setting(db_path, "expense_settings", current)
+
+
+def _clean_hhmm(value: Any, default: str) -> str:
+    text = str(value or "").strip()
+    parts = text.split(":", 1)
+    if len(parts) != 2:
+        return default
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+    except (TypeError, ValueError):
+        return default
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return default
+    return f"{hour:02d}:{minute:02d}"
 
 
 def set_receipts_settings(db_path: str, settings: dict[str, Any]) -> None:

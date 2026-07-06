@@ -370,6 +370,17 @@ Current contract:
 - Runtime receipt settings are stored in admin DB key `receipts_settings`.
 - Signed receipt upload links are only injected for `PAYMENT TYPE = CARD` entries that show `Invoice sent ✅`.
 - Receipt upload flow can call Google Document AI when receipts are enabled and parser settings are filled.
+- Field Expenses receipt photos and approvals must save immediately, but
+  lower-priority Xero bill/payment writes for subcontractor settlements are
+  controlled by the visible Field Expenses setting
+  `expense_settings.xero_submission_mode` plus
+  `expense_settings.xero_submission_time`.
+- Engineer-facing receipt pages must never create Xero bills as a hidden side
+  effect. They may record that a payment settled receipts locally, then leave
+  Xero submission waiting for admin timing/manual action.
+- Automatic admin-page processing and the admin "Run due Xero submissions now"
+  action are capped at 5 settlement bills per page load/click. Do not remove
+  that cap without adding an equivalent Xero pressure guard.
 
 Key files:
 - `app/receipts/models.py`
@@ -501,3 +512,20 @@ Current rule:
   attachment helpers, and admin-only pause helpers.
 - Regression guard: `tests/test_main_parity.py` compares `app/main.py` to
   `main:app/main.py`. Do not loosen that test to hide branch drift.
+
+## Field Expenses / Receipt Dump Guardrails
+
+- Receipt dump bank matching must never guess across all bank accounts. If a
+  dump has no chosen card/bank account, show a clear "bank matching has not run"
+  prompt and require the user to choose the account first.
+- AI-selected receipt categories and fallback defaults must resolve to a real
+  Xero expense account code before a receipt can be approved or imported. Human
+  labels such as "materials" are only accepted if they unambiguously match one
+  real Xero account name; otherwise the receipt stays in "Needs account".
+- Do not let "Keep" or "Import" promote a receipt with a blank or invalid Xero
+  category. Push it back to manual review instead.
+- Duplicate protection is image-first where possible: identical stored receipt
+  hashes are duplicates; same merchant/date/amount against an existing claim is
+  suspicious unless the image comparison proves it is different. Existing Xero
+  attachments may be fetched only for a known prior receipt record, not by
+  broad-scanning Xero attachments.

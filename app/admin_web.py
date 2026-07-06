@@ -1374,6 +1374,63 @@ def _exp_acct_label(account: dict) -> str:
     return name or code
 
 
+def _norm_account_choice(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def _resolve_expense_account_choice(choice: str, accounts: list) -> "tuple[str, str]":
+    """Resolve a stored/default account choice to a real Xero account code.
+
+    Older settings sometimes held a human word such as "materials" rather than
+    the Xero account code. Accept exact codes, exact account names, and a single
+    unambiguous account-name contains match. Anything ambiguous or unknown must
+    stay unresolved so the user picks it manually.
+    """
+    raw = str(choice or "").strip()
+    if not raw or not accounts:
+        return "", ""
+
+    rows: list[tuple[str, str, str, str]] = []
+    for account in accounts:
+        code = str(account.get("Code") or "").strip()
+        name = str(account.get("Name") or "").strip()
+        if not code:
+            continue
+        rows.append((code, name, _norm_account_choice(code), _norm_account_choice(name)))
+    if not rows:
+        return "", ""
+
+    raw_lower = raw.lower()
+    raw_norm = _norm_account_choice(raw)
+    for code, name, code_norm, _name_norm in rows:
+        if raw == code or raw_lower == code.lower() or raw_norm == code_norm:
+            return code, name
+
+    exact_name = [(code, name) for code, name, _code_norm, name_norm in rows
+                  if raw_norm and raw_norm == name_norm]
+    if len(exact_name) == 1:
+        return exact_name[0]
+
+    label_matches = [
+        (code, name) for code, name, _code_norm, _name_norm in rows
+        if raw_norm and raw_norm == _norm_account_choice(_exp_acct_label({
+            "Code": code,
+            "Name": name,
+        }))
+    ]
+    if len(label_matches) == 1:
+        return label_matches[0]
+
+    contains_name = [
+        (code, name) for code, name, _code_norm, name_norm in rows
+        if raw_norm and name_norm and (raw_norm in name_norm or name_norm in raw_norm)
+    ]
+    if len(contains_name) == 1:
+        return contains_name[0]
+
+    return "", ""
+
+
 def _exp_acct_options(accounts: list, selected: str, *, default_label: str) -> str:
     """Build <option>s for an expense/bank account <select>.
 
@@ -10925,7 +10982,43 @@ body {{ background:#f7f6f3 !important; }}
         chosen = [items[i][1] for i in chosen_idx]
         return chosen, best, target, total
 
-    def _create_xero_bill_for_settlement(eng, settlement, receipts):
+    def _expense_xero_submit_status(*, force: bool = False) -> tuple[bool, str, str]:
+        """Return whether Field Expenses may write to Xero right now.
+
+        Engineers can upload/approve receipts at any time. This gate only controls
+        the lower-priority Xero bill/payment write for settled subcontractor
+        receipts, so those writes do not happen as a hidden side effect.
+        """
+        settings = get_expense_settings(config.admin_db_file)
+        mode = str(settings.get("xero_submission_mode") or "scheduled").strip().lower()
+        submit_time = str(settings.get("xero_submission_time") or "17:00").strip() or "17:00"
+        if force:
+            return True, "Manual run now", submit_time
+        if mode == "immediate":
+            return True, "Immediate", submit_time
+        if mode == "manual":
+            return False, "Manual mode: waiting for admin to run receipt Xero submissions.", submit_time
+        try:
+            hour_s, minute_s = submit_time.split(":", 1)
+            target = (int(hour_s), int(minute_s))
+        except Exception:
+            target = (17, 0)
+            submit_time = "17:00"
+        now_local = dt.datetime.now(dt.timezone.utc).astimezone()
+        if (now_local.hour, now_local.minute) >= target:
+            return True, f"Scheduled window open since {submit_time}", submit_time
+        return False, f"Waiting for receipt Xero submit time ({submit_time}).", submit_time
+
+    def _is_waiting_expense_xero_error(value: str) -> bool:
+        text = (value or "").strip().lower()
+        return (
+            not text
+            or text.startswith("waiting for receipt xero submit")
+            or text.startswith("manual mode:")
+            or text.startswith("waiting for admin receipt xero submission")
+        )
+
+    def _create_xero_bill_for_settlement(eng, settlement, receipts, *, force: bool = False):
         """Raise a Xero ACCPAY purchase bill for the receipts a subcontractor
         payment has just settled, then record the payment against it so the bill
         shows as paid. One line per receipt (its own account code + amount), so
@@ -10935,6 +11028,13 @@ body {{ background:#f7f6f3 !important; }}
         logged + stored on the settlement (xero_error) rather than raised. No-op
         when Xero is paused or there is nothing to bill. Returns the bill id or "".
         """
+        allowed, wait_reason, _submit_time = _expense_xero_submit_status(force=force)
+        if not allowed:
+            exp_store.update_settlement(
+                config.admin_db_file, settlement["id"],
+                xero_error=wait_reason,
+            )
+            return ""
         if xero_is_disabled():
             exp_store.update_settlement(
                 config.admin_db_file, settlement["id"],
@@ -11068,7 +11168,49 @@ body {{ background:#f7f6f3 !important; }}
                   flush=True)
             return ""
 
-    def _maybe_settle_subcontractor(eng):
+    def _process_due_settlement_xero_bills(eng, *, force: bool = False, limit: int = 5) -> int:
+        """Create pending Xero bills for already-recognised subcontractor settlements.
+
+        Auto mode only retries settlements that are waiting for the configured
+        submission window. A manual run may retry any settlement that has not
+        successfully recorded a Xero bill yet, capped per click to avoid bursts.
+        """
+        if (eng.get("kind") or "") != "subcontractor":
+            return 0
+        db = config.admin_db_file
+        receipts = exp_store.list_receipts_for_engineer(db, eng["id"])
+        by_settlement: dict[int, list[dict]] = {}
+        for r in receipts:
+            sid = r.get("settlement_id")
+            if sid is None:
+                continue
+            try:
+                sid_int = int(sid)
+            except (TypeError, ValueError):
+                continue
+            by_settlement.setdefault(sid_int, []).append(r)
+        done = 0
+        for settlement in exp_store.list_settlements_for_engineer(db, eng["id"]):
+            if done >= max(int(limit or 5), 1):
+                break
+            if (settlement.get("xero_bill_id") or "").strip():
+                continue
+            if not force and not _is_waiting_expense_xero_error(settlement.get("xero_error") or ""):
+                continue
+            billable = by_settlement.get(int(settlement["id"])) or []
+            if not billable:
+                continue
+            before = (settlement.get("xero_error") or "").strip()
+            bill_id = _create_xero_bill_for_settlement(
+                eng, settlement, billable, force=force
+            )
+            after = exp_store.list_settlements_for_engineer(db, eng["id"])
+            latest = next((s for s in after if s.get("id") == settlement.get("id")), {})
+            if bill_id or before != (latest.get("xero_error") or "").strip():
+                done += 1
+        return done
+
+    def _maybe_settle_subcontractor(eng, *, allow_xero: bool = True):
         """Recognise the company's payment to a subcontractor in the Plaid feed
         by the app's payment reference (PWSUB<id>), then reconcile it against the
         actual receipts it covers — one payment is usually a COMBINATION of a few
@@ -11176,8 +11318,15 @@ body {{ background:#f7f6f3 !important; }}
                   f"settled={settled_p/100:.2f} of owed={total_p/100:.2f} "
                   f"status={status}", flush=True)
             # Raise + pay the Xero bill for exactly the receipts this payment
-            # settled (best-effort; never undoes the local settlement above).
-            _create_xero_bill_for_settlement(eng, s, chosen)
+            # settled only from admin-controlled flows. Engineer pages must never
+            # create hidden Xero traffic just because someone opened the portal.
+            if allow_xero:
+                _create_xero_bill_for_settlement(eng, s, chosen)
+            else:
+                exp_store.update_settlement(
+                    db, s["id"],
+                    xero_error="Waiting for admin receipt Xero submission.",
+                )
             return
 
     def _exp_pull_receipt_image_from_xero(rec):
@@ -11292,7 +11441,7 @@ body {{ background:#f7f6f3 !important; }}
         # running balance + the reference the office should use to pay.
         owed_html = ""
         if eng.get("kind") == "subcontractor":
-            _maybe_settle_subcontractor(eng)
+            _maybe_settle_subcontractor(eng, allow_xero=False)
             owed = exp_store.amount_owed_to_engineer(db, eng["id"])
             ref = _subcontractor_reference(eng)
             settlements = exp_store.list_settlements_for_engineer(db, eng["id"])
@@ -11534,11 +11683,9 @@ body {{ background:#f7f6f3 !important; }}
                     or (settings.get("default_expense_account") or "").strip()
                 )
                 if fallback:
-                    cat_code = fallback
-                    for _a in _exp_accounts:
-                        if str(_a.get("Code") or "").strip() == fallback:
-                            cat_name = str(_a.get("Name") or "").strip()
-                            break
+                    cat_code, cat_name = _resolve_expense_account_choice(
+                        fallback, _exp_accounts
+                    )
             _, cat_code, cat_name = _apply_fuel_threshold(
                 [], cat_code, cat_name, total, _exp_accounts,
                 result.get("raw_text", ""),
@@ -11596,10 +11743,13 @@ body {{ background:#f7f6f3 !important; }}
         exp_accounts, _ = _get_xero_expense_accounts(_at, _tid, config.admin_db_file)
         category_html = ""
         if exp_accounts:
-            selected_cat = (
+            selected_raw = (
                 (rec.get("category_account_code") or "").strip()
                 or (eng.get("expense_account_code") or "").strip()
                 or (_settings.get("default_expense_account") or "").strip()
+            )
+            selected_cat, _selected_name = _resolve_expense_account_choice(
+                selected_raw, exp_accounts
             )
             # If the AI already coded this receipt, tell the engineer so they
             # know they're just confirming rather than choosing from scratch.
@@ -11800,14 +11950,16 @@ body {{ background:#f7f6f3 !important; }}
         # category instead of silently clearing it.
         if "category_account_code" in request.form:
             category_code = (request.form.get("category_account_code") or "").strip()
-            category_name = ""
-            if category_code:
-                _at, _tid, _ = _load_xero_at_tid(config)
-                _exp_accounts, _ = _get_xero_expense_accounts(_at, _tid, config.admin_db_file)
-                for _a in _exp_accounts:
-                    if str(_a.get("Code") or "").strip() == category_code:
-                        category_name = str(_a.get("Name") or "").strip()
-                        break
+            _at, _tid, _ = _load_xero_at_tid(config)
+            _exp_accounts, _ = _get_xero_expense_accounts(_at, _tid, config.admin_db_file)
+            category_code, category_name = _resolve_expense_account_choice(
+                category_code, _exp_accounts
+            )
+            if not category_code:
+                return _exp_error_page(
+                    "Please choose what this receipt was for before approving it.",
+                    400,
+                )
             updates["category_account_code"] = category_code
             updates["category_account_name"] = category_name
 
@@ -12049,12 +12201,11 @@ body {{ background:#f7f6f3 !important; }}
                         or (settings.get("default_expense_account") or "").strip()
                     )
                     if fallback:
-                        cat_code = fallback
-                        cat_source = "default"
-                        for _a in exp_accounts:
-                            if str(_a.get("Code") or "").strip() == fallback:
-                                cat_name = str(_a.get("Name") or "").strip()
-                                break
+                        cat_code, cat_name = _resolve_expense_account_choice(
+                            fallback, exp_accounts
+                        )
+                        if cat_code:
+                            cat_source = "default"
             segments, cat_code, cat_name = _apply_fuel_threshold(
                 segments, cat_code, cat_name, total, exp_accounts,
                 result.get("raw_text", ""),
@@ -12601,6 +12752,10 @@ body {{ background:#f7f6f3 !important; }}
                         f"Images cleared from {flash_n} submitted/settled receipt(s)."
                         if flash_n else "Images cleared."
                     ),
+                    "xero_processed": (
+                        f"Receipt Xero submissions checked: {flash_n} settlement(s) touched."
+                        if flash_n else "Receipt Xero submissions checked."
+                    ),
                 }
                 msg = _flash_labels.get(flash, "Done.")
             err_flashes = {"not_found", "username_taken"}
@@ -12665,6 +12820,7 @@ body {{ background:#f7f6f3 !important; }}
             return f"••{_mask}" if _mask else account_id
 
         eng_cards = []
+        auto_xero_bill_budget = 5
         for e in engineers:
             link = f"{base_url}/expenses/{e['token']}"
             receipts = exp_store.list_receipts_for_engineer(db, e["id"])
@@ -12728,7 +12884,14 @@ body {{ background:#f7f6f3 !important; }}
             kind_label = "Company card" if kind == "company_card" else "Subcontractor"
             owed_html = ""
             if kind == "subcontractor":
-                _maybe_settle_subcontractor(e)
+                _maybe_settle_subcontractor(e, allow_xero=False)
+                if auto_xero_bill_budget > 0:
+                    _processed_bills = _process_due_settlement_xero_bills(
+                        e, limit=auto_xero_bill_budget
+                    )
+                    auto_xero_bill_budget = max(
+                        auto_xero_bill_budget - _processed_bills, 0
+                    )
                 owed = exp_store.amount_owed_to_engineer(db, e["id"])
                 _setts = exp_store.list_settlements_for_engineer(db, e["id"])
                 _pay_line = (
@@ -12751,6 +12914,13 @@ body {{ background:#f7f6f3 !important; }}
                         "<div class='mt-1 text-xs rounded-md border "
                         "border-amber-300 bg-amber-50 text-amber-800 px-2 py-1'>"
                         f"&#9888; {escape(_last_note)}</div>"
+                    )
+                _last_xero_error = (_setts[0].get("xero_error") or "").strip() if _setts else ""
+                if _last_xero_error:
+                    _warn += (
+                        "<div class='mt-1 text-xs rounded-md border "
+                        "border-blue-200 bg-blue-50 text-blue-800 px-2 py-1'>"
+                        f"Xero: {escape(_last_xero_error)}</div>"
                     )
                 owed_html = (
                     f"{_pay_line}"
@@ -12954,6 +13124,30 @@ body {{ background:#f7f6f3 !important; }}
                 f"value='{escape(settings['default_payment_account'])}' "
                 f"class='{_set_cls}' placeholder='e.g. 090'>"
             )
+        xero_submit_mode = str(settings.get("xero_submission_mode") or "scheduled")
+        xero_submit_time = str(settings.get("xero_submission_time") or "17:00")
+        xero_submit_options = "".join(
+            [
+                "<option value='scheduled' "
+                + ("selected" if xero_submit_mode == "scheduled" else "")
+                + ">Scheduled after the time below</option>",
+                "<option value='manual' "
+                + ("selected" if xero_submit_mode == "manual" else "")
+                + ">Manual only</option>",
+                "<option value='immediate' "
+                + ("selected" if xero_submit_mode == "immediate" else "")
+                + ">Immediately after admin recognition</option>",
+            ]
+        )
+        xero_allowed, xero_reason, _xero_submit_time = _expense_xero_submit_status()
+        xero_status_cls = (
+            "bg-emerald-50 text-emerald-800 border-emerald-200"
+            if xero_allowed else "bg-amber-50 text-amber-800 border-amber-200"
+        )
+        xero_submit_status_html = (
+            f"<span class='inline-flex items-center px-2 py-0.5 rounded-full border "
+            f"text-xs font-semibold {xero_status_cls}'>{escape(xero_reason)}</span>"
+        )
 
         # ── Storage section ─────────────────────────────────────────────────
         receipts_with_images = exp_store.list_receipts_with_images(db)
@@ -13174,8 +13368,8 @@ body {{ background:#f7f6f3 !important; }}
                   <h2 class="font-semibold text-gray-900">Settings</h2>
                   <svg class="w-4 h-4 text-gray-400 transition-transform duration-200 group-open:rotate-180 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
                 </summary>
-                <form method="post" action="/receipts/expenses/save-settings"
-                      class="grid grid-cols-1 sm:grid-cols-3 gap-3 px-4 pb-4 pt-2 border-t border-gray-100">
+	                <form method="post" action="/receipts/expenses/save-settings"
+	                      class="grid grid-cols-1 sm:grid-cols-3 gap-3 px-4 pb-4 pt-2 border-t border-gray-100">
                   <div>
                     <label class="block text-xs text-gray-500 mb-1">Default VAT rate (%)</label>
                     <input name="vat_rate" type="number" step="0.1" value="{settings['vat_rate']}"
@@ -13186,13 +13380,40 @@ body {{ background:#f7f6f3 !important; }}
                     {default_exp_field}
                     <p class="text-xs text-gray-400 mt-1">Only used as a fallback when the AI can&rsquo;t work out a receipt&rsquo;s account &mdash; those receipts are held for you to confirm or change before importing.</p>
                   </div>
-                  <div>
-                    <label class="block text-xs text-gray-500 mb-1">Default payment/bank account</label>
-                    {default_pay_field}
-                  </div>
-                  <div class="sm:col-span-3">
-                    <button type="submit"
-                            class="px-4 py-2 rounded bg-gray-900 text-white text-sm font-medium">
+	                  <div>
+	                    <label class="block text-xs text-gray-500 mb-1">Default payment/bank account</label>
+	                    {default_pay_field}
+	                  </div>
+	                  <div class="sm:col-span-3 rounded-lg border border-blue-200 bg-blue-50 p-3 space-y-3">
+	                    <div class="flex items-center justify-between gap-2 flex-wrap">
+	                      <div>
+	                        <label class="block text-xs font-semibold text-blue-950 mb-1">Field Expenses Xero submission timing</label>
+	                        <p class="text-xs text-blue-800">Receipt photos and approvals save immediately. This only controls lower-priority Xero bill/payment writes for settled subcontractor receipts.</p>
+	                      </div>
+	                      {xero_submit_status_html}
+	                    </div>
+	                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+	                      <div class="sm:col-span-2">
+	                        <select name="xero_submission_mode" class="w-full rounded border border-blue-200 px-3 py-2 text-sm bg-white">
+	                          {xero_submit_options}
+	                        </select>
+	                      </div>
+	                      <div>
+	                        <input name="xero_submission_time" type="time" value="{escape(xero_submit_time)}"
+	                               class="w-full rounded border border-blue-200 px-3 py-2 text-sm bg-white">
+	                      </div>
+	                    </div>
+	                    <div class="flex items-center gap-2 flex-wrap">
+	                      <button type="submit" formaction="/receipts/expenses/process-xero-submissions"
+	                              class="px-3 py-1.5 rounded border border-blue-300 bg-white text-blue-800 text-xs font-semibold hover:bg-blue-100">
+	                        Run due Xero submissions now
+	                      </button>
+	                      <span class="text-xs text-blue-700">Runs at most 5 settlement bills per click to avoid a burst of Xero requests.</span>
+	                    </div>
+	                  </div>
+	                  <div class="sm:col-span-3">
+	                    <button type="submit"
+	                            class="px-4 py-2 rounded bg-gray-900 text-white text-sm font-medium">
                       Save settings
                     </button>
                   </div>
@@ -13292,9 +13513,31 @@ body {{ background:#f7f6f3 !important; }}
                 "default_payment_account": (
                     request.form.get("default_payment_account") or ""
                 ).strip(),
+                "xero_submission_mode": (
+                    request.form.get("xero_submission_mode") or "scheduled"
+                ).strip(),
+                "xero_submission_time": (
+                    request.form.get("xero_submission_time") or "17:00"
+                ).strip(),
             },
         )
         return redirect("/receipts/expenses?flash=settings")
+
+    @app.post("/receipts/expenses/process-xero-submissions")
+    @require_login
+    def expense_admin_process_xero_submissions():
+        db = config.admin_db_file
+        processed = 0
+        for eng in exp_store.list_engineers(db, include_inactive=False):
+            if (eng.get("kind") or "") != "subcontractor":
+                continue
+            remaining = max(5 - processed, 0)
+            if remaining <= 0:
+                break
+            processed += _process_due_settlement_xero_bills(
+                eng, force=True, limit=remaining
+            )
+        return redirect(f"/receipts/expenses?flash=xero_processed&n={processed}")
 
     def _exp_safe_remove_file(db: str, stored_file: str) -> bool:
         """Remove *stored_file* from disk only when no dump item or expense receipt still
@@ -14026,10 +14269,11 @@ body {{ background:#f7f6f3 !important; }}
                     "border-gray-300 text-sm'>"
                 )
             inner = (
-                "<p class='text-xs text-gray-600 mb-2'>No card was chosen for "
-                "this batch, so we can't tell which account's payments to "
-                "check these receipts against (and we won't mix accounts). "
-                "Pick the card these receipts were paid from:</p>"
+                "<p class='text-xs text-gray-600 mb-2'><span class='font-semibold'>"
+                "Bank matching has not run for this dump yet.</span> No card "
+                "or bank account was chosen for this batch, so we can't tell "
+                "which payments to check these receipts against (and we won't "
+                "mix accounts). Pick the card these receipts were paid from:</p>"
                 "<form method='post' action='"
                 + escape(set_card_action
                          or ("/receipts/expenses/dump/" + (batch_id or "")
@@ -14420,6 +14664,7 @@ body {{ background:#f7f6f3 !important; }}
             segments = []
             cat_code = cat_name = ""
             ai_uncertain = False
+            fallback_unresolved = ""
             try:
                 segments = _ai_analyze_receipt(
                     db, result.get("merchant", ""), result.get("raw_text", ""),
@@ -14444,11 +14689,11 @@ body {{ background:#f7f6f3 !important; }}
                             or (settings.get("default_expense_account") or "").strip()
                         )
                         if fallback:
-                            cat_code = fallback
-                            for _a in exp_accounts:
-                                if str(_a.get("Code") or "").strip() == fallback:
-                                    cat_name = str(_a.get("Name") or "").strip()
-                                    break
+                            cat_code, cat_name = _resolve_expense_account_choice(
+                                fallback, exp_accounts
+                            )
+                            if not cat_code:
+                                fallback_unresolved = fallback
             except Exception:
                 pass
             # If the AI never produced an account (categorise failed or raised),
@@ -14589,6 +14834,11 @@ body {{ background:#f7f6f3 !important; }}
                         "The AI couldn't work out which account this belongs to. "
                         "Please pick the right account before importing."
                     )
+                    if fallback_unresolved:
+                        dup_reason += (
+                            " The configured default '" + fallback_unresolved
+                            + "' is not a valid Xero expense account."
+                        )
 
             if len(splits) >= 2:
                 _note = ("This photo contains " + str(len(splits))
@@ -16306,6 +16556,12 @@ body {{ background:#f7f6f3 !important; }}
         # What the AI decided — account chosen (code + name) and the VAT split.
         ai_code = (item.get("category_account_code") or "").strip()
         ai_name = (item.get("category_account_name") or "").strip()
+        if ai_code and exp_accounts:
+            resolved_code, resolved_name = _resolve_expense_account_choice(
+                ai_code, exp_accounts
+            )
+            if resolved_code:
+                ai_code, ai_name = resolved_code, resolved_name
         acct_label = (
             (ai_name + (" (" + ai_code + ")" if ai_code else ""))
             if (ai_name or ai_code) else "no account chosen"
@@ -16395,7 +16651,7 @@ body {{ background:#f7f6f3 !important; }}
         is_active = item["status"] in dump_store.ACTIVE_STATUSES
         if is_active:
             opts = _exp_acct_options(
-                exp_accounts, item.get("category_account_code") or "",
+                exp_accounts, ai_code,
                 default_label="— choose account —",
             )
             controls = (
@@ -16709,6 +16965,8 @@ body {{ background:#f7f6f3 !important; }}
 
         balance_html = _dump_balance_panel(sub_summary)
         outstanding_html = _dump_outstanding_panel(recon, batch_id)
+        card_prompt_html = outstanding_html if (recon or {}).get("no_card") else ""
+        bottom_outstanding_html = "" if (recon or {}).get("no_card") else outstanding_html
 
         if is_test:
             _del_msg = ("Delete this test dump and its stored receipt images? "
@@ -16739,10 +16997,10 @@ body {{ background:#f7f6f3 !important; }}
                "rounded-full bg-amber-100 text-amber-700'>TEST</span>" if is_test else "")
             + "</h1>"
             + delete_header + "</div>"
-            + test_banner + balance_html
+            + test_banner + balance_html + card_prompt_html
             + (sections or "<p class='text-sm text-gray-500'>No "
             "receipts in this batch.</p>")
-            + outstanding_html + import_bar
+            + bottom_outstanding_html + import_bar
             + "</div>"
         )
         return _page(body)
@@ -16855,21 +17113,26 @@ body {{ background:#f7f6f3 !important; }}
         action = (request.form.get("action") or "keep").strip()
         code = (request.form.get("account_code") or "").strip()
         fields: dict = {}
-        if code and code != (item.get("category_account_code") or ""):
-            name = ""
+        resolved_code = resolved_name = ""
+        if code:
             try:
                 _at, _tid, _ = _load_xero_at_tid(config)
                 accts, _ = _get_xero_expense_accounts(_at, _tid, db)
-                for a in accts:
-                    if str(a.get("Code") or "").strip() == code:
-                        name = str(a.get("Name") or "").strip()
-                        break
+                resolved_code, resolved_name = _resolve_expense_account_choice(
+                    code, accts
+                )
             except Exception:
-                name = ""
-            fields["category_account_code"] = code
-            fields["category_account_name"] = name
+                resolved_code = resolved_name = ""
+            if resolved_code and resolved_code != (item.get("category_account_code") or ""):
+                fields["category_account_code"] = resolved_code
+                fields["category_account_name"] = resolved_name
         if action == "ignore":
             fields["status"] = dump_store.STATUS_IGNORED
+        elif not resolved_code:
+            fields["status"] = dump_store.STATUS_NEEDS_ACCOUNT
+            fields["dup_reason"] = (
+                "Pick a real Xero expense account before importing this receipt."
+            )
         else:
             fields["status"] = dump_store.STATUS_NEW
         dump_store.update_item(db, item_id, **fields)
@@ -16887,6 +17150,12 @@ body {{ background:#f7f6f3 !important; }}
             return redirect("/receipts/expenses/dump/" + batch_id)
         items = dump_store.list_items(db, batch_id)
         default_eid = batch.get("engineer_id")
+        exp_accounts = []
+        try:
+            _at, _tid, _ = _load_xero_at_tid(config)
+            exp_accounts, _ = _get_xero_expense_accounts(_at, _tid, db)
+        except Exception:
+            exp_accounts = []
         imported = 0
         for it in items:
             if it["status"] != dump_store.STATUS_NEW:
@@ -16894,6 +17163,24 @@ body {{ background:#f7f6f3 !important; }}
             eid = it.get("assigned_engineer_id") or default_eid
             if not eid:
                 continue
+            account_code = (it.get("category_account_code") or "").strip()
+            account_name = (it.get("category_account_name") or "").strip()
+            if exp_accounts:
+                resolved_code, resolved_name = _resolve_expense_account_choice(
+                    account_code, exp_accounts
+                )
+                if not resolved_code:
+                    dump_store.update_item(
+                        db,
+                        it["id"],
+                        status=dump_store.STATUS_NEEDS_ACCOUNT,
+                        dup_reason=(
+                            "This receipt cannot be imported until it has a real "
+                            "Xero expense account selected."
+                        ),
+                    )
+                    continue
+                account_code, account_name = resolved_code, resolved_name
             exp_store.create_receipt(
                 db,
                 engineer_id=int(eid),
@@ -16911,8 +17198,8 @@ body {{ background:#f7f6f3 !important; }}
                 stored_file=it.get("stored_file", ""),
                 filename=it.get("filename", ""),
                 mime_type=it.get("mime_type", ""),
-                category_account_code=it.get("category_account_code", ""),
-                category_account_name=it.get("category_account_name", ""),
+                category_account_code=account_code,
+                category_account_name=account_name,
                 status="pending_review",
             )
             dump_store.update_item(db, it["id"], status=dump_store.STATUS_IMPORTED)
