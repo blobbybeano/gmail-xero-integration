@@ -396,6 +396,71 @@ def _cashflows_receive_transactions(data: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _reconciled_cashflows_bank_transactions(data: Any) -> list[dict[str, Any]]:
+    if isinstance(data, dict):
+        items = data.get("BankTransactions") or []
+    else:
+        items = data or []
+    out: list[dict[str, Any]] = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        status = str(raw.get("Status") or "").strip().upper()
+        tx_type = str(raw.get("Type") or "").strip().upper()
+        is_reconciled = bool(raw.get("IsReconciled")) or status == "RECONCILED"
+        if status == "DELETED" or tx_type != "RECEIVE" or not is_reconciled:
+            continue
+        contact = raw.get("Contact") or {}
+        ref = str(raw.get("Reference") or "").strip()
+        line_text = " ".join(
+            str(li.get("Description") or "")
+            for li in (raw.get("LineItems") or [])
+            if isinstance(li, dict)
+        ).strip()
+        searchable = " ".join(
+            part
+            for part in (
+                ref,
+                str(raw.get("Description") or ""),
+                str(contact.get("Name") or ""),
+                line_text,
+            )
+            if part
+        )
+        searchable_upper = searchable.upper()
+        if "CASHFLOWS" not in searchable_upper and "CFE SETT" not in searchable_upper:
+            continue
+        out.append(
+            {
+                "id": str(raw.get("BankTransactionID") or raw.get("ID") or raw.get("Id") or "").strip(),
+                "reference": ref,
+                "searchable": searchable,
+                "date": _date(raw.get("Date") or raw.get("DateString") or raw.get("date")),
+                "amount": _money(raw.get("Total") or raw.get("Amount")),
+                "status": status,
+                "is_reconciled": True,
+                "raw": raw,
+            }
+        )
+    return out
+
+
+def _match_reconciled_cashflows_bank_transaction(
+    payout: CsvPayout,
+    transactions: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    candidates = [
+        tx
+        for tx in transactions
+        if tx.get("date") == payout.date
+        and abs(abs(tx.get("amount") or Decimal("0.00")) - payout.amount) <= MONEY / 2
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda tx: str(tx.get("id") or ""))
+    return candidates[0]
+
+
 def _match_cashflows_receive(
     payout: CsvPayout,
     receives: list[dict[str, Any]],
@@ -738,6 +803,7 @@ def build_csv_reconciliation_preview(
 
     bank_lines: list[XeroBankLine] = []
     cashflows_receives: list[dict[str, Any]] = []
+    reconciled_cashflows_bank_transactions: list[dict[str, Any]] = []
     reconciled_payment_amounts_by_invoice: dict[str, Decimal] = {}
     invoices: list[XeroInvoiceCandidate] = []
     manual_candidate_invoices: list[XeroInvoiceCandidate] = []
@@ -757,6 +823,9 @@ def build_csv_reconciliation_preview(
                 bank_payload = xero_client.get_bank_transactions(start_date=start, end_date=end)
                 bank_lines = parse_xero_bank_lines(bank_payload)
                 cashflows_receives = _cashflows_receive_transactions(bank_payload)
+                reconciled_cashflows_bank_transactions = (
+                    _reconciled_cashflows_bank_transactions(bank_payload)
+                )
             except Exception as exc:  # pragma: no cover
                 msg = str(exc)
                 if "401" in msg or "AuthorizationUnsuccessful" in msg or "Unauthorized" in msg:
@@ -890,9 +959,14 @@ def build_csv_reconciliation_preview(
         fees = sum((s.fee for s in batch_sales), Decimal("0.00")).quantize(MONEY)
 
         existing_receive = _match_cashflows_receive(payout, cashflows_receives)
+        existing_reconciled_bank_tx = _match_reconciled_cashflows_bank_transaction(
+            payout,
+            reconciled_cashflows_bank_transactions,
+        )
         already_reconciled = (
             str(payout.csv_ref) in reconciled_refs
             or bool(existing_receive and existing_receive.get("is_reconciled"))
+            or bool(existing_reconciled_bank_tx)
         )
         prepared_in_xero = bool(existing_receive and not existing_receive.get("is_reconciled"))
 
@@ -997,6 +1071,12 @@ def build_csv_reconciliation_preview(
                     "amount": _money_float(existing_receive.get("amount")),
                     "is_reconciled": bool(existing_receive.get("is_reconciled")),
                 } if existing_receive else None,
+                "xero_reconciled_bank_transaction": {
+                    "id": existing_reconciled_bank_tx.get("id"),
+                    "reference": existing_reconciled_bank_tx.get("reference"),
+                    "date": _date_text(existing_reconciled_bank_tx.get("date")),
+                    "amount": _money_float(existing_reconciled_bank_tx.get("amount")),
+                } if existing_reconciled_bank_tx else None,
                 "sales": sale_rows,
                 "sale_count": len(batch_sales),
                 "matched_invoice_count": matched_count,
