@@ -6,6 +6,7 @@ import json
 import os
 import threading
 import time
+from urllib.parse import urlparse
 from typing import Dict
 
 import requests
@@ -19,6 +20,19 @@ DEFAULT_PAYMENT_ACCOUNT_CODE = "090"
 _TOKEN_REFRESH_LOCK = threading.Lock()
 _XERO_RATE_LIMIT_LOCK = threading.Lock()
 _XERO_RATE_LIMIT_UNTIL_TS = 0.0
+
+
+def _log_xero_request(method: str, url: str, status: int | str, *, retry_after: str = "") -> None:
+    """Emit a compact audit line for Xero traffic without logging customer payloads."""
+    try:
+        parsed = urlparse(url)
+        path = parsed.path or url
+        if parsed.query:
+            path = f"{path}?{parsed.query[:160]}"
+        suffix = f" retry_after={retry_after}" if retry_after else ""
+        print(f"[xero-request] {str(method).upper()} {path} -> {status}{suffix}", flush=True)
+    except Exception:
+        pass
 
 
 class XeroDisabledError(RuntimeError):
@@ -160,14 +174,27 @@ class XeroClient:
         now_ts = time.time()
         if now_ts < _XERO_RATE_LIMIT_UNTIL_TS:
             remaining = int(max(1, _XERO_RATE_LIMIT_UNTIL_TS - now_ts))
+            _log_xero_request(method, url, "blocked-local-cooldown", retry_after=str(remaining))
             raise RuntimeError(
                 f"Xero rate-limited: 429 cooldown active (Retry-After={remaining}s)"
             )
 
         response = requests.request(method, url, headers=self._headers(), timeout=30, **kwargs)
+        _log_xero_request(
+            method,
+            response.url or url,
+            response.status_code,
+            retry_after=str(response.headers.get("Retry-After") or "").strip(),
+        )
         if response.status_code == 401 and self._refresh_access_token():
             response = requests.request(
                 method, url, headers=self._headers(), timeout=30, **kwargs
+            )
+            _log_xero_request(
+                method,
+                response.url or url,
+                response.status_code,
+                retry_after=str(response.headers.get("Retry-After") or "").strip(),
             )
         if response.status_code == 429:
             retry_after_seconds = 300

@@ -4912,6 +4912,66 @@ def run() -> None:
                         _retry_map[_ev_key] = time.time() + _next_backoff
                         state["event_xero_retry_after"] = _retry_map
                         state["event_xero_retry_backoff"] = _retry_backoff_map
+                        try:
+                            _event_429_fp = hashlib.sha1(
+                                "|".join(
+                                    [
+                                        str(event.get("updated") or event_updated or ""),
+                                        str(event.get("summary") or ""),
+                                        str(event.get("description") or ""),
+                                    ]
+                                ).encode("utf-8")
+                            ).hexdigest()[:10]
+                            state, _event_429_attempts = bump_xero_action_attempts(
+                                state,
+                                _ev_key,
+                                "xero_429",
+                                _event_429_fp,
+                            )
+                        except Exception:
+                            _event_429_attempts = 1
+                        # A 429 means this exact calendar save has already hit Xero.
+                        # Do not automatically retry it after the cooldown; staff can
+                        # re-save the event when Xero is healthy if it still needs work.
+                        if event_updated:
+                            state = set_processed_update_marker(
+                                state,
+                                _ev_key,
+                                event_updated,
+                            )
+                        try:
+                            blocked_description = upsert_app_ledger(
+                                event.get("description") or "",
+                                message="Needs input - Xero rate limit stopped retry",
+                                state="needs_input",
+                                reason="xero_429",
+                                fingerprint=_event_429_fp,
+                                xero_attempts=_event_429_attempts,
+                                wait="human_save",
+                            )
+                            if blocked_description != (event.get("description") or ""):
+                                updated = safe_update(
+                                    event_id=event.get("id"),
+                                    description=blocked_description,
+                                    label="Xero rate limit",
+                                    summary_status="orange",
+                                    current_summary=event.get("summary"),
+                                    calendar_id=event.get("_calendar_id") or config.google_calendar_id,
+                                )
+                                if updated:
+                                    event["description"] = updated.get("description", blocked_description)
+                                    event["updated"] = updated.get("updated", event.get("updated"))
+                                    event_updated = event.get("updated") or event_updated
+                                    state = set_processed_update_marker(
+                                        state,
+                                        _ev_key,
+                                        event_updated,
+                                    )
+                        except Exception as _ledger_exc:
+                            print(
+                                f"Event {_ev_id}: failed to write Xero 429 ledger marker: {_ledger_exc}",
+                                flush=True,
+                            )
                     _now_notice = time.time()
                     if (_now_notice - _last_xero_429_notice_at) >= 60:
                         _mins = int(
