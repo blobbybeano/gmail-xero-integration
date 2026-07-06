@@ -19,6 +19,8 @@ import requests
 from flask import Flask, Response, jsonify, redirect, request, send_file, session, url_for
 from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.security import check_password_hash, generate_password_hash
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2.credentials import Credentials
 from googleapiclient.errors import HttpError
 
 from .admin_store import (
@@ -3876,6 +3878,52 @@ def create_app() -> Flask:
         google_error = request.args.get("error") or ""
         if google_error:
             print(f"[OAuth Callback] Google returned ERROR: {google_error}")
+        gmail_pending = get_json_setting(
+            config.admin_db_file, "email_gmail_oauth_pending", {}
+        ) or {}
+        gmail_state = str(gmail_pending.get("state") or "").strip()
+        if code and state and gmail_state and state == gmail_state:
+            dynamic_google_redirect = _current_base_url() + "/oauth/callback"
+            try:
+                creds = oauth_exchange_code(
+                    config, state=state, code=code,
+                    redirect_uri=dynamic_google_redirect,
+                )
+                aid = str(gmail_pending.get("account_id") or "").strip() or secrets.token_urlsafe(8)
+                token_path = _gmail_token_dir() / f"{aid}.json"
+                token_path.write_text(creds.to_json())
+                email_addr = ""
+                try:
+                    profile = _gmail_mod.GmailClient(creds).profile()
+                    email_addr = str(profile.get("emailAddress") or "").strip()
+                except Exception:
+                    pass
+                accounts = [a for a in _gmail_accounts_saved() if a.get("id") != aid]
+                accounts.append(
+                    {
+                        "id": aid,
+                        "email": email_addr,
+                        "label": email_addr or "Gmail inbox",
+                        "token_file": str(token_path),
+                        "connected_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        "enabled": True,
+                    }
+                )
+                _gmail_accounts_save(accounts)
+                set_json_setting(config.admin_db_file, "email_gmail_oauth_pending", {})
+                session["logged_in"] = True
+                session["save_notice"] = "success:Gmail inbox connected for invoice scanning."
+                return redirect("/receipts/emails")
+            except Exception as exc:
+                return _page(f"""
+                <div class="min-h-screen flex items-center justify-center bg-gray-50">
+                  <div class="bg-white rounded-2xl shadow p-8 max-w-md w-full text-center">
+                    <p class="text-red-600 font-medium mb-2">Gmail inbox connection failed.</p>
+                    <p class="text-gray-700 text-sm mb-4">{escape(str(exc))}</p>
+                    <a href="/receipts/emails" class="text-indigo-600 hover:underline text-sm">Back to Email Invoice Importer</a>
+                  </div>
+                </div>
+                """), 400
         expected_session = session.get("oauth_state") or ""
         expected_store = str(
             get_json_setting(config.admin_db_file, "oauth_pending_state", "")
@@ -16730,6 +16778,7 @@ body {{ background:#f7f6f3 !important; }}
     # ═══════════════════════════════════════════════════════════════════════════
 
     _EMAIL_SCAN_SETTINGS_KEY = "email_scan_settings"
+    _EMAIL_SCAN_GMAIL_ACCOUNTS_KEY = "email_scan_gmail_accounts"
     _EMAIL_SCAN_DEFAULT_OWN_NAMES = [
         "Power Wash", "Power Wash Ltd", "Pow Wash", "Powwash",
         "Pow Services", "Pow Services Ltd", "Pow Services Limited",
@@ -16768,11 +16817,100 @@ body {{ background:#f7f6f3 !important; }}
         current.update(kw)
         set_json_setting(config.admin_db_file, _EMAIL_SCAN_SETTINGS_KEY, current)
 
-    def _gmail_connected() -> tuple[bool, str]:
-        """(ok, message)  — checks admin creds have gmail.readonly scope."""
-        creds = load_admin_credentials(config)
+    def _gmail_token_dir() -> Path:
+        base = Path(config.google_admin_token_file).parent / "gmail_invoice_tokens"
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+
+    def _gmail_accounts_saved() -> list[dict]:
+        raw = get_json_setting(config.admin_db_file, _EMAIL_SCAN_GMAIL_ACCOUNTS_KEY, []) or []
+        out: list[dict] = []
+        for a in raw:
+            if not isinstance(a, dict):
+                continue
+            aid = str(a.get("id") or "").strip()
+            path = str(a.get("token_file") or "").strip()
+            if not aid or not path:
+                continue
+            out.append(
+                {
+                    "id": aid,
+                    "email": str(a.get("email") or "").strip(),
+                    "label": str(a.get("label") or "").strip(),
+                    "token_file": path,
+                    "connected_at": str(a.get("connected_at") or "").strip(),
+                    "enabled": bool(a.get("enabled", True)),
+                }
+            )
+        return out
+
+    def _gmail_accounts_save(accounts: list[dict]) -> None:
+        set_json_setting(config.admin_db_file, _EMAIL_SCAN_GMAIL_ACCOUNTS_KEY, accounts)
+
+    def _gmail_scopes() -> list[str]:
+        scopes = list(config.google_admin_scopes or config.google_scopes or [])
+        if _gmail_mod.GMAIL_READONLY_SCOPE not in scopes:
+            scopes.append(_gmail_mod.GMAIL_READONLY_SCOPE)
+        return scopes
+
+    def _load_gmail_token_file(path: str):
+        p = Path(path)
+        if not p.exists():
+            return None
+        creds = Credentials.from_authorized_user_file(p.as_posix(), _gmail_scopes())
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(GoogleAuthRequest())
+                p.write_text(creds.to_json())
+            except Exception:
+                return None
+        return creds if creds and creds.valid else None
+
+    def _gmail_connected_accounts() -> list[dict]:
+        accounts: list[dict] = []
+        admin_creds = load_admin_credentials(config)
+        admin_ok = bool(
+            admin_creds
+            and _gmail_mod.GMAIL_READONLY_SCOPE in (admin_creds.scopes or set())
+        )
+        admin_email = "ben@powwash.co.uk"
+        if admin_ok:
+            try:
+                profile = _gmail_mod.GmailClient(admin_creds).profile()
+                admin_email = profile.get("emailAddress") or admin_email
+            except Exception:
+                pass
+        accounts.append(
+            {
+                "id": "admin",
+                "email": admin_email,
+                "label": f"{admin_email} (main Google connection)",
+                "connected": admin_ok,
+                "is_admin": True,
+            }
+        )
+        for a in _gmail_accounts_saved():
+            if not a.get("enabled", True):
+                continue
+            ok = bool(_load_gmail_token_file(a.get("token_file") or ""))
+            email = a.get("email") or a.get("label") or "Gmail account"
+            label = a.get("label") or email
+            accounts.append({**a, "label": label, "connected": ok, "is_admin": False})
+        return accounts
+
+    def _load_gmail_credentials_for_account(account_id: str):
+        if not account_id or account_id == "admin":
+            return load_admin_credentials(config)
+        for a in _gmail_accounts_saved():
+            if a.get("id") == account_id and a.get("enabled", True):
+                return _load_gmail_token_file(a.get("token_file") or "")
+        return None
+
+    def _gmail_connected(account_id: str = "admin") -> tuple[bool, str]:
+        """(ok, message) — selected inbox has gmail.readonly scope."""
+        creds = _load_gmail_credentials_for_account(account_id)
         if creds is None:
-            return False, "Google not connected — reconnect via Settings."
+            return False, "Selected Gmail inbox is not connected."
         scope_ok = _gmail_mod.GMAIL_READONLY_SCOPE in (creds.scopes or set())
         if not scope_ok:
             return False, (
@@ -16862,6 +17000,51 @@ body {{ background:#f7f6f3 !important; }}
             + _row("Xero", xero_ok, xero_detail, paused=xero_paused, href="/settings#xero")
             + _row("OpenAI", oa_ok, oa_detail, href="/settings#openai")
         )
+
+    @app.get("/receipts/emails/gmail/connect")
+    @require_login
+    def email_scan_gmail_connect():
+        if not Path(config.google_credentials_file).exists():
+            session["save_notice"] = "error:Upload the Google OAuth JSON first."
+            return redirect("/receipts/emails")
+        try:
+            dynamic_google_redirect = _current_base_url() + "/oauth/callback"
+            auth_url, state = oauth_authorization_url(
+                config, redirect_uri=dynamic_google_redirect
+            )
+            aid = secrets.token_urlsafe(8)
+            set_json_setting(
+                config.admin_db_file,
+                "email_gmail_oauth_pending",
+                {"state": state, "account_id": aid},
+            )
+            session["save_notice"] = "success:Gmail inbox authorisation link generated."
+            return redirect(auth_url)
+        except Exception as exc:
+            session["save_notice"] = f"error:Could not start Gmail OAuth: {exc}"
+            return redirect("/receipts/emails")
+
+    @app.post("/receipts/emails/gmail/<account_id>/remove")
+    @require_login
+    def email_scan_gmail_remove(account_id: str):
+        if account_id == "admin":
+            session["save_notice"] = "error:The main Google connection cannot be removed here."
+            return redirect("/receipts/emails")
+        kept = []
+        removed = None
+        for a in _gmail_accounts_saved():
+            if a.get("id") == account_id:
+                removed = a
+                continue
+            kept.append(a)
+        _gmail_accounts_save(kept)
+        if removed and removed.get("token_file"):
+            try:
+                Path(removed["token_file"]).unlink(missing_ok=True)
+            except Exception:
+                pass
+        session["save_notice"] = "success:Gmail inbox removed from invoice scanning."
+        return redirect("/receipts/emails")
 
     def _escan_status_badge(status: str) -> str:
         MAP = {
@@ -17130,7 +17313,22 @@ body {{ background:#f7f6f3 !important; }}
     def email_scan_list():
         settings  = _escan_settings()
         batches   = em_store.list_batches(config.admin_db_file)
-        gmail_ok, gmail_msg = _gmail_connected()
+        gmail_accounts = _gmail_connected_accounts()
+        selected_gmail = str(settings.get("default_gmail_account_id") or "admin")
+        if selected_gmail not in {a.get("id") for a in gmail_accounts}:
+            selected_gmail = "admin"
+        selected_account = next(
+            (a for a in gmail_accounts if a.get("id") == selected_gmail),
+            None,
+        )
+        if not selected_account or not selected_account.get("connected"):
+            selected_account = next(
+                (a for a in gmail_accounts if a.get("connected")),
+                selected_account,
+            )
+            if selected_account:
+                selected_gmail = str(selected_account.get("id") or "admin")
+        gmail_ok, gmail_msg = _gmail_connected(selected_gmail)
         engineers = exp_store.list_engineers(config.admin_db_file)
 
         # build engineer options
@@ -17156,6 +17354,54 @@ body {{ background:#f7f6f3 !important; }}
     <p class="text-xs text-amber-600 mt-0.5">{gmail_msg}</p>
   </div>
 </div>"""
+
+        inbox_options = ""
+        inbox_rows = ""
+        any_connected_inbox = False
+        for a in gmail_accounts:
+            aid = str(a.get("id") or "admin")
+            email = a.get("email") or a.get("label") or "Gmail inbox"
+            label = a.get("label") or email
+            connected = bool(a.get("connected"))
+            any_connected_inbox = any_connected_inbox or connected
+            sel = "selected" if aid == selected_gmail else ""
+            disabled = "" if connected else " disabled"
+            inbox_options += (
+                f"<option value='{escape(aid)}' {sel}{disabled}>"
+                f"{escape(label)}{' — reconnect needed' if not connected else ''}</option>"
+            )
+            remove_html = ""
+            if not a.get("is_admin"):
+                remove_html = (
+                    f"<form method='post' action='/receipts/emails/gmail/{escape(aid)}/remove' "
+                    "onsubmit=\"return confirm('Remove this Gmail inbox from invoice scanning?')\">"
+                    "<button class='text-xs text-red-600 hover:underline'>Remove</button></form>"
+                )
+            inbox_rows += (
+                "<div class='flex items-center justify-between gap-2 py-2 border-b border-gray-100 last:border-0'>"
+                "<div class='min-w-0'>"
+                f"<div class='text-sm font-medium text-gray-800 truncate'>{escape(email)}</div>"
+                f"<div class='text-xs text-gray-400'>{'Main Google connection' if a.get('is_admin') else 'Additional Gmail inbox'}</div>"
+                "</div>"
+                "<div class='flex items-center gap-3 shrink-0'>"
+                f"<span class='text-xs font-medium {'text-emerald-700' if connected else 'text-red-600'}'>"
+                f"{'Connected' if connected else 'Reconnect needed'}</span>{remove_html}</div></div>"
+            )
+        if not any_connected_inbox:
+            gmail_ok = False
+        inbox_panel = f"""
+  <details class="bg-white border border-gray-200 rounded-xl shadow-sm">
+    <summary class="px-5 py-3 cursor-pointer text-sm font-semibold text-gray-700 select-none">
+      Gmail inboxes for invoice scanning
+    </summary>
+    <div class="px-5 pb-5 pt-2 border-t border-gray-100">
+      <p class="text-xs text-gray-500 mb-3">Connect extra Gmail inboxes here, then choose which inbox to scan in the form below. Gmail access is read-only.</p>
+      <div class="rounded-lg border border-gray-100 bg-gray-50 px-3 mb-3">{inbox_rows}</div>
+      <a href="/receipts/emails/gmail/connect" class="inline-flex px-3 py-1.5 text-sm rounded bg-indigo-600 text-white hover:bg-indigo-500">
+        Connect another Gmail inbox
+      </a>
+    </div>
+  </details>"""
 
         # Most recent scan error (e.g. Gmail API not enabled) — surface it clearly
         scan_err_banner = ""
@@ -17199,7 +17445,7 @@ body {{ background:#f7f6f3 !important; }}
 <tr class="hover:bg-gray-50">
   <td class="px-4 py-2 text-xs text-gray-500">{b.get("created_at","")[:16]}</td>
   <td class="px-4 py-2 text-xs font-medium">{b.get("label") or b.get("id","")}{test_tag}</td>
-  <td class="px-4 py-2 text-xs text-gray-600">{b.get("date_from","")} → {b.get("date_to","")}</td>
+  <td class="px-4 py-2 text-xs text-gray-600">{b.get("date_from","")} → {b.get("date_to","")}<br><span class="text-gray-400">{escape(b.get("gmail_account_email") or "main Gmail")}</span></td>
   <td class="px-4 py-2 text-xs {st_col} font-medium">{b.get("status","")}</td>
   <td class="px-4 py-2 text-xs">{found} found · {new_c} new · {dup_c} dup{(" · error: "+str(err_c)) if err_c else ""}</td>
   <td class="px-4 py-2 text-xs">
@@ -17302,6 +17548,7 @@ body {{ background:#f7f6f3 !important; }}
 
   {gmail_banner}
   {scan_err_banner}
+  {inbox_panel}
 
   <!-- New scan form -->
   <div class="bg-white border border-gray-200 rounded-xl p-5 shadow-sm">
@@ -17309,6 +17556,12 @@ body {{ background:#f7f6f3 !important; }}
     <p class="text-xs text-gray-400 mb-4">Looks through Gmail for invoices from suppliers — PDFs, scanned images and Word (.docx) attachments. Reads emails only — never marks them as read or sends anything. Invoices <strong>sent by Powwash</strong> are automatically skipped.</p>
     <form method="post" action="/receipts/emails/scan" id="escan-form" class="space-y-4">
       <div class="flex flex-wrap gap-4 items-end">
+        <div>
+          <label class="block text-xs text-gray-500 mb-1">Gmail inbox</label>
+          <select name="gmail_account_id" class="text-sm border border-gray-200 rounded px-3 py-1.5 min-w-56" required>
+            {inbox_options}
+          </select>
+        </div>
         <div>
           <label class="block text-xs text-gray-500 mb-1">From date</label>
           <input type="date" name="date_from" value="{d_from_def}" class="text-sm border border-gray-200 rounded px-3 py-1.5" required>
@@ -17468,6 +17721,14 @@ body {{ background:#f7f6f3 !important; }}
         label     = (_req.form.get("label") or "").strip()
         is_test   = bool(_req.form.get("is_test"))
         card_acct = (_req.form.get("card_account") or "").strip()
+        gmail_account_id = (_req.form.get("gmail_account_id") or "admin").strip()
+        gmail_account = next(
+            (a for a in _gmail_connected_accounts() if a.get("id") == gmail_account_id),
+            None,
+        )
+        if not gmail_account or not gmail_account.get("connected"):
+            session["save_notice"] = "error:Selected Gmail inbox is not connected."
+            return redirect("/receipts/emails")
 
         if not date_from or not date_to:
             return redirect("/receipts/emails")
@@ -17479,6 +17740,8 @@ body {{ background:#f7f6f3 !important; }}
             date_to=date_to,
             is_test=is_test,
             card_account=card_acct,
+            gmail_account_id=gmail_account_id,
+            gmail_account_email=gmail_account.get("email") or gmail_account.get("label") or "",
         )
         if card_acct:
             try:
@@ -17488,7 +17751,8 @@ body {{ background:#f7f6f3 !important; }}
                 pass
 
         settings    = _escan_settings()
-        gmail_creds = load_admin_credentials(config)
+        _escan_settings_save(default_gmail_account_id=gmail_account_id)
+        gmail_creds = _load_gmail_credentials_for_account(gmail_account_id)
         svc         = ReceiptService(config)
 
         # Load Xero expense accounts if available
@@ -17760,7 +18024,7 @@ body {{ background:#f7f6f3 !important; }}
       <button class="px-2.5 py-1 text-xs border border-red-200 text-red-600 rounded hover:bg-red-50">Delete scan</button>
     </form>
   </div>
-  <p class="text-xs text-gray-400">{batch.get("date_from","")} → {batch.get("date_to","")}</p>
+  <p class="text-xs text-gray-400">{batch.get("date_from","")} → {batch.get("date_to","")} · Gmail: {escape(batch.get("gmail_account_email") or "main Gmail")}</p>
 
   <!-- Summary stat pills -->
   <div class="flex flex-wrap gap-2">{stats_html}</div>
@@ -17938,11 +18202,12 @@ document.addEventListener('submit', function(e) {{
         if not batch or batch.get("is_test"):
             return redirect(f"/receipts/emails/{batch_id}")
 
-        gmail_ok, _msg = _gmail_connected()
+        gmail_account_id = str(batch.get("gmail_account_id") or "admin").strip() or "admin"
+        gmail_ok, _msg = _gmail_connected(gmail_account_id)
         if not gmail_ok:
             return redirect(f"/receipts/emails/{batch_id}")
 
-        gmail_creds = load_admin_credentials(config)
+        gmail_creds = _load_gmail_credentials_for_account(gmail_account_id)
         svc         = ReceiptService(config)
 
         exp_accts: list = []

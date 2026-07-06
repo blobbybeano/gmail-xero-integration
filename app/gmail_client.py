@@ -138,6 +138,10 @@ class GmailClient:
     def __init__(self, creds) -> None:
         self._svc = build("gmail", "v1", credentials=creds)
 
+    def profile(self) -> dict[str, Any]:
+        """Return Gmail profile metadata for the connected account."""
+        return self._svc.users().getProfile(userId="me").execute()
+
     # ------------------------------------------------------------------
     def search_messages(
         self,

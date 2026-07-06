@@ -51,6 +51,8 @@ def _ensure_tables(db_path: str) -> None:
                 is_test     INTEGER NOT NULL DEFAULT 0,
                 total_found INTEGER NOT NULL DEFAULT 0,
                 summary_json TEXT   NOT NULL DEFAULT '{}',
+                gmail_account_id TEXT NOT NULL DEFAULT 'admin',
+                gmail_account_email TEXT NOT NULL DEFAULT '',
                 created_at  TEXT    NOT NULL,
                 updated_at  TEXT    NOT NULL
             )
@@ -99,6 +101,20 @@ def _ensure_tables(db_path: str) -> None:
             )
         except sqlite3.OperationalError:
             pass  # column already exists
+        try:
+            conn.execute(
+                "ALTER TABLE email_scan_batches "
+                "ADD COLUMN gmail_account_id TEXT NOT NULL DEFAULT 'admin'"
+            )
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute(
+                "ALTER TABLE email_scan_batches "
+                "ADD COLUMN gmail_account_email TEXT NOT NULL DEFAULT ''"
+            )
+        except sqlite3.OperationalError:
+            pass
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_escan_items_batch  "
             "ON email_scan_items (batch_id, seq)"
@@ -142,16 +158,19 @@ def create_batch(
     date_to: str = "",
     is_test: bool = False,
     card_account: str = "",
+    gmail_account_id: str = "admin",
+    gmail_account_email: str = "",
 ) -> dict:
     bid = f"escan-{uuid.uuid4().hex[:12]}"
     now = _now_iso()
     with _conn(db_path) as conn:
         conn.execute(
             "INSERT INTO email_scan_batches "
-            "(id, label, date_from, date_to, status, is_test, total_found, summary_json, card_account, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, 'processing', ?, 0, '{}', ?, ?, ?)",
+            "(id, label, date_from, date_to, status, is_test, total_found, summary_json, card_account, gmail_account_id, gmail_account_email, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 'processing', ?, 0, '{}', ?, ?, ?, ?, ?)",
             (bid, label, date_from, date_to, 1 if is_test else 0,
-             card_account or "", now, now),
+             card_account or "", gmail_account_id or "admin",
+             gmail_account_email or "", now, now),
         )
         conn.commit()
     return get_batch(db_path, bid)
@@ -167,7 +186,7 @@ def get_batch(db_path: str, batch_id: str) -> dict | None:
 
 def update_batch(db_path: str, batch_id: str, **fields) -> dict | None:
     allowed = {"label", "status", "is_test", "total_found", "summary_json",
-               "card_account"}
+               "card_account", "gmail_account_id", "gmail_account_email"}
     sets = {k: v for k, v in fields.items() if k in allowed}
     if not sets:
         return get_batch(db_path, batch_id)
