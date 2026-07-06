@@ -93,6 +93,9 @@ from .xero_client import (
     xero_is_disabled,
     xero_lockout_is_active,
     get_xero_rate_limit_until_ts,
+    _log_xero_request,
+    _throttle_xero_request,
+    record_xero_rate_limit_from_response,
 )
 from .google_sheets import backfill_submitter_in_sheet, update_invoice_paid_in_sheet
 from .google_sheets import ensure_header, append_stats_row
@@ -917,7 +920,7 @@ def _list_today_created_event_titles(config: AppConfig) -> list[str]:
 
 
 def _xero_fetch_draft_invoices(config: AppConfig) -> list[dict]:
-    if xero_is_disabled():
+    if xero_is_disabled() or xero_lockout_is_active(config):
         return []
     tok = load_xero_token(config.xero_token_file)
     access_token = str(tok.get("access_token") or "").strip()
@@ -932,12 +935,27 @@ def _xero_fetch_draft_invoices(config: AppConfig) -> list[dict]:
     }
     results: list[dict] = []
     for page in range(1, 8):
+        _throttle_xero_request()
         resp = requests.get(
             url,
             headers=headers,
             params={"where": 'Status=="DRAFT"', "page": page},
             timeout=20,
         )
+        _log_xero_request(
+            "GET",
+            resp.url or url,
+            resp.status_code,
+            retry_after=str(resp.headers.get("Retry-After") or "").strip(),
+        )
+        if resp.status_code == 429:
+            retry_after_s = record_xero_rate_limit_from_response(resp)
+            state = load_state(config.state_file)
+            state["xero_lockout_until_ts"] = time.time() + max(60, retry_after_s or 300)
+            state["xero_lockout_reason"] = "Xero API rate limit (429) during draft lookup"
+            state["xero_lockout_updated_at_ts"] = time.time()
+            save_state_merged(config.state_file, state)
+            break
         if not resp.ok:
             break
         rows = (resp.json() or {}).get("Invoices") or []
@@ -1059,11 +1077,19 @@ def _get_tenant_acct_themes(at: str, tid: str) -> "tuple[list, list, list, str]"
     all_accounts: list = []
     warnings: list[str] = []
     try:
+        _throttle_xero_request()
         _ar = requests.get(
             "https://api.xero.com/api.xro/2.0/Accounts",
             headers=hdrs,
             timeout=3,
         )
+        _log_xero_request(
+            "GET",
+            _ar.url or "https://api.xero.com/api.xro/2.0/Accounts",
+            _ar.status_code,
+            retry_after=str(_ar.headers.get("Retry-After") or "").strip(),
+        )
+        record_xero_rate_limit_from_response(_ar)
         if _ar.ok:
             for _a in _ar.json().get("Accounts", []):
                 if _a.get("Status") != "ACTIVE":
@@ -1085,11 +1111,19 @@ def _get_tenant_acct_themes(at: str, tid: str) -> "tuple[list, list, list, str]"
         warnings.append("Cannot load account list (request failed).")
     themes: list = []
     try:
+        _throttle_xero_request()
         _tr = requests.get(
             "https://api.xero.com/api.xro/2.0/BrandingThemes",
             headers=hdrs,
             timeout=3,
         )
+        _log_xero_request(
+            "GET",
+            _tr.url or "https://api.xero.com/api.xro/2.0/BrandingThemes",
+            _tr.status_code,
+            retry_after=str(_tr.headers.get("Retry-After") or "").strip(),
+        )
+        record_xero_rate_limit_from_response(_tr)
         if _tr.ok:
             themes = sorted(
                 _tr.json().get("BrandingThemes", []),
@@ -1169,11 +1203,19 @@ def _get_xero_active_accounts(
         "Accept": "application/json",
     }
     try:
+        _throttle_xero_request()
         res = requests.get(
             "https://api.xero.com/api.xro/2.0/Accounts",
             headers=hdrs,
             timeout=3,
         )
+        _log_xero_request(
+            "GET",
+            res.url or "https://api.xero.com/api.xro/2.0/Accounts",
+            res.status_code,
+            retry_after=str(res.headers.get("Retry-After") or "").strip(),
+        )
+        record_xero_rate_limit_from_response(res)
         if res.ok:
             accounts = [
                 a for a in res.json().get("Accounts", [])
@@ -1278,11 +1320,19 @@ def _get_xero_expense_accounts(
     accts: list = []
     warning = ""
     try:
+        _throttle_xero_request()
         r = requests.get(
             "https://api.xero.com/api.xro/2.0/Accounts",
             headers=hdrs,
             timeout=3,
         )
+        _log_xero_request(
+            "GET",
+            r.url or "https://api.xero.com/api.xro/2.0/Accounts",
+            r.status_code,
+            retry_after=str(r.headers.get("Retry-After") or "").strip(),
+        )
+        record_xero_rate_limit_from_response(r)
         if r.ok:
             for a in r.json().get("Accounts", []):
                 if a.get("Status") != "ACTIVE":
@@ -6330,7 +6380,14 @@ function toggleReceiptsEnabled(requested) {{
                 "Xero-tenant-id": xero_tenant,
                 "Accept": "application/json",
             }
+            _throttle_xero_request()
             resp = requests.get(url, headers=headers, timeout=10)
+            _log_xero_request(
+                "GET",
+                resp.url or url,
+                resp.status_code,
+                retry_after=str(resp.headers.get("Retry-After") or "").strip(),
+            )
             if resp.status_code == 401 and xero_tok.get("refresh_token"):
                 try:
                     _cid, _csec = _get_xero_creds(config)
@@ -6340,17 +6397,20 @@ function toggleReceiptsEnabled(requested) {{
                         save_xero_token(config.xero_token_file, xero_tok)
                         xero_at = (xero_tok or {}).get("access_token", "")
                         headers["Authorization"] = f"Bearer {xero_at}"
+                        _throttle_xero_request()
                         resp = requests.get(url, headers=headers, timeout=10)
+                        _log_xero_request(
+                            "GET",
+                            resp.url or url,
+                            resp.status_code,
+                            retry_after=str(resp.headers.get("Retry-After") or "").strip(),
+                        )
                 except Exception as exc:
                     print(f"[webhook] Xero token refresh failed while fetching invoice: {exc}", flush=True)
             if resp.status_code == 429:
-                retry_after_s = 300
-                raw_retry = str(resp.headers.get("Retry-After") or "").strip()
-                if raw_retry.isdigit():
-                    try:
-                        retry_after_s = max(60, int(raw_retry))
-                    except Exception:
-                        retry_after_s = 300
+                retry_after_s = record_xero_rate_limit_from_response(resp)
+                if not retry_after_s:
+                    retry_after_s = 300
                 _lockout_until = time.time() + retry_after_s
                 _ls = load_state(config.state_file)
                 _ls["xero_lockout_until_ts"] = _lockout_until

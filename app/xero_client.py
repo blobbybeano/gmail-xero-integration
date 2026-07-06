@@ -100,6 +100,29 @@ def get_xero_rate_limit_until_ts() -> float:
         return float(_XERO_RATE_LIMIT_UNTIL_TS or 0.0)
 
 
+def record_xero_rate_limit_from_response(response, *, default_seconds: int = 300) -> int:
+    """Record a process-wide Xero cooldown from a 429 response.
+
+    Returns the cooldown seconds applied, or 0 when the response was not a 429.
+    """
+    global _XERO_RATE_LIMIT_UNTIL_TS
+    if getattr(response, "status_code", None) != 429:
+        return 0
+    retry_after_seconds = int(default_seconds or 300)
+    raw_retry = str(getattr(response, "headers", {}).get("Retry-After") or "").strip()
+    if raw_retry.isdigit():
+        try:
+            retry_after_seconds = max(60, int(raw_retry))
+        except Exception:
+            retry_after_seconds = int(default_seconds or 300)
+    with _XERO_RATE_LIMIT_LOCK:
+        _XERO_RATE_LIMIT_UNTIL_TS = max(
+            _XERO_RATE_LIMIT_UNTIL_TS,
+            time.time() + retry_after_seconds,
+        )
+    return retry_after_seconds
+
+
 def _short_reference(event: Dict) -> str:
     event_id = (event.get("id") or "").strip()
     date_raw = (event.get("start") or "").split("T", 1)[0].replace("-", "")
@@ -225,19 +248,7 @@ class XeroClient:
                 response.status_code,
                 retry_after=str(response.headers.get("Retry-After") or "").strip(),
             )
-        if response.status_code == 429:
-            retry_after_seconds = 300
-            raw_retry = str(response.headers.get("Retry-After") or "").strip()
-            if raw_retry.isdigit():
-                try:
-                    retry_after_seconds = max(60, int(raw_retry))
-                except Exception:
-                    retry_after_seconds = 300
-            with _XERO_RATE_LIMIT_LOCK:
-                _XERO_RATE_LIMIT_UNTIL_TS = max(
-                    _XERO_RATE_LIMIT_UNTIL_TS,
-                    time.time() + retry_after_seconds,
-                )
+        record_xero_rate_limit_from_response(response)
         return response
 
     def get_organisation(self) -> Dict:
@@ -637,10 +648,25 @@ class XeroClient:
         url = f"{self.base_url}/Invoices/{invoice_id}/Attachments/{safe_name}"
         hdrs = {k: v for k, v in self._headers().items() if k != "Content-Type"}
         hdrs["Content-Type"] = content_type
+        _throttle_xero_request()
         resp = requests.request("PUT", url, headers=hdrs, data=data, timeout=60)
+        _log_xero_request(
+            "PUT",
+            resp.url or url,
+            resp.status_code,
+            retry_after=str(resp.headers.get("Retry-After") or "").strip(),
+        )
         if resp.status_code == 401 and self._refresh_access_token():
             hdrs["Authorization"] = f"Bearer {self.access_token}"
+            _throttle_xero_request()
             resp = requests.request("PUT", url, headers=hdrs, data=data, timeout=60)
+            _log_xero_request(
+                "PUT",
+                resp.url or url,
+                resp.status_code,
+                retry_after=str(resp.headers.get("Retry-After") or "").strip(),
+            )
+        record_xero_rate_limit_from_response(resp)
         if not resp.ok:
             raise RuntimeError(
                 f"Xero attachment failed ({resp.status_code}): {resp.text[:300]}"
