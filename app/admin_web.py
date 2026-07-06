@@ -1500,9 +1500,24 @@ def set_ai_receipt_hints(db_path: str, hints: str) -> None:
 def _ai_receipt_hints_block(db_path: str) -> str:
     """Prompt fragment injecting the admin's coding hints, or '' when none."""
     hints = get_ai_receipt_hints(db_path)
+    builtin = (
+        "Built-in Powwash coding rules:\n"
+        "- Only use a fuel account when the receipt clearly looks like a petrol "
+        "station / forecourt fuel receipt, with evidence such as litres, pump, "
+        "unleaded, petrol, diesel, fuel grade, or a known fuel-station merchant.\n"
+        "- Tyre shops, garages, MOT, brakes, exhausts, batteries, wheel alignment "
+        "and autocentres should be coded to vehicle repairs / maintenance, not "
+        "materials and not fuel.\n"
+        "- Screwfix, Toolstation, builders merchants and hardware stores are "
+        "normally materials / tools / consumables unless the receipt clearly "
+        "says otherwise.\n"
+        "- Parking apps, car parks and meters should be coded to parking / motor "
+        "travel, not materials.\n\n"
+    )
     if not hints:
-        return ""
+        return builtin
     return (
+        builtin +
         "The business owner has provided the following bookkeeping hints. "
         "Apply each hint ONLY when its stated conditions are clearly and "
         "specifically met by THIS receipt — do NOT generalise a conditional "
@@ -1860,6 +1875,95 @@ def _looks_like_multi_receipt_text(raw_text: str) -> bool:
 _FUEL_THRESHOLD_GBP = 40.0
 
 
+def _receipt_rule_text(merchant: str = "", raw_text: str = "") -> str:
+    return re.sub(r"[^a-z0-9]+", " ", ((merchant or "") + " " + (raw_text or "")).lower()).strip()
+
+
+def _account_has_fuel_name(code: str = "", name: str = "") -> bool:
+    return "fuel" in _norm_account_choice((name or "") + " " + (code or ""))
+
+
+def _find_account_by_terms(
+    accounts: list,
+    *,
+    any_terms: tuple[str, ...],
+    all_terms: tuple[str, ...] = (),
+    exclude_terms: tuple[str, ...] = (),
+) -> tuple[str, str]:
+    best: tuple[int, str, str] | None = None
+    for a in accounts or []:
+        code = str(a.get("Code") or "").strip()
+        name = str(a.get("Name") or "").strip()
+        if not code or not name:
+            continue
+        norm = _norm_account_choice(name)
+        if exclude_terms and any(t in norm for t in exclude_terms):
+            continue
+        if all_terms and not all(t in norm for t in all_terms):
+            continue
+        hits = sum(1 for t in any_terms if t in norm)
+        if not hits:
+            continue
+        score = hits * 10
+        if "maintenance" in norm or "repair" in norm:
+            score += 4
+        if "vehicle" in norm or "motor" in norm or "van" in norm:
+            score += 4
+        if best is None or score > best[0]:
+            best = (score, code, name)
+    return ("", "") if best is None else (best[1], best[2])
+
+
+def _looks_like_fuel_receipt(merchant: str = "", raw_text: str = "") -> bool:
+    text = _receipt_rule_text(merchant, raw_text)
+    if not text:
+        return False
+    station_terms = (
+        "shell", "esso", "bp", "texaco", "gulf", "jet", "applegreen",
+        "harvest energy", "morrisons petrol", "tesco petrol", "sainsburys petrol",
+        "asda petrol", "forecourt", "service station", "filling station",
+    )
+    fuel_terms = (
+        "diesel", "unleaded", "petrol", "fuel", "litre", "litres", " ltr ",
+        "pump", "adblue", "v power", "e10", "e5",
+    )
+    has_station = any(t in text for t in station_terms)
+    has_fuel = any(t in text for t in fuel_terms) or bool(
+        re.search(r"\b\d+(?:\.\d+)?\s*(?:litres?|ltrs?|ltr|l)\b", text)
+    )
+    # A petrol station shop receipt can be food only, so known merchant alone is
+    # not enough. We need some product/forecourt evidence too.
+    return has_fuel or ("forecourt" in text and has_station)
+
+
+def _looks_like_vehicle_maintenance(merchant: str = "", raw_text: str = "") -> bool:
+    text = _receipt_rule_text(merchant, raw_text)
+    terms = (
+        "tyre", "tyres", "kwik fit", "ats euromaster", "protyre",
+        "national tyres", "blackcircles", "formula one autocentre",
+        "autocentre", "auto centre", "garage", "mot", "wheel alignment",
+        "tracking", "brake", "brakes", "exhaust", "clutch", "battery",
+        "windscreen", "wiper", "vehicle repair", "car repair", "van repair",
+    )
+    return any(t in text for t in terms)
+
+
+def _looks_like_materials(merchant: str = "", raw_text: str = "") -> bool:
+    text = _receipt_rule_text(merchant, raw_text)
+    terms = (
+        "screwfix", "toolstation", "wickes", "travis perkins", "jewson",
+        "selco", "b q", "bandq", "builder depot", "builders merchant",
+        "sealant", "screws", "fixings", "gutter", "downpipe",
+    )
+    return any(t in text for t in terms)
+
+
+def _looks_like_parking(merchant: str = "", raw_text: str = "") -> bool:
+    text = _receipt_rule_text(merchant, raw_text)
+    terms = ("parking", "car park", "paybyphone", "ringgo", "justpark", "ncp", "meter")
+    return any(t in text for t in terms)
+
+
 def _find_fuel_accounts(accounts: list) -> "tuple[tuple[str, str], tuple[str, str]]":
     """Locate the (machinery, van) fuel accounts by name in the Xero expense
     account list. Returns ((code, name), (code, name)); either pair is
@@ -1936,6 +2040,84 @@ def _apply_fuel_threshold(segments, cat_code, cat_name, total, accounts,
     return segments, cat_code, cat_name
 
 
+def _apply_receipt_account_guardrails(
+    segments,
+    cat_code,
+    cat_name,
+    total,
+    accounts,
+    merchant: str = "",
+    raw_text: str = "",
+):
+    """Apply deterministic Powwash coding rules after AI account selection."""
+
+    def _set_single(code: str, name: str):
+        nonlocal segments, cat_code, cat_name
+        if not code:
+            return
+        if segments and len(segments) == 1:
+            segments[0]["account_code"] = code
+            segments[0]["account_name"] = name
+        elif segments and len(segments) > 1:
+            # Split receipts are left as AI-coded unless a segment was already
+            # fuel and the fuel threshold rule below corrects it.
+            return
+        cat_code, cat_name = code, name
+
+    if _looks_like_vehicle_maintenance(merchant, raw_text):
+        code, name = _find_account_by_terms(
+            accounts,
+            any_terms=("vehicle", "motor", "van", "repair", "maintenance", "running"),
+            exclude_terms=("fuel", "parking"),
+        )
+        _set_single(code, name)
+        return segments, cat_code, cat_name
+
+    if _looks_like_parking(merchant, raw_text):
+        code, name = _find_account_by_terms(
+            accounts,
+            any_terms=("parking", "car park", "travel", "motor"),
+            exclude_terms=("fuel",),
+        )
+        _set_single(code, name)
+        return segments, cat_code, cat_name
+
+    is_fuel_receipt = _looks_like_fuel_receipt(merchant, raw_text)
+    (m_code, m_name), (v_code, v_name) = _find_fuel_accounts(accounts)
+    if is_fuel_receipt and m_code and v_code:
+        # If the receipt clearly is fuel, make it fuel even if the AI picked a
+        # generic materials/default account. Then apply the machinery/van rule.
+        try:
+            amt = float(total or 0)
+        except (TypeError, ValueError):
+            amt = 0
+        if "diesel" in (raw_text or "").lower() or amt >= _FUEL_THRESHOLD_GBP:
+            _set_single(v_code, v_name)
+        elif amt > 0:
+            _set_single(m_code, m_name)
+        return _apply_fuel_threshold(segments, cat_code, cat_name, total, accounts, raw_text)
+
+    if _looks_like_materials(merchant, raw_text):
+        code, name = _find_account_by_terms(
+            accounts,
+            any_terms=("material", "materials", "tools", "consumable", "supplies"),
+            exclude_terms=("fuel", "vehicle", "motor", "parking"),
+        )
+        _set_single(code, name)
+        return segments, cat_code, cat_name
+
+    # If the AI chose a fuel account but the receipt has no fuel evidence, do
+    # not silently submit it as van/machinery fuel. Force a human account pick.
+    if _account_has_fuel_name(cat_code, cat_name) and not is_fuel_receipt:
+        if segments and len(segments) == 1:
+            segments[0]["account_code"] = ""
+            segments[0]["account_name"] = ""
+        cat_code, cat_name = "", ""
+        return segments, cat_code, cat_name
+
+    return _apply_fuel_threshold(segments, cat_code, cat_name, total, accounts, raw_text)
+
+
 # ── Receipt Dump helpers (bulk past-receipt upload & reconciliation) ─────────
 
 def _dump_digests(file_bytes: bytes) -> "tuple[str, str]":
@@ -1965,7 +2147,7 @@ def _dump_mime_for(path: str) -> str:
     ext = (path.rsplit(".", 1)[-1].lower() if "." in path else "")
     return {
         "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
-        "webp": "image/webp", "gif": "image/gif",
+        "webp": "image/webp", "gif": "image/gif", "pdf": "application/pdf",
     }.get(ext, "")
 
 
@@ -1985,7 +2167,8 @@ def _dump_compare_receipt_images(db_path: str, path_a: str, path_b: str) -> dict
         if not (p and _os.path.exists(p)):
             out["reason"] = "One of the receipt images is not available locally."
             return out
-        if not _dump_mime_for(p):
+        mime = _dump_mime_for(p)
+        if not mime or not mime.startswith("image/"):
             out["reason"] = "Image comparison only supports photo formats (not PDF)."
             return out
     _oa = get_openai_settings(db_path)
@@ -11707,9 +11890,9 @@ body {{ background:#f7f6f3 !important; }}
                     cat_code, cat_name = _resolve_expense_account_choice(
                         fallback, _exp_accounts
                     )
-            _, cat_code, cat_name = _apply_fuel_threshold(
+            _, cat_code, cat_name = _apply_receipt_account_guardrails(
                 [], cat_code, cat_name, total, _exp_accounts,
-                result.get("raw_text", ""),
+                result.get("merchant", ""), result.get("raw_text", ""),
             )
         except Exception:
             cat_code, cat_name = "", ""
@@ -12227,9 +12410,9 @@ body {{ background:#f7f6f3 !important; }}
                         )
                         if cat_code:
                             cat_source = "default"
-            segments, cat_code, cat_name = _apply_fuel_threshold(
+            segments, cat_code, cat_name = _apply_receipt_account_guardrails(
                 segments, cat_code, cat_name, total, exp_accounts,
-                result.get("raw_text", ""),
+                result.get("merchant", ""), result.get("raw_text", ""),
             )
         except Exception:
             pass
@@ -14226,8 +14409,7 @@ body {{ background:#f7f6f3 !important; }}
                 rows.append({"item": it, "tx": sugg[0], "kind": "suggested"})
 
         outstanding = [t for t in txs
-                       if not t["used"] and not t["reconciled"]
-                       and not t["has_attachment"]]
+                       if not t["used"] and not t["has_attachment"]]
         return {"paused": False, "rows": rows, "outstanding": outstanding,
                 "txs": txs, "chosen": chosen}
 
@@ -14331,8 +14513,9 @@ body {{ background:#f7f6f3 !important; }}
 
         # Build the card-feed timeline. Every transaction on the chosen card is
         # classified:
-        #   - already reconciled / attachment in Xero AND no receipt in this
+        #   - already reconciled WITH attachment in Xero AND no receipt in this
         #     batch  -> fully left out (nothing to do)
+        #   - reconciled in Xero WITHOUT attachment -> shown as attachment-missing
         #   - matched to a receipt in this batch, but the transaction ALREADY
         #     had a receipt / was reconciled in Xero -> "Previously submitted"
         #   - matched to a receipt in this batch -> full (green) row
@@ -14347,10 +14530,17 @@ body {{ background:#f7f6f3 !important; }}
             if _amt <= 0 and not matched:
                 # Money IN — card being paid off / a refund, not an expense.
                 continue
-            already = bool(t.get("reconciled")) or bool(t.get("has_attachment"))
+            reconciled = bool(t.get("reconciled"))
+            attached = bool(t.get("has_attachment"))
+            already = reconciled or attached
             if already and not matched:
-                continue          # settled in Xero, nothing uploaded here — hide
-            if matched and already:
+                if reconciled and not attached:
+                    kind = "attach_missing"
+                else:
+                    continue      # settled and has a receipt already — hide
+            elif matched and reconciled and not attached:
+                kind = "attach_missing"
+            elif matched and already:
                 kind = "prev"
             elif matched:
                 kind = "matched"
@@ -14362,6 +14552,7 @@ body {{ background:#f7f6f3 !important; }}
                       reverse=True)
 
         n_thin = sum(1 for _, k in timeline if k == "thin")
+        n_attach_missing = sum(1 for _, k in timeline if k == "attach_missing")
         if not timeline:
             return _wrap(
                 "<p class='text-xs text-gray-500'>Nothing left over — every card "
@@ -14388,6 +14579,29 @@ body {{ background:#f7f6f3 !important; }}
                     + " <span class='text-gray-400'>\u00b7 " + td + "</span></div>"
                     "<div class='font-medium text-gray-700 shrink-0'>"
                     + amt_s + "</div></div>"
+                )
+            if kind == "attach_missing":
+                it = t.get("matched_item") or {}
+                note = (
+                    "Reconciled in Xero, but no receipt attachment is on that "
+                    "Xero transaction yet."
+                )
+                if it:
+                    note = "This upload can attach the receipt image to that existing Xero transaction."
+                return (
+                    "<div class='px-4 py-2 border-b border-gray-100 text-sm bg-sky-50/60'>"
+                    "<div class='flex items-center justify-between gap-2'>"
+                    "<div class='min-w-0 pr-1'>"
+                    "<div class='font-medium text-gray-800 truncate'>" + contact + "</div>"
+                    "<div class='text-xs text-gray-500'>" + td + "</div></div>"
+                    "<div class='flex items-center gap-2 shrink-0'>"
+                    "<span class='text-[11px] font-semibold px-2 py-0.5 "
+                    "rounded-full bg-sky-100 text-sky-800 shrink-0'>"
+                    "Receipt attachment missing</span>"
+                    "<span class='font-semibold text-gray-900'>" + amt_s
+                    + "</span></div></div>"
+                    "<div class='text-[11px] text-gray-500 mt-0.5'>"
+                    + escape(note) + "</div></div>"
                 )
             it = t.get("matched_item") or {}
             r_merchant = escape(str(it.get("merchant") or "receipt"))
@@ -14441,9 +14655,12 @@ body {{ background:#f7f6f3 !important; }}
         for i, (mk, pairs) in enumerate(months):
             rows_html = "".join(_render_row(t, k) for t, k in pairs)
             thin_ct = sum(1 for _, k in pairs if k == "thin")
+            attach_ct = sum(1 for _, k in pairs if k == "attach_missing")
             sub = f"{len(pairs)} transaction{'s' if len(pairs) != 1 else ''}"
             if thin_ct:
                 sub += f" \u00b7 {thin_ct} missing a receipt"
+            if attach_ct:
+                sub += f" \u00b7 {attach_ct} missing attachment"
             hidden = "" if i == 0 else " hidden"
             sections += (
                 "<div class='dump-feed-month" + hidden + "'>"
@@ -14470,14 +14687,14 @@ body {{ background:#f7f6f3 !important; }}
 
         badge = (
             "<span class='text-xs font-semibold px-2 py-0.5 rounded-full "
-            "bg-gray-200 text-gray-700'>" + str(n_thin) + "</span>"
+            "bg-gray-200 text-gray-700'>" + str(n_thin + n_attach_missing) + "</span>"
         )
 
         # "Card-feed gap report": card payments in this dump's date window that
         # still have no receipt in this upload. This is not the same as "Xero
         # expenses waiting to submit"; it is just a cross-check list.
         nonsub_html = ""
-        nonsub = [t for t, k in timeline if k == "thin"]
+        nonsub = [t for t, k in timeline if k in ("thin", "attach_missing")]
         if nonsub:
             _tot = 0.0
             body = ""
@@ -14508,7 +14725,8 @@ body {{ background:#f7f6f3 !important; }}
                 "border border-gray-200 p-4 text-sm'>"
                 "<div class='font-semibold text-gray-800 mb-2'>"
                 "Card-feed gap report \u2014 card payments in this date window "
-                "with no receipt in this dump</div>"
+                "with no receipt in this dump, or reconciled Xero spends missing "
+                "an attachment</div>"
                 "<table class='w-full text-xs'><thead>"
                 "<tr class='text-left text-gray-400'>"
                 "<th class='py-1 pr-3 font-medium'>Date</th>"
@@ -14519,7 +14737,7 @@ body {{ background:#f7f6f3 !important; }}
                 "justify-between text-xs'>"
                 "<span class='text-gray-500'>" + str(len(nonsub))
                 + " card payment" + ("s" if len(nonsub) != 1 else "")
-                + " without a receipt in this dump"
+                + " needing a receipt or attachment check"
                 + "</span><span class='font-semibold text-gray-900'>Total "
                 + sym + format(_tot, ",.2f") + "</span></div>"
                 "<div class='flex justify-between text-xs mt-1'>"
@@ -14686,6 +14904,48 @@ body {{ background:#f7f6f3 !important; }}
             )
         )
         return exact[0]
+
+    def _dump_attach_item_to_existing_xero_spend(item: dict, xero_match: dict) -> tuple[bool, str]:
+        """Attach a dump receipt image to an existing Xero BankTransaction."""
+        if not xero_match:
+            return False, "No matching Xero spend found."
+        if xero_match.get("has_attachment"):
+            return True, "Xero spend already has an attachment."
+        xid = str(xero_match.get("id") or "").strip()
+        if not xid:
+            return False, "Matching Xero spend has no BankTransactionID."
+        if xero_is_disabled():
+            return False, "Xero is paused — receipt image not attached."
+        path = os.path.abspath(str(item.get("stored_file") or ""))
+        if not path or not os.path.exists(path):
+            return False, "Receipt image is not available locally."
+        try:
+            data = Path(path).read_bytes()
+        except OSError as exc:
+            return False, "Could not read receipt image: " + str(exc).splitlines()[0][:120]
+        if not data:
+            return False, "Receipt image file is empty."
+        filename = (
+            Path(str(item.get("filename") or "")).name
+            or Path(path).name
+            or "receipt.jpg"
+        )
+        mime = (
+            str(item.get("mime_type") or "").strip()
+            or _dump_mime_for(path)
+            or _exp_sniff_mime(data[:16])
+            or "application/octet-stream"
+        )
+        try:
+            client = build_xero_client(config)
+            client.attach_file_to_bank_transaction(xid, filename, mime, data)
+            for txs in _dump_xero_spend_cache.values():
+                for tx in txs:
+                    if str(tx.get("id") or "") == xid:
+                        tx["has_attachment"] = True
+            return True, "Receipt image attached to existing Xero card spend."
+        except Exception as exc:
+            return False, "Xero attachment failed: " + str(exc).splitlines()[0][:180]
 
     def _dump_process(batch, files, *, total_count: int | None = None):
         """Process an uploaded batch: OCR + AI-code + dedupe + classify each file,
@@ -14874,9 +15134,9 @@ body {{ background:#f7f6f3 !important; }}
             # Deterministic £40 fuel rule: under £40 → machinery fuel,
             # £40+ → van fuel; diesel is ALWAYS van fuel (machines take
             # unleaded). Done in code, never left to the LLM.
-            segments, cat_code, cat_name = _apply_fuel_threshold(
+            segments, cat_code, cat_name = _apply_receipt_account_guardrails(
                 segments, cat_code, cat_name, total, exp_accounts,
-                result.get("raw_text", ""),
+                result.get("merchant", ""), result.get("raw_text", ""),
             )
 
             today = dt.datetime.now(dt.timezone.utc).date().isoformat()
@@ -14971,21 +15231,30 @@ body {{ background:#f7f6f3 !important; }}
                 )
                 _xero_s += time.perf_counter() - _t_stage
                 if xero_match:
-                    status = dump_store.STATUS_DUPLICATE
                     contact = (xero_match.get("contact") or "Xero expense").strip()
                     account = (xero_match.get("account") or "bank account").strip()
-                    reason_bits = [
-                        "Already submitted in Xero",
-                        "same date " + _exp_uk_date(xero_match.get("date") or purchased_on),
-                        "same amount £" + format(float(xero_match.get("amount") or 0), ",.2f"),
-                    ]
-                    if xero_match.get("merchant_match"):
-                        reason_bits.append("merchant/contact matched " + contact)
+                    if xero_match.get("has_attachment"):
+                        status = dump_store.STATUS_DUPLICATE
+                        reason_bits = [
+                            "Already submitted in Xero",
+                            "same date " + _exp_uk_date(xero_match.get("date") or purchased_on),
+                            "same amount £" + format(float(xero_match.get("amount") or 0), ",.2f"),
+                        ]
+                        if xero_match.get("merchant_match"):
+                            reason_bits.append("merchant/contact matched " + contact)
+                        else:
+                            reason_bits.append("matched Xero contact " + contact)
+                        if account:
+                            reason_bits.append("account " + account)
+                        dup_reason = " — ".join(reason_bits) + "."
                     else:
-                        reason_bits.append("matched Xero contact " + contact)
-                    if account:
-                        reason_bits.append("account " + account)
-                    dup_reason = " — ".join(reason_bits) + "."
+                        dup_reason = (
+                            "Already in Xero on " + _exp_uk_date(xero_match.get("date") or purchased_on)
+                            + " for £" + format(float(xero_match.get("amount") or 0), ",.2f")
+                            + ", but no receipt image is attached yet. Importing this row "
+                            "will attach this photo to that existing Xero spend only — "
+                            "no duplicate expense will be created."
+                        )
 
             card_status = ""
             if status == dump_store.STATUS_NEW:
@@ -15110,9 +15379,9 @@ body {{ background:#f7f6f3 !important; }}
                                 db, s_merchant, s_text, s_total, exp_accounts)
                     except Exception:
                         pass
-                    s_segments, s_code, s_name = _apply_fuel_threshold(
+                    s_segments, s_code, s_name = _apply_receipt_account_guardrails(
                         s_segments, s_code, s_name, s_total, exp_accounts,
-                        s_text)
+                        s_merchant, s_text)
                     # Mirror the main path's gating so split receipts are
                     # never quietly more importable than normal ones.
                     s_status = dump_store.STATUS_NEW
@@ -17448,31 +17717,36 @@ body {{ background:#f7f6f3 !important; }}
         except Exception:
             exp_accounts = []
         imported = 0
+
+        def _create_local_receipt_from_dump_item(it, eid, account_code, account_name, status):
+            rec = exp_store.create_receipt(
+                db,
+                engineer_id=int(eid),
+                merchant=it.get("merchant", ""),
+                purchased_on=it.get("purchased_on", ""),
+                amount_inc=it.get("amount_inc"),
+                amount_ex=it.get("amount_ex"),
+                vat_amount=it.get("vat_amount"),
+                currency=it.get("currency", "GBP"),
+                ocr_merchant=it.get("merchant", ""),
+                ocr_amount=it.get("amount_inc"),
+                ocr_date=it.get("purchased_on", ""),
+                ocr_raw=it.get("ocr_raw", ""),
+                ocr_error=it.get("ocr_error", ""),
+                stored_file=it.get("stored_file", ""),
+                filename=it.get("filename", ""),
+                mime_type=it.get("mime_type", ""),
+                category_account_code=account_code,
+                category_account_name=account_name,
+                status=status,
+            )
+            return rec
+
         for it in items:
             if it["status"] != dump_store.STATUS_NEW:
                 continue
             eid = it.get("assigned_engineer_id") or default_eid
             if not eid:
-                continue
-            xero_match = _dump_xero_existing_spend_match(
-                amount_inc=it.get("amount_inc"),
-                purchased_on=it.get("purchased_on", ""),
-                merchant=it.get("merchant", ""),
-                card_account=(batch.get("card_account") or "").strip(),
-            )
-            if xero_match:
-                dump_store.update_item(
-                    db,
-                    it["id"],
-                    status=dump_store.STATUS_DUPLICATE,
-                    dup_reason=(
-                        "Already submitted in Xero — same date "
-                        + _exp_uk_date(xero_match.get("date") or it.get("purchased_on") or "")
-                        + ", same amount £"
-                        + format(float(xero_match.get("amount") or 0), ",.2f")
-                        + "."
-                    ),
-                )
                 continue
             account_code = (it.get("category_account_code") or "").strip()
             account_name = (it.get("category_account_name") or "").strip()
@@ -17492,26 +17766,58 @@ body {{ background:#f7f6f3 !important; }}
                     )
                     continue
                 account_code, account_name = resolved_code, resolved_name
-            exp_store.create_receipt(
-                db,
-                engineer_id=int(eid),
-                merchant=it.get("merchant", ""),
-                purchased_on=it.get("purchased_on", ""),
+            xero_match = _dump_xero_existing_spend_match(
                 amount_inc=it.get("amount_inc"),
-                amount_ex=it.get("amount_ex"),
-                vat_amount=it.get("vat_amount"),
-                currency=it.get("currency", "GBP"),
-                ocr_merchant=it.get("merchant", ""),
-                ocr_amount=it.get("amount_inc"),
-                ocr_date=it.get("purchased_on", ""),
-                ocr_raw=it.get("ocr_raw", ""),
-                ocr_error=it.get("ocr_error", ""),
-                stored_file=it.get("stored_file", ""),
-                filename=it.get("filename", ""),
-                mime_type=it.get("mime_type", ""),
-                category_account_code=account_code,
-                category_account_name=account_name,
-                status="pending_review",
+                purchased_on=it.get("purchased_on", ""),
+                merchant=it.get("merchant", ""),
+                card_account=(batch.get("card_account") or "").strip(),
+            )
+            if xero_match:
+                if not xero_match.get("has_attachment"):
+                    ok, msg = _dump_attach_item_to_existing_xero_spend(it, xero_match)
+                    if not ok:
+                        dump_store.update_item(
+                            db,
+                            it["id"],
+                            dup_reason=(
+                                "Existing Xero spend found, but the receipt image "
+                                "could not be attached yet. " + msg
+                            ),
+                        )
+                        continue
+                    rec = _create_local_receipt_from_dump_item(
+                        it, eid, account_code, account_name, "submitted"
+                    )
+                    exp_store.update_receipt(
+                        db,
+                        rec["id"],
+                        xero_type="BankTransactions",
+                        xero_id=str(xero_match.get("id") or ""),
+                        xero_error="",
+                    )
+                    dump_store.update_item(
+                        db,
+                        it["id"],
+                        status=dump_store.STATUS_IMPORTED,
+                        dup_reason=msg,
+                    )
+                    imported += 1
+                    continue
+                dump_store.update_item(
+                    db,
+                    it["id"],
+                    status=dump_store.STATUS_DUPLICATE,
+                    dup_reason=(
+                        "Already submitted in Xero — same date "
+                        + _exp_uk_date(xero_match.get("date") or it.get("purchased_on") or "")
+                        + ", same amount £"
+                        + format(float(xero_match.get("amount") or 0), ",.2f")
+                        + "."
+                    ),
+                )
+                continue
+            _create_local_receipt_from_dump_item(
+                it, eid, account_code, account_name, "pending_review"
             )
             dump_store.update_item(db, it["id"], status=dump_store.STATUS_IMPORTED)
             imported += 1

@@ -626,26 +626,27 @@ class XeroClient:
             )
         return response.content, response.headers.get("Content-Type", "")
 
-    def attach_file_to_invoice(
-        self, invoice_id: str, filename: str, content_type: str, data: bytes
+    def attach_file_to_object(
+        self, endpoint: str, guid: str, filename: str, content_type: str, data: bytes
     ) -> dict:
-        """Attach a file to a Xero invoice via PUT /Invoices/{id}/Attachments/{name}.
-
-        Dry-run returns a preview dict without writing to Xero.
-        """
+        """Attach a file to a Xero object, e.g. Invoices or BankTransactions."""
         import re as _re
 
+        endpoint = (endpoint or "").strip().strip("/")
+        if endpoint not in {"Invoices", "BankTransactions"}:
+            raise ValueError(f"Unsupported Xero attachment endpoint: {endpoint}")
         safe_name = (_re.sub(r"[^\w.\-]", "_", filename or "receipt.jpg")[:100] or "receipt.jpg")
         if self.dry_run:
             return {
                 "dry_run": True,
-                "invoice_id": invoice_id,
+                "endpoint": endpoint,
+                "guid": guid,
                 "filename": safe_name,
                 "content_type": content_type,
                 "size_bytes": len(data),
             }
         guard_xero("Xero attachment upload")
-        url = f"{self.base_url}/Invoices/{invoice_id}/Attachments/{safe_name}"
+        url = f"{self.base_url}/{endpoint}/{guid}/Attachments/{safe_name}"
         hdrs = {k: v for k, v in self._headers().items() if k != "Content-Type"}
         hdrs["Content-Type"] = content_type
         _throttle_xero_request()
@@ -672,6 +673,25 @@ class XeroClient:
                 f"Xero attachment failed ({resp.status_code}): {resp.text[:300]}"
             )
         return resp.json()
+
+    def attach_file_to_invoice(
+        self, invoice_id: str, filename: str, content_type: str, data: bytes
+    ) -> dict:
+        """Attach a file to a Xero invoice via PUT /Invoices/{id}/Attachments/{name}.
+
+        Dry-run returns a preview dict without writing to Xero.
+        """
+        return self.attach_file_to_object(
+            "Invoices", invoice_id, filename, content_type, data
+        )
+
+    def attach_file_to_bank_transaction(
+        self, bank_transaction_id: str, filename: str, content_type: str, data: bytes
+    ) -> dict:
+        """Attach a file to a Xero spend/bank transaction."""
+        return self.attach_file_to_object(
+            "BankTransactions", bank_transaction_id, filename, content_type, data
+        )
 
     def delete_draft_invoice(self, invoice_id: str) -> Dict:
         """
