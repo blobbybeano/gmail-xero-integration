@@ -2196,8 +2196,9 @@ def run() -> None:
                 pay_mode_hint = payment_choice(event.get("description")) or ""
                 _event_end = _event_end_utc(event)
                 _event_is_past = bool(_event_end and _event_end <= now)
+                _event_directly_targeted = event_key in _target_event_keys
                 _event_targeted = (
-                    (event_key in _target_event_keys)
+                    _event_directly_targeted
                     or (calendar_id in _target_calendar_ids)
                 )
                 _event_stale_for_automatic_xero = bool(
@@ -2217,7 +2218,8 @@ def run() -> None:
                     )
                     continue
                 _allow_paid_reconcile = bool(
-                    _event_is_past and (_is_hourly_reconcile_cycle or _event_targeted)
+                    _event_is_past
+                    and (_is_hourly_reconcile_cycle or _event_directly_targeted)
                 )
                 _budget_description = (
                     normalize_user_sections(event.get("description") or "")
@@ -2450,6 +2452,7 @@ def run() -> None:
                         )
                         _allow_card_paid_sync = bool(
                             pay_mode_hint == "card"
+                            and _allow_paid_reconcile
                             and (_event_is_past or _has_send_intent)
                         )
                         _allow_invoice_paid_sync = bool(
