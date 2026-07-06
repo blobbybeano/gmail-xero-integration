@@ -238,13 +238,19 @@ def run() -> None:
     # Scan strategy:
     # - Webhook-targeted cycles scan only touched calendars/events.
     # - Every poll cycle does a lightweight "recent saves" Google-only safety scan.
-    # - Hourly reconcile scans past entries for paid status, in controlled Xero batches.
+    # - Paid status is webhook-first. The optional scheduled sweep is off by
+    #   default so background calendar scans cannot grow into Xero polling.
     _last_hourly_reconcile_ts: float = 0.0
     _HOURLY_RECONCILE_SECONDS = max(
-        int(os.getenv("HOURLY_RECONCILE_SECONDS", "3600") or "3600"), 300
+        int(os.getenv("HOURLY_RECONCILE_SECONDS", "3600") or "3600"), 1800
     )
-    _HOURLY_RECONCILE_PAST_DAYS = max(
-        int(os.getenv("HOURLY_RECONCILE_PAST_DAYS", "45") or "45"), 1
+    _HOURLY_RECONCILE_PAST_DAYS = min(
+        max(int(os.getenv("HOURLY_RECONCILE_PAST_DAYS", "14") or "14"), 1),
+        14,
+    )
+    _PAID_SYNC_SWEEP_EVENTS_PER_CYCLE = min(
+        max(int(os.getenv("PAID_SYNC_SWEEP_EVENTS_PER_CYCLE", "0") or "0"), 0),
+        _XERO_EVENTS_PER_CYCLE,
     )
     _PAST_EVENT_AUTO_XERO_HOURS = max(
         int(os.getenv("PAST_EVENT_AUTO_XERO_HOURS", "24") or "24"), 1
@@ -1670,8 +1676,17 @@ def run() -> None:
         }
         _now_ts = time.time()
         _is_targeted_cycle = bool(_target_calendar_ids)
-        _is_hourly_reconcile_cycle = (_now_ts - _last_hourly_reconcile_ts) >= _HOURLY_RECONCILE_SECONDS
-        if _is_hourly_reconcile_cycle:
+        _hourly_reconcile_due = (
+            (_now_ts - _last_hourly_reconcile_ts) >= _HOURLY_RECONCILE_SECONDS
+        )
+        _is_scheduled_maintenance_cycle = bool(
+            _hourly_reconcile_due and not _is_targeted_cycle
+        )
+        _is_hourly_reconcile_cycle = bool(
+            _is_scheduled_maintenance_cycle
+            and _PAID_SYNC_SWEEP_EVENTS_PER_CYCLE > 0
+        )
+        if _is_scheduled_maintenance_cycle:
             _last_hourly_reconcile_ts = _now_ts
 
         # Auto-manage Google Calendar watches — run at most once per hour,
@@ -1881,7 +1896,7 @@ def run() -> None:
 
         # Retry deferred Xero draft cleanup for cash-completed entries.
         # Keep this low-frequency and low-volume (hourly, capped) to avoid extra load.
-        if _is_hourly_reconcile_cycle and xero_client:
+        if _is_scheduled_maintenance_cycle and xero_client:
             _cleanup_queue = dict(state.get("draft_cleanup_queue", {}) or {})
             if _cleanup_queue:
                 _cleanup_now = time.time()
@@ -2054,6 +2069,7 @@ def run() -> None:
         _flush_sales_backlog(admin_creds)
 
         _xero_events_used = 0
+        _paid_sync_sweep_used = 0
         for event in events:
             try:
                 event_id = event.get("id") or ""
@@ -2217,9 +2233,21 @@ def run() -> None:
                         event.get("updated") or "",
                     )
                     continue
+                _event_in_paid_sweep_window = bool(
+                    _event_end
+                    and _event_end >= (now - dt.timedelta(days=_HOURLY_RECONCILE_PAST_DAYS))
+                )
+                _allow_scheduled_paid_reconcile = bool(
+                    _is_hourly_reconcile_cycle
+                    and _event_in_paid_sweep_window
+                    and _paid_sync_sweep_used < _PAID_SYNC_SWEEP_EVENTS_PER_CYCLE
+                )
                 _allow_paid_reconcile = bool(
                     _event_is_past
-                    and (_is_hourly_reconcile_cycle or _event_directly_targeted)
+                    and (
+                        _event_directly_targeted
+                        or _allow_scheduled_paid_reconcile
+                    )
                 )
                 _budget_description = (
                     normalize_user_sections(event.get("description") or "")
@@ -2491,6 +2519,12 @@ def run() -> None:
                                 "warn",
                             )
                             needs_invoice_paid_sync = False
+                        if (
+                            needs_invoice_paid_sync
+                            and not _event_directly_targeted
+                            and _allow_scheduled_paid_reconcile
+                        ):
+                            _paid_sync_sweep_used += 1
                         # Cleanup stale payment-type alert when invoice was already sent
                         # (or paid) and no resend action is pending.
                         if _stale_payment_alert and (sent_state or paid_state or _has_sent_marker):

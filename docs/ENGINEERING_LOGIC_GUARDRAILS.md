@@ -56,6 +56,28 @@ Regression tests that must keep passing:
   - includes `xero_webhook_echo_does_not_recheck_xero`
   - includes `paid_sync_failures_stop_until_resave`
 
+### 2026-07-06 Paid-Status Polling Pressure
+
+Observed incident:
+- After Xero came back online, normal invoice create/send work succeeded, but
+  Google Calendar webhook echoes caused repeated `GET /Invoices/{id}` reads for
+  the same recently sent invoices.
+- The throttle spaced those reads out and no new 429 was observed, but the
+  reads were unnecessary because Xero invoice-payment webhooks are the primary
+  source of paid truth.
+
+Permanent rules:
+- Paid status is webhook-first. A Google calendar-level webhook must not make
+  every sent/unpaid event on that calendar eligible for Xero paid polling.
+- A direct event re-save may trigger a paid-status check for that exact entry.
+- The scheduled paid-status sweep must default to `PAID_SYNC_SWEEP_EVENTS_PER_CYCLE=0`.
+  If enabled, it must stay capped, recent-only, and never look back more than
+  14 days.
+- Operators handle older unpaid follow-up manually. Do not reintroduce broad
+  historical polling as a convenience feature.
+- Keep Xero call pacing (`XERO_MIN_REQUEST_INTERVAL_SECONDS`) in place even for
+  webhook and admin-triggered Xero paths.
+
 ### 2026-06-16 Xero 429 Lockout
 
 Observed incident:
@@ -259,9 +281,9 @@ These invariants exist specifically to prevent formatter loops and duplicate dra
     exact events and do not run a broader calendar scan for that notification;
   - missing/expired Google sync tokens may use a bounded fallback scan for that
     cycle, but token priming must not enqueue the historical result set as work;
-  - hourly paid-status reconcile must stay narrow (default 24 hours) and must
-    not run immediately on app resume; broad historical payment sweeps create
-    Xero pressure from old yellow/unpaid entries;
+  - paid-status reconcile is webhook-first. The scheduled paid sweep must be
+    disabled by default (`PAID_SYNC_SWEEP_EVENTS_PER_CYCLE=0`); if deliberately
+    enabled, it must stay capped, recent-only, and hard-limited to 14 days;
   - fallback webhook-targeted calendar scans must include a bounded recent-past actionable
     window (default 14 days) so unchanged `PROCESS DRAFT=Y` jobs are not missed
     after their appointment date;
@@ -270,7 +292,8 @@ These invariants exist specifically to prevent formatter loops and duplicate dra
   - a calendar-level webhook target is not event-level intent: it must not make
     every future draft immediately eligible or make every historical unpaid
     invoice consume the Xero slot; only an explicit event target, a recent event
-    edit, or the hourly reconcile cycle may bypass those time gates;
+    edit, or a deliberately enabled capped paid sweep may bypass those time
+    gates;
   - draft update decision in both flow branches must remain fingerprint-led:
     - around `should_try_update` blocks (both occurrences),
     - never revert to `event_updated != last_invoice_update` as a primary update trigger.
