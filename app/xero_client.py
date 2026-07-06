@@ -19,7 +19,9 @@ DEFAULT_SALES_ACCOUNT_CODE = "200"
 DEFAULT_PAYMENT_ACCOUNT_CODE = "090"
 _TOKEN_REFRESH_LOCK = threading.Lock()
 _XERO_RATE_LIMIT_LOCK = threading.Lock()
+_XERO_REQUEST_THROTTLE_LOCK = threading.Lock()
 _XERO_RATE_LIMIT_UNTIL_TS = 0.0
+_XERO_LAST_REQUEST_AT_TS = 0.0
 
 
 def _log_xero_request(method: str, url: str, status: int | str, *, retry_after: str = "") -> None:
@@ -33,6 +35,31 @@ def _log_xero_request(method: str, url: str, status: int | str, *, retry_after: 
         print(f"[xero-request] {str(method).upper()} {path} -> {status}{suffix}", flush=True)
     except Exception:
         pass
+
+
+def _throttle_xero_request() -> None:
+    """Optional process-wide pacing for Xero API calls.
+
+    Xero counts all endpoints together for the same connection. Event-level
+    guards are not enough because a single calendar event can do several
+    requests: contact lookup, invoice mutation, online invoice URL, payment
+    check. This throttle spaces those requests out before Xero has to reject us.
+    """
+    global _XERO_LAST_REQUEST_AT_TS
+    raw_interval = os.getenv("XERO_MIN_REQUEST_INTERVAL_SECONDS", "").strip()
+    try:
+        min_interval = max(0.0, float(raw_interval or "0"))
+    except Exception:
+        min_interval = 0.0
+    if min_interval <= 0:
+        return
+    with _XERO_REQUEST_THROTTLE_LOCK:
+        now_ts = time.time()
+        wait_for = (_XERO_LAST_REQUEST_AT_TS + min_interval) - now_ts
+        if wait_for > 0:
+            time.sleep(wait_for)
+            now_ts = time.time()
+        _XERO_LAST_REQUEST_AT_TS = now_ts
 
 
 class XeroDisabledError(RuntimeError):
@@ -179,6 +206,7 @@ class XeroClient:
                 f"Xero rate-limited: 429 cooldown active (Retry-After={remaining}s)"
             )
 
+        _throttle_xero_request()
         response = requests.request(method, url, headers=self._headers(), timeout=30, **kwargs)
         _log_xero_request(
             method,
@@ -187,6 +215,7 @@ class XeroClient:
             retry_after=str(response.headers.get("Retry-After") or "").strip(),
         )
         if response.status_code == 401 and self._refresh_access_token():
+            _throttle_xero_request()
             response = requests.request(
                 method, url, headers=self._headers(), timeout=30, **kwargs
             )

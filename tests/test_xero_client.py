@@ -1,8 +1,9 @@
 import unittest
 import time
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+from app import xero_client as xero_mod
 from app.xero_client import XeroClient, build_xero_client
 
 
@@ -111,6 +112,32 @@ class XeroClientBuilderSafetyTests(unittest.TestCase):
 
         load_token.assert_not_called()
         refresh_token.assert_not_called()
+
+
+class XeroRequestThrottleTests(unittest.TestCase):
+    @patch.dict("os.environ", {"XERO_MIN_REQUEST_INTERVAL_SECONDS": "3"})
+    @patch("app.xero_client.requests.request")
+    @patch("app.xero_client.time.sleep")
+    @patch("app.xero_client.time.time")
+    def test_request_throttle_spaces_consecutive_xero_calls(
+        self, time_mock, sleep_mock, request_mock
+    ):
+        xero_mod._XERO_LAST_REQUEST_AT_TS = 0.0
+        xero_mod._XERO_RATE_LIMIT_UNTIL_TS = 0.0
+        time_mock.side_effect = [100.0, 100.0, 101.0, 101.0, 103.0]
+        response = Mock()
+        response.status_code = 200
+        response.headers = {}
+        response.url = "https://api.xero.com/api.xro/2.0/Contacts"
+        response.ok = True
+        request_mock.return_value = response
+
+        client = XeroClient("token", "tenant", dry_run=False)
+        client._request("GET", "https://api.xero.com/api.xro/2.0/Contacts")
+        client._request("GET", "https://api.xero.com/api.xro/2.0/Contacts")
+
+        sleep_mock.assert_called_once_with(2.0)
+        self.assertEqual(request_mock.call_count, 2)
 
 
 if __name__ == "__main__":
