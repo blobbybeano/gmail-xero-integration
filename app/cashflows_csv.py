@@ -39,6 +39,7 @@ from .cashflows_reconciliation import (
     parse_xero_bank_lines,
     parse_xero_invoices,
 )
+from .state import load_state
 
 SALE_TYPE = "Sale Settlement"
 FEE_TYPE = "Merchant Service Charge"
@@ -506,6 +507,7 @@ def _candidate_dict(inv: XeroInvoiceCandidate, sale: CsvSale) -> dict[str, Any]:
         "xero_date": _date_text(inv.date),
         "total": _money_float(inv_total),
         "amount_due": _money_float(inv.amount_due),
+        "status": inv.status,
         # An "open" (unpaid) invoice still has money due. Matching one of these
         # is what would flip it to PAID once a real (non-test) run submits.
         "is_open": inv.amount_due > Decimal("0.00"),
@@ -635,6 +637,49 @@ def _rank_candidate_invoices(
 
     ranked = sorted(pool, key=_key)
     return [_candidate_dict(inv, sale) for inv in ranked[:limit]]
+
+
+def _calendar_linked_invoice_candidates(
+    config: Any,
+    xero_client: Any | None,
+    calendar_suggestions: list[dict[str, Any]] | None,
+    existing_pool: list[XeroInvoiceCandidate],
+) -> list[XeroInvoiceCandidate]:
+    """Fetch invoices linked to exact calendar suggestions via app state.
+
+    Some calendar-created invoices can be DRAFT, so they do not appear in the
+    normal open/paid Xero pools. If the calendar row is the exact sale clue, use
+    the app's event_invoice_map to surface that invoice as the top manual
+    candidate instead of falling back to unrelated historical invoices.
+    """
+    state_file = str(getattr(config, "state_file", "") or "").strip()
+    if not state_file or not xero_client or not calendar_suggestions:
+        return []
+    try:
+        event_invoice_map = (load_state(state_file).get("event_invoice_map") or {})
+    except Exception:
+        return []
+
+    existing_ids = {inv.id for inv in existing_pool}
+    out: list[XeroInvoiceCandidate] = []
+    seen: set[str] = set()
+    for suggestion in calendar_suggestions[:5]:
+        event_key = str(suggestion.get("event_key") or "").strip()
+        if not event_key:
+            cal_id = str(suggestion.get("calendar_id") or "").strip()
+            event_id = str(suggestion.get("event_id") or "").strip()
+            event_key = f"{cal_id}:{event_id}" if cal_id and event_id else ""
+        invoice_id = str(event_invoice_map.get(event_key) or "").strip()
+        if not invoice_id or invoice_id in existing_ids or invoice_id in seen:
+            continue
+        try:
+            parsed = parse_xero_invoices({"Invoices": [xero_client.get_invoice(invoice_id)]})
+        except Exception:
+            parsed = []
+        for inv in parsed:
+            seen.add(inv.id)
+            out.append(inv)
+    return out
 
 
 def build_csv_reconciliation_preview(
@@ -953,9 +998,15 @@ def build_csv_reconciliation_preview(
             row["calendar_suggestions"] = _calendar_suggestions(sale_obj)
             if row.get("invoice") is None:
                 # Missing sale: offer ranked nearby invoices as manual picks.
+                row_candidates = unaccounted + _calendar_linked_invoice_candidates(
+                    config,
+                    xero_client,
+                    row.get("calendar_suggestions") or [],
+                    candidate_pool,
+                )
                 cands = _rank_candidate_invoices(
                     sale_obj,
-                    unaccounted,
+                    row_candidates,
                     row.get("calendar_suggestions") or [],
                 )
                 row["candidates"] = cands

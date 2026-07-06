@@ -7649,8 +7649,10 @@ function toggleReceiptsEnabled(requested) {{
             const expectedAdj = selected ? _expectedAdjustment(Number(s.gross || 0), invTotal) : null;
             const adjustment = _getAdjustment(saleKey);
             const adjustmentOk = _adjustmentMatches(expectedAdj, adjustment);
-            const ready = !!selected && adjustmentOk;
-            return {{saleKey, selected, invTotal, expectedAdj, adjustment, adjustmentOk, ready}};
+            const selectedStatus = String((selected && selected.status) || '').toUpperCase();
+            const invoiceReady = selectedStatus !== 'DRAFT';
+            const ready = !!selected && adjustmentOk && invoiceReady;
+            return {{saleKey, selected, invTotal, expectedAdj, adjustment, adjustmentOk, invoiceReady, ready}};
           }});
           // A sale counts toward the total only if it has a selected invoice and
           // any under/over difference has an explicit adjustment plan.
@@ -7675,6 +7677,7 @@ function toggleReceiptsEnabled(requested) {{
             const expectedAdj = rowState.expectedAdj;
             const adjustment = rowState.adjustment;
             const adjustmentOk = rowState.adjustmentOk;
+            const invoiceReady = rowState.invoiceReady;
 
             // Option list: matched -> [app pick, ...same-amount alts]; missing -> ranked candidates.
             const allOptions = isMissing
@@ -7863,11 +7866,19 @@ function toggleReceiptsEnabled(requested) {{
                     : '<button class="cf-adjust-set mt-1 inline-flex px-2 py-1 rounded bg-amber-600 text-white text-[11px] font-semibold hover:bg-amber-700" data-si="' + idx + '" data-type="' + expectedAdj.type + '" data-amt="' + expectedAdj.amount.toFixed(2) + '">' + actionText + ' (' + money(expectedAdj.amount) + ')</button>')
                 + '</div>';
             }}
+            if (favoured && String(favoured.status || '').toUpperCase() === 'DRAFT') {{
+              invCell += '<div class="mt-2 rounded border border-amber-200 bg-amber-50 p-2 text-[11px] text-amber-800">'
+                + '<div class="font-semibold">Draft invoice found: process/approve this Xero invoice first.</div>'
+                + '<div class="mt-0.5">It is the best match, but it cannot be included in a Cashflows submission while still DRAFT.</div>'
+                + '</div>';
+            }}
 
             // Status badge.
             let statusBadge;
             if (noMatch) {{
               statusBadge = '<span class="text-amber-600 font-semibold">\u23f3 no matches found</span>';
+            }} else if (favoured && String(favoured.status || '').toUpperCase() === 'DRAFT') {{
+              statusBadge = '<span class="text-amber-700 font-semibold">\u26a0 draft invoice \u2014 process first</span>';
             }} else if (userChosen) {{
               statusBadge = expectedAdj && !adjustmentOk
                 ? '<span class="text-amber-700 font-semibold">\u26a0 adjustment needed</span>'
@@ -7913,7 +7924,9 @@ function toggleReceiptsEnabled(requested) {{
                 : '<span class="text-[10px] text-gray-400">' + (opt.days_apart===0?'same day':opt.days_apart+'d apart') + '</span>';
               const assigned = opt.assigned_to ? ' <span class="text-[10px] text-orange-500 italic">(now on ' + esc(opt.assigned_to) + ')</span>' : '';
               const openBadge = (opt.is_open === true)
-                ? '<span class="text-[10px] font-semibold text-indigo-700 bg-indigo-100 rounded px-1">unpaid \u2014 reconciling marks paid</span>'
+                ? (String(opt.status || '').toUpperCase() === 'DRAFT'
+                    ? '<span class="text-[10px] font-semibold text-amber-700 bg-amber-100 rounded px-1">draft \u2014 process first</span>'
+                    : '<span class="text-[10px] font-semibold text-indigo-700 bg-indigo-100 rounded px-1">unpaid \u2014 reconciling marks paid</span>')
                 : (opt.is_open === false ? '<span class="text-[10px] text-gray-400 bg-gray-100 rounded px-1">already paid</span>' : '');
               const optTotal = Number(opt.total ?? opt.amount ?? opt.amount_due ?? 0);
               const saleGross = Number(s.gross || 0);
@@ -9052,6 +9065,11 @@ function toggleReceiptsEnabled(requested) {{
                 if not selected:
                     blocking_errors.append(
                         f"Batch {batch_id} sale {sale_ref or idx + 1} has no selected invoice."
+                    )
+                    continue
+                if str(selected.get("status") or "").strip().upper() == "DRAFT":
+                    blocking_errors.append(
+                        f"Batch {batch_id} invoice {selected.get('number') or selected.get('id') or 'invoice'} is still DRAFT in Xero. Process/approve the invoice first, then refresh this batch."
                     )
                     continue
                 selected_id = str(selected.get("id") or "").strip()

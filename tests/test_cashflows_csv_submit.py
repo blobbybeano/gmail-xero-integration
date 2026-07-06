@@ -918,6 +918,70 @@ class CashflowsCsvSubmitTests(unittest.TestCase):
                 )
         self.assertEqual(resp.status_code, 400)
 
+    def test_draft_invoice_selection_is_rejected(self):
+        preview = {
+            "preview_id": "preview-1",
+            "batches": [
+                {
+                    "id": "batch-1",
+                    "status": "ready",
+                    "payout": {"csv_ref": "pay-1", "date": "2026-06-12"},
+                    "gross": 174.0,
+                    "net": 173.36,
+                    "sales": [
+                        {
+                            "sale_ref": "sale-1",
+                            "date": "2026-06-12",
+                            "gross": 174.0,
+                            "fee": 0.64,
+                            "invoice": None,
+                            "candidates": [
+                                {
+                                    "id": "draft-gordon",
+                                    "number": "INV-5660",
+                                    "contact_name": "Gordon Mowat",
+                                    "total": 174.0,
+                                    "amount_due": 174.0,
+                                    "is_open": True,
+                                    "status": "DRAFT",
+                                }
+                            ],
+                            "tied_candidates": [],
+                        }
+                    ],
+                }
+            ],
+        }
+        app = self._app_with_preview(preview, dry_run=False, production=True)
+        fake = FakeXeroClient()
+        fake.dry_run = False
+        with app.test_client() as client:
+            with client.session_transaction() as session:
+                session["logged_in"] = True
+            with patch("app.admin_web.build_xero_client", return_value=fake), patch(
+                "app.admin_web._CF_SUBMIT_PACE_SECONDS", 0
+            ):
+                resp = client.post(
+                    "/cashflows-sync/submit-csv-batches",
+                    json={
+                        "preview_id": "preview-1",
+                        "batches": [
+                            {
+                                "batch_id": "batch-1",
+                                "sales": [
+                                    {
+                                        "sale_index": 0,
+                                        "selected_invoice_id": "draft-gordon",
+                                        "selected_invoice_number": "INV-5660",
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("DRAFT", resp.get_json()["error"])
+
     def test_refresh_csv_preview_rebuilds_from_cached_csv(self):
         from app.admin_store import get_json_setting, set_json_setting
         from app.admin_web import _CF_SUBMIT_JOB_KEY

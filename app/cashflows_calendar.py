@@ -380,6 +380,13 @@ class CalendarPool:
                 "customer": p.get("customer") or "",
                 "event_gross": float(eg) if eg is not None else None,
                 "event_summary": (p["event"].get("summary") or "")[:120],
+                "calendar_id": p["event"].get("_calendar_id") or "",
+                "event_id": p["event"].get("id") or "",
+                "event_key": (
+                    f"{p['event'].get('_calendar_id')}:{p['event'].get('id')}"
+                    if p["event"].get("_calendar_id") and p["event"].get("id")
+                    else ""
+                ),
                 "event_start": start_dt.strftime("%H:%M") if start_dt else "",
                 "event_end": end_dt.strftime("%H:%M") if end_dt else "",
                 "event_date": ev_date.isoformat(),
@@ -443,7 +450,10 @@ def build_calendar_pool(
                 )
                 .execute()
             )
-            raw_events.extend(page.get("items", []))
+            for ev in page.get("items", []):
+                ev_copy = dict(ev)
+                ev_copy["_calendar_id"] = cal_id
+                raw_events.append(ev_copy)
         except Exception as exc:
             log.debug("Calendar %s fetch failed: %s", cal_id, exc)
 

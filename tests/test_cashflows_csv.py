@@ -5,6 +5,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 from app.admin_store import init_admin_store
+from app.state import save_state
 from app.cashflows_csv import (
     CsvParseError,
     allocate_sales_to_payouts,
@@ -34,11 +35,12 @@ def _remit(ref, date, debit):
 
 
 class _FakeXero:
-    def __init__(self, invoices=None, bank=None, raise_on=None, paid=None):
+    def __init__(self, invoices=None, bank=None, raise_on=None, paid=None, by_id=None):
         self._invoices = invoices or {"Invoices": []}
         self._bank = bank or {"BankTransactions": []}
         self._raise_on = raise_on
         self._paid = paid or {"Invoices": []}
+        self._by_id = by_id or {}
 
     def get_bank_transactions(self, start_date=None, end_date=None):
         if self._raise_on == "bank":
@@ -52,6 +54,11 @@ class _FakeXero:
 
     def get_paid_invoices(self, start_date=None, end_date=None):
         return self._paid
+
+    def get_invoice(self, invoice_id):
+        if invoice_id not in self._by_id:
+            raise RuntimeError("missing invoice")
+        return self._by_id[invoice_id]
 
 
 def _bank_line(ref, date, amount):
@@ -89,6 +96,14 @@ def _invoice(inv_id, number, date, total, contact="Customer", reference=None):
     if reference is not None:
         raw["Reference"] = reference
     return raw
+
+
+class _FakeCalendarPool:
+    def __init__(self, suggestions):
+        self._suggestions = suggestions
+
+    def suggest_for_sale(self, *_args, **_kwargs):
+        return list(self._suggestions)
 
 
 class ParseTests(unittest.TestCase):
@@ -221,12 +236,18 @@ class PreviewTests(unittest.TestCase):
     def setUp(self):
         fd, self._db_path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
+        fd_state, self._state_path = tempfile.mkstemp(suffix=".json")
+        os.close(fd_state)
         init_admin_store(self._db_path)
-        self.config = SimpleNamespace(admin_db_file=self._db_path)
+        self.config = SimpleNamespace(admin_db_file=self._db_path, state_file=self._state_path)
 
     def tearDown(self):
         try:
             os.remove(self._db_path)
+        except OSError:
+            pass
+        try:
+            os.remove(self._state_path)
         except OSError:
             pass
 
@@ -478,6 +499,79 @@ class PreviewTests(unittest.TestCase):
         self.assertEqual(row["candidates"][0]["number"], "INV-5662")
         self.assertEqual(row["candidates"][0]["contact_name"], "Margaret Doherty")
         self.assertEqual(row["candidates"][0]["total"], 120.0)
+
+    def test_calendar_linked_draft_invoice_beats_unrelated_candidate(self):
+        from unittest.mock import patch
+
+        event_key = "calendar-1:event-gordon"
+        save_state(
+            self._state_path,
+            {"event_invoice_map": {event_key: "draft-gordon"}},
+        )
+        text = _csv(
+            [
+                _sale("1", "2026-06-12", "AAA", "174.00"),
+                _fee("2", "2026-06-12", "AAA", "0.64"),
+                _remit("3", "2026-06-13", "173.36"),
+            ]
+        )
+        gordon_draft = {
+            "InvoiceID": "draft-gordon",
+            "InvoiceNumber": "INV-5660",
+            "Date": "2026-06-12",
+            "Status": "DRAFT",
+            "AmountDue": "174.00",
+            "Total": "174.00",
+            "Reference": "GC-20260612-hegd",
+            "Contact": {"Name": "Gordon Mowat"},
+        }
+        xero = _FakeXero(
+            invoices={"Invoices": []},
+            bank={"BankTransactions": [_bank_line("b1", "2026-06-13", "173.36")]},
+            paid={
+                "Invoices": [
+                    _invoice(
+                        "old-ian",
+                        "INV-5457",
+                        "2026-05-07",
+                        "108.00",
+                        contact="Ian Weinstein",
+                        reference="GC-20260507-hbfe",
+                    )
+                ]
+            },
+            by_id={"draft-gordon": gordon_draft},
+        )
+        cal_pool = _FakeCalendarPool(
+            [
+                {
+                    "customer": "Gordon Mowat",
+                    "event_gross": 174.0,
+                    "event_summary": "SW15 G.C Gordon",
+                    "calendar_id": "calendar-1",
+                    "event_id": "event-gordon",
+                    "event_key": event_key,
+                    "event_start": "08:00",
+                    "event_end": "09:00",
+                    "event_date": "2026-06-12",
+                    "score": 0.95,
+                    "source": "structured",
+                }
+            ]
+        )
+        with patch("app.cashflows_csv.build_calendar_pool", return_value=cal_pool):
+            result = build_csv_reconciliation_preview(
+                self.config,
+                text,
+                xero_client=xero,
+                calendar_ids=["calendar-1"],
+            )
+        row = result["batches"][0]["sales"][0]
+        self.assertIsNone(row["invoice"])
+        self.assertEqual(row["candidates"][0]["number"], "INV-5660")
+        self.assertEqual(row["candidates"][0]["contact_name"], "Gordon Mowat")
+        self.assertEqual(row["candidates"][0]["status"], "DRAFT")
+        self.assertEqual(row["candidates"][0]["total"], 174.0)
 
     def test_sheet_configured_accepts_card_paid_invoice(self):
         from unittest.mock import patch
