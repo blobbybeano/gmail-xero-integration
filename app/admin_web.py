@@ -13939,14 +13939,13 @@ body {{ background:#f7f6f3 !important; }}
             return {"paused": False, "rows": _fallback_rows(),
                     "outstanding": [], "chosen": chosen}
 
-        # Fetch a wide window so far-off candidates are available to the
-        # suggestion pass: receipt OCR dates can be months wrong (day/month
-        # swaps move a date up to ~6 months, year misreads up to ~12), so a tight
-        # window would hide the very transactions we want to suggest. Confident
-        # matching is still bounded by the 90d/45d caps in the qualify logic
-        # below; only the exact-amount-plus-name suggestions use the extra slack.
-        start = min(dates) - dt.timedelta(days=365)
-        end = max(dates) + dt.timedelta(days=365)
+        # Keep this report focused on the uploaded batch. The previous wide
+        # one-year-each-side window pulled in old VAT-return-era card payments,
+        # making the "missing receipt" count look much larger than the current
+        # dump. A 45-day buffer still covers realistic posting delays and most
+        # OCR date mistakes without turning the page into a full historical audit.
+        start = min(dates) - dt.timedelta(days=45)
+        end = max(dates) + dt.timedelta(days=45)
 
         txs = []
         acct_names_seen: set = set()
@@ -14474,9 +14473,9 @@ body {{ background:#f7f6f3 !important; }}
             "bg-gray-200 text-gray-700'>" + str(n_thin) + "</span>"
         )
 
-        # "Non-submission report": every card payment (all months in the
-        # window) that still has no receipt, with dates, a grand total and the
-        # VAT locked inside those totals (20% rate → total ÷ 6).
+        # "Card-feed gap report": card payments in this dump's date window that
+        # still have no receipt in this upload. This is not the same as "Xero
+        # expenses waiting to submit"; it is just a cross-check list.
         nonsub_html = ""
         nonsub = [t for t, k in timeline if k == "thin"]
         if nonsub:
@@ -14504,12 +14503,12 @@ body {{ background:#f7f6f3 !important; }}
                 "rounded-lg border border-gray-300 text-gray-700 "
                 "hover:bg-gray-50' onclick=\"document.getElementById("
                 "'dump-nonsub').classList.toggle('hidden')\">"
-                "Non-submission report</button></div>"
+                "Card-feed gap report</button></div>"
                 "<div id='dump-nonsub' class='hidden bg-white rounded-xl "
                 "border border-gray-200 p-4 text-sm'>"
                 "<div class='font-semibold text-gray-800 mb-2'>"
-                "Non-submission report \u2014 card payments with no receipt "
-                "handed in</div>"
+                "Card-feed gap report \u2014 card payments in this date window "
+                "with no receipt in this dump</div>"
                 "<table class='w-full text-xs'><thead>"
                 "<tr class='text-left text-gray-400'>"
                 "<th class='py-1 pr-3 font-medium'>Date</th>"
@@ -14519,7 +14518,8 @@ body {{ background:#f7f6f3 !important; }}
                 "<div class='mt-3 pt-2 border-t border-gray-200 flex "
                 "justify-between text-xs'>"
                 "<span class='text-gray-500'>" + str(len(nonsub))
-                + " unsubmitted expense" + ("s" if len(nonsub) != 1 else "")
+                + " card payment" + ("s" if len(nonsub) != 1 else "")
+                + " without a receipt in this dump"
                 + "</span><span class='font-semibold text-gray-900'>Total "
                 + sym + format(_tot, ",.2f") + "</span></div>"
                 "<div class='flex justify-between text-xs mt-1'>"
@@ -14751,6 +14751,17 @@ body {{ background:#f7f6f3 !important; }}
                 counts[st] = counts.get(st, 0) + 1
         seq = 0
         for file_bytes, filename, content_type in files:
+            try:
+                live_batch = dump_store.get_batch(db, batch["id"]) or {}
+                if live_batch.get("status") == "cancelled":
+                    print(
+                        "[receipt-dump] stopped cancelled batch "
+                        f"{batch['id']}",
+                        flush=True,
+                    )
+                    break
+            except Exception:
+                pass
             seq += 1
             _receipt_started = time.perf_counter()
             _resize_s = _ocr_s = _split_s = _ai_s = _xero_s = _card_s = 0.0
@@ -15183,8 +15194,20 @@ body {{ background:#f7f6f3 !important; }}
             except Exception:
                 pass
 
+        final_items = dump_store.list_items(db, batch["id"])
+        final_counts: dict = {}
+        for it in final_items:
+            st = it.get("status") or ""
+            if st:
+                final_counts[st] = final_counts.get(st, 0) + 1
+        final_batch = dump_store.get_batch(db, batch["id"]) or {}
+        final_status = "cancelled" if final_batch.get("status") == "cancelled" else "ready"
         dump_store.update_batch(
-            db, batch["id"], status="ready", total_count=seq, summary=counts
+            db,
+            batch["id"],
+            status=final_status,
+            total_count=len(final_items),
+            summary=final_counts,
         )
 
     def _cardfeed_redirect_uri():
@@ -16604,9 +16627,11 @@ body {{ background:#f7f6f3 !important; }}
                     flush=True,
                 )
                 try:
-                    dump_store.update_batch(
-                        config.admin_db_file, b["id"], status="processing"
-                    )
+                    live = dump_store.get_batch(config.admin_db_file, b["id"]) or {}
+                    if live.get("status") != "cancelled":
+                        dump_store.update_batch(
+                            config.admin_db_file, b["id"], status="processing"
+                        )
                 except Exception:
                     pass
         threading.Thread(target=_bg, daemon=True).start()
@@ -16633,6 +16658,24 @@ body {{ background:#f7f6f3 !important; }}
         _dump_launch_background(batch, _dump_staged_paths(batch_id))
         return jsonify({"url": result_url})
 
+    @app.post("/receipts/expenses/dump/<batch_id>/cancel")
+    @require_login
+    def expense_dump_cancel(batch_id):
+        """Stop a receipt dump after the current in-flight receipt finishes."""
+        db = config.admin_db_file
+        batch = dump_store.get_batch(db, batch_id)
+        if not batch:
+            return redirect("/receipts/expenses/dump")
+        items = dump_store.list_items(db, batch_id)
+        dump_store.update_batch(
+            db,
+            batch_id,
+            status="cancelled",
+            total_count=len(items),
+        )
+        _dump_cleanup_staging_dir(batch_id)
+        return redirect("/receipts/expenses/dump/" + batch_id)
+
     def _dump_last_activity(batch, items):
         """Most recent activity timestamp for a batch — the latest of the batch's
         own updated_at and any of its items' updated_at. Used as a heartbeat to
@@ -16652,7 +16695,7 @@ body {{ background:#f7f6f3 !important; }}
         _dump_process skip items already written for the same batch. If no staged
         files remain, fall back to showing the partial result instead of leaving
         the page spinning forever."""
-        if not batch or batch.get("status") != "finalizing":
+        if not batch or batch.get("status") not in ("processing", "finalizing"):
             return batch
         items = dump_store.list_items(db, batch["id"])
         last = _dump_last_activity(batch, items)
@@ -16673,7 +16716,10 @@ body {{ background:#f7f6f3 !important; }}
                     db,
                     batch["id"],
                     status="finalizing",
-                    total_count=max(int(batch.get("total_count") or 0), len(staged_paths)),
+                    total_count=max(
+                        int(batch.get("total_count") or 0),
+                        len(items) + len(staged_paths),
+                    ),
                 ) or batch
                 print(
                     "[receipt-dump] relaunching stuck batch "
@@ -16682,7 +16728,9 @@ body {{ background:#f7f6f3 !important; }}
                 )
                 _dump_launch_background(refreshed, staged_paths)
                 return refreshed
-            dump_store.update_batch(db, batch["id"], status="ready")
+            dump_store.update_batch(
+                db, batch["id"], status="ready", total_count=len(items)
+            )
             return dump_store.get_batch(db, batch["id"]) or batch
         return batch
 
@@ -16697,7 +16745,7 @@ body {{ background:#f7f6f3 !important; }}
             return jsonify({"ok": False}), 404
         batch = _dump_stuck_recover(db, batch)
         done = len(dump_store.list_items(db, batch_id))
-        total = batch.get("total_count") or 0
+        total = max(int(batch.get("total_count") or 0), done)
         return jsonify({
             "ok": True,
             "status": batch.get("status"),
@@ -17050,8 +17098,8 @@ body {{ background:#f7f6f3 !important; }}
         # (e.g. the background thread was killed by an app restart), auto-recover.
         batch = _dump_stuck_recover(db, batch)
         if batch.get("status") in ("processing", "finalizing"):
-            total0 = batch.get("total_count") or 0
             done0 = len(dump_store.list_items(db, batch_id))
+            total0 = max(int(batch.get("total_count") or 0), done0)
             pct0 = min(99, round(done0 / total0 * 100)) if total0 else 3
             count_line = (
                 ("Read " + str(done0) + " of " + str(total0) + " receipts")
@@ -17073,7 +17121,8 @@ body {{ background:#f7f6f3 !important; }}
                 "</div>"
                 "<h1 class='text-xl font-bold text-gray-900 mb-2'>Reading your receipts…</h1>"
                 "<p class='text-sm text-gray-500 mb-6'>Running OCR and AI "
-                "categorisation. You don't need to do anything — keep this page open.</p>"
+                "categorisation. You can leave this page open, or stop this dump "
+                "if it is the wrong upload.</p>"
                 "<div class='max-w-md mx-auto'>"
                 "<div class='w-full bg-gray-200 rounded-full h-3 overflow-hidden'>"
                 "<div id='dump-progress-bar' class='bg-indigo-600 h-3 rounded-full "
@@ -17081,6 +17130,11 @@ body {{ background:#f7f6f3 !important; }}
                 "</div></div>"
                 "<p id='dump-progress-text' class='text-sm font-medium text-gray-600 "
                 "mt-3'>" + count_line + "</p>"
+                "<form method='post' action='/receipts/expenses/dump/" + batch_id
+                + "/cancel' class='mt-5' onsubmit=\"return confirm('Stop reading this receipt dump? Already-read receipts will stay visible, but the remaining upload queue will be discarded.')\">"
+                "<button type='submit' class='text-sm font-semibold px-4 py-2 "
+                "rounded-lg border border-rose-200 bg-rose-50 text-rose-700 "
+                "hover:bg-rose-100'>Stop this dump</button></form>"
                 "</div>"
                 "</div>"
                 "<script>(function(){"
@@ -17092,7 +17146,7 @@ body {{ background:#f7f6f3 !important; }}
                 ".then(function(r){return r.json();}).then(function(d){"
                 "if(!d||!d.ok){setTimeout(poll,2500);return;}"
                 "if(d.status!=='processing'&&d.status!=='finalizing'){window.location.reload();return;}"
-                "var total=d.total||0,done=d.done||0;"
+                "var total=Math.max(d.total||0,d.done||0),done=d.done||0;"
                 "var pct=total?Math.min(99,Math.round(done/total*100)):3;"
                 "if(bar)bar.style.width=pct+'%';"
                 "if(txt)txt.textContent=total?('Read '+done+' of '+total+' receipts'):'Reading receipts…';"
