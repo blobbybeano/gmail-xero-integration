@@ -1020,6 +1020,7 @@ def _openai_assistant_reply(prompt: str) -> tuple[str | None, str | None]:
 
 
 _xero_acct_cache: "dict[str, tuple[float, list, list, list, str]]" = {}
+_xero_all_acct_cache: "dict[str, tuple[float, list, str]]" = {}
 _xero_conn_cache: "dict[str, tuple[float, list[dict]]]" = {}
 _XERO_CACHE_TTL = 300  # seconds (5 min)
 _XERO_CONN_CACHE_TTL = 300  # seconds
@@ -1050,6 +1051,7 @@ def _get_tenant_acct_themes(at: str, tid: str) -> "tuple[list, list, list, str]"
     }
     rev: list = []
     bank: list = []
+    all_accounts: list = []
     warnings: list[str] = []
     try:
         _ar = requests.get(
@@ -1061,6 +1063,7 @@ def _get_tenant_acct_themes(at: str, tid: str) -> "tuple[list, list, list, str]"
             for _a in _ar.json().get("Accounts", []):
                 if _a.get("Status") != "ACTIVE":
                     continue
+                all_accounts.append(_a)
                 _typ = _a.get("Type", "")
                 if _typ in ("REVENUE", "SALES", "OTHERINCOME"):
                     rev.append(_a)
@@ -1114,6 +1117,8 @@ def _get_tenant_acct_themes(at: str, tid: str) -> "tuple[list, list, list, str]"
         _xero_acct_cache[key] = (time.time() - (_XERO_CACHE_TTL - 20), rev, bank, themes, warning)
     else:
         _xero_acct_cache[key] = (time.time(), rev, bank, themes, warning)
+    if all_accounts or warning:
+        _xero_all_acct_cache[key] = (time.time(), all_accounts, warning)
     return rev, bank, themes, warning
 
 
@@ -1124,6 +1129,54 @@ def _get_tenant_cached_only(tid: str) -> "tuple[list, list, list, str]":
         return [], [], [], ""
     _, rev, bank, themes, warning = cached
     return rev, bank, themes, warning
+
+
+def _get_xero_active_accounts(at: str, tid: str) -> "tuple[list, str]":
+    """Return active Xero accounts for owner-paid receipt account selection."""
+    if xero_is_disabled():
+        cached = _xero_all_acct_cache.get(tid)
+        if cached:
+            _ts, accounts, _warning = cached
+            return accounts, "Xero is paused — showing cached account data."
+        return [], "Xero is paused — account data unavailable until Xero is re-enabled."
+    cached = _xero_all_acct_cache.get(tid)
+    if cached:
+        ts, accounts, warning = cached
+        if time.time() - ts < _XERO_CACHE_TTL:
+            return accounts, warning
+    if not at or not tid:
+        return [], "Xero account list unavailable until Xero is connected."
+    hdrs = {
+        "Authorization": f"Bearer {at}",
+        "Xero-tenant-id": tid,
+        "Accept": "application/json",
+    }
+    try:
+        res = requests.get(
+            "https://api.xero.com/api.xro/2.0/Accounts",
+            headers=hdrs,
+            timeout=3,
+        )
+        if res.ok:
+            accounts = [
+                a for a in res.json().get("Accounts", [])
+                if a.get("Status") == "ACTIVE" and str(a.get("Code") or "").strip()
+            ]
+            accounts.sort(key=lambda a: (str(a.get("Type") or ""), str(a.get("Name") or "")))
+            _xero_all_acct_cache[tid] = (time.time(), accounts, "")
+            return accounts, ""
+        warning = f"Cannot load full Xero account list (HTTP {res.status_code})."
+    except Exception:
+        warning = "Cannot load full Xero account list (request failed)."
+    if cached:
+        _ts, accounts, _old_warning = cached
+        return accounts, warning + " Using cached options."
+    _xero_all_acct_cache[tid] = (
+        time.time() - (_XERO_CACHE_TTL - 20),
+        [],
+        warning,
+    )
+    return [], warning
 
 
 # Expense-style Xero accounts (the categories engineers code receipts against).
@@ -1263,6 +1316,35 @@ def _exp_acct_options(accounts: list, selected: str, *, default_label: str) -> s
     if sel and not found:
         out += f"<option value='{escape(sel)}' selected>Saved code ({escape(sel)})</option>"
     return out
+
+
+def _expense_owner_paid_enabled(eng: dict | None) -> bool:
+    if not eng or eng.get("kind") != "company_card":
+        return False
+    return bool(eng.get("allow_owner_paid")) and bool(
+        str(eng.get("owner_paid_account_code") or "").strip()
+    )
+
+
+def _expense_normalise_payment_source(
+    eng: dict | None,
+    requested: str | None,
+) -> "tuple[str, str]":
+    """Return (payment_source, owner_paid_account_code) for a receipt.
+
+    Subcontractor receipts are always owner-paid. Company-card engineers only
+    get owner-paid if the office explicitly enables it and assigns a Xero
+    account in Field Expenses.
+    """
+    source = (requested or "company_card").strip()
+    if source not in {"company_card", "owner_paid"}:
+        source = "company_card"
+    owner_code = str((eng or {}).get("owner_paid_account_code") or "").strip()
+    if eng and eng.get("kind") != "company_card":
+        return "owner_paid", owner_code
+    if source == "owner_paid" and _expense_owner_paid_enabled(eng):
+        return "owner_paid", owner_code
+    return "company_card", ""
 
 
 _AI_HINTS_KEY = "ai_receipt_hints"
@@ -11042,7 +11124,7 @@ body {{ background:#f7f6f3 !important; }}
             )
 
         paid_with_html = ""
-        if eng.get("kind") == "company_card":
+        if _expense_owner_paid_enabled(eng):
             paid_with_html = """
                 <div class="rounded-xl border border-gray-200 bg-white p-2 grid grid-cols-2 gap-2">
                   <label class="cursor-pointer">
@@ -11067,6 +11149,8 @@ body {{ background:#f7f6f3 !important; }}
                   </label>
                 </div>
             """
+        elif eng.get("kind") == "company_card":
+            paid_with_html = '<input type="hidden" name="payment_source" value="company_card">'
         else:
             paid_with_html = '<input type="hidden" name="payment_source" value="owner_paid">'
 
@@ -11251,11 +11335,9 @@ body {{ background:#f7f6f3 !important; }}
         file = request.files.get("receipt_file")
         if not file or not file.filename:
             return redirect(f"/expenses/{token}")
-        payment_source = (request.form.get("payment_source") or "company_card").strip()
-        if payment_source not in {"company_card", "owner_paid"}:
-            payment_source = "company_card"
-        if eng.get("kind") != "company_card":
-            payment_source = "owner_paid"
+        payment_source, owner_paid_account_code = _expense_normalise_payment_source(
+            eng, request.form.get("payment_source")
+        )
 
         file_bytes = file.read() or b""
         filename = file.filename or "receipt.jpg"
@@ -11351,6 +11433,7 @@ body {{ background:#f7f6f3 !important; }}
             category_account_code=cat_code,
             category_account_name=cat_name,
             payment_source=payment_source,
+            owner_paid_account_code=owner_paid_account_code,
             status="pending_review",
         )
         return redirect(f"/expenses/{token}/review/{rec['id']}")
@@ -11442,9 +11525,10 @@ body {{ background:#f7f6f3 !important; }}
 
         source = rec.get("payment_source") or "company_card"
         source_html = ""
-        if eng.get("kind") == "company_card":
+        if _expense_owner_paid_enabled(eng):
             company_checked = "checked" if source != "owner_paid" else ""
             owner_checked = "checked" if source == "owner_paid" else ""
+            owner_code = escape(str(eng.get("owner_paid_account_code") or "").strip())
             source_html = (
                 "<div>"
                 "<label class='block text-xs font-medium text-gray-500 mb-1'>Paid with</label>"
@@ -11458,9 +11542,11 @@ body {{ background:#f7f6f3 !important; }}
                 "<span class='block text-center rounded-lg border border-gray-200 px-3 py-2 text-sm font-semibold text-gray-700 peer-checked:bg-emerald-600 peer-checked:text-white peer-checked:border-emerald-600'>Personal card</span>"
                 "</label>"
                 "</div>"
-                "<p class='text-xs text-gray-400 mt-1'>Personal card receipts are saved as owner-paid and do not expect a company-card bank match.</p>"
+                f"<p class='text-xs text-gray-400 mt-1'>Personal card receipts are saved as owner-paid to Xero account {owner_code} and do not expect a company-card bank match.</p>"
                 "</div>"
             )
+        elif eng.get("kind") == "company_card":
+            source_html = "<input type='hidden' name='payment_source' value='company_card'>"
         else:
             source_html = "<input type='hidden' name='payment_source' value='owner_paid'>"
 
@@ -11566,16 +11652,14 @@ body {{ background:#f7f6f3 !important; }}
             vat_amount=_num("vat_amount"),
             status="approved",
         )
-        payment_source = (
+        payment_source, owner_paid_account_code = _expense_normalise_payment_source(
+            eng,
             request.form.get("payment_source")
             or rec.get("payment_source")
-            or "company_card"
-        ).strip()
-        if payment_source not in {"company_card", "owner_paid"}:
-            payment_source = "company_card"
-        if eng.get("kind") != "company_card":
-            payment_source = "owner_paid"
+            or "company_card",
+        )
         updates["payment_source"] = payment_source
+        updates["owner_paid_account_code"] = owner_paid_account_code
 
         # Only touch the category when the dropdown was actually rendered/submitted.
         # If Xero was unavailable the field is absent, so we preserve any existing
@@ -12158,12 +12242,23 @@ body {{ background:#f7f6f3 !important; }}
         _at, _tid, _acct_warn = _load_xero_at_tid(config)
         exp_accounts, _exp_warn = _get_xero_expense_accounts(_at, _tid, config.admin_db_file)
         bank_accounts: list = []
+        owner_paid_accounts: list = []
+        _owner_warn = ""
         try:
             _r, bank_accounts, _t, _bw = _get_tenant_acct_themes(_at, _tid) if (_at and _tid) else ([], [], [], "")
         except Exception:
             bank_accounts = []
+        try:
+            owner_paid_accounts, _owner_warn = (
+                _get_xero_active_accounts(_at, _tid) if (_at and _tid) else ([], "")
+            )
+        except Exception:
+            owner_paid_accounts, _owner_warn = [], ""
         acct_warning = " ".join(
-            dict.fromkeys([w.strip() for w in (_acct_warn, _exp_warn) if w and w.strip()])
+            dict.fromkeys([
+                w.strip() for w in (_acct_warn, _exp_warn, _owner_warn)
+                if w and w.strip()
+            ])
         )
         acct_warning_html = ""
         if acct_warning:
@@ -12537,6 +12632,23 @@ body {{ background:#f7f6f3 !important; }}
                     f"value='{escape(e.get('payment_account_code') or '')}' "
                     f"class='{_sel_cls}' placeholder='blank = default'>"
                 )
+            owner_checked = "checked" if e.get("allow_owner_paid") else ""
+            owner_account_code = e.get("owner_paid_account_code") or ""
+            if owner_paid_accounts:
+                owner_account_field = (
+                    f"<select name='owner_paid_account_code' class='{_sel_cls}'>"
+                    + _exp_acct_options(
+                        owner_paid_accounts, owner_account_code,
+                        default_label="Choose Xero account",
+                    )
+                    + "</select>"
+                )
+            else:
+                owner_account_field = (
+                    f"<input name='owner_paid_account_code' "
+                    f"value='{escape(owner_account_code)}' "
+                    f"class='{_sel_cls}' placeholder='e.g. Ben personal account code'>"
+                )
             has_pw = bool((e.get("password_hash") or "").strip())
             pw_hint = (
                 "<span class='text-emerald-600 font-normal'>(set)</span>" if has_pw
@@ -12603,6 +12715,13 @@ body {{ background:#f7f6f3 !important; }}
                 f"{exp_field}</div>"
                 "<div><label class='block text-xs text-gray-500 mb-1'>Payment/bank account</label>"
                 f"{pay_field}</div>"
+                "<div class='sm:col-span-2 rounded-lg border border-emerald-100 bg-emerald-50 p-3'>"
+                "<label class='flex items-start gap-2 text-sm font-medium text-emerald-900'>"
+                f"<input type='checkbox' name='allow_owner_paid' value='1' {owner_checked} class='mt-1'> "
+                "<span>Allow personal / owner-paid receipt option</span></label>"
+                "<p class='text-xs text-emerald-700 mt-1'>Only enabled engineers will see a personal-card choice on the photo screen.</p>"
+                "<label class='block text-xs text-emerald-800 mt-2 mb-1'>Owner-paid Xero account</label>"
+                f"{owner_account_field}</div>"
                 "<div><label class='block text-xs text-gray-500 mb-1'>Login username</label>"
                 f"<input name='username' value='{escape(e.get('username') or '')}' "
                 "autocapitalize='none' class='w-full rounded border border-gray-300 px-2 py-1 "
@@ -12770,6 +12889,32 @@ body {{ background:#f7f6f3 !important; }}
             + _create_card_inner
             + "</div>"
         )
+        if owner_paid_accounts:
+            _create_owner_account_inner = (
+                "<select name='owner_paid_account_code' "
+                "class='w-full rounded border border-gray-300 px-3 py-2 text-sm'>"
+                + _exp_acct_options(
+                    owner_paid_accounts, "",
+                    default_label="Choose Xero account",
+                )
+                + "</select>"
+            )
+        else:
+            _create_owner_account_inner = (
+                "<input name='owner_paid_account_code' "
+                "class='w-full rounded border border-gray-300 px-3 py-2 text-sm' "
+                "placeholder='e.g. Ben personal account code'>"
+            )
+        _create_owner_field_html = (
+            "<div class='sm:col-span-3 rounded-lg border border-emerald-100 bg-emerald-50 p-3'>"
+            "<label class='flex items-start gap-2 text-sm font-medium text-emerald-900'>"
+            "<input type='checkbox' name='allow_owner_paid' value='1' class='mt-1'>"
+            "<span>Allow personal / owner-paid receipt option</span></label>"
+            "<p class='text-xs text-emerald-700 mt-1'>Use this only for people who should be able to submit receipts paid from a non-company card.</p>"
+            "<label class='block text-xs text-emerald-800 mt-2 mb-1'>Owner-paid Xero account</label>"
+            + _create_owner_account_inner
+            + "</div>"
+        )
 
         return _page(
             f"""
@@ -12828,6 +12973,7 @@ body {{ background:#f7f6f3 !important; }}
                     </select>
                   </div>
                   {_create_card_field_html}
+                  {_create_owner_field_html}
                   <div class="sm:col-span-3">
                     <button type="submit"
                             class="px-4 py-2 rounded bg-indigo-600 text-white text-sm font-medium">
@@ -12880,7 +13026,15 @@ body {{ background:#f7f6f3 !important; }}
         kind = (request.form.get("kind") or "company_card").strip()
         if not name:
             return redirect("/receipts/expenses")
-        eng = exp_store.create_engineer(db, name=name, kind=kind)
+        eng = exp_store.create_engineer(
+            db,
+            name=name,
+            kind=kind,
+            allow_owner_paid=1 if request.form.get("allow_owner_paid") else 0,
+            owner_paid_account_code=(
+                request.form.get("owner_paid_account_code") or ""
+            ).strip(),
+        )
         plaid_account_id = (request.form.get("plaid_account_id") or "").strip()
         if plaid_account_id and kind == "company_card":
             exp_store.update_engineer(db, eng["id"], plaid_account_id=plaid_account_id)
@@ -12907,6 +13061,10 @@ body {{ background:#f7f6f3 !important; }}
             expense_account_code=(request.form.get("expense_account_code") or "").strip(),
             payment_account_code=(request.form.get("payment_account_code") or "").strip(),
             plaid_account_id=new_card,
+            allow_owner_paid=1 if request.form.get("allow_owner_paid") else 0,
+            owner_paid_account_code=(
+                request.form.get("owner_paid_account_code") or ""
+            ).strip(),
             username=username,
             active=1 if request.form.get("active") else 0,
         )

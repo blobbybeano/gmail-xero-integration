@@ -56,6 +56,8 @@ def _ensure_tables(db_path: str) -> None:
                 xero_contact_name TEXT NOT NULL DEFAULT '',
                 expense_account_code TEXT NOT NULL DEFAULT '',
                 payment_account_code TEXT NOT NULL DEFAULT '',
+                allow_owner_paid INTEGER NOT NULL DEFAULT 0,
+                owner_paid_account_code TEXT NOT NULL DEFAULT '',
                 active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL
             )
@@ -81,6 +83,10 @@ def _ensure_tables(db_path: str) -> None:
                 stored_file TEXT NOT NULL DEFAULT '',
                 filename TEXT NOT NULL DEFAULT '',
                 mime_type TEXT NOT NULL DEFAULT '',
+                category_account_code TEXT NOT NULL DEFAULT '',
+                category_account_name TEXT NOT NULL DEFAULT '',
+                payment_source TEXT NOT NULL DEFAULT 'company_card',
+                owner_paid_account_code TEXT NOT NULL DEFAULT '',
                 xero_type TEXT NOT NULL DEFAULT '',
                 xero_id TEXT NOT NULL DEFAULT '',
                 xero_error TEXT NOT NULL DEFAULT '',
@@ -126,6 +132,11 @@ def _ensure_tables(db_path: str) -> None:
                 "ALTER TABLE expense_receipts "
                 "ADD COLUMN payment_source TEXT NOT NULL DEFAULT 'company_card'"
             )
+        if "owner_paid_account_code" not in _cols:
+            conn.execute(
+                "ALTER TABLE expense_receipts "
+                "ADD COLUMN owner_paid_account_code TEXT NOT NULL DEFAULT ''"
+            )
         # Migrations: per-engineer login credentials + linked bank card.
         _eng_cols = {
             r[1] for r in conn.execute(
@@ -139,6 +150,10 @@ def _ensure_tables(db_path: str) -> None:
              "ALTER TABLE expense_engineers ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''"),
             ("plaid_account_id",
              "ALTER TABLE expense_engineers ADD COLUMN plaid_account_id TEXT NOT NULL DEFAULT ''"),
+            ("allow_owner_paid",
+             "ALTER TABLE expense_engineers ADD COLUMN allow_owner_paid INTEGER NOT NULL DEFAULT 0"),
+            ("owner_paid_account_code",
+             "ALTER TABLE expense_engineers ADD COLUMN owner_paid_account_code TEXT NOT NULL DEFAULT ''"),
         ):
             if _col not in _eng_cols:
                 conn.execute(_ddl)
@@ -200,6 +215,8 @@ def create_engineer(
     xero_contact_name: str = "",
     expense_account_code: str = "",
     payment_account_code: str = "",
+    allow_owner_paid: bool | int = False,
+    owner_paid_account_code: str = "",
 ) -> dict[str, Any]:
     name = (name or "").strip()
     if not name:
@@ -217,13 +234,15 @@ def create_engineer(
             """
             INSERT INTO expense_engineers
                 (token, name, kind, xero_contact_id, xero_contact_name,
-                 expense_account_code, payment_account_code, active, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+                 expense_account_code, payment_account_code, allow_owner_paid,
+                 owner_paid_account_code, active, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
             """,
             (
                 token, name, kind, xero_contact_id.strip(),
                 xero_contact_name.strip(), expense_account_code.strip(),
-                payment_account_code.strip(), _now_iso(),
+                payment_account_code.strip(), 1 if allow_owner_paid else 0,
+                owner_paid_account_code.strip(), _now_iso(),
             ),
         )
         conn.commit()
@@ -238,6 +257,7 @@ def update_engineer(db_path: str, engineer_id: int, **fields) -> dict[str, Any] 
         "name", "kind", "xero_contact_id", "xero_contact_name",
         "expense_account_code", "payment_account_code", "active",
         "username", "password_hash", "plaid_account_id",
+        "allow_owner_paid", "owner_paid_account_code",
     }
     sets = {k: v for k, v in fields.items() if k in allowed}
     if not sets:
@@ -246,6 +266,8 @@ def update_engineer(db_path: str, engineer_id: int, **fields) -> dict[str, Any] 
         sets["kind"] = "company_card"
     if "active" in sets:
         sets["active"] = 1 if sets["active"] else 0
+    if "allow_owner_paid" in sets:
+        sets["allow_owner_paid"] = 1 if sets["allow_owner_paid"] else 0
     cols = ", ".join(f"{k} = ?" for k in sets)
     with _conn(db_path) as conn:
         conn.execute(
@@ -338,6 +360,7 @@ def create_receipt(
     category_account_code: str = "",
     category_account_name: str = "",
     payment_source: str = "company_card",
+    owner_paid_account_code: str = "",
     status: str = "pending_review",
 ) -> dict[str, Any]:
     rid = f"exp-{uuid.uuid4().hex[:12]}"
@@ -352,15 +375,15 @@ def create_receipt(
                  amount_ex, vat_amount, currency, ocr_merchant, ocr_amount,
                  ocr_date, ocr_raw, ocr_error, stored_file, filename,
                  mime_type, category_account_code, category_account_name,
-                 payment_source, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 payment_source, owner_paid_account_code, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 rid, engineer_id, status, merchant, purchased_on, amount_inc,
                 amount_ex, vat_amount, currency, ocr_merchant, ocr_amount,
                 ocr_date, ocr_raw, ocr_error, stored_file, filename,
                 mime_type, category_account_code, category_account_name,
-                payment_source,
+                payment_source, owner_paid_account_code.strip(),
                 now, now,
             ),
         )
@@ -373,7 +396,7 @@ def update_receipt(db_path: str, receipt_id: str, **fields) -> dict[str, Any] | 
         "status", "merchant", "purchased_on", "amount_inc", "amount_ex",
         "vat_amount", "currency", "xero_type", "xero_id", "xero_error",
         "settlement_id", "category_account_code", "category_account_name",
-        "payment_source",
+        "payment_source", "owner_paid_account_code",
     }
     sets = {k: v for k, v in fields.items() if k in allowed}
     if "payment_source" in sets and sets["payment_source"] not in PAYMENT_SOURCES:
