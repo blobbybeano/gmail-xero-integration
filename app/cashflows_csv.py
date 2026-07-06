@@ -849,6 +849,10 @@ def build_csv_reconciliation_preview(
 ) -> dict[str, Any]:
     statement = parse_merchant_csv(csv_text)
     allocation, leftover_sales = allocate_sales_to_payouts(statement)
+    historical_reference_date = max(
+        (p.date for p in statement.payouts if p.date),
+        default=dt.datetime.now(dt.timezone.utc).date(),
+    )
 
     reconciled_refs = get_cashflows_reconciled_refs(config.admin_db_file)
 
@@ -1115,7 +1119,7 @@ def build_csv_reconciliation_preview(
             and bool(payout.date)
             and payout.date
             <= (
-                dt.datetime.now(dt.timezone.utc).date()
+                historical_reference_date
                 - dt.timedelta(days=HISTORICAL_NO_BANK_LINE_GRACE_DAYS)
             )
         )
@@ -1181,6 +1185,12 @@ def build_csv_reconciliation_preview(
                 "already_reconciled": already_reconciled,
                 "legacy_reconciled": legacy_reconciled,
                 "historical_no_bank_line": historical_no_bank_line,
+                "xero_deleted_bank_transaction": {
+                    "id": existing_deleted_bank_tx.get("id"),
+                    "reference": existing_deleted_bank_tx.get("reference"),
+                    "date": _date_text(existing_deleted_bank_tx.get("date")),
+                    "amount": _money_float(existing_deleted_bank_tx.get("amount")),
+                } if existing_deleted_bank_tx else None,
                 "missing_invoices": missing_invoices,
             }
         )
