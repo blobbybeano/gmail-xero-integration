@@ -7752,6 +7752,7 @@ function toggleReceiptsEnabled(requested) {{
 
             const favoured = allOptions[favIdx] || null;
             const favCal = favoured ? optCal[favIdx] : null;
+            const favCalNameMatch = !!(favCal && favoured && _nameOverlap(favCal.customer || '', favoured.contact_name || ''));
             const noMatch = !favoured;
             const userChosen = !!(tswap || manualPick);
             const ambiguous = !isMissing && !!s.ambiguous;
@@ -7784,7 +7785,7 @@ function toggleReceiptsEnabled(requested) {{
               ? '<span class="text-amber-700">No match found</span>'
               : noAmountMatch
                 ? (likelyCal
-                    ? '<span class="text-teal-800">' + esc(likelyCal.customer || 'Calendar job') + '</span>'
+                    ? '<span class="text-teal-800">' + esc(likelyCal.customer || 'Calendar job') + '</span><div class="text-[10px] text-teal-600 font-normal">calendar/card-sale clue</div>'
                     : '<span class="text-amber-700">' + money(s.gross) + ' card sale</span>')
                 : esc(favoured.contact_name || favoured.number || '\u2014');
             const calLineTone = needsSuggestionConfirm ? 'text-amber-700' : 'text-teal-700';
@@ -7809,7 +7810,7 @@ function toggleReceiptsEnabled(requested) {{
                       + '<div class="mt-0.5"><span class="font-semibold text-gray-900">' + esc(favoured.contact_name || favoured.number || '') + '</span> '
                         + '<span class="text-indigo-700 font-mono">' + esc(favoured.number || '') + '</span> '
                         + '<span class="text-gray-400 font-mono">' + esc(favoured.reference || '') + '</span></div>'
-                      + (favCal
+                      + (favCalNameMatch
                           ? '<div class="mt-0.5 text-teal-700">&#128197; ' + esc(_fmtCalEntry(favCal))
                               + ((favCal.event_gross !== null && favCal.event_gross !== undefined) ? ' <span class="font-bold">(\u00a3' + Number(favCal.event_gross).toFixed(2) + ')</span>' : '')
                               + '</div>'
@@ -8064,7 +8065,7 @@ function toggleReceiptsEnabled(requested) {{
                   <thead>
                     <tr class="bg-gray-50 text-[11px] uppercase tracking-wide text-gray-400 text-left">
                       <th class="px-3 py-2">Date / Time</th>
-                      <th class="px-3 py-2">Customer</th>
+                      <th class="px-3 py-2">Sale / customer</th>
                       <th class="px-3 py-2">Invoice / Ref</th>
                       <th class="px-3 py-2 text-right">Gross</th>
                       <th class="px-3 py-2 text-right">CF fee</th>
