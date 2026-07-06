@@ -1836,6 +1836,27 @@ def _ai_split_multi_receipts(db_path, raw_text):
     return out
 
 
+def _looks_like_multi_receipt_text(raw_text: str) -> bool:
+    """Cheap pre-check before spending an AI call on multi-receipt detection."""
+    text = re.sub(r"\s+", " ", (raw_text or "").lower()).strip()
+    if len(text) < 160:
+        return False
+    money_count = len(re.findall(r"(?:£|\bgbp\b)?\s*\d+\.\d{2}\b", text))
+    if money_count < 2:
+        return False
+    markers = (
+        "balance due", "amount due", "total due", "grand total",
+        "total", "card payment", "card sale", "payment received",
+    )
+    marker_hits = sum(text.count(m) for m in markers)
+    if marker_hits >= 2:
+        return True
+    # Side-by-side pump / till photos often repeat VAT or receipt identifiers
+    # even when the OCR misses a literal "total" on one of them.
+    receiptish_hits = len(re.findall(r"\b(receipt|vat|terminal|auth|card)\b", text))
+    return receiptish_hits >= 4 and money_count >= 4
+
+
 _FUEL_THRESHOLD_GBP = 40.0
 
 
@@ -14721,12 +14742,17 @@ body {{ background:#f7f6f3 !important; }}
         seq = 0
         for file_bytes, filename, content_type in files:
             seq += 1
+            _receipt_started = time.perf_counter()
+            _resize_s = _ocr_s = _split_s = _ai_s = _xero_s = _card_s = 0.0
             # Compute hashes from the ORIGINAL bytes so dedup stays consistent
             # with prior uploads of the same photo, then shrink the image for
             # faster OCR and smaller on-disk storage.
             full_hash, digest16 = _dump_digests(file_bytes)
+            _t_stage = time.perf_counter()
             file_bytes, filename, content_type = _exp_resize_for_ocr(
                 file_bytes, filename, content_type)
+            _resize_s = time.perf_counter() - _t_stage
+            _t_stage = time.perf_counter()
             try:
                 result = svc.analyze_upload(
                     file_bytes=file_bytes, filename=filename, mime_type=content_type
@@ -14737,6 +14763,7 @@ body {{ background:#f7f6f3 !important; }}
                     "tax": None, "date": "", "currency": "GBP", "raw_text": "",
                     "ocr_error": str(exc).splitlines()[0][:200],
                 }
+            _ocr_s = time.perf_counter() - _t_stage
 
             # One photo can contain SEVERAL physical receipts (e.g. two pump
             # receipts side by side). Ask the AI (conservatively); when it
@@ -14744,11 +14771,17 @@ body {{ background:#f7f6f3 !important; }}
             # the rest become their own dump items further down, sharing the
             # same photo.
             splits: list = []
-            if result.get("raw_text") and not result.get("ocr_error"):
+            if (
+                result.get("raw_text")
+                and not result.get("ocr_error")
+                and _looks_like_multi_receipt_text(result.get("raw_text", ""))
+            ):
+                _t_stage = time.perf_counter()
                 try:
                     splits = _ai_split_multi_receipts(db, result.get("raw_text", ""))
                 except Exception:
                     splits = []
+                _split_s = time.perf_counter() - _t_stage
             if len(splits) >= 2:
                 s0 = splits[0]
                 result = dict(result)
@@ -14772,6 +14805,7 @@ body {{ background:#f7f6f3 !important; }}
             cat_code = cat_name = ""
             ai_uncertain = False
             fallback_unresolved = ""
+            _t_stage = time.perf_counter()
             try:
                 segments = _ai_analyze_receipt(
                     db, result.get("merchant", ""), result.get("raw_text", ""),
@@ -14803,6 +14837,7 @@ body {{ background:#f7f6f3 !important; }}
                                 fallback_unresolved = fallback
             except Exception:
                 pass
+            _ai_s = time.perf_counter() - _t_stage
             # If the AI never produced an account (categorise failed or raised),
             # treat it as uncertain so the receipt is surfaced for a manual pick
             # rather than silently importing with no/guessed account.
@@ -14899,12 +14934,14 @@ body {{ background:#f7f6f3 !important; }}
                             ).strip()
 
             if status == dump_store.STATUS_NEW:
+                _t_stage = time.perf_counter()
                 xero_match = _dump_xero_existing_spend_match(
                     amount_inc=total,
                     purchased_on=purchased_on,
                     merchant=result.get("merchant", ""),
                     card_account=batch_card_acct,
                 )
+                _xero_s += time.perf_counter() - _t_stage
                 if xero_match:
                     status = dump_store.STATUS_DUPLICATE
                     contact = (xero_match.get("contact") or "Xero expense").strip()
@@ -14924,9 +14961,11 @@ body {{ background:#f7f6f3 !important; }}
 
             card_status = ""
             if status == dump_store.STATUS_NEW:
+                _t_stage = time.perf_counter()
                 card_status = _dump_card_feed_check(
                     engineer, total, purchased_on, card_account=batch_card_acct
                 )
+                _card_s += time.perf_counter() - _t_stage
                 if card_status == "missing":
                     if batch_card_acct:
                         # The admin explicitly designated this batch for a named
@@ -14979,6 +15018,16 @@ body {{ background:#f7f6f3 !important; }}
 
             seen_in_batch.add(full_hash)
             counts[status] = counts.get(status, 0) + 1
+            _receipt_total_s = time.perf_counter() - _receipt_started
+            print(
+                "[receipt-dump] processed "
+                f"{seq}/{total_count or '?'} status={status} "
+                f"total={_receipt_total_s:.2f}s resize={_resize_s:.2f}s "
+                f"ocr={_ocr_s:.2f}s split_ai={_split_s:.2f}s "
+                f"account_ai={_ai_s:.2f}s xero_dedupe={_xero_s:.2f}s "
+                f"card={_card_s:.2f}s",
+                flush=True,
+            )
             dump_store.create_item(
                 db,
                 batch_id=batch["id"],
