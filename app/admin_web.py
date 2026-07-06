@@ -9277,7 +9277,14 @@ function toggleReceiptsEnabled(requested) {{
                     elif _matches_account_ref(payment, clearing_account_ref):
                         payments_already_in_clearing.append(payment)
                     else:
-                        bad_existing_payments.append({**payment, "problem": _payment_problem(payment)})
+                        payment_moves_to_clearing.append(
+                            {
+                                **payment,
+                                "source_account_warning": (
+                                    f"Moved from {payment.get('account_name') or payment.get('account_code') or 'unknown account'}"
+                                ),
+                            }
+                        )
                 covered_invoice_ids = {
                     str(payment.get("invoice_id") or "").strip()
                     for payment in (payment_moves_to_clearing + payments_already_in_clearing)
