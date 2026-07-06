@@ -366,11 +366,12 @@ def _exp_heic_to_jpeg(data: bytes, filename: str, mime: str):
         from PIL import Image  # type: ignore
 
         pillow_heif.register_heif_opener()
-        img = Image.open(io.BytesIO(data))
-        if img.mode not in ("RGB", "L"):
-            img = img.convert("RGB")
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=95)
+        with Image.open(io.BytesIO(data)) as img:
+            img.load()
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=95, optimize=True)
         stem = Path(filename or "receipt").stem or "receipt"
         return buf.getvalue(), stem + ".jpg", "image/jpeg"
     except Exception:
@@ -392,17 +393,19 @@ def _exp_resize_for_ocr(data: bytes, filename: str, mime: str):
     try:
         import io
         from PIL import Image
-        img = Image.open(io.BytesIO(data))
-        max_dim = 1200
-        w, h = img.size
-        if max(w, h) <= max_dim:
-            return data, filename, mime  # already small enough — skip re-encode
-        scale = max_dim / max(w, h)
-        if img.mode not in ("RGB", "L"):
-            img = img.convert("RGB")
-        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=88)
+        with Image.open(io.BytesIO(data)) as img:
+            img.load()
+            max_dim = 1200
+            w, h = img.size
+            if max(w, h) <= max_dim and len(data) <= 2 * 1024 * 1024:
+                return data, filename, mime  # already small enough — skip re-encode
+            scale = min(1.0, max_dim / max(w, h))
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            if scale < 1.0:
+                img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=86, optimize=True)
         stem = Path(filename or "receipt").stem or "receipt"
         return buf.getvalue(), stem + ".jpg", "image/jpeg"
     except Exception:
@@ -14252,10 +14255,12 @@ body {{ background:#f7f6f3 !important; }}
         except Exception:
             return ""
 
-    def _dump_process(batch, files):
+    def _dump_process(batch, files, *, total_count: int | None = None):
         """Process an uploaded batch: OCR + AI-code + dedupe + classify each file,
         persisting a dump item per receipt. ``files`` is a list of
-        (bytes, filename, content_type)."""
+        (bytes, filename, content_type). For large browser uploads this may be
+        a generator that reads one staged file from disk at a time, so avoid
+        assuming the whole batch is in memory."""
         db = config.admin_db_file
         svc = ReceiptService(config)
         settings = get_expense_settings(db)
@@ -14292,7 +14297,12 @@ body {{ background:#f7f6f3 !important; }}
         # Record the total up-front so the results page can show a real progress
         # bar (done / total) while the background thread works through the files.
         try:
-            dump_store.update_batch(db, batch["id"], total_count=len(files))
+            if total_count is None:
+                try:
+                    total_count = len(files)
+                except TypeError:
+                    total_count = 0
+            dump_store.update_batch(db, batch["id"], total_count=total_count)
         except Exception:
             pass
 
@@ -14642,6 +14652,14 @@ body {{ background:#f7f6f3 !important; }}
                         ocr_raw=(s_text or "")[:4000],
                         ocr_error="",
                     )
+
+            # Drop the large byte buffer before the next receipt. Gunicorn's
+            # worker is small on Fly; without this, a batch of phone photos can
+            # keep enough memory live to trigger an OOM restart.
+            try:
+                del file_bytes
+            except Exception:
+                pass
 
         dump_store.update_batch(
             db, batch["id"], status="ready", total_count=seq, summary=counts
@@ -15955,6 +15973,8 @@ body {{ background:#f7f6f3 !important; }}
         if not data:
             return jsonify({"ok": False, "error": "empty"}), 400
         data, fname, _fmime = _exp_heic_to_jpeg(data, f.filename, f.mimetype or "")
+        mime = _exp_sniff_mime(data[:16]) or _fmime or f.mimetype or "application/octet-stream"
+        data, fname, mime = _exp_resize_for_ocr(data, fname, mime)
         pdir = _dump_pending_dir(batch_id)
         pdir.mkdir(parents=True, exist_ok=True)
         seq = sum(1 for p in pdir.iterdir() if p.is_file())
@@ -15978,36 +15998,45 @@ body {{ background:#f7f6f3 !important; }}
             return jsonify({"url": result_url})
         # Mark as finalizing so a retried /finish doesn't double-launch.
         dump_store.update_batch(db, batch_id, status="finalizing")
-        # Load staged files into memory now, then clean up the staging dir
-        # immediately (before the thread starts) so there's no race on cleanup.
+        # Keep staged files on disk and process them one at a time in the
+        # background thread. Loading every phone photo into a single Python list
+        # is enough to OOM the small Fly machine.
         pdir = _dump_pending_dir(batch_id)
-        payloads = []
-        if pdir.exists():
-            for p in sorted(pdir.iterdir()):
-                if not p.is_file():
-                    continue
-                data = p.read_bytes()
-                if not data:
-                    continue
-                name = p.name.split("__", 1)[1] if "__" in p.name else p.name
-                mime = _exp_sniff_mime(data[:16]) or "application/octet-stream"
-                payloads.append((data, name, mime))
-        try:
-            if pdir.exists():
-                for p in pdir.iterdir():
+        staged_paths = [p for p in sorted(pdir.iterdir()) if p.is_file()] if pdir.exists() else []
+
+        def _iter_staged(paths):
+            for p in paths:
+                try:
+                    data = p.read_bytes()
+                    if not data:
+                        continue
+                    name = p.name.split("__", 1)[1] if "__" in p.name else p.name
+                    mime = _exp_sniff_mime(data[:16]) or "application/octet-stream"
+                    yield data, name, mime
+                finally:
                     try:
                         p.unlink()
                     except OSError:
                         pass
-                pdir.rmdir()
-        except OSError:
-            pass
+
+        def _cleanup_staging_dir():
+            try:
+                if pdir.exists():
+                    for p in pdir.iterdir():
+                        try:
+                            p.unlink()
+                        except OSError:
+                            pass
+                    pdir.rmdir()
+            except OSError:
+                pass
+
         # Run OCR + AI in a background thread so this request returns instantly.
         # The results page detects "finalizing" status and auto-refreshes until done.
-        def _bg(b=batch, pl=payloads):
+        def _bg(b=batch, paths=staged_paths):
             try:
-                if pl:
-                    _dump_process(b, pl)
+                if paths:
+                    _dump_process(b, _iter_staged(paths), total_count=len(paths))
                 else:
                     dump_store.update_batch(db, b["id"], status="ready", total_count=0)
             except Exception:
@@ -16015,6 +16044,8 @@ body {{ background:#f7f6f3 !important; }}
                     dump_store.update_batch(db, b["id"], status="ready", total_count=0)
                 except Exception:
                     pass
+            finally:
+                _cleanup_staging_dir()
         threading.Thread(target=_bg, daemon=True).start()
         return jsonify({"url": result_url})
 
