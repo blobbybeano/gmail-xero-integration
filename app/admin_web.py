@@ -12261,23 +12261,55 @@ body {{ background:#f7f6f3 !important; }}
         settings = get_expense_settings(db)
         base_url = request.url_root.rstrip("/")
 
-        # Live Xero account lists so dropdowns reflect the real chart of accounts.
+        # Saved-first Xero account lists. This page is opened frequently while
+        # configuring expenses, so it must not keep hitting Xero's Accounts
+        # endpoint and causing avoidable 429 cooldowns.
         _at, _tid, _acct_warn = _load_xero_at_tid(config)
-        exp_accounts, _exp_warn = _get_xero_expense_accounts(_at, _tid, config.admin_db_file)
+        saved_exp_accounts = (
+            get_json_setting(db, _XERO_EXP_ACCT_SNAPSHOT_KEY, []) or []
+        )
+        saved_all_accounts = (
+            get_json_setting(db, _XERO_ALL_ACCT_SNAPSHOT_KEY, []) or []
+        )
+        exp_accounts = saved_exp_accounts
+        _exp_warn = (
+            "Using saved Xero expense account options."
+            if exp_accounts else ""
+        )
+        if not exp_accounts:
+            exp_accounts, _exp_warn = _get_xero_expense_accounts(
+                _at, _tid, config.admin_db_file
+            )
         bank_accounts: list = []
         owner_paid_accounts: list = []
-        _owner_warn = ""
-        try:
-            _r, bank_accounts, _t, _bw = _get_tenant_acct_themes(_at, _tid) if (_at and _tid) else ([], [], [], "")
-        except Exception:
-            bank_accounts = []
-        try:
-            owner_paid_accounts, _owner_warn = (
-                _get_xero_active_accounts(_at, _tid, config.admin_db_file)
-                if (_at and _tid) else ([], "")
+        if saved_all_accounts:
+            bank_accounts = [
+                a for a in saved_all_accounts if a.get("Type") == "BANK"
+            ]
+            owner_paid_accounts = saved_all_accounts
+            _owner_warn = "Using saved Xero account options."
+        else:
+            owner_paid_accounts = saved_exp_accounts
+            _owner_warn = (
+                "Using saved Xero expense account options until the full account list can refresh."
+                if owner_paid_accounts else ""
             )
-        except Exception:
-            owner_paid_accounts, _owner_warn = [], ""
+            try:
+                _r, bank_accounts, _t, _bw = (
+                    _get_tenant_acct_themes(_at, _tid)
+                    if (_at and _tid and not bank_accounts and not owner_paid_accounts)
+                    else ([], bank_accounts, [], "")
+                )
+            except Exception:
+                bank_accounts = []
+            if not owner_paid_accounts:
+                try:
+                    owner_paid_accounts, _owner_warn = (
+                        _get_xero_active_accounts(_at, _tid, config.admin_db_file)
+                        if (_at and _tid) else ([], "")
+                    )
+                except Exception:
+                    owner_paid_accounts, _owner_warn = [], ""
         acct_warning = " ".join(
             dict.fromkeys([
                 w.strip() for w in (_acct_warn, _exp_warn, _owner_warn)
