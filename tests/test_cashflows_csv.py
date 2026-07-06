@@ -83,6 +83,26 @@ def _cashflows_receive(ref, date, amount, *, reconciled):
     }
 
 
+def _cashflows_receive_line_ref(ref, date, amount, *, reconciled):
+    return {
+        "BankTransactionID": f"cashflows-line-{ref}",
+        "Type": "RECEIVE",
+        "Date": date,
+        "Reference": "",
+        "Total": amount,
+        "Status": "AUTHORISED",
+        "IsReconciled": reconciled,
+        "Contact": {"Name": "Cashflows"},
+        "LineItems": [
+            {
+                "Description": f"Cashflows gross card takings for Cashflows {ref}",
+                "AccountCode": "780",
+                "LineAmount": amount,
+            }
+        ],
+    }
+
+
 def _invoice(inv_id, number, date, total, contact="Customer", reference=None):
     raw = {
         "InvoiceID": inv_id,
@@ -295,6 +315,48 @@ class PreviewTests(unittest.TestCase):
         )
         xero = _FakeXero(
             bank={"BankTransactions": [_cashflows_receive("3", "2026-05-02", "99.00", reconciled=False)]},
+        )
+        result = build_csv_reconciliation_preview(self.config, text, xero_client=xero)
+
+        self.assertEqual(result["batches"][0]["status"], "prepared_in_xero")
+        self.assertEqual(result["status_counts"]["prepared_in_xero"], 1)
+        self.assertEqual(result["active_batch_count"], 0)
+
+    def test_reconciled_cashflows_receive_can_match_payout_ref_in_line_description(self):
+        text = _csv(
+            [
+                _sale("1", "2026-05-01", "AAA", "100.00"),
+                _fee("2", "2026-05-01", "AAA", "1.00"),
+                _remit("3", "2026-05-02", "99.00"),
+            ]
+        )
+        xero = _FakeXero(
+            bank={
+                "BankTransactions": [
+                    _cashflows_receive_line_ref("3", "2026-05-02", "99.00", reconciled=True)
+                ]
+            },
+        )
+        result = build_csv_reconciliation_preview(self.config, text, xero_client=xero)
+
+        self.assertEqual(result["batches"][0]["status"], "already_reconciled")
+        self.assertEqual(result["status_counts"]["already_reconciled"], 1)
+        self.assertEqual(result["active_batch_count"], 0)
+
+    def test_unreconciled_cashflows_receive_can_match_payout_ref_in_line_description(self):
+        text = _csv(
+            [
+                _sale("1", "2026-05-01", "AAA", "100.00"),
+                _fee("2", "2026-05-01", "AAA", "1.00"),
+                _remit("3", "2026-05-02", "99.00"),
+            ]
+        )
+        xero = _FakeXero(
+            bank={
+                "BankTransactions": [
+                    _cashflows_receive_line_ref("3", "2026-05-02", "99.00", reconciled=False)
+                ]
+            },
         )
         result = build_csv_reconciliation_preview(self.config, text, xero_client=xero)
 

@@ -373,12 +373,19 @@ def _cashflows_receive_transactions(data: Any) -> list[dict[str, Any]]:
         status = str(raw.get("Status") or "").strip().upper()
         tx_type = str(raw.get("Type") or "").strip().upper()
         ref = str(raw.get("Reference") or "").strip()
-        if status == "DELETED" or tx_type != "RECEIVE" or not ref.startswith("Cashflows "):
+        line_text = " ".join(
+            str(li.get("Description") or "")
+            for li in (raw.get("LineItems") or [])
+            if isinstance(li, dict)
+        ).strip()
+        searchable = f"{ref} {line_text}".strip()
+        if status == "DELETED" or tx_type != "RECEIVE" or "Cashflows " not in searchable:
             continue
         out.append(
             {
                 "id": str(raw.get("BankTransactionID") or raw.get("ID") or raw.get("Id") or "").strip(),
                 "reference": ref,
+                "searchable": searchable,
                 "date": _date(raw.get("Date") or raw.get("DateString") or raw.get("date")),
                 "amount": _money(raw.get("Total") or raw.get("Amount")),
                 "status": status,
@@ -397,7 +404,7 @@ def _match_cashflows_receive(
     candidates = [
         tx
         for tx in receives
-        if tx.get("reference") == ref
+        if ref in str(tx.get("searchable") or tx.get("reference") or "")
         and abs(abs(tx.get("amount") or Decimal("0.00")) - payout.amount) <= MONEY / 2
     ]
     if not candidates:
