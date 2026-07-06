@@ -666,6 +666,7 @@ def build_csv_reconciliation_preview(
     bank_lines: list[XeroBankLine] = []
     cashflows_receives: list[dict[str, Any]] = []
     invoices: list[XeroInvoiceCandidate] = []
+    manual_candidate_invoices: list[XeroInvoiceCandidate] = []
     xero_connected = bool(xero_client)
     xero_error = ""
     bank_scope_missing = False
@@ -759,6 +760,18 @@ def build_csv_reconciliation_preview(
                     for inv in paid_invoices
                     if _has_card_signal(inv)
                 ]
+                # Manual suggestions are allowed to be wider than automatic
+                # matching. A paid invoice with no GC/card signal must not be
+                # auto-consumed, but if it is exact/same-day the user still
+                # needs to see it as a candidate instead of being pushed toward
+                # a wrong open invoice.
+                seen_candidate_ids: set[str] = set()
+                manual_candidate_invoices = []
+                for inv in invoices + paid_invoices:
+                    if inv.id in seen_candidate_ids:
+                        continue
+                    seen_candidate_ids.add(inv.id)
+                    manual_candidate_invoices.append(inv)
             except Exception as exc:  # pragma: no cover - network/runtime guard
                 xero_connected = False
                 xero_error = str(exc).splitlines()[0][:200]
@@ -894,7 +907,8 @@ def build_csv_reconciliation_preview(
     # ---- Candidate and tied-alternative suggestions ----------------------
     # Now that the auto-match pass is complete, anything left in the invoice
     # pool is "unaccounted" and can be offered as a manual-match suggestion.
-    unaccounted = [inv for inv in invoices if inv.id not in used_invoice_ids]
+    candidate_pool = manual_candidate_invoices or invoices
+    unaccounted = [inv for inv in candidate_pool if inv.id not in used_invoice_ids]
 
     # Build a single calendar event pool covering every sale date: one calendar
     # fetch + one AI batch for the whole preview, instead of one lookup per sale.

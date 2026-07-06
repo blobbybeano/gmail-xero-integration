@@ -431,6 +431,53 @@ class PreviewTests(unittest.TestCase):
             )
         row = result["batches"][0]["sales"][0]
         self.assertIsNone(row["invoice"])
+        self.assertEqual(row["candidates"][0]["number"], "INV-900")
+        self.assertEqual(row["candidates"][0]["total"], 100.0)
+
+    def test_paid_invoice_without_card_signal_is_manual_candidate_not_auto_match(self):
+        from unittest.mock import patch
+
+        text = _csv(
+            [
+                _sale("1", "2026-06-15", "AAA", "120.00"),
+                _fee("2", "2026-06-15", "AAA", "1.05"),
+                _remit("3", "2026-06-16", "118.95"),
+            ]
+        )
+        xero = _FakeXero(
+            invoices={
+                "Invoices": [
+                    _invoice("open-wrong", "INV-5658", "2026-06-15", "270.00", contact="Lavine")
+                ]
+            },
+            bank={"BankTransactions": [_bank_line("b1", "2026-06-16", "118.95")]},
+            paid={
+                "Invoices": [
+                    _invoice(
+                        "paid-exact",
+                        "INV-5662",
+                        "2026-06-15",
+                        "120.00",
+                        contact="Margaret Doherty",
+                        reference="",
+                    )
+                ]
+            },
+        )
+        empty_lookup = SimpleNamespace(
+            gc_refs=set(), inv_numbers=set(), total_card=0, total_rows=0
+        )
+        with patch(
+            "app.cashflows_csv.fetch_card_lookup", return_value=empty_lookup
+        ):
+            result = build_csv_reconciliation_preview(
+                self.config, text, xero_client=xero, correlation_sheet_id="sheet-1"
+            )
+        row = result["batches"][0]["sales"][0]
+        self.assertIsNone(row["invoice"])
+        self.assertEqual(row["candidates"][0]["number"], "INV-5662")
+        self.assertEqual(row["candidates"][0]["contact_name"], "Margaret Doherty")
+        self.assertEqual(row["candidates"][0]["total"], 120.0)
 
     def test_sheet_configured_accepts_card_paid_invoice(self):
         from unittest.mock import patch

@@ -9239,6 +9239,28 @@ function toggleReceiptsEnabled(requested) {{
                         return str(payment.get("account_code") or "") == account_ref.get("Code")
                     return False
 
+                def _payment_problem(payment: dict) -> str:
+                    invoice_label = payment.get("invoice_number") or payment.get("invoice_id") or "invoice"
+                    account_label = payment.get("account_name") or payment.get("account_code") or "unknown account"
+                    status = str(payment.get("status") or "").strip() or "unknown"
+                    amount = _money_value(payment.get("amount"))
+                    expected = _money_value(payment.get("expected_amount"))
+                    if status != "AUTHORISED":
+                        return f"{invoice_label}: payment is {status}, not AUTHORISED"
+                    if payment.get("is_reconciled"):
+                        return f"{invoice_label}: existing payment is already reconciled in Xero"
+                    if abs(amount - expected) > 0.01:
+                        return (
+                            f"{invoice_label}: existing payment is £{amount:.2f}, "
+                            f"expected £{expected:.2f}"
+                        )
+                    if not (
+                        _matches_account_ref(payment, payment_account_ref)
+                        or _matches_account_ref(payment, clearing_account_ref)
+                    ):
+                        return f"{invoice_label}: existing payment is in {account_label}, not the configured card/Cashflows account"
+                    return f"{invoice_label}: existing payment cannot be safely moved"
+
                 payment_moves_to_clearing: list[dict] = []
                 payments_already_in_clearing: list[dict] = []
                 bad_existing_payments: list[dict] = []
@@ -9249,13 +9271,13 @@ function toggleReceiptsEnabled(requested) {{
                         and abs(_money_value(payment.get("amount")) - _money_value(payment.get("expected_amount"))) <= 0.01
                     )
                     if not basic_safe:
-                        bad_existing_payments.append(payment)
+                        bad_existing_payments.append({**payment, "problem": _payment_problem(payment)})
                     elif _matches_account_ref(payment, payment_account_ref):
                         payment_moves_to_clearing.append(payment)
                     elif _matches_account_ref(payment, clearing_account_ref):
                         payments_already_in_clearing.append(payment)
                     else:
-                        bad_existing_payments.append(payment)
+                        bad_existing_payments.append({**payment, "problem": _payment_problem(payment)})
                 covered_invoice_ids = {
                     str(payment.get("invoice_id") or "").strip()
                     for payment in (payment_moves_to_clearing + payments_already_in_clearing)
@@ -9267,8 +9289,12 @@ function toggleReceiptsEnabled(requested) {{
                     if str(inv.get("id") or "").strip()
                 }
                 if bad_existing_payments:
+                    details = "; ".join(
+                        str(payment.get("problem") or _payment_problem(payment))
+                        for payment in bad_existing_payments[:3]
+                    )
                     blocking_errors.append(
-                        f"Batch {batch_id} includes already-paid invoice(s): {names}, but one existing payment is already reconciled, moved, or no longer matches the invoice amount."
+                        f"Batch {batch_id} includes already-paid invoice(s): {names}, but Xero cannot package one existing payment safely: {details}."
                     )
                     continue
                 if not expected_invoice_ids.issubset(covered_invoice_ids):

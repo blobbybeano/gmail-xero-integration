@@ -720,6 +720,78 @@ class CashflowsCsvSubmitTests(unittest.TestCase):
         self.assertEqual(payments[-1]["Invoice"]["InvoiceID"], "extra-inv-1")
         self.assertEqual(payments[-1]["Amount"], 12.0)
 
+    def test_production_paid_invoice_wrong_account_error_names_invoice(self):
+        preview = {
+            "preview_id": "preview-1",
+            "batches": [
+                {
+                    "id": "batch-1",
+                    "status": "ready",
+                    "payout": {"csv_ref": "pay-1", "date": "2026-06-18"},
+                    "gross": 114.0,
+                    "net": 113.0,
+                    "sales": [
+                        {
+                            "sale_ref": "sale-1",
+                            "date": "2026-06-17",
+                            "gross": 114.0,
+                            "fee": 1.0,
+                            "invoice": {
+                                "id": "inv-paid",
+                                "number": "INV-5669",
+                                "contact_name": "Sakib Rahman",
+                                "total": 114.0,
+                                "amount_due": 0.0,
+                                "is_open": False,
+                            },
+                            "candidates": [],
+                            "tied_candidates": [],
+                        }
+                    ],
+                }
+            ],
+        }
+        app = self._app_with_preview(preview, dry_run=False, production=True)
+        fake = FakeXeroClient()
+        fake.dry_run = False
+        fake.invoice_payments["inv-paid"] = [{"PaymentID": "pay-wrong"}]
+        fake.payment_details["pay-wrong"] = {
+            "PaymentID": "pay-wrong",
+            "HasAccount": True,
+            "Status": "AUTHORISED",
+            "IsReconciled": False,
+            "Amount": 114.0,
+            "Account": {"AccountID": "gocardless-id", "Name": "GoCardless-GBP"},
+        }
+        with app.test_client() as client:
+            with client.session_transaction() as session:
+                session["logged_in"] = True
+            with patch("app.admin_web.build_xero_client", return_value=fake), patch(
+                "app.admin_web._CF_SUBMIT_PACE_SECONDS", 0
+            ):
+                resp = client.post(
+                    "/cashflows-sync/submit-csv-batches",
+                    json={
+                        "preview_id": "preview-1",
+                        "batches": [
+                            {
+                                "batch_id": "batch-1",
+                                "sales": [
+                                    {
+                                        "sale_index": 0,
+                                        "selected_invoice_id": "inv-paid",
+                                        "selected_invoice_number": "INV-5669",
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                )
+        self.assertEqual(resp.status_code, 400)
+        msg = resp.get_json()["error"]
+        self.assertIn("INV-5669", msg)
+        self.assertIn("GoCardless-GBP", msg)
+
     def test_invented_invoice_id_is_rejected(self):
         preview = {
             "preview_id": "preview-1",
