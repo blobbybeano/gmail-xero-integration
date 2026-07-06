@@ -12660,7 +12660,7 @@ body {{ background:#f7f6f3 !important; }}
             owner_account_code = e.get("owner_paid_account_code") or ""
             if owner_paid_accounts:
                 owner_account_field = (
-                    f"<select name='owner_paid_account_code' class='{_sel_cls}'>"
+                    f"<select name='owner_paid_account_code' class='{_sel_cls} bg-white'>"
                     + _exp_acct_options(
                         owner_paid_accounts, owner_account_code,
                         default_label="Choose Xero account",
@@ -12673,6 +12673,11 @@ body {{ background:#f7f6f3 !important; }}
                     f"value='{escape(owner_account_code)}' "
                     f"class='{_sel_cls}' placeholder='e.g. Ben personal account code'>"
                 )
+            owner_picker_hint = (
+                "Choose the Xero account these personal receipts should post to."
+                if owner_paid_accounts else
+                "Xero account options are unavailable right now; type the account code here."
+            )
             has_pw = bool((e.get("password_hash") or "").strip())
             pw_hint = (
                 "<span class='text-emerald-600 font-normal'>(set)</span>" if has_pw
@@ -12739,13 +12744,17 @@ body {{ background:#f7f6f3 !important; }}
                 f"{exp_field}</div>"
                 "<div><label class='block text-xs text-gray-500 mb-1'>Payment/bank account</label>"
                 f"{pay_field}</div>"
-                "<div class='sm:col-span-2 rounded-lg border border-emerald-100 bg-emerald-50 p-3'>"
-                "<label class='flex items-start gap-2 text-sm font-medium text-emerald-900'>"
+                "<div class='sm:col-span-2 rounded-lg border border-emerald-300 bg-emerald-50 p-3 space-y-2'>"
+                "<label class='flex items-start gap-2 text-sm font-semibold text-emerald-950'>"
                 f"<input type='checkbox' name='allow_owner_paid' value='1' {owner_checked} class='mt-1'> "
                 "<span>Allow personal / owner-paid receipt option</span></label>"
                 "<p class='text-xs text-emerald-700 mt-1'>Only enabled engineers will see a personal-card choice on the photo screen.</p>"
-                "<label class='block text-xs text-emerald-800 mt-2 mb-1'>Owner-paid Xero account</label>"
-                f"{owner_account_field}</div>"
+                "<div class='rounded-md border border-emerald-200 bg-white/80 p-2'>"
+                "<label class='block text-xs font-semibold text-emerald-900 mb-1'>"
+                "Xero account to post these personal receipts to</label>"
+                f"{owner_account_field}"
+                f"<p class='text-[11px] text-emerald-700 mt-1'>{escape(owner_picker_hint)}</p>"
+                "</div></div>"
                 "<div><label class='block text-xs text-gray-500 mb-1'>Login username</label>"
                 f"<input name='username' value='{escape(e.get('username') or '')}' "
                 "autocapitalize='none' class='w-full rounded border border-gray-300 px-2 py-1 "
@@ -12916,7 +12925,7 @@ body {{ background:#f7f6f3 !important; }}
         if owner_paid_accounts:
             _create_owner_account_inner = (
                 "<select name='owner_paid_account_code' "
-                "class='w-full rounded border border-gray-300 px-3 py-2 text-sm'>"
+                "class='w-full rounded border border-gray-300 bg-white px-3 py-2 text-sm'>"
                 + _exp_acct_options(
                     owner_paid_accounts, "",
                     default_label="Choose Xero account",
@@ -12929,15 +12938,23 @@ body {{ background:#f7f6f3 !important; }}
                 "class='w-full rounded border border-gray-300 px-3 py-2 text-sm' "
                 "placeholder='e.g. Ben personal account code'>"
             )
+        _create_owner_picker_hint = (
+            "Choose the Xero account these personal receipts should post to."
+            if owner_paid_accounts else
+            "Xero account options are unavailable right now; type the account code here."
+        )
         _create_owner_field_html = (
-            "<div class='sm:col-span-3 rounded-lg border border-emerald-100 bg-emerald-50 p-3'>"
-            "<label class='flex items-start gap-2 text-sm font-medium text-emerald-900'>"
+            "<div class='sm:col-span-3 rounded-lg border border-emerald-300 bg-emerald-50 p-3 space-y-2'>"
+            "<label class='flex items-start gap-2 text-sm font-semibold text-emerald-950'>"
             "<input type='checkbox' name='allow_owner_paid' value='1' class='mt-1'>"
             "<span>Allow personal / owner-paid receipt option</span></label>"
             "<p class='text-xs text-emerald-700 mt-1'>Use this only for people who should be able to submit receipts paid from a non-company card.</p>"
-            "<label class='block text-xs text-emerald-800 mt-2 mb-1'>Owner-paid Xero account</label>"
+            "<div class='rounded-md border border-emerald-200 bg-white/80 p-2'>"
+            "<label class='block text-xs font-semibold text-emerald-900 mb-1'>"
+            "Xero account to post these personal receipts to</label>"
             + _create_owner_account_inner
-            + "</div>"
+            + f"<p class='text-[11px] text-emerald-700 mt-1'>{escape(_create_owner_picker_hint)}</p>"
+            + "</div></div>"
         )
 
         return _page(
