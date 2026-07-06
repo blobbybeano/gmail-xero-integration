@@ -1131,9 +1131,21 @@ def _get_tenant_cached_only(tid: str) -> "tuple[list, list, list, str]":
     return rev, bank, themes, warning
 
 
-def _get_xero_active_accounts(at: str, tid: str) -> "tuple[list, str]":
+_XERO_ALL_ACCT_SNAPSHOT_KEY = "xero_active_accounts_snapshot"
+
+
+def _get_xero_active_accounts(
+    at: str, tid: str, db_path: str | None = None
+) -> "tuple[list, str]":
     """Return active Xero accounts for owner-paid receipt account selection."""
     if xero_is_disabled():
+        snap = []
+        if db_path:
+            snap = get_json_setting(db_path, _XERO_ALL_ACCT_SNAPSHOT_KEY, []) or []
+            if not snap:
+                snap = get_json_setting(db_path, _XERO_EXP_ACCT_SNAPSHOT_KEY, []) or []
+        if snap:
+            return snap, "Xero is paused — showing the last saved account list."
         cached = _xero_all_acct_cache.get(tid)
         if cached:
             _ts, accounts, _warning = cached
@@ -1164,6 +1176,11 @@ def _get_xero_active_accounts(at: str, tid: str) -> "tuple[list, str]":
             ]
             accounts.sort(key=lambda a: (str(a.get("Type") or ""), str(a.get("Name") or "")))
             _xero_all_acct_cache[tid] = (time.time(), accounts, "")
+            if db_path and accounts:
+                try:
+                    set_json_setting(db_path, _XERO_ALL_ACCT_SNAPSHOT_KEY, accounts)
+                except Exception:
+                    pass
             return accounts, ""
         warning = f"Cannot load full Xero account list (HTTP {res.status_code})."
     except Exception:
@@ -1171,6 +1188,12 @@ def _get_xero_active_accounts(at: str, tid: str) -> "tuple[list, str]":
     if cached:
         _ts, accounts, _old_warning = cached
         return accounts, warning + " Using cached options."
+    if db_path:
+        snap = get_json_setting(db_path, _XERO_ALL_ACCT_SNAPSHOT_KEY, []) or []
+        if not snap:
+            snap = get_json_setting(db_path, _XERO_EXP_ACCT_SNAPSHOT_KEY, []) or []
+        if snap:
+            return snap, warning + " Using last saved account list."
     _xero_all_acct_cache[tid] = (
         time.time() - (_XERO_CACHE_TTL - 20),
         [],
@@ -12250,7 +12273,8 @@ body {{ background:#f7f6f3 !important; }}
             bank_accounts = []
         try:
             owner_paid_accounts, _owner_warn = (
-                _get_xero_active_accounts(_at, _tid) if (_at and _tid) else ([], "")
+                _get_xero_active_accounts(_at, _tid, config.admin_db_file)
+                if (_at and _tid) else ([], "")
             )
         except Exception:
             owner_paid_accounts, _owner_warn = [], ""
