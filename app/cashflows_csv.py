@@ -59,6 +59,7 @@ EXPECTED_COLUMNS = (
 
 DEFAULT_INVOICE_MATCH_DAYS = 7
 DEFAULT_BANK_MATCH_DAYS = 5
+HISTORICAL_NO_BANK_LINE_GRACE_DAYS = 7
 MANUAL_CANDIDATE_PAID_DAYS = 62
 GROUP_TOLERANCE = Decimal("0.06")  # absorbs decline fees / sub-penny rounding
 RECOMMENDED_OVERLAP_DAYS = 3
@@ -445,7 +446,70 @@ def _reconciled_cashflows_bank_transactions(data: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _deleted_cashflows_bank_transactions(data: Any) -> list[dict[str, Any]]:
+    if isinstance(data, dict):
+        items = data.get("BankTransactions") or []
+    else:
+        items = data or []
+    out: list[dict[str, Any]] = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        status = str(raw.get("Status") or "").strip().upper()
+        tx_type = str(raw.get("Type") or "").strip().upper()
+        if status != "DELETED" or tx_type != "RECEIVE":
+            continue
+        contact = raw.get("Contact") or {}
+        ref = str(raw.get("Reference") or "").strip()
+        line_text = " ".join(
+            str(li.get("Description") or "")
+            for li in (raw.get("LineItems") or [])
+            if isinstance(li, dict)
+        ).strip()
+        searchable = " ".join(
+            part
+            for part in (
+                ref,
+                str(raw.get("Description") or ""),
+                str(contact.get("Name") or ""),
+                line_text,
+            )
+            if part
+        )
+        searchable_upper = searchable.upper()
+        if "CASHFLOWS" not in searchable_upper and "CFE SETT" not in searchable_upper:
+            continue
+        out.append(
+            {
+                "id": str(raw.get("BankTransactionID") or raw.get("ID") or raw.get("Id") or "").strip(),
+                "reference": ref,
+                "searchable": searchable,
+                "date": _date(raw.get("Date") or raw.get("DateString") or raw.get("date")),
+                "amount": _money(raw.get("Total") or raw.get("Amount")),
+                "status": status,
+                "raw": raw,
+            }
+        )
+    return out
+
+
 def _match_reconciled_cashflows_bank_transaction(
+    payout: CsvPayout,
+    transactions: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    candidates = [
+        tx
+        for tx in transactions
+        if tx.get("date") == payout.date
+        and abs(abs(tx.get("amount") or Decimal("0.00")) - payout.amount) <= MONEY / 2
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda tx: str(tx.get("id") or ""))
+    return candidates[0]
+
+
+def _match_deleted_cashflows_bank_transaction(
     payout: CsvPayout,
     transactions: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
@@ -804,6 +868,7 @@ def build_csv_reconciliation_preview(
     bank_lines: list[XeroBankLine] = []
     cashflows_receives: list[dict[str, Any]] = []
     reconciled_cashflows_bank_transactions: list[dict[str, Any]] = []
+    deleted_cashflows_bank_transactions: list[dict[str, Any]] = []
     reconciled_payment_amounts_by_invoice: dict[str, Decimal] = {}
     invoices: list[XeroInvoiceCandidate] = []
     manual_candidate_invoices: list[XeroInvoiceCandidate] = []
@@ -825,6 +890,9 @@ def build_csv_reconciliation_preview(
                 cashflows_receives = _cashflows_receive_transactions(bank_payload)
                 reconciled_cashflows_bank_transactions = (
                     _reconciled_cashflows_bank_transactions(bank_payload)
+                )
+                deleted_cashflows_bank_transactions = (
+                    _deleted_cashflows_bank_transactions(bank_payload)
                 )
             except Exception as exc:  # pragma: no cover
                 msg = str(exc)
@@ -963,6 +1031,10 @@ def build_csv_reconciliation_preview(
             payout,
             reconciled_cashflows_bank_transactions,
         )
+        existing_deleted_bank_tx = _match_deleted_cashflows_bank_transaction(
+            payout,
+            deleted_cashflows_bank_transactions,
+        )
         already_reconciled = (
             str(payout.csv_ref) in reconciled_refs
             or bool(existing_receive and existing_receive.get("is_reconciled"))
@@ -1027,6 +1099,29 @@ def build_csv_reconciliation_preview(
         if legacy_reconciled:
             already_reconciled = True
 
+        matched_invoice_payment_incomplete = any(
+            row.get("_matched_invoice_id")
+            and reconciled_payment_amounts_by_invoice.get(str(row.get("_matched_invoice_id")), Decimal("0.00"))
+            < _money((row.get("invoice") or {}).get("total"))
+            for row in sale_rows
+        )
+        historical_no_bank_line = (
+            xero_connected
+            and not already_reconciled
+            and not prepared_in_xero
+            and not bank_line
+            and not existing_deleted_bank_tx
+            and not matched_invoice_payment_incomplete
+            and bool(payout.date)
+            and payout.date
+            <= (
+                dt.datetime.now(dt.timezone.utc).date()
+                - dt.timedelta(days=HISTORICAL_NO_BANK_LINE_GRACE_DAYS)
+            )
+        )
+        if historical_no_bank_line:
+            already_reconciled = True
+
         if already_reconciled:
             status = "already_reconciled"
         elif prepared_in_xero:
@@ -1085,6 +1180,7 @@ def build_csv_reconciliation_preview(
                 "ambiguous_count": ambiguous_count,
                 "already_reconciled": already_reconciled,
                 "legacy_reconciled": legacy_reconciled,
+                "historical_no_bank_line": historical_no_bank_line,
                 "missing_invoices": missing_invoices,
             }
         )

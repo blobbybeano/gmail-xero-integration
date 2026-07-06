@@ -406,6 +406,21 @@ class PreviewTests(unittest.TestCase):
         self.assertEqual(result["status_counts"]["already_reconciled"], 1)
         self.assertEqual(result["active_batch_count"], 0)
 
+    def test_old_missing_bank_line_is_hidden_as_historical(self):
+        text = _csv(
+            [
+                _sale("1", "2000-05-01", "AAA", "100.00"),
+                _fee("2", "2000-05-01", "AAA", "1.00"),
+                _remit("3", "2000-05-02", "99.00"),
+            ]
+        )
+        xero = _FakeXero(bank={"BankTransactions": []})
+        result = build_csv_reconciliation_preview(self.config, text, xero_client=xero)
+
+        self.assertEqual(result["batches"][0]["status"], "already_reconciled")
+        self.assertTrue(result["batches"][0]["historical_no_bank_line"])
+        self.assertEqual(result["active_batch_count"], 0)
+
     def test_deleted_cashflows_bank_payment_does_not_hide_batch(self):
         text = _csv(
             [
@@ -424,6 +439,7 @@ class PreviewTests(unittest.TestCase):
         result = build_csv_reconciliation_preview(self.config, text, xero_client=xero)
 
         self.assertNotEqual(result["batches"][0]["status"], "already_reconciled")
+        self.assertFalse(result["batches"][0]["historical_no_bank_line"])
         self.assertEqual(result["active_batch_count"], 1)
 
     def test_unreconciled_cashflows_receive_can_match_payout_ref_in_line_description(self):
