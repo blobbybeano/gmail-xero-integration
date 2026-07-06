@@ -8727,6 +8727,13 @@ function toggleReceiptsEnabled(requested) {{
                 correlation_sheet_id=sheet_id,
                 calendar_ids=cal_ids or None,
             )
+            if not result.get("xero_connected"):
+                msg = str(result.get("xero_error") or "Xero is not connected.").strip()
+                return _flask.jsonify({
+                    "error": f"Cashflows preview needs Xero data. {msg}",
+                    "xero_connected": False,
+                    "xero_error": msg,
+                }), 503
             result["source_filename"] = (upload.filename or "").strip()
             cached_preview = {**result, "_source_csv_text": csv_text}
             set_json_setting(config.admin_db_file, "cashflows_csv_preview", cached_preview)
@@ -8771,6 +8778,13 @@ function toggleReceiptsEnabled(requested) {{
                 correlation_sheet_id=sheet_id,
                 calendar_ids=cal_ids or None,
             )
+            if not result.get("xero_connected"):
+                msg = str(result.get("xero_error") or "Xero is not connected.").strip()
+                return _flask.jsonify({
+                    "error": f"Cashflows refresh kept the previous preview because Xero data is unavailable. {msg}",
+                    "xero_connected": False,
+                    "xero_error": msg,
+                }), 503
             result["source_filename"] = str(preview.get("source_filename") or "").strip()
             cached_preview = {**result, "_source_csv_text": csv_text}
             set_json_setting(config.admin_db_file, "cashflows_csv_preview", cached_preview)
