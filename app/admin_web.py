@@ -14724,7 +14724,13 @@ body {{ background:#f7f6f3 !important; }}
             # single test run.
             existing_by_digest = {}
             prior_hashes = set()
-        seen_in_batch: set = set()
+        existing_batch_items = dump_store.list_items(db, batch["id"])
+        existing_batch_hashes: set[str] = {
+            (str(it.get("content_sha256") or "").split("#", 1)[0])
+            for it in existing_batch_items
+            if it.get("content_sha256")
+        }
+        seen_in_batch: set = set(existing_batch_hashes)
 
         # Record the total up-front so the results page can show a real progress
         # bar (done / total) while the background thread works through the files.
@@ -14739,6 +14745,10 @@ body {{ background:#f7f6f3 !important; }}
             pass
 
         counts: dict = {}
+        for it in existing_batch_items:
+            st = it.get("status") or ""
+            if st:
+                counts[st] = counts.get(st, 0) + 1
         seq = 0
         for file_bytes, filename, content_type in files:
             seq += 1
@@ -14748,6 +14758,13 @@ body {{ background:#f7f6f3 !important; }}
             # with prior uploads of the same photo, then shrink the image for
             # faster OCR and smaller on-disk storage.
             full_hash, digest16 = _dump_digests(file_bytes)
+            if full_hash in existing_batch_hashes:
+                print(
+                    "[receipt-dump] resume skipped existing "
+                    f"{seq}/{total_count or '?'} hash={full_hash[:12]}",
+                    flush=True,
+                )
+                continue
             _t_stage = time.perf_counter()
             file_bytes, filename, content_type = _exp_resize_for_ocr(
                 file_bytes, filename, content_type)
@@ -16542,6 +16559,58 @@ body {{ background:#f7f6f3 !important; }}
         (pdir / (uuid.uuid4().hex[:12] + "__" + safe)).write_bytes(data)
         return jsonify({"ok": True})
 
+    def _dump_staged_paths(batch_id: str) -> list[Path]:
+        pdir = _dump_pending_dir(batch_id)
+        return [p for p in sorted(pdir.iterdir()) if p.is_file()] if pdir.exists() else []
+
+    def _dump_iter_staged(paths):
+        for p in paths:
+            data = p.read_bytes()
+            if not data:
+                continue
+            name = p.name.split("__", 1)[1] if "__" in p.name else p.name
+            mime = _exp_sniff_mime(data[:16]) or "application/octet-stream"
+            yield data, name, mime
+
+    def _dump_cleanup_staging_dir(batch_id: str):
+        pdir = _dump_pending_dir(batch_id)
+        try:
+            if pdir.exists():
+                for p in pdir.iterdir():
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+                pdir.rmdir()
+        except OSError:
+            pass
+
+    def _dump_launch_background(batch, staged_paths):
+        # Run OCR + AI in a background thread so this request returns instantly.
+        # Staged files are only deleted after the whole batch reaches "ready".
+        def _bg(b=batch, paths=staged_paths):
+            try:
+                if paths:
+                    _dump_process(b, _dump_iter_staged(paths), total_count=len(paths))
+                else:
+                    dump_store.update_batch(
+                        config.admin_db_file, b["id"], status="ready", total_count=0
+                    )
+                _dump_cleanup_staging_dir(b["id"])
+            except Exception as exc:
+                print(
+                    "[receipt-dump] background processing failed for "
+                    f"{b.get('id')}: {exc}",
+                    flush=True,
+                )
+                try:
+                    dump_store.update_batch(
+                        config.admin_db_file, b["id"], status="processing"
+                    )
+                except Exception:
+                    pass
+        threading.Thread(target=_bg, daemon=True).start()
+
     @app.post("/receipts/expenses/dump/<batch_id>/finish")
     @require_login
     def expense_dump_finish(batch_id):
@@ -16557,56 +16626,11 @@ body {{ background:#f7f6f3 !important; }}
         if batch.get("status") != "processing":
             return jsonify({"url": result_url})
         # Mark as finalizing so a retried /finish doesn't double-launch.
-        dump_store.update_batch(db, batch_id, status="finalizing")
+        batch = dump_store.update_batch(db, batch_id, status="finalizing") or batch
         # Keep staged files on disk and process them one at a time in the
         # background thread. Loading every phone photo into a single Python list
         # is enough to OOM the small Fly machine.
-        pdir = _dump_pending_dir(batch_id)
-        staged_paths = [p for p in sorted(pdir.iterdir()) if p.is_file()] if pdir.exists() else []
-
-        def _iter_staged(paths):
-            for p in paths:
-                try:
-                    data = p.read_bytes()
-                    if not data:
-                        continue
-                    name = p.name.split("__", 1)[1] if "__" in p.name else p.name
-                    mime = _exp_sniff_mime(data[:16]) or "application/octet-stream"
-                    yield data, name, mime
-                finally:
-                    try:
-                        p.unlink()
-                    except OSError:
-                        pass
-
-        def _cleanup_staging_dir():
-            try:
-                if pdir.exists():
-                    for p in pdir.iterdir():
-                        try:
-                            p.unlink()
-                        except OSError:
-                            pass
-                    pdir.rmdir()
-            except OSError:
-                pass
-
-        # Run OCR + AI in a background thread so this request returns instantly.
-        # The results page detects "finalizing" status and auto-refreshes until done.
-        def _bg(b=batch, paths=staged_paths):
-            try:
-                if paths:
-                    _dump_process(b, _iter_staged(paths), total_count=len(paths))
-                else:
-                    dump_store.update_batch(db, b["id"], status="ready", total_count=0)
-            except Exception:
-                try:
-                    dump_store.update_batch(db, b["id"], status="ready", total_count=0)
-                except Exception:
-                    pass
-            finally:
-                _cleanup_staging_dir()
-        threading.Thread(target=_bg, daemon=True).start()
+        _dump_launch_background(batch, _dump_staged_paths(batch_id))
         return jsonify({"url": result_url})
 
     def _dump_last_activity(batch, items):
@@ -16622,9 +16646,12 @@ body {{ background:#f7f6f3 !important; }}
         return latest
 
     def _dump_stuck_recover(db, batch):
-        """If a batch is stuck in 'finalizing' with no activity for >10 minutes,
-        flip it to 'ready' so the user sees whatever was processed. Returns the
-        (possibly refreshed) batch."""
+        """Recover a batch whose background thread died.
+
+        If staged files are still present, relaunch processing and let
+        _dump_process skip items already written for the same batch. If no staged
+        files remain, fall back to showing the partial result instead of leaving
+        the page spinning forever."""
         if not batch or batch.get("status") != "finalizing":
             return batch
         items = dump_store.list_items(db, batch["id"])
@@ -16640,6 +16667,21 @@ body {{ background:#f7f6f3 !important; }}
         # nothing has been processed yet to avoid recovering a still-working batch.
         threshold = 10 if items else 25
         if age_mins > threshold:
+            staged_paths = _dump_staged_paths(batch["id"])
+            if staged_paths:
+                refreshed = dump_store.update_batch(
+                    db,
+                    batch["id"],
+                    status="finalizing",
+                    total_count=max(int(batch.get("total_count") or 0), len(staged_paths)),
+                ) or batch
+                print(
+                    "[receipt-dump] relaunching stuck batch "
+                    f"{batch['id']} with {len(staged_paths)} staged file(s)",
+                    flush=True,
+                )
+                _dump_launch_background(refreshed, staged_paths)
+                return refreshed
             dump_store.update_batch(db, batch["id"], status="ready")
             return dump_store.get_batch(db, batch["id"]) or batch
         return batch
