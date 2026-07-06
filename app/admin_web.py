@@ -15704,21 +15704,93 @@ body {{ background:#f7f6f3 !important; }}
         x.send(body);
       });
     }
+    function resizeForUpload(f){
+      if(!f||!/^image\//.test(f.type||'')||/(gif|svg)/i.test(f.type||'')){
+        return Promise.resolve(f);
+      }
+      if(f.size<=900*1024){
+        return Promise.resolve(f);
+      }
+      return new Promise(function(resolve){
+        var url=URL.createObjectURL(f);
+        var img=new Image();
+        img.onload=function(){
+          try{
+            var maxDim=1400;
+            var w=img.naturalWidth||img.width;
+            var h=img.naturalHeight||img.height;
+            var scale=Math.min(1,maxDim/Math.max(w,h));
+            var canvas=document.createElement('canvas');
+            canvas.width=Math.max(1,Math.round(w*scale));
+            canvas.height=Math.max(1,Math.round(h*scale));
+            var ctx=canvas.getContext('2d',{alpha:false});
+            ctx.drawImage(img,0,0,canvas.width,canvas.height);
+            canvas.toBlob(function(blob){
+              URL.revokeObjectURL(url);
+              if(!blob){resolve(f);return;}
+              var stem=(f.name||'receipt').replace(/\.[^.]+$/,'')||'receipt';
+              resolve(new File([blob],stem+'.jpg',{type:'image/jpeg',lastModified:f.lastModified||Date.now()}));
+            },'image/jpeg',0.82);
+          }catch(err){
+            URL.revokeObjectURL(url);
+            resolve(f);
+          }
+        };
+        img.onerror=function(){URL.revokeObjectURL(url);resolve(f);};
+        img.src=url;
+      });
+    }
     var failed=0;
     function uploadOne(addUrl,idx,attempt){
       var f=files[idx];
-      var fd=new FormData();
-      fd.append('receipt',f,f.name);
-      setStatus('Uploading receipt '+(idx+1)+' of '+total+' - '+(total-idx-1)+' to go... please keep this page open.');
-      if(btn){btn.textContent='Uploading '+(idx+1)+'/'+total;}
-      return postForm(addUrl,fd).catch(function(x){
-        if((attempt||0)<2){
-          return new Promise(function(r){setTimeout(r,800);}).then(function(){
-            return uploadOne(addUrl,idx,(attempt||0)+1);
-          });
-        }
-        failed++;
-        return null;
+      setStatus('Preparing receipt '+(idx+1)+' of '+total+' for upload...');
+      return resizeForUpload(f).then(function(uploadFile){
+        var fd=new FormData();
+        fd.append('receipt',uploadFile,uploadFile.name||f.name);
+        setStatus('Uploading receipts... '+(idx+1)+' of '+total+' started.');
+        return postForm(addUrl,fd).catch(function(x){
+          if((attempt||0)<2){
+            return new Promise(function(r){setTimeout(r,800);}).then(function(){
+              return uploadOne(addUrl,idx,(attempt||0)+1);
+            });
+          }
+          failed++;
+          return null;
+        });
+      });
+    }
+    function uploadQueue(addUrl){
+      var next=0;
+      var done=0;
+      var concurrency=Math.min(3,total);
+      if(btn){btn.textContent='Uploading 0/'+total;}
+      function worker(){
+        if(next>=total){return Promise.resolve();}
+        var idx=next++;
+        return uploadOne(addUrl,idx,0).then(function(){
+          done++;
+          setStatus('Uploaded '+done+' of '+total+' receipt'+(total===1?'':'s')+' - '+(total-done)+' to go... please keep this page open.');
+          if(btn){btn.textContent='Uploading '+done+'/'+total;}
+          return worker();
+        });
+      }
+      var workers=[];
+      for(var i=0;i<concurrency;i++){
+        workers.push(worker());
+      }
+      return Promise.all(workers);
+    }
+    function finishBatch(data,finishUrl,total,failed){
+      if(total-failed<=0){
+        reset('None of the files could be uploaded - please check your connection and try again.');
+        return Promise.resolve();
+      }
+      var okn=total-failed;
+      setStatus('All uploaded ('+okn+' of '+total+(failed?(', '+failed+' could not be sent'):'')+') - processing now... this can take a little while, please keep this page open.');
+      if(btn){btn.textContent='Processing...';}
+      return postForm(finishUrl,new FormData()).then(function(x2){
+        var d2={};try{d2=JSON.parse(x2.responseText);}catch(err){}
+        window.location=d2.url||('/receipts/expenses/dump/'+data.batch_id);
       });
     }
     setStatus('Preparing upload of '+total+' file'+(total===1?'':'s')+'...');
@@ -15727,22 +15799,8 @@ body {{ background:#f7f6f3 !important; }}
       if(!data.batch_id){throw x;}
       var addUrl='/receipts/expenses/dump/'+data.batch_id+'/add';
       var finishUrl='/receipts/expenses/dump/'+data.batch_id+'/finish';
-      var chain=Promise.resolve();
-      for(var k=0;k<total;k++){
-        (function(idx){chain=chain.then(function(){return uploadOne(addUrl,idx,0);});})(k);
-      }
-      return chain.then(function(){
-        if(total-failed<=0){
-          reset('None of the files could be uploaded - please check your connection and try again.');
-          return;
-        }
-        var okn=total-failed;
-        setStatus('All uploaded ('+okn+' of '+total+(failed?(', '+failed+' could not be sent'):'')+') - processing now... this can take a little while, please keep this page open.');
-        if(btn){btn.textContent='Processing...';}
-        return postForm(finishUrl,new FormData()).then(function(x2){
-          var d2={};try{d2=JSON.parse(x2.responseText);}catch(err){}
-          window.location=d2.url||('/receipts/expenses/dump/'+data.batch_id);
-        });
+      return uploadQueue(addUrl).then(function(){
+        return finishBatch(data,finishUrl,total,failed);
       });
     }).catch(function(){
       reset('Upload failed - please check your connection and try again.');
@@ -15972,14 +16030,11 @@ body {{ background:#f7f6f3 !important; }}
         data = f.read()
         if not data:
             return jsonify({"ok": False, "error": "empty"}), 400
-        data, fname, _fmime = _exp_heic_to_jpeg(data, f.filename, f.mimetype or "")
-        mime = _exp_sniff_mime(data[:16]) or _fmime or f.mimetype or "application/octet-stream"
-        data, fname, mime = _exp_resize_for_ocr(data, fname, mime)
+        fname = f.filename or "receipt"
         pdir = _dump_pending_dir(batch_id)
         pdir.mkdir(parents=True, exist_ok=True)
-        seq = sum(1 for p in pdir.iterdir() if p.is_file())
         safe = Path(fname or "receipt").name
-        (pdir / (f"{seq:04d}__" + safe)).write_bytes(data)
+        (pdir / (uuid.uuid4().hex[:12] + "__" + safe)).write_bytes(data)
         return jsonify({"ok": True})
 
     @app.post("/receipts/expenses/dump/<batch_id>/finish")

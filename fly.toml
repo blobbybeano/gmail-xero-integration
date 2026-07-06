@@ -30,7 +30,7 @@ primary_region = "lhr"
   CASHFLOWS_RECONCILE_AI_ENABLED = "false"
 
 [processes]
-  app = "gunicorn -b 0.0.0.0:8080 --workers 1 --threads 6 --timeout 120 run:app"
+  app = "gunicorn -b 0.0.0.0:8080 --workers 1 --threads 3 --timeout 120 run:app"
 
 [http_service]
   internal_port = 8080
@@ -41,7 +41,7 @@ primary_region = "lhr"
   processes = ["app"]
 
 [[vm]]
-  memory = "512mb"
+  memory = "1gb"
   cpu_kind = "shared"
   cpus = 1
   processes = ["app"]
