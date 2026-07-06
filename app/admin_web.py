@@ -7307,9 +7307,9 @@ function toggleReceiptsEnabled(requested) {{
           ready: {{label: '✅ Invoices add up — ready to reconcile', cls: 'border-emerald-200 bg-emerald-50 text-emerald-800'}},
           needs_review: {{label: '🔎 Worth a quick check', cls: 'border-orange-200 bg-orange-50 text-orange-800'}},
           waiting_invoices: {{label: '⏳ An invoice is still missing', cls: 'border-amber-200 bg-amber-50 text-amber-800'}},
-          no_bank_line: {{label: 'Not in your Xero bank feed yet', cls: 'border-gray-200 bg-gray-50 text-gray-700'}},
+          no_bank_line: {{label: 'Not shown in Xero reconcile list', cls: 'border-gray-200 bg-gray-50 text-gray-700'}},
           prepared_in_xero: {{label: 'Prepared in Xero — press OK in bank reconciliation', cls: 'border-sky-200 bg-sky-50 text-sky-800'}},
-          already_reconciled: {{label: '☑️ Already reconciled in Xero', cls: 'border-gray-200 bg-gray-50 text-gray-500'}}
+          already_reconciled: {{label: '☑️ Already reconciled in Xero', cls: 'border-emerald-200 bg-emerald-50 text-emerald-700'}}
         }};
 
         function csvShowError(msg) {{
@@ -7360,6 +7360,17 @@ function toggleReceiptsEnabled(requested) {{
         }}
         function _batchCanSubmit(batch) {{
           return batch && !['already_reconciled', 'prepared_in_xero'].includes(batch.status);
+        }}
+        function _batchNeedsVisibleAction(batch) {{
+          if (!batch || batch.status !== 'no_bank_line') return false;
+          return (batch.sales || []).some(function(s, idx) {{
+            const selected = _selectedInvoiceForSale(batch, s, idx);
+            if (!selected) return true;
+            if (String(selected.status || '').toUpperCase() === 'DRAFT') return true;
+            const expected = _expectedAdjustment(Number(s.gross || 0), _invAmount(selected));
+            if (!expected) return false;
+            return !_adjustmentMatches(expected, _getAdjustment(_saleKey(batch.id, s, idx)));
+          }});
         }}
 
         // Manual invoice picks for "missing" sales (scoped to this preview upload).
@@ -7635,7 +7646,7 @@ function toggleReceiptsEnabled(requested) {{
           }} else if (bank) {{
             bankPill = `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 text-[11px] font-semibold">✅ Confirmed in Xero bank feed</span>`;
           }} else if (b.status === 'no_bank_line') {{
-            bankPill = `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-gray-50 border border-gray-200 text-gray-500 text-[11px]">⏳ Not yet in Xero bank feed</span>`;
+            bankPill = `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-gray-50 border border-gray-200 text-gray-500 text-[11px]">⏳ Not shown in Xero reconcile list</span>`;
           }} else {{
             bankPill = `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-50 border border-amber-200 text-amber-700 text-[11px]">⚠ Bank scope missing — using CSV as proxy</span>`;
           }}
@@ -7868,7 +7879,7 @@ function toggleReceiptsEnabled(requested) {{
             }}
             if (favoured && String(favoured.status || '').toUpperCase() === 'DRAFT') {{
               invCell += '<div class="mt-2 rounded border border-amber-200 bg-amber-50 p-2 text-[11px] text-amber-800">'
-                + '<div class="font-semibold">Draft invoice found: process/approve this Xero invoice first.</div>'
+                + '<div class="font-semibold">Invoice needs finalising: process/approve this Xero draft first.</div>'
                 + '<div class="mt-0.5">It is the best match, but it cannot be included in a Cashflows submission while still DRAFT.</div>'
                 + '</div>';
             }}
@@ -7878,7 +7889,7 @@ function toggleReceiptsEnabled(requested) {{
             if (noMatch) {{
               statusBadge = '<span class="text-amber-600 font-semibold">\u23f3 no matches found</span>';
             }} else if (favoured && String(favoured.status || '').toUpperCase() === 'DRAFT') {{
-              statusBadge = '<span class="text-amber-700 font-semibold">\u26a0 draft invoice \u2014 process first</span>';
+              statusBadge = '<span class="text-amber-700 font-semibold">\u26a0 invoice needs finalising</span>';
             }} else if (userChosen) {{
               statusBadge = expectedAdj && !adjustmentOk
                 ? '<span class="text-amber-700 font-semibold">\u26a0 adjustment needed</span>'
@@ -8247,9 +8258,11 @@ function toggleReceiptsEnabled(requested) {{
         function renderBatchCompactSection(title, batches, note, tone) {{
           if (!batches.length) return null;
           const section = document.createElement('details');
-          section.open = true;
-          const toneCls = tone === 'submitted'
+          section.open = false;
+          const toneCls = tone === 'submitted' || tone === 'reconciled'
             ? 'border-emerald-200 bg-emerald-50 text-emerald-900'
+            : tone === 'prepared'
+              ? 'border-sky-200 bg-sky-50 text-sky-900'
             : 'border-gray-200 bg-gray-50 text-gray-800';
           section.className = 'rounded-xl border ' + toneCls;
           const rows = batches.map(function(b) {{
@@ -8259,7 +8272,13 @@ function toggleReceiptsEnabled(requested) {{
               return inv.contact_name || inv.number || s.sale_ref || '';
             }}).filter(Boolean).slice(0, 3).join(', ');
             const date = gb((b.bank_line || {{}}).date || payout.date || '');
-            const label = tone === 'submitted' ? 'Submitted' : 'Reconciled in Xero';
+            const label = tone === 'submitted'
+              ? 'Submitted'
+              : tone === 'prepared'
+                ? 'Prepared in Xero'
+                : tone === 'waiting'
+                  ? 'Not in Xero reconcile list'
+                  : 'Already reconciled in Xero';
             return `<div class="grid grid-cols-12 gap-2 items-center px-3 py-2 border-t border-white/60 first:border-t-0 text-xs">
               <div class="col-span-12 sm:col-span-3 font-semibold">${{esc(payout.csv_ref || b.id || '')}}</div>
               <div class="col-span-6 sm:col-span-2">${{money(b.net || payout.amount || 0)}}</div>
@@ -8287,6 +8306,9 @@ function toggleReceiptsEnabled(requested) {{
           const reconciledBatches = (data.batches || []).filter(b => b.status === 'already_reconciled');
           const preparedBatches = (data.batches || []).filter(b => b.status === 'prepared_in_xero');
           const activeBatches = (data.batches || []).filter(b => !['already_reconciled', 'prepared_in_xero'].includes(b.status) && !_isSubmitted(b.id));
+          const actionNoBankBatches = activeBatches.filter(b => b.status === 'no_bank_line' && _batchNeedsVisibleAction(b));
+          const quietNoBankBatches = activeBatches.filter(b => b.status === 'no_bank_line' && !_batchNeedsVisibleAction(b));
+          const workBatches = activeBatches.filter(b => b.status !== 'no_bank_line').concat(actionNoBankBatches);
           const total = data.active_batch_count || activeBatches.length;
           const bankMatched = data.bank_matched_count || 0;
 
@@ -8348,22 +8370,26 @@ function toggleReceiptsEnabled(requested) {{
           const pct = total > 0 ? Math.round(bankMatched / total * 100) : 0;
           const barCls = pct === 100 ? 'bg-emerald-500' : pct > 0 ? 'bg-amber-400' : 'bg-gray-300';
           matchPanel.innerHTML = `
-            <div class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Settlement batches (the CFE SETT lines Xero is waiting on)</div>
+            <div class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Cashflows batches from this CSV</div>
             <div class="flex items-center gap-3 flex-wrap">
               <div class="flex-1 min-w-32 h-2 rounded-full bg-gray-100 overflow-hidden">
                 <div class="h-2 rounded-full ${{barCls}}" style="width:${{pct}}%"></div>
               </div>
               <span class="text-sm font-semibold text-gray-900">${{bankMatched}} of ${{total}} settlement batches found in your Xero bank feed</span>
             </div>
+            <div class="mt-1 text-xs text-gray-500">The main list below shows batches that need action now. Older CSV batches that are not visible in Xero's reconcile list are tucked into a collapsed section.</div>
             <div class="mt-2 flex flex-wrap gap-2 text-xs">
               <span class="px-2 py-1 rounded-full ${{STATUS_META.ready.cls}}">${{counts.ready||0}} ready to reconcile</span>
               <span class="px-2 py-1 rounded-full ${{STATUS_META.needs_review.cls}}">${{counts.needs_review||0}} worth a check</span>
               <span class="px-2 py-1 rounded-full ${{STATUS_META.waiting_invoices.cls}}">${{counts.waiting_invoices||0}} missing an invoice</span>
-              <span class="px-2 py-1 rounded-full ${{STATUS_META.no_bank_line.cls}}">${{counts.no_bank_line||0}} not in Xero yet</span>
+              <span class="px-2 py-1 rounded-full ${{STATUS_META.no_bank_line.cls}}">${{counts.no_bank_line||0}} not in Xero reconcile list</span>
               ${{preparedInXero ? `<span class="px-2 py-1 rounded-full ${{STATUS_META.prepared_in_xero.cls}}">${{preparedInXero}} prepared in Xero</span>` : ''}}
-              ${{alreadyDone ? `<span class="px-2 py-1 rounded-full border border-gray-200 bg-gray-50 text-gray-400">${{alreadyDone}} already reconciled in Xero &mdash; shown above</span>` : ''}}
+              ${{alreadyDone ? `<span class="px-2 py-1 rounded-full ${{STATUS_META.already_reconciled.cls}}">${{alreadyDone}} already reconciled in Xero</span>` : ''}}
             </div>`;
           csvResults.appendChild(matchPanel);
+
+          // ── Main work list ──────────────────────────────────────────────────
+          workBatches.slice().reverse().forEach(b => csvResults.appendChild(renderBatch(b)));
 
           const submittedSection = renderBatchCompactSection(
             'Submitted this session',
@@ -8389,8 +8415,13 @@ function toggleReceiptsEnabled(requested) {{
           );
           if (reconciledSection) csvResults.appendChild(reconciledSection);
 
-          // ── Batch list (skip already-reconciled, newest first) ────────────
-          activeBatches.slice().reverse().forEach(b => csvResults.appendChild(renderBatch(b)));
+          const noBankSection = renderBatchCompactSection(
+            'Not currently visible in Xero reconcile list',
+            quietNoBankBatches.slice().reverse(),
+            'Collapsed to keep the work list focused',
+            'waiting'
+          );
+          if (noBankSection) csvResults.appendChild(noBankSection);
 
           // ── Unpaid sales footer ───────────────────────────────────────────
           const unpaid = data.unpaid_sales || [];
