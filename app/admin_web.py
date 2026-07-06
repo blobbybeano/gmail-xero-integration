@@ -7361,17 +7361,6 @@ function toggleReceiptsEnabled(requested) {{
         function _batchCanSubmit(batch) {{
           return batch && !['already_reconciled', 'prepared_in_xero'].includes(batch.status);
         }}
-        function _batchNeedsVisibleAction(batch) {{
-          if (!batch || batch.status !== 'no_bank_line') return false;
-          return (batch.sales || []).some(function(s, idx) {{
-            const selected = _selectedInvoiceForSale(batch, s, idx);
-            if (!selected) return true;
-            if (String(selected.status || '').toUpperCase() === 'DRAFT') return true;
-            const expected = _expectedAdjustment(Number(s.gross || 0), _invAmount(selected));
-            if (!expected) return false;
-            return !_adjustmentMatches(expected, _getAdjustment(_saleKey(batch.id, s, idx)));
-          }});
-        }}
 
         // Manual invoice picks for "missing" sales (scoped to this preview upload).
         // These are included when the user submits a checked batch, so the UI
@@ -8306,9 +8295,7 @@ function toggleReceiptsEnabled(requested) {{
           const reconciledBatches = (data.batches || []).filter(b => b.status === 'already_reconciled');
           const preparedBatches = (data.batches || []).filter(b => b.status === 'prepared_in_xero');
           const activeBatches = (data.batches || []).filter(b => !['already_reconciled', 'prepared_in_xero'].includes(b.status) && !_isSubmitted(b.id));
-          const actionNoBankBatches = activeBatches.filter(b => b.status === 'no_bank_line' && _batchNeedsVisibleAction(b));
-          const quietNoBankBatches = activeBatches.filter(b => b.status === 'no_bank_line' && !_batchNeedsVisibleAction(b));
-          const workBatches = activeBatches.filter(b => b.status !== 'no_bank_line').concat(actionNoBankBatches);
+          const workBatches = activeBatches;
           const total = data.active_batch_count || activeBatches.length;
           const bankMatched = data.bank_matched_count || 0;
 
@@ -8377,7 +8364,7 @@ function toggleReceiptsEnabled(requested) {{
               </div>
               <span class="text-sm font-semibold text-gray-900">${{bankMatched}} of ${{total}} settlement batches found in your Xero bank feed</span>
             </div>
-            <div class="mt-1 text-xs text-gray-500">The main list below shows batches that need action now. Older CSV batches that are not visible in Xero's reconcile list are tucked into a collapsed section.</div>
+            <div class="mt-1 text-xs text-gray-500">Already reconciled, prepared, and submitted batches are collapsed below so the active work stays visible without losing anything.</div>
             <div class="mt-2 flex flex-wrap gap-2 text-xs">
               <span class="px-2 py-1 rounded-full ${{STATUS_META.ready.cls}}">${{counts.ready||0}} ready to reconcile</span>
               <span class="px-2 py-1 rounded-full ${{STATUS_META.needs_review.cls}}">${{counts.needs_review||0}} worth a check</span>
@@ -8414,14 +8401,6 @@ function toggleReceiptsEnabled(requested) {{
             'reconciled'
           );
           if (reconciledSection) csvResults.appendChild(reconciledSection);
-
-          const noBankSection = renderBatchCompactSection(
-            'Not currently visible in Xero reconcile list',
-            quietNoBankBatches.slice().reverse(),
-            'Collapsed to keep the work list focused',
-            'waiting'
-          );
-          if (noBankSection) csvResults.appendChild(noBankSection);
 
           // ── Unpaid sales footer ───────────────────────────────────────────
           const unpaid = data.unpaid_sales || [];
