@@ -36,6 +36,16 @@ _AMOUNT_NEAR = Decimal("5.00")
 _MIN_SCORE = 0.1
 # Calendars to ignore when falling back to "all accessible" (no customer jobs).
 _NOISE_HINTS = ("holiday", "weather", "birthday", "uk holidays")
+_SERVICE_TITLE_TOKENS = {
+    "gc",
+    "g.c",
+    "pw",
+    "p.w",
+    "wc",
+    "w.c",
+    "ds",
+    "d.s",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +88,29 @@ def _gross_from_invoice_lines(lines: list[dict]) -> Decimal | None:
     return total if total > 0 else None
 
 
+def _customer_from_summary(summary: str) -> str:
+    """Best-effort customer fallback for titles like ``SW14 G.C Adam May``."""
+    text = re.sub(r"<[^>]+>", " ", summary or "")
+    text = re.sub(r"[^\w\s().'-]", " ", text)
+    text = re.sub(r"\([^)]*\)", " ", text)
+    words = [w.strip(" .'-") for w in text.split() if w.strip(" .'-")]
+    kept: list[str] = []
+    for word in words:
+        norm = word.lower().replace(" ", "")
+        compact = re.sub(r"[^a-z0-9]", "", norm)
+        if not kept and (
+            norm in _SERVICE_TITLE_TOKENS
+            or compact in {t.replace(".", "") for t in _SERVICE_TITLE_TOKENS}
+            or re.fullmatch(r"[a-z]{1,2}\d{1,2}[a-z]?", compact)
+        ):
+            continue
+        kept.append(word)
+    customer = " ".join(kept).strip()
+    if not re.search(r"[A-Za-z]", customer):
+        return ""
+    return customer[:80]
+
+
 # ---------------------------------------------------------------------------
 # Event datetime helpers
 # ---------------------------------------------------------------------------
@@ -118,7 +151,11 @@ def _parse_event_structured(event: dict) -> dict:
     summary = event.get("summary") or ""
     description = event.get("description") or ""
 
-    customer = parse_customer_fields(description).get("name") or ""
+    customer = (
+        parse_customer_fields(description).get("name")
+        or _customer_from_summary(summary)
+        or ""
+    )
 
     # Amount: prefer the [invoice] block (most reliable)
     lines = extract_invoice_lines(description)
@@ -500,7 +537,7 @@ def build_calendar_pool(
             # time-proximity scoring still works for events whose description is
             # empty or whose name is only in the title (e.g. "-SM4 W.C Tony Byrne").
             if not customer:
-                customer = (ev.get("summary") or "")[:80]
+                customer = _customer_from_summary(ev.get("summary") or "") or (ev.get("summary") or "")[:80]
             parsed.append(_pack_event(ev, customer, eg, "ai"))
 
     return CalendarPool(parsed)

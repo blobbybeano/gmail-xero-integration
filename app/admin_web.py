@@ -7756,6 +7756,7 @@ function toggleReceiptsEnabled(requested) {{
             const favoured = allOptions[favIdx] || null;
             const favCal = favoured ? optCal[favIdx] : null;
             const favCalNameMatch = !!(favCal && favoured && _nameOverlap(favCal.customer || '', favoured.contact_name || ''));
+            const favDateMismatch = !!(favCalNameMatch && favoured && Number(favoured.days_apart || 0) > 3);
             const noMatch = !favoured;
             const userChosen = !!(tswap || manualPick);
             const ambiguous = !isMissing && !!s.ambiguous;
@@ -7797,6 +7798,7 @@ function toggleReceiptsEnabled(requested) {{
               ? '<div class="text-[11px] ' + calLineTone + ' mt-0.5">&#128197; Calendar entry \u2014 ' + esc(_fmtCalEntry(favCal))
                   + ((favCal.event_gross !== null && favCal.event_gross !== undefined) ? ' <span class="text-xs font-bold ' + calLineAmountTone + '">(\u00a3' + favCal.event_gross.toFixed(2) + ')</span>' : '')
                   + (needsSuggestionConfirm ? ' <span class="text-[10px] font-semibold bg-amber-100 border border-amber-200 rounded px-1">needs confirmation</span>' : '')
+                  + (favDateMismatch ? ' <span class="text-[10px] font-semibold bg-amber-100 border border-amber-200 rounded px-1">invoice date differs</span>' : '')
                   + '</div>'
               : '';
             const suggestedConfirmBtn = needsSuggestionConfirm
@@ -7816,6 +7818,7 @@ function toggleReceiptsEnabled(requested) {{
                       + (favCalNameMatch
                           ? '<div class="mt-0.5 text-teal-700">&#128197; ' + esc(_fmtCalEntry(favCal))
                               + ((favCal.event_gross !== null && favCal.event_gross !== undefined) ? ' <span class="font-bold">(\u00a3' + Number(favCal.event_gross).toFixed(2) + ')</span>' : '')
+                              + (favDateMismatch ? ' <span class="text-[10px] font-semibold text-amber-700 bg-amber-100 border border-amber-200 rounded px-1">invoice date differs</span>' : '')
                               + '</div>'
                           : '')
                       + '<div class="mt-0.5 text-gray-500">Invoice total ' + money(favoured.total) + ' vs card payment ' + money(s.gross) + '. Confirming will show the adjustment needed.</div>'
@@ -7950,6 +7953,9 @@ function toggleReceiptsEnabled(requested) {{
                     + (calConfirmed
                         ? ' <span class="text-[10px] text-teal-700 font-semibold bg-teal-50 rounded px-1">\u2713 name match</span>'
                         : ' <span class="text-[10px] text-gray-400 bg-gray-100 rounded px-1">? proximity only</span>')
+                    + (calConfirmed && Number(opt.days_apart || 0) > 3
+                        ? ' <span class="text-[10px] text-amber-700 font-semibold bg-amber-100 border border-amber-200 rounded px-1">invoice date differs</span>'
+                        : '')
                     + '</div>'
                 : '';
               const slot = (displayCal && displayCal.event_date && displayCal.event_start) ? (displayCal.event_date + 'T' + displayCal.event_start) : '';

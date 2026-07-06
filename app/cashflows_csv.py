@@ -59,6 +59,7 @@ EXPECTED_COLUMNS = (
 
 DEFAULT_INVOICE_MATCH_DAYS = 7
 DEFAULT_BANK_MATCH_DAYS = 5
+MANUAL_CANDIDATE_PAID_DAYS = 62
 GROUP_TOLERANCE = Decimal("0.06")  # absorbs decline fees / sub-penny rounding
 RECOMMENDED_OVERLAP_DAYS = 3
 RECOMMENDED_DEFAULT_DAYS = 30
@@ -758,6 +759,17 @@ def build_csv_reconciliation_preview(
                     if start and end and hasattr(xero_client, "get_paid_invoices")
                     else []
                 )
+                wide_paid_invoices: list[XeroInvoiceCandidate] = []
+                if start and end and hasattr(xero_client, "get_paid_invoices"):
+                    wide_start = start - dt.timedelta(days=MANUAL_CANDIDATE_PAID_DAYS)
+                    wide_end = end + dt.timedelta(days=MANUAL_CANDIDATE_PAID_DAYS)
+                    if wide_start != start or wide_end != end:
+                        wide_paid_invoices = parse_xero_invoices(
+                            xero_client.get_paid_invoices(
+                                start_date=wide_start,
+                                end_date=wide_end,
+                            )
+                        )
                 # Card-eligibility for the invoice pool.
                 #
                 # Priority 1 — correlation sheet is configured and loaded:
@@ -812,7 +824,7 @@ def build_csv_reconciliation_preview(
                 # a wrong open invoice.
                 seen_candidate_ids: set[str] = set()
                 manual_candidate_invoices = []
-                for inv in invoices + paid_invoices:
+                for inv in invoices + paid_invoices + wide_paid_invoices:
                     if inv.id in seen_candidate_ids:
                         continue
                     seen_candidate_ids.add(inv.id)

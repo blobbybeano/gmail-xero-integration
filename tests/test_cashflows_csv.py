@@ -823,6 +823,84 @@ class PreviewTests(unittest.TestCase):
         )
         self.assertFalse(row["candidates"][0]["amount_match"])
 
+    def test_calendar_exact_match_finds_paid_invoice_outside_normal_date_window(self):
+        from unittest.mock import patch
+
+        text = _csv(
+            [
+                '"1","2026-06-10","08:51:03","Sale ADAM","Sale Settlement","","174.00","0.00"',
+                '"2","2026-06-10","08:51:03","Merchant Service Charge Sale Ref: ADAM",'
+                '"Merchant Service Charge","0.64","","0.00"',
+                _remit("3", "2026-06-11", "173.36"),
+            ]
+        )
+
+        class _RangeXero(_FakeXero):
+            def get_paid_invoices(self, start_date=None, end_date=None):
+                invoice_date = __import__("datetime").date(2026, 7, 20)
+                if start_date <= invoice_date <= end_date:
+                    return {
+                        "Invoices": [
+                            {
+                                "InvoiceID": "adam",
+                                "InvoiceNumber": "INV-ADAM",
+                                "Date": "2026-07-20",
+                                "Status": "PAID",
+                                "AmountDue": "0.00",
+                                "Total": "174.00",
+                                "Reference": "GC-20260720-adam",
+                                "Contact": {"Name": "Adam May"},
+                            }
+                        ]
+                    }
+                return {"Invoices": []}
+
+        xero = _RangeXero(
+            invoices={
+                "Invoices": [
+                    _invoice(
+                        "paul",
+                        "INV-5713",
+                        "2026-06-23",
+                        "318.00",
+                        contact="Paul Campana",
+                        reference="GC-20260623-qb2t",
+                    )
+                ]
+            },
+            bank={"BankTransactions": [_bank_line("b1", "2026-06-11", "173.36")]},
+        )
+
+        cal_pool = _FakeCalendarPool(
+            [
+                {
+                    "customer": "Adam May",
+                    "event_gross": 174.0,
+                    "event_summary": "SW14 G.C Adam May",
+                    "event_date": "2026-06-10",
+                    "event_start": "08:30",
+                    "event_end": "09:30",
+                    "score": 0.95,
+                    "source": "structured",
+                }
+            ]
+        )
+
+        with patch("app.cashflows_csv.build_calendar_pool", return_value=cal_pool):
+            result = build_csv_reconciliation_preview(
+                self.config,
+                text,
+                xero_client=xero,
+                calendar_ids=["cal-1"],
+            )
+
+        row = result["batches"][0]["sales"][0]
+        self.assertIsNone(row["invoice"])
+        self.assertEqual(row["candidates"][0]["number"], "INV-ADAM")
+        self.assertEqual(row["candidates"][0]["contact_name"], "Adam May")
+        self.assertTrue(row["candidates"][0]["amount_match"])
+        self.assertEqual(row["candidates"][0]["days_apart"], 40)
+
     def test_candidate_is_open_flag_reflects_amount_due(self):
         # A missing sale (no exact-amount invoice to auto-match) is offered two
         # unaccounted invoices: one AUTHORISED (unpaid -> is_open=True) and one
