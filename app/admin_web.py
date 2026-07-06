@@ -14135,7 +14135,12 @@ body {{ background:#f7f6f3 !important; }}
             if best:
                 best["used"] = True
                 best["matched_item"] = it
-                rows.append({"item": it, "tx": best, "kind": "matched"})
+                row_kind = (
+                    "already_xero"
+                    if best.get("reconciled") or best.get("has_attachment")
+                    else "matched"
+                )
+                rows.append({"item": it, "tx": best, "kind": row_kind})
             else:
                 pending.append((it, amt, mname))
 
@@ -14559,6 +14564,108 @@ body {{ background:#f7f6f3 !important; }}
         except Exception:
             return ""
 
+    _dump_xero_spend_cache: dict = {}
+
+    def _dump_xero_existing_spend_match(
+        *,
+        amount_inc,
+        purchased_on: str,
+        merchant: str = "",
+        card_account: str = "",
+    ) -> dict | None:
+        """Find an existing Xero SPEND expense for this receipt.
+
+        This is intentionally independent of the app's local receipt table. It
+        answers the user's main duplicate question: "has this receipt/expense
+        already been put into Xero?" The strong duplicate signal is exact Xero
+        transaction date + exact amount. Merchant/contact match is recorded in
+        the reason, but is not required when date and amount match.
+
+        The lookup is cached per month-sized date window so a 50-photo dump does
+        not make 50 Xero calls.
+        """
+        if xero_is_disabled() or amount_inc is None:
+            return None
+        try:
+            amt = round(float(amount_inc), 2)
+            day = dt.date.fromisoformat((purchased_on or "")[:10])
+        except (TypeError, ValueError):
+            return None
+        if amt <= 0:
+            return None
+
+        # One cached fetch per calendar month, with a small overlap so receipts
+        # at month edges still catch Xero transactions entered a few days away.
+        month_start = day.replace(day=1)
+        if month_start.month == 12:
+            next_month = dt.date(month_start.year + 1, 1, 1)
+        else:
+            next_month = dt.date(month_start.year, month_start.month + 1, 1)
+        start = month_start - dt.timedelta(days=5)
+        end = next_month + dt.timedelta(days=4)
+        acct_norm = _norm_account_choice(card_account)
+        cache_key = (start.isoformat(), end.isoformat(), acct_norm)
+
+        if cache_key not in _dump_xero_spend_cache:
+            txs = []
+            try:
+                client = build_xero_client(config)
+                payload = client.get_bank_transactions(start_date=start, end_date=end)
+                raw = (payload or {}).get("BankTransactions") or []
+                for t in raw:
+                    if str(t.get("Type") or "").upper() != "SPEND":
+                        continue
+                    acct_name = (t.get("BankAccount") or {}).get("Name") or ""
+                    if acct_norm:
+                        a_norm = _norm_account_choice(acct_name)
+                        if a_norm and acct_norm not in a_norm and a_norm not in acct_norm:
+                            continue
+                    try:
+                        total = round(float(t.get("Total") or 0), 2)
+                    except (TypeError, ValueError):
+                        continue
+                    if total <= 0:
+                        continue
+                    txs.append({
+                        "amount": total,
+                        "date": _xero_date_to_iso(t.get("Date")),
+                        "contact": (t.get("Contact") or {}).get("Name") or "",
+                        "account": acct_name,
+                        "reconciled": bool(t.get("IsReconciled")),
+                        "has_attachment": bool(t.get("HasAttachments")),
+                        "id": str(t.get("BankTransactionID") or ""),
+                    })
+            except Exception as exc:
+                print(f"[dump-xero-dedupe] Xero spend lookup failed: {exc}", flush=True)
+                txs = []
+            _dump_xero_spend_cache[cache_key] = txs
+
+        exact = []
+        for tx in _dump_xero_spend_cache.get(cache_key, []):
+            if tx.get("date") != day.isoformat():
+                continue
+            try:
+                if abs(float(tx.get("amount") or 0) - amt) > 0.02:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            tx = dict(tx)
+            tx["merchant_match"] = _merch_match(merchant, tx.get("contact"))
+            exact.append(tx)
+        if not exact:
+            return None
+
+        # Prefer the most convincing exact match, but any same-date/same-amount
+        # Xero SPEND line is enough to stop a duplicate import.
+        exact.sort(
+            key=lambda tx: (
+                0 if tx.get("merchant_match") else 1,
+                0 if tx.get("has_attachment") else 1,
+                0 if tx.get("reconciled") else 1,
+            )
+        )
+        return exact[0]
+
     def _dump_process(batch, files, *, total_count: int | None = None):
         """Process an uploaded batch: OCR + AI-code + dedupe + classify each file,
         persisting a dump item per receipt. ``files`` is a list of
@@ -14717,6 +14824,7 @@ body {{ background:#f7f6f3 !important; }}
             match_id = ""
             match_eid = None
             image_check: dict = {}
+            batch_card_acct = (batch.get("card_account") or "").strip()
 
             if digest16 and digest16 in existing_by_digest:
                 m = existing_by_digest[digest16]
@@ -14790,7 +14898,30 @@ body {{ background:#f7f6f3 !important; }}
                                 "unavailable. " + (image_check.get("reason") or "")
                             ).strip()
 
-            batch_card_acct = (batch.get("card_account") or "").strip()
+            if status == dump_store.STATUS_NEW:
+                xero_match = _dump_xero_existing_spend_match(
+                    amount_inc=total,
+                    purchased_on=purchased_on,
+                    merchant=result.get("merchant", ""),
+                    card_account=batch_card_acct,
+                )
+                if xero_match:
+                    status = dump_store.STATUS_DUPLICATE
+                    contact = (xero_match.get("contact") or "Xero expense").strip()
+                    account = (xero_match.get("account") or "bank account").strip()
+                    reason_bits = [
+                        "Already submitted in Xero",
+                        "same date " + _exp_uk_date(xero_match.get("date") or purchased_on),
+                        "same amount £" + format(float(xero_match.get("amount") or 0), ",.2f"),
+                    ]
+                    if xero_match.get("merchant_match"):
+                        reason_bits.append("merchant/contact matched " + contact)
+                    else:
+                        reason_bits.append("matched Xero contact " + contact)
+                    if account:
+                        reason_bits.append("account " + account)
+                    dup_reason = " — ".join(reason_bits) + "."
+
             card_status = ""
             if status == dump_store.STATUS_NEW:
                 card_status = _dump_card_feed_check(
@@ -14910,6 +15041,21 @@ body {{ background:#f7f6f3 !important; }}
                     s_status = dump_store.STATUS_NEW
                     s_reason = ""
                     s_card = ""
+                    s_xero_match = _dump_xero_existing_spend_match(
+                        amount_inc=s_total,
+                        purchased_on=s_date,
+                        merchant=s_merchant,
+                        card_account=batch_card_acct,
+                    )
+                    if s_xero_match:
+                        s_status = dump_store.STATUS_DUPLICATE
+                        s_reason = (
+                            "Already submitted in Xero — same date "
+                            + _exp_uk_date(s_xero_match.get("date") or s_date)
+                            + ", same amount £"
+                            + format(float(s_xero_match.get("amount") or 0), ",.2f")
+                            + "."
+                        )
                     if s_status == dump_store.STATUS_NEW:
                         s_card = _dump_card_feed_check(
                             engineer, s_total, s_date,
@@ -17162,6 +17308,26 @@ body {{ background:#f7f6f3 !important; }}
                 continue
             eid = it.get("assigned_engineer_id") or default_eid
             if not eid:
+                continue
+            xero_match = _dump_xero_existing_spend_match(
+                amount_inc=it.get("amount_inc"),
+                purchased_on=it.get("purchased_on", ""),
+                merchant=it.get("merchant", ""),
+                card_account=(batch.get("card_account") or "").strip(),
+            )
+            if xero_match:
+                dump_store.update_item(
+                    db,
+                    it["id"],
+                    status=dump_store.STATUS_DUPLICATE,
+                    dup_reason=(
+                        "Already submitted in Xero — same date "
+                        + _exp_uk_date(xero_match.get("date") or it.get("purchased_on") or "")
+                        + ", same amount £"
+                        + format(float(xero_match.get("amount") or 0), ",.2f")
+                        + "."
+                    ),
+                )
                 continue
             account_code = (it.get("category_account_code") or "").strip()
             account_name = (it.get("category_account_name") or "").strip()

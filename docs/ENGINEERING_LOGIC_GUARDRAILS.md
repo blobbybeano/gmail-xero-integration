@@ -529,3 +529,8 @@ Current rule:
   suspicious unless the image comparison proves it is different. Existing Xero
   attachments may be fetched only for a known prior receipt record, not by
   broad-scanning Xero attachments.
+- Receipt dump duplicate protection must also check Xero itself, not only the
+  app's local receipt table. A same-date and same-amount Xero `SPEND` bank
+  transaction means the expense is already submitted in Xero and must not be
+  imported again. Cache these Xero reads by date window so a large dump does not
+  create one Xero request per photo.
