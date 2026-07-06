@@ -23,6 +23,7 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 ENGINEER_KINDS = ("company_card", "subcontractor")
+PAYMENT_SOURCES = ("company_card", "owner_paid")
 
 # Statuses a single receipt claim moves through.
 RECEIPT_STATUSES = (
@@ -119,6 +120,11 @@ def _ensure_tables(db_path: str) -> None:
             conn.execute(
                 "ALTER TABLE expense_receipts "
                 "ADD COLUMN category_account_name TEXT NOT NULL DEFAULT ''"
+            )
+        if "payment_source" not in _cols:
+            conn.execute(
+                "ALTER TABLE expense_receipts "
+                "ADD COLUMN payment_source TEXT NOT NULL DEFAULT 'company_card'"
             )
         # Migrations: per-engineer login credentials + linked bank card.
         _eng_cols = {
@@ -331,10 +337,13 @@ def create_receipt(
     mime_type: str = "",
     category_account_code: str = "",
     category_account_name: str = "",
+    payment_source: str = "company_card",
     status: str = "pending_review",
 ) -> dict[str, Any]:
     rid = f"exp-{uuid.uuid4().hex[:12]}"
     now = _now_iso()
+    if payment_source not in PAYMENT_SOURCES:
+        payment_source = "company_card"
     with _conn(db_path) as conn:
         conn.execute(
             """
@@ -343,14 +352,15 @@ def create_receipt(
                  amount_ex, vat_amount, currency, ocr_merchant, ocr_amount,
                  ocr_date, ocr_raw, ocr_error, stored_file, filename,
                  mime_type, category_account_code, category_account_name,
-                 created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 payment_source, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 rid, engineer_id, status, merchant, purchased_on, amount_inc,
                 amount_ex, vat_amount, currency, ocr_merchant, ocr_amount,
                 ocr_date, ocr_raw, ocr_error, stored_file, filename,
                 mime_type, category_account_code, category_account_name,
+                payment_source,
                 now, now,
             ),
         )
@@ -363,8 +373,11 @@ def update_receipt(db_path: str, receipt_id: str, **fields) -> dict[str, Any] | 
         "status", "merchant", "purchased_on", "amount_inc", "amount_ex",
         "vat_amount", "currency", "xero_type", "xero_id", "xero_error",
         "settlement_id", "category_account_code", "category_account_name",
+        "payment_source",
     }
     sets = {k: v for k, v in fields.items() if k in allowed}
+    if "payment_source" in sets and sets["payment_source"] not in PAYMENT_SOURCES:
+        sets["payment_source"] = "company_card"
     if not sets:
         return get_receipt(db_path, receipt_id)
     sets["updated_at"] = _now_iso()

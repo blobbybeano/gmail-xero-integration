@@ -10549,6 +10549,8 @@ body {{ background:#f7f6f3 !important; }}
 
         def _ticked(amt, d):
             for r in receipts:
+                if (r.get("payment_source") or "company_card") != "company_card":
+                    continue
                 try:
                     ra = float(r.get("amount_inc") or 0)
                 except (TypeError, ValueError):
@@ -11039,6 +11041,35 @@ body {{ background:#f7f6f3 !important; }}
                 "p-3 text-sm text-gray-700 text-center'>Receipt removed.</div>"
             )
 
+        paid_with_html = ""
+        if eng.get("kind") == "company_card":
+            paid_with_html = """
+                <div class="rounded-xl border border-gray-200 bg-white p-2 grid grid-cols-2 gap-2">
+                  <label class="cursor-pointer">
+                    <input type="radio" name="payment_source" value="company_card"
+                           class="peer sr-only" checked>
+                    <span class="block text-center rounded-lg border border-indigo-200
+                                 bg-indigo-50 px-3 py-2 text-sm font-semibold text-indigo-800
+                                 peer-checked:bg-indigo-600 peer-checked:text-white
+                                 peer-checked:border-indigo-600">
+                      Company card
+                    </span>
+                  </label>
+                  <label class="cursor-pointer">
+                    <input type="radio" name="payment_source" value="owner_paid"
+                           class="peer sr-only">
+                    <span class="block text-center rounded-lg border border-gray-200
+                                 bg-white px-3 py-2 text-sm font-semibold text-gray-700
+                                 peer-checked:bg-emerald-600 peer-checked:text-white
+                                 peer-checked:border-emerald-600">
+                      Personal card
+                    </span>
+                  </label>
+                </div>
+            """
+        else:
+            paid_with_html = '<input type="hidden" name="payment_source" value="owner_paid">'
+
         # Subcontractor: recognise any payment in the feed, then show the
         # running balance + the reference the office should use to pay.
         owed_html = ""
@@ -11088,6 +11119,12 @@ body {{ background:#f7f6f3 !important; }}
                     f"bg-indigo-50 text-indigo-700 mt-0.5'>{escape(cat_name)}</span>"
                     if cat_name else ""
                 )
+                source_html = (
+                    "<span class='inline-block text-xs px-2 py-0.5 rounded-full "
+                    "bg-emerald-50 text-emerald-700 mt-0.5'>Personal card</span>"
+                    if (r.get("payment_source") or "company_card") == "owner_paid"
+                    else ""
+                )
                 rows.append(
                     f"<a href='/expenses/{escape(token)}/review/{escape(r['id'])}' "
                     "class='flex items-center justify-between gap-3 px-4 py-3 "
@@ -11095,7 +11132,7 @@ body {{ background:#f7f6f3 !important; }}
                     "<div class='min-w-0'>"
                     f"<div class='font-medium text-gray-900 truncate'>{escape(merchant)}</div>"
                     f"<div class='mt-0.5 flex items-center gap-2'>"
-                    f"{_exp_status_badge(r.get('status'))}{cat_html}</div>"
+                    f"{_exp_status_badge(r.get('status'))}{cat_html}{source_html}</div>"
                     "</div>"
                     f"<div class='text-right font-semibold text-gray-900 "
                     f"whitespace-nowrap'>{amount}</div></a>"
@@ -11156,6 +11193,7 @@ body {{ background:#f7f6f3 !important; }}
               <form id="exp-form" method="post"
                     action="/expenses/{escape(token)}/upload"
                     enctype="multipart/form-data">
+                {paid_with_html}
                 <label for="exp-file"
                        class="flex flex-col items-center justify-center w-full h-36
                               rounded-2xl bg-indigo-600 text-white cursor-pointer
@@ -11213,6 +11251,11 @@ body {{ background:#f7f6f3 !important; }}
         file = request.files.get("receipt_file")
         if not file or not file.filename:
             return redirect(f"/expenses/{token}")
+        payment_source = (request.form.get("payment_source") or "company_card").strip()
+        if payment_source not in {"company_card", "owner_paid"}:
+            payment_source = "company_card"
+        if eng.get("kind") != "company_card":
+            payment_source = "owner_paid"
 
         file_bytes = file.read() or b""
         filename = file.filename or "receipt.jpg"
@@ -11307,6 +11350,7 @@ body {{ background:#f7f6f3 !important; }}
             mime_type=content_type,
             category_account_code=cat_code,
             category_account_name=cat_name,
+            payment_source=payment_source,
             status="pending_review",
         )
         return redirect(f"/expenses/{token}/review/{rec['id']}")
@@ -11396,6 +11440,30 @@ body {{ background:#f7f6f3 !important; }}
                 f"{escape(rec.get('status'))}. You can still correct the details.</div>"
             )
 
+        source = rec.get("payment_source") or "company_card"
+        source_html = ""
+        if eng.get("kind") == "company_card":
+            company_checked = "checked" if source != "owner_paid" else ""
+            owner_checked = "checked" if source == "owner_paid" else ""
+            source_html = (
+                "<div>"
+                "<label class='block text-xs font-medium text-gray-500 mb-1'>Paid with</label>"
+                "<div class='grid grid-cols-2 gap-2'>"
+                "<label class='cursor-pointer'>"
+                f"<input type='radio' name='payment_source' value='company_card' class='peer sr-only' {company_checked}>"
+                "<span class='block text-center rounded-lg border border-gray-200 px-3 py-2 text-sm font-semibold text-gray-700 peer-checked:bg-indigo-600 peer-checked:text-white peer-checked:border-indigo-600'>Company card</span>"
+                "</label>"
+                "<label class='cursor-pointer'>"
+                f"<input type='radio' name='payment_source' value='owner_paid' class='peer sr-only' {owner_checked}>"
+                "<span class='block text-center rounded-lg border border-gray-200 px-3 py-2 text-sm font-semibold text-gray-700 peer-checked:bg-emerald-600 peer-checked:text-white peer-checked:border-emerald-600'>Personal card</span>"
+                "</label>"
+                "</div>"
+                "<p class='text-xs text-gray-400 mt-1'>Personal card receipts are saved as owner-paid and do not expect a company-card bank match.</p>"
+                "</div>"
+            )
+        else:
+            source_html = "<input type='hidden' name='payment_source' value='owner_paid'>"
+
         return _page(
             f"""
             <main class="max-w-xl mx-auto p-4 space-y-4">
@@ -11409,6 +11477,7 @@ body {{ background:#f7f6f3 !important; }}
               <form method="post" action="/expenses/{escape(token)}/review/{escape(rid)}"
                     class="space-y-4 rounded-xl border border-gray-200 bg-white p-4">
                 <div id="vat_meta" data-rate="{vat_rate}"></div>
+                {source_html}
                 <div>
                   <label class="block text-xs font-medium text-gray-500 mb-1">Shop / supplier</label>
                   <input type="text" name="merchant" value="{merchant}"
@@ -11497,6 +11566,16 @@ body {{ background:#f7f6f3 !important; }}
             vat_amount=_num("vat_amount"),
             status="approved",
         )
+        payment_source = (
+            request.form.get("payment_source")
+            or rec.get("payment_source")
+            or "company_card"
+        ).strip()
+        if payment_source not in {"company_card", "owner_paid"}:
+            payment_source = "company_card"
+        if eng.get("kind") != "company_card":
+            payment_source = "owner_paid"
+        updates["payment_source"] = payment_source
 
         # Only touch the category when the dropdown was actually rendered/submitted.
         # If Xero was unavailable the field is absent, so we preserve any existing
