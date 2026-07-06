@@ -490,6 +490,42 @@ class XeroClient:
                 continue
         return {"Payments": all_items, "total": round(total, 2)}
 
+    def get_payments(
+        self,
+        *,
+        start_date: "dt.date | None" = None,
+        end_date: "dt.date | None" = None,
+    ) -> Dict:
+        """Fetch authorised payments in a bounded date range."""
+        clauses = ['Status=="AUTHORISED"']
+        if start_date is not None:
+            clauses.append(
+                f"Date>=DateTime({start_date.year},{start_date.month},{start_date.day})"
+            )
+        if end_date is not None:
+            clauses.append(
+                f"Date<=DateTime({end_date.year},{end_date.month},{end_date.day})"
+            )
+        where = "&&".join(clauses)
+        all_items: list[Dict] = []
+        page = 1
+        while True:
+            response = self._request(
+                "GET",
+                f"{self.base_url}/Payments",
+                params={"where": where, "page": page},
+            )
+            if not response.ok:
+                raise RuntimeError(
+                    f"Xero payments fetch failed: {response.status_code} {response.text}"
+                )
+            items = (response.json() or {}).get("Payments") or []
+            all_items.extend(items)
+            if len(items) < 100:
+                break
+            page += 1
+        return {"Payments": all_items}
+
     def get_attachments(self, endpoint: str, guid: str) -> list:
         """List attachments on a Xero object (e.g. endpoint='BankTransactions'
         or 'Invoices'). Returns the Attachments list (possibly empty)."""

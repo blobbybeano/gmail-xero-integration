@@ -35,12 +35,13 @@ def _remit(ref, date, debit):
 
 
 class _FakeXero:
-    def __init__(self, invoices=None, bank=None, raise_on=None, paid=None, by_id=None):
+    def __init__(self, invoices=None, bank=None, raise_on=None, paid=None, by_id=None, payments=None):
         self._invoices = invoices or {"Invoices": []}
         self._bank = bank or {"BankTransactions": []}
         self._raise_on = raise_on
         self._paid = paid or {"Invoices": []}
         self._by_id = by_id or {}
+        self._payments = payments or {"Payments": []}
 
     def get_bank_transactions(self, start_date=None, end_date=None):
         if self._raise_on == "bank":
@@ -54,6 +55,9 @@ class _FakeXero:
 
     def get_paid_invoices(self, start_date=None, end_date=None):
         return self._paid
+
+    def get_payments(self, start_date=None, end_date=None):
+        return self._payments
 
     def get_invoice(self, invoice_id):
         if invoice_id not in self._by_id:
@@ -100,6 +104,17 @@ def _cashflows_receive_line_ref(ref, date, amount, *, reconciled):
                 "LineAmount": amount,
             }
         ],
+    }
+
+
+def _payment(payment_id, invoice_id, amount, *, reconciled, invoice_num=""):
+    return {
+        "PaymentID": payment_id,
+        "Status": "AUTHORISED",
+        "Date": "2026-05-02",
+        "Amount": amount,
+        "IsReconciled": reconciled,
+        "Invoice": {"InvoiceID": invoice_id, "InvoiceNumber": invoice_num},
     }
 
 
@@ -363,6 +378,68 @@ class PreviewTests(unittest.TestCase):
         self.assertEqual(result["batches"][0]["status"], "prepared_in_xero")
         self.assertEqual(result["status_counts"]["prepared_in_xero"], 1)
         self.assertEqual(result["active_batch_count"], 0)
+
+    def test_legacy_reconciled_invoice_payments_mark_batch_done(self):
+        text = _csv(
+            [
+                _sale("1", "2026-05-01", "A", "60.00"),
+                _fee("2", "2026-05-01", "A", "0.50"),
+                _sale("3", "2026-05-01", "B", "40.00"),
+                _fee("4", "2026-05-01", "B", "0.50"),
+                _remit("5", "2026-05-02", "99.00"),
+            ]
+        )
+        xero = _FakeXero(
+            invoices={
+                "Invoices": [
+                    _invoice("inv-a", "INV-A", "2026-05-01", "60.00", reference="GC-20260501-a"),
+                    _invoice("inv-b", "INV-B", "2026-05-01", "40.00", reference="GC-20260501-b"),
+                ]
+            },
+            bank={"BankTransactions": []},
+            payments={
+                "Payments": [
+                    _payment("pay-a", "inv-a", "60.00", reconciled=True, invoice_num="INV-A"),
+                    _payment("pay-b", "inv-b", "40.00", reconciled=True, invoice_num="INV-B"),
+                ]
+            },
+        )
+        result = build_csv_reconciliation_preview(self.config, text, xero_client=xero)
+
+        self.assertEqual(result["batches"][0]["status"], "already_reconciled")
+        self.assertTrue(result["batches"][0]["legacy_reconciled"])
+        self.assertEqual(result["active_batch_count"], 0)
+
+    def test_unreconciled_invoice_payment_keeps_batch_active(self):
+        text = _csv(
+            [
+                _sale("1", "2026-05-01", "A", "60.00"),
+                _fee("2", "2026-05-01", "A", "0.50"),
+                _sale("3", "2026-05-01", "B", "40.00"),
+                _fee("4", "2026-05-01", "B", "0.50"),
+                _remit("5", "2026-05-02", "99.00"),
+            ]
+        )
+        xero = _FakeXero(
+            invoices={
+                "Invoices": [
+                    _invoice("inv-a", "INV-A", "2026-05-01", "60.00", reference="GC-20260501-a"),
+                    _invoice("inv-b", "INV-B", "2026-05-01", "40.00", reference="GC-20260501-b"),
+                ]
+            },
+            bank={"BankTransactions": []},
+            payments={
+                "Payments": [
+                    _payment("pay-a", "inv-a", "60.00", reconciled=True, invoice_num="INV-A"),
+                    _payment("pay-b", "inv-b", "40.00", reconciled=False, invoice_num="INV-B"),
+                ]
+            },
+        )
+        result = build_csv_reconciliation_preview(self.config, text, xero_client=xero)
+
+        self.assertNotEqual(result["batches"][0]["status"], "already_reconciled")
+        self.assertFalse(result["batches"][0]["legacy_reconciled"])
+        self.assertEqual(result["active_batch_count"], 1)
 
     def test_ambiguous_match_is_needs_review_not_ready(self):
         # Two open invoices share the same amount AND the same date -> ambiguous.

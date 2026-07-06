@@ -416,6 +416,26 @@ def _match_cashflows_receive(
     return candidates[0]
 
 
+def _reconciled_payment_amounts_by_invoice(data: Any) -> dict[str, Decimal]:
+    if isinstance(data, dict):
+        items = data.get("Payments") or []
+    else:
+        items = data or []
+    out: dict[str, Decimal] = {}
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        if str(raw.get("Status") or "").strip().upper() == "DELETED":
+            continue
+        if not raw.get("IsReconciled"):
+            continue
+        invoice_id = str((raw.get("Invoice") or {}).get("InvoiceID") or "").strip()
+        if not invoice_id:
+            continue
+        out[invoice_id] = (out.get(invoice_id, Decimal("0.00")) + _money(raw.get("Amount"))).quantize(MONEY)
+    return out
+
+
 def _invoice_service_date(inv: XeroInvoiceCandidate) -> dt.date | None:
     """Prefer the calendar service date encoded in GC-YYYYMMDD references.
 
@@ -718,6 +738,7 @@ def build_csv_reconciliation_preview(
 
     bank_lines: list[XeroBankLine] = []
     cashflows_receives: list[dict[str, Any]] = []
+    reconciled_payment_amounts_by_invoice: dict[str, Decimal] = {}
     invoices: list[XeroInvoiceCandidate] = []
     manual_candidate_invoices: list[XeroInvoiceCandidate] = []
     xero_connected = bool(xero_client)
@@ -836,6 +857,10 @@ def build_csv_reconciliation_preview(
                         continue
                     seen_candidate_ids.add(inv.id)
                     manual_candidate_invoices.append(inv)
+                if start and end and hasattr(xero_client, "get_payments"):
+                    reconciled_payment_amounts_by_invoice = _reconciled_payment_amounts_by_invoice(
+                        xero_client.get_payments(start_date=start, end_date=end)
+                    )
             except Exception as exc:  # pragma: no cover - network/runtime guard
                 xero_connected = False
                 xero_error = str(exc).splitlines()[0][:200]
@@ -896,6 +921,7 @@ def build_csv_reconciliation_preview(
                 {
                     **sale.to_dict(),
                     "invoice": _candidate_dict(invoice, sale) if invoice else None,
+                    "_matched_invoice_id": invoice.id if invoice else "",
                     "ambiguous": bool(ambiguous),
                     # Shown in UI for unmatched sales so the user knows
                     # exactly what invoice to create/mark paid in Xero.
@@ -912,6 +938,20 @@ def build_csv_reconciliation_preview(
             bool((row.get("invoice") or {}).get("is_open") is False)
             for row in sale_rows
         )
+        legacy_reconciled = (
+            not already_reconciled
+            and not prepared_in_xero
+            and bool(batch_sales)
+            and matched_count == len(batch_sales)
+            and all(
+                row.get("_matched_invoice_id")
+                and reconciled_payment_amounts_by_invoice.get(str(row.get("_matched_invoice_id")), Decimal("0.00"))
+                >= _money((row.get("invoice") or {}).get("total"))
+                for row in sale_rows
+            )
+        )
+        if legacy_reconciled:
+            already_reconciled = True
 
         if already_reconciled:
             status = "already_reconciled"
@@ -964,6 +1004,7 @@ def build_csv_reconciliation_preview(
                 "missing_invoice_count": len(batch_sales) - matched_count,
                 "ambiguous_count": ambiguous_count,
                 "already_reconciled": already_reconciled,
+                "legacy_reconciled": legacy_reconciled,
                 "missing_invoices": missing_invoices,
             }
         )
@@ -1010,6 +1051,7 @@ def build_csv_reconciliation_preview(
         missing_candidate_count = 0
         for row in batch["sales"]:
             sale_obj = row.pop("_sale", None)
+            row.pop("_matched_invoice_id", None)
             if sale_obj is None:
                 continue
             # Calendar cross-reference for EVERY row: a subtle confidence signal
