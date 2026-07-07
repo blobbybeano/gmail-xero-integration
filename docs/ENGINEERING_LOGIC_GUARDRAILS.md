@@ -41,8 +41,13 @@ Permanent rules:
 - Payment truth from Xero webhook wins over older local poller memory.
 - When a Xero webhook handles an invoice/event, store a short-lived
   `recent_xero_webhook_events` marker.
+- When a Xero webhook has just handled an invoice as paid, duplicate Xero
+  `UPDATE` webhook events for that same invoice must not repeatedly fetch the
+  invoice again within the short duplicate window.
 - Google webhook echoes caused by app-owned Calendar updates must not
   immediately re-query Xero for the same invoice/event.
+- Poller self-heal probes for voided/deleted invoices must not run for entries
+  already known as paid, and must skip recently webhook-handled invoices.
 - Background paid-status checks must have the same failure discipline as
   draft/send actions: repeated failures for the same unchanged event/invoice
   are capped, then paused until the calendar entry is changed/re-saved.

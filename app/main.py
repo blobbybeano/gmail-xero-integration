@@ -2228,7 +2228,21 @@ def run() -> None:
                 # Self-heal: if mapped invoice was voided/deleted in Xero,
                 # drop local sent/paid flags so the event can be rebuilt/resubmitted.
                 existing_invoice_id = get_invoice_for_event(state, event_key) or ""
-                if existing_invoice_id and xero_client and (sent_state or paid_state):
+                _recent_webhook_for_existing_invoice = bool(
+                    existing_invoice_id
+                    and was_recent_xero_webhook(
+                        state,
+                        event_key,
+                        existing_invoice_id,
+                    )
+                )
+                if (
+                    existing_invoice_id
+                    and xero_client
+                    and sent_state
+                    and not paid_state
+                    and not _recent_webhook_for_existing_invoice
+                ):
                     try:
                         _mutable_probe, _status_probe = _is_invoice_mutable(existing_invoice_id)
                         _status_upper_probe = (_status_probe or "").upper()

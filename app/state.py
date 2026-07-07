@@ -114,6 +114,7 @@ def merge_state_for_save(latest: Dict, incoming: Dict) -> Dict:
         "event_cash_global_log_updates",
         "recent_xero_webhook_events",
         "deferred_xero_event_targets",
+        "recent_paid_xero_invoice_webhooks",
     ]
     for field in additive_maps:
         out = {}

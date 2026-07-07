@@ -127,6 +127,28 @@ class StateMergeTests(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_merge_preserves_recent_paid_webhook_invoice_marker(self):
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        try:
+            save_state(
+                path,
+                {
+                    "recent_paid_xero_invoice_webhooks": {
+                        "invoice-1": {"handled_at_ts": 1000, "event_key": "cal:event"}
+                    }
+                },
+            )
+            merged = save_state_merged(path, {"event_processed_updates": {}})
+
+            self.assertIn("invoice-1", merged["recent_paid_xero_invoice_webhooks"])
+            self.assertEqual(
+                merged["recent_paid_xero_invoice_webhooks"]["invoice-1"]["event_key"],
+                "cal:event",
+            )
+        finally:
+            os.unlink(path)
+
 
 if __name__ == "__main__":
     unittest.main()

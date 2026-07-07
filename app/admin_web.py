@@ -6591,6 +6591,16 @@ function toggleReceiptsEnabled(requested) {{
         app_state = load_state(config.state_file)
         inv_map = app_state.get("event_invoice_map", {})
         inv_id_to_key = {v: k for k, v in inv_map.items()}
+        _now_webhook_ts = time.time()
+        _recent_paid_invoice_webhooks = {
+            str(k): dict(v or {})
+            for k, v in (app_state.get("recent_paid_xero_invoice_webhooks", {}) or {}).items()
+            if (_now_webhook_ts - float((v or {}).get("handled_at_ts") or 0.0)) <= 300
+        }
+        if _recent_paid_invoice_webhooks != (
+            app_state.get("recent_paid_xero_invoice_webhooks", {}) or {}
+        ):
+            app_state["recent_paid_xero_invoice_webhooks"] = _recent_paid_invoice_webhooks
 
         if xero_is_disabled() or xero_lockout_is_active(config):
             print(
@@ -6723,6 +6733,13 @@ function toggleReceiptsEnabled(requested) {{
             invoice_id = ev.get("resourceId", "")
             if not invoice_id:
                 continue
+            _recent_paid_row = _recent_paid_invoice_webhooks.get(invoice_id) or {}
+            if _recent_paid_row:
+                print(
+                    f"[webhook] Duplicate paid invoice webhook skipped for {invoice_id}",
+                    flush=True,
+                )
+                continue
             print(f"[webhook] Xero invoice event: {ev.get('eventType')} {invoice_id}", flush=True)
 
             try:
@@ -6741,6 +6758,13 @@ function toggleReceiptsEnabled(requested) {{
                 is_sent_or_authorised = status_raw in {"AUTHORISED", "PAID"}
                 inv_number = str((invoice or {}).get("InvoiceNumber") or "").strip()
                 event_key = inv_id_to_key.get(invoice_id, "")
+                if is_paid_or_settled:
+                    _recent_paid_invoice_webhooks[invoice_id] = {
+                        "handled_at_ts": time.time(),
+                        "event_key": event_key,
+                        "invoice_number": inv_number,
+                    }
+                    app_state["recent_paid_xero_invoice_webhooks"] = _recent_paid_invoice_webhooks
 
                 # Keep mapped diary entry in sync with Xero-side invoice edits and status.
                 if event_key and ":" in event_key and creds and invoice:
