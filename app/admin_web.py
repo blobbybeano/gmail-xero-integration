@@ -4459,6 +4459,21 @@ def create_app() -> Flask:
             xero_pressure_card = _signal_card("Xero pressure", "Locked", "429 cooldown active", "text-red-300")
         elif not xero_pressure_recent:
             xero_pressure_card = _signal_card("Xero pressure", "No cycle yet", "Waiting for poller", "text-neutral-500")
+        elif xero_pressure_level == "paused":
+            xero_pressure_card = _signal_card(
+                "Xero pressure",
+                "Paused",
+                "Live View toggle is off",
+                "text-neutral-400",
+            )
+        elif xero_pressure_level == "busy":
+            _busy_reason = str(xero_pressure.get("reason") or "Another Xero task is running")
+            xero_pressure_card = _signal_card(
+                "Xero pressure",
+                "Waiting",
+                _busy_reason[:70],
+                "text-amber-300",
+            )
         elif xero_pressure_level == "danger":
             xero_pressure_card = _signal_card(
                 "Xero pressure",

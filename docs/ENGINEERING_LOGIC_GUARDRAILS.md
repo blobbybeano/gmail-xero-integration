@@ -78,6 +78,29 @@ Permanent rules:
 - Keep Xero call pacing (`XERO_MIN_REQUEST_INTERVAL_SECONDS`) in place even for
   webhook and admin-triggered Xero paths.
 
+### 2026-07-07 Xero Pressure Display Staleness
+
+Observed incident:
+- The dashboard's Xero pressure card was reading `state["xero_pressure"]`, but
+  the poller no longer refreshed that snapshot each cycle.
+- The live app was processing Google Calendar webhooks, but the card still
+  showed an old June value / "waiting for poller", making operators blind to
+  whether work was genuinely delayed, paused, busy, or deferred by the Xero
+  slot guard.
+
+Permanent rules:
+- Every poller cycle must write a fresh compact `xero_pressure` snapshot before
+  sleeping, including `updated_at_ts`, `events_used`, `events_per_cycle`,
+  `deferred_events`, `deferred_sample`, and `active_retry_count`.
+- If Xero work is paused, locked, or another feature is holding the shared Xero
+  busy guard, the pressure snapshot must say that explicitly.
+- When the per-cycle Xero budget is full, skipped calendar work must be counted
+  as deferred and sampled for the dashboard. Silent deferrals make save delays
+  impossible to diagnose.
+- The pressure card is an operational safety tool, not decoration. Do not remove
+  or let it become stale when changing poller, receipt, Cashflows, or Xero
+  throttling code.
+
 ### 2026-06-16 Xero 429 Lockout
 
 Observed incident:

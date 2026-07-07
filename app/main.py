@@ -1587,6 +1587,28 @@ def run() -> None:
         )
         return event_updated
 
+    def _set_xero_pressure(
+        *,
+        level: str,
+        events_used: int = 0,
+        deferred_events: int = 0,
+        deferred_sample: list[dict] | None = None,
+        active_retry_count: int = 0,
+        reason: str = "",
+    ) -> None:
+        now_utc = dt.datetime.now(dt.timezone.utc)
+        state["xero_pressure"] = {
+            "updated_at": now_utc.isoformat(),
+            "updated_at_ts": now_utc.timestamp(),
+            "level": level,
+            "events_used": int(events_used or 0),
+            "events_per_cycle": int(_XERO_EVENTS_PER_CYCLE),
+            "deferred_events": int(deferred_events or 0),
+            "deferred_sample": list(deferred_sample or [])[:5],
+            "active_retry_count": int(active_retry_count or 0),
+            "reason": str(reason or ""),
+        }
+
     while True:
         now = dt.datetime.now(dt.timezone.utc)
         _now_ts_for_xero = time.time()
@@ -1607,6 +1629,10 @@ def run() -> None:
                     "warn",
                 )
                 _xero_lock_notice_ts = _now_ts_for_xero
+            _set_xero_pressure(
+                level="locked",
+                reason=state.get("xero_lockout_reason") or "Xero API rate limit",
+            )
             state = save_state_merged(config.state_file, state)
         elif _persisted_lock_until:
             state["xero_lockout_until_ts"] = 0.0
@@ -1646,6 +1672,8 @@ def run() -> None:
             if _was_enabled:
                 _feed.push("System paused — no events will be processed", "system")
             _was_enabled = False
+            _set_xero_pressure(level="paused", reason="Live View toggle is off")
+            state = save_state_merged(config.state_file, state)
             wait_for_poll(backoff_seconds)
             continue
         if not _was_enabled:
@@ -2069,6 +2097,9 @@ def run() -> None:
         _flush_sales_backlog(admin_creds)
 
         _xero_events_used = 0
+        _xero_deferred_events = 0
+        _xero_deferred_sample: list[dict] = []
+        _xero_active_retry_count = 0
         _paid_sync_sweep_used = 0
         for event in events:
             try:
@@ -2086,6 +2117,7 @@ def run() -> None:
                 ):
                     _desc = event.get("description") or ""
                     if done_choice_is_yes(_desc) or send_choice_is_yes(_desc):
+                        _xero_active_retry_count += 1
                         continue
                 # During a global Xero lockout, keep processing calendar-only
                 # formatting/status work. Xero write/read branches are gated on
@@ -2310,6 +2342,17 @@ def run() -> None:
                 )
                 if _needs_xero_event_work:
                     if _xero_events_used >= _XERO_EVENTS_PER_CYCLE:
+                        _xero_deferred_events += 1
+                        if len(_xero_deferred_sample) < 5:
+                            _xero_deferred_sample.append(
+                                {
+                                    "calendar_id": calendar_id,
+                                    "event_id": event_id,
+                                    "summary": event.get("summary") or event_id,
+                                    "updated": event.get("updated") or "",
+                                    "reason": "xero_slot_limit",
+                                }
+                            )
                         continue
                     _xero_events_used += 1
                 # Keep title light resilient: if a move/edit flow overwrites summary
@@ -5039,6 +5082,32 @@ def run() -> None:
             state = set_last_sync(state, now)
         else:
             print("[poll] Keeping last_sync unchanged because one or more calendars failed this cycle", flush=True)
+        if _xero_busy.get("active"):
+            _pressure_level = "busy"
+            _pressure_reason = str(_xero_busy.get("reason") or _xero_busy.get("owner") or "Xero work is busy")
+        elif time.time() < _xero_retry_after:
+            _pressure_level = "locked"
+            _pressure_reason = state.get("xero_lockout_reason") or "Xero cooldown active"
+        elif _xero_deferred_events:
+            _pressure_level = "danger"
+            _pressure_reason = "Xero slot limit deferred calendar work"
+        elif _xero_events_used >= _XERO_EVENTS_PER_CYCLE and _xero_events_used > 0:
+            _pressure_level = "warn"
+            _pressure_reason = "Xero slot limit fully used"
+        elif _xero_active_retry_count:
+            _pressure_level = "watch"
+            _pressure_reason = "Event retry cooldown active"
+        else:
+            _pressure_level = "ok"
+            _pressure_reason = ""
+        _set_xero_pressure(
+            level=_pressure_level,
+            events_used=_xero_events_used,
+            deferred_events=_xero_deferred_events,
+            deferred_sample=_xero_deferred_sample,
+            active_retry_count=_xero_active_retry_count,
+            reason=_pressure_reason,
+        )
         state = save_state_merged(
             config.state_file,
             state,
