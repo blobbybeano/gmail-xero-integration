@@ -4455,49 +4455,54 @@ def create_app() -> Flask:
             wh_color = "text-neutral-400"
         webhook_card = _signal_card("Webhooks", wh_value, wh_sub, wh_color)
 
+        def _xero_pressure_card(value: str, sub: str, color: str) -> str:
+            return _signal_card("Xero pressure", value, sub, color).replace(
+                '<div ', '<div id="xero-pressure-card" ', 1
+            )
+
         if xero_lockout_active:
-            xero_pressure_card = _signal_card("Xero pressure", "Locked", "429 cooldown active", "text-red-300")
-        elif not xero_pressure_recent:
-            xero_pressure_card = _signal_card("Xero pressure", "No cycle yet", "Waiting for poller", "text-neutral-500")
+            xero_pressure_card = _xero_pressure_card("Locked", "429 cooldown active", "text-red-300")
+        elif xero_pressure_updated_ts and not xero_pressure_recent:
+            xero_pressure_card = _xero_pressure_card(
+                "Stale",
+                f"Last cycle {_ago(xero_pressure_updated_ts)}",
+                "text-amber-300",
+            )
+        elif not xero_pressure_updated_ts:
+            xero_pressure_card = _xero_pressure_card("No cycle yet", "Waiting for poller", "text-neutral-500")
         elif xero_pressure_level == "paused":
-            xero_pressure_card = _signal_card(
-                "Xero pressure",
+            xero_pressure_card = _xero_pressure_card(
                 "Paused",
                 "Live View toggle is off",
                 "text-neutral-400",
             )
         elif xero_pressure_level == "busy":
             _busy_reason = str(xero_pressure.get("reason") or "Another Xero task is running")
-            xero_pressure_card = _signal_card(
-                "Xero pressure",
+            xero_pressure_card = _xero_pressure_card(
                 "Waiting",
                 _busy_reason[:70],
                 "text-amber-300",
             )
         elif xero_pressure_level == "danger":
-            xero_pressure_card = _signal_card(
-                "Xero pressure",
+            xero_pressure_card = _xero_pressure_card(
                 "High",
                 f"{xero_deferred_events} deferred, {xero_events_used}/{xero_events_per_cycle} used",
                 "text-red-300",
             )
         elif xero_pressure_level == "warn":
-            xero_pressure_card = _signal_card(
-                "Xero pressure",
+            xero_pressure_card = _xero_pressure_card(
                 "Watch",
                 f"{xero_events_used}/{xero_events_per_cycle} slots used",
                 "text-amber-300",
             )
         elif xero_pressure_level == "watch":
-            xero_pressure_card = _signal_card(
-                "Xero pressure",
+            xero_pressure_card = _xero_pressure_card(
                 "Retry queue",
                 f"{xero_active_retry_count} event(s) cooling down",
                 "text-amber-300",
             )
         else:
-            xero_pressure_card = _signal_card(
-                "Xero pressure",
+            xero_pressure_card = _xero_pressure_card(
                 "OK",
                 f"{xero_events_used}/{xero_events_per_cycle} slots used",
                 "text-emerald-300",
@@ -4744,9 +4749,34 @@ const levelPrefix = {{
   event: '◆', success: '✓', warn: '⚠', error: '✗', paid: '£', system: '·', info: '›',
 }};
 
+const pressureColorClasses = ['text-red-300', 'text-amber-300', 'text-neutral-500', 'text-neutral-400', 'text-emerald-300'];
+
 function escHtml(s) {{
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }}
+
+function renderXeroPressure(data) {{
+  const card = document.getElementById('xero-pressure-card');
+  if (!card || !data) return;
+  const valueEl = card.querySelector('[data-pressure-value]') || card.children[1];
+  const subEl = card.querySelector('[data-pressure-sub]') || card.children[2];
+  if (!valueEl || !subEl) return;
+  pressureColorClasses.forEach((cls) => valueEl.classList.remove(cls));
+  valueEl.classList.add(data.color || 'text-neutral-500');
+  valueEl.textContent = data.value || 'No cycle yet';
+  valueEl.title = data.value || '';
+  subEl.textContent = data.sub || '';
+}}
+
+async function refreshXeroPressure() {{
+  try {{
+    const resp = await fetch('/xero-pressure-status', {{credentials: 'same-origin'}});
+    if (!resp.ok) return;
+    renderXeroPressure(await resp.json());
+  }} catch (err) {{}}
+}}
+refreshXeroPressure();
+setInterval(refreshXeroPressure, 5000);
 
 function appendLine(entry) {{
   const ts = new Date(entry.ts * 1000).toLocaleTimeString('en-GB', {{hour:'2-digit',minute:'2-digit',second:'2-digit'}});
@@ -4888,6 +4918,78 @@ function toggleReceiptsEnabled(requested) {{
             stream_with_context(generate()),
             content_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.get("/xero-pressure-status")
+    @require_login
+    def xero_pressure_status():
+        state = load_state(config.state_file)
+        pressure = state.get("xero_pressure", {}) or {}
+        level = str(pressure.get("level") or "unknown").strip().lower()
+        try:
+            updated_ts = float(pressure.get("updated_at_ts") or 0.0)
+        except Exception:
+            updated_ts = 0.0
+        age_seconds = max(0.0, time.time() - updated_ts) if updated_ts else None
+        recent = bool(updated_ts and age_seconds is not None and age_seconds <= 900)
+        events_used = int(pressure.get("events_used") or 0)
+        events_per_cycle = int(pressure.get("events_per_cycle") or 0)
+        deferred_events = int(pressure.get("deferred_events") or 0)
+        active_retry_count = int(pressure.get("active_retry_count") or 0)
+        lockout_until_ts = float(state.get("xero_lockout_until_ts") or 0.0)
+        lockout_active = lockout_until_ts > time.time()
+
+        def _age_text(seconds: float | None) -> str:
+            if seconds is None:
+                return ""
+            if seconds < 60:
+                return f"{int(seconds)}s ago"
+            if seconds < 3600:
+                return f"{int(seconds // 60)}m ago"
+            return f"{int(seconds // 3600)}h ago"
+
+        if lockout_active:
+            value, sub, color = "Locked", "429 cooldown active", "text-red-300"
+        elif updated_ts and not recent:
+            value, sub, color = "Stale", f"Last cycle {_age_text(age_seconds)}", "text-amber-300"
+        elif not updated_ts:
+            value, sub, color = "No cycle yet", "Waiting for poller", "text-neutral-500"
+        elif level == "paused":
+            value, sub, color = "Paused", "Live View toggle is off", "text-neutral-400"
+        elif level == "busy":
+            value = "Waiting"
+            sub = str(pressure.get("reason") or "Another Xero task is running")[:70]
+            color = "text-amber-300"
+        elif level == "danger":
+            value = "High"
+            sub = f"{deferred_events} deferred, {events_used}/{events_per_cycle} used"
+            color = "text-red-300"
+        elif level == "warn":
+            value = "Watch"
+            sub = f"{events_used}/{events_per_cycle} slots used"
+            color = "text-amber-300"
+        elif level == "watch":
+            value = "Retry queue"
+            sub = f"{active_retry_count} event(s) cooling down"
+            color = "text-amber-300"
+        else:
+            value = "OK"
+            sub = f"{events_used}/{events_per_cycle} slots used"
+            color = "text-emerald-300"
+
+        return jsonify(
+            {
+                "value": value,
+                "sub": sub,
+                "color": color,
+                "level": level,
+                "updated_at_ts": updated_ts,
+                "age_seconds": age_seconds,
+                "events_used": events_used,
+                "events_per_cycle": events_per_cycle,
+                "deferred_events": deferred_events,
+                "active_retry_count": active_retry_count,
+            }
         )
 
     @app.post("/poll-now")
