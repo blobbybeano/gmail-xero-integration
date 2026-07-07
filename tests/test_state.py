@@ -127,6 +127,26 @@ class StateMergeTests(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_merge_allows_deferred_xero_target_removal(self):
+        event_key = "cal:event-delayed"
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        try:
+            save_state(
+                path,
+                {
+                    "deferred_xero_event_targets": {
+                        event_key: {"next_retry_at": 1000, "reason": "xero_slot_limit"}
+                    }
+                },
+            )
+
+            merged = save_state_merged(path, {"deferred_xero_event_targets": {}})
+
+            self.assertEqual(merged.get("deferred_xero_event_targets"), {})
+        finally:
+            os.unlink(path)
+
     def test_merge_preserves_recent_paid_webhook_invoice_marker(self):
         fd, path = tempfile.mkstemp()
         os.close(fd)
