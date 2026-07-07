@@ -107,6 +107,10 @@ Permanent rules:
   future jobs can sit outside the normal daily safety window.
 - Deferred queues are queues, not permanent markers: when the poller consumes a
   deferred event key, the state merge must allow that key to be removed.
+- A deferred event is not consumed merely because its retry time became due.
+  Keep it queued until the event either receives a Xero processing slot, is
+  blocked for human formatting input, or no longer needs Xero work. Removing it
+  before the slot is granted can leave valid saves waiting silently.
 - While the deferred queue is non-empty, the next poll delay must stay short.
   Do not fall back to the normal long poll interval just because the current
   cycle did not add a new deferred event.

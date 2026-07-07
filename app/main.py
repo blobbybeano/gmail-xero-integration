@@ -1613,6 +1613,16 @@ def run() -> None:
             "reason": str(reason or ""),
         }
 
+    def _clear_deferred_xero_target(event_key: str) -> None:
+        if not event_key:
+            return
+        deferred_targets = state.get("deferred_xero_event_targets", {}) or {}
+        if event_key not in deferred_targets:
+            return
+        deferred_targets = dict(deferred_targets)
+        deferred_targets.pop(event_key, None)
+        state["deferred_xero_event_targets"] = deferred_targets
+
     while True:
         now = dt.datetime.now(dt.timezone.utc)
         _now_ts_for_xero = time.time()
@@ -1701,7 +1711,6 @@ def run() -> None:
                 _next_retry_at = 0.0
             if _next_retry_at <= _now_ts:
                 _due_deferred_event_targets.append(str(_key))
-                _deferred_target_rows.pop(_key, None)
         if _deferred_target_rows != (state.get("deferred_xero_event_targets", {}) or {}):
             state["deferred_xero_event_targets"] = _deferred_target_rows
 
@@ -2361,6 +2370,7 @@ def run() -> None:
                             "warn",
                         )
                     state = set_processed_update_marker(state, event_key, event_updated)
+                    _clear_deferred_xero_target(event_key)
                     continue
                 _needs_xero_event_work = bool(
                     (
@@ -2375,6 +2385,8 @@ def run() -> None:
                         and _allow_paid_reconcile
                     )
                 )
+                if not _needs_xero_event_work:
+                    _clear_deferred_xero_target(event_key)
                 if _needs_xero_event_work:
                     if _xero_events_used >= _XERO_EVENTS_PER_CYCLE:
                         _xero_deferred_events += 1
@@ -2399,6 +2411,7 @@ def run() -> None:
                                 }
                             )
                         continue
+                    _clear_deferred_xero_target(event_key)
                     _xero_events_used += 1
                 # Keep title light resilient: if a move/edit flow overwrites summary
                 # and removes/changes the status prefix, restamp the expected one.
