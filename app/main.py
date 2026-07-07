@@ -5161,7 +5161,8 @@ def run() -> None:
 
         if config.run_once:
             break
-        if _xero_deferred_events:
+        _pending_deferred_events = len(state.get("deferred_xero_event_targets", {}) or {})
+        if _xero_deferred_events or _pending_deferred_events:
             backoff_seconds = min(
                 max(config.poll_seconds, 5),
                 _XERO_DEFERRED_RETRY_SECONDS,

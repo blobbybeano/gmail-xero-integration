@@ -107,6 +107,9 @@ Permanent rules:
   future jobs can sit outside the normal daily safety window.
 - Deferred queues are queues, not permanent markers: when the poller consumes a
   deferred event key, the state merge must allow that key to be removed.
+- While the deferred queue is non-empty, the next poll delay must stay short.
+  Do not fall back to the normal long poll interval just because the current
+  cycle did not add a new deferred event.
 - The pressure card is an operational safety tool, not decoration. Do not remove
   or let it become stale when changing poller, receipt, Cashflows, or Xero
   throttling code.
