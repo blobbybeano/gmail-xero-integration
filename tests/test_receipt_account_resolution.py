@@ -62,6 +62,27 @@ class ReceiptAccountResolutionTests(unittest.TestCase):
         )
         self.assertEqual((code, name), ("402", "Van Fuel"))
 
+    def test_unleaded_overrides_generic_account_to_machinery_fuel(self):
+        _segments, code, name = _apply_receipt_account_guardrails(
+            [], "449", "Motor Vehicle Expenses", 15.74, self.accounts,
+            "MFG Queens Service Station",
+            "SALE Unleaded Pump6 10.23L Total 15.74",
+        )
+        self.assertEqual((code, name), ("403", "Machinery Fuel"))
+
+    def test_unleaded_uses_machinery_fuel_even_without_van_fuel(self):
+        accounts = [
+            {"Code": "310", "Name": "Materials"},
+            {"Code": "449", "Name": "Machinery Expenses"},
+            {"Code": "451", "Name": "Machinery Fuel"},
+        ]
+        _segments, code, name = _apply_receipt_account_guardrails(
+            [], "449", "Machinery Expenses", 20.00, accounts,
+            "Shell Co-op Hilton Park",
+            "FS Unleaded Pump 6 12.91L Total GBP 20.00",
+        )
+        self.assertEqual((code, name), ("451", "Machinery Fuel"))
+
 
 if __name__ == "__main__":
     unittest.main()

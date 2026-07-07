@@ -1972,19 +1972,48 @@ def _find_fuel_accounts(accounts: list) -> "tuple[tuple[str, str], tuple[str, st
     for a in accounts or []:
         code = str(a.get("Code") or "").strip()
         name = str(a.get("Name") or "").strip()
-        low = name.lower()
+        low = _norm_account_choice(name)
         if not code:
             continue
-        is_mach = "fuel" in low and ("machin" in low or "plant" in low)
-        is_van = "fuel" in low and "van" in low
+        if "fuel" not in low:
+            continue
+        is_mach = "machin" in low or "plant" in low
+        is_van = "van" in low or "vehicle" in low or "motor" in low
         if is_mach and is_van:
             # Ambiguous name (mentions both) — don't guess either way.
             continue
         if is_mach:
             machinery = (code, name)
         elif is_van:
-            van = (code, name)
+            # Prefer a literal "Van Fuel" account over a broader
+            # "Motor Vehicle Fuel" if both exist.
+            if not van[0] or "van" in low:
+                van = (code, name)
     return machinery, van
+
+
+def _pick_fuel_account(total, accounts, raw_text="") -> "tuple[str, str]":
+    """Choose the right fuel account from deterministic receipt evidence."""
+    (m_code, m_name), (v_code, v_name) = _find_fuel_accounts(accounts)
+    if not m_code and not v_code:
+        return "", ""
+    text = _receipt_rule_text("", raw_text)
+    is_diesel = "diesel" in text
+    is_petrol = any(t in text for t in ("unleaded", "petrol", "e10", "e5", "v power"))
+    if is_diesel:
+        return (v_code, v_name) if v_code else ("", "")
+    if is_petrol and m_code:
+        return m_code, m_name
+    try:
+        amt = float(total)
+    except (TypeError, ValueError):
+        amt = 0.0
+    if amt > 0:
+        if amt < _FUEL_THRESHOLD_GBP and m_code:
+            return m_code, m_name
+        if amt >= _FUEL_THRESHOLD_GBP and v_code:
+            return v_code, v_name
+    return (m_code, m_name) if m_code else (v_code, v_name)
 
 
 def _apply_fuel_threshold(segments, cat_code, cat_name, total, accounts,
@@ -1997,28 +2026,17 @@ def _apply_fuel_threshold(segments, cat_code, cat_name, total, accounts,
     The AI decides WHETHER a spend is fuel (by coding it to either fuel
     account); this function then makes the amount comparison in code, because
     LLMs are unreliable at numeric thresholds. Applies per-segment on split
-    receipts and to the headline category otherwise. No-op unless BOTH fuel
+    receipts and to the headline category otherwise. Uses whichever fuel
     accounts exist in Xero. Returns (segments, cat_code, cat_name).
     """
     (m_code, m_name), (v_code, v_name) = _find_fuel_accounts(accounts)
-    if not m_code or not v_code:
+    if not m_code and not v_code:
         return segments, cat_code, cat_name
-    fuel_codes = {m_code, v_code}
-    is_diesel = "diesel" in (raw_text or "").lower()
+    fuel_codes = {c for c in (m_code, v_code) if c}
 
     def _pick(amount):
-        if is_diesel:
-            # Diesel is never machinery fuel — machines take unleaded.
-            return v_code, v_name
-        try:
-            amt = float(amount)
-        except (TypeError, ValueError):
-            return None
-        if amt <= 0:
-            return None
-        if amt < _FUEL_THRESHOLD_GBP:
-            return m_code, m_name
-        return v_code, v_name
+        picked = _pick_fuel_account(amount, accounts, raw_text)
+        return picked if picked[0] else None
 
     if segments:
         for seg in segments:
@@ -2084,17 +2102,11 @@ def _apply_receipt_account_guardrails(
 
     is_fuel_receipt = _looks_like_fuel_receipt(merchant, raw_text)
     (m_code, m_name), (v_code, v_name) = _find_fuel_accounts(accounts)
-    if is_fuel_receipt and m_code and v_code:
+    if is_fuel_receipt and (m_code or v_code):
         # If the receipt clearly is fuel, make it fuel even if the AI picked a
         # generic materials/default account. Then apply the machinery/van rule.
-        try:
-            amt = float(total or 0)
-        except (TypeError, ValueError):
-            amt = 0
-        if "diesel" in (raw_text or "").lower() or amt >= _FUEL_THRESHOLD_GBP:
-            _set_single(v_code, v_name)
-        elif amt > 0:
-            _set_single(m_code, m_name)
+        pick_code, pick_name = _pick_fuel_account(total, accounts, raw_text)
+        _set_single(pick_code, pick_name)
         return _apply_fuel_threshold(segments, cat_code, cat_name, total, accounts, raw_text)
 
     if _looks_like_materials(merchant, raw_text):
@@ -14957,9 +14969,9 @@ body {{ background:#f7f6f3 !important; }}
 
         This is intentionally independent of the app's local receipt table. It
         answers the user's main duplicate question: "has this receipt/expense
-        already been put into Xero?" The strong duplicate signal is exact Xero
-        transaction date + exact amount. Merchant/contact match is recorded in
-        the reason, but is not required when date and amount match.
+        already been put into Xero?" Exact Xero transaction date + exact amount
+        is the core signal; merchant/contact match and attachment state are
+        carried back so the UI can explain how strong the match is.
 
         The lookup is cached per month-sized date window so a 50-photo dump does
         not make 50 Xero calls.
@@ -15150,7 +15162,25 @@ body {{ background:#f7f6f3 !important; }}
             st = it.get("status") or ""
             if st:
                 counts[st] = counts.get(st, 0) + 1
+
+        source_total = int(total_count or 0)
+
+        def _write_dump_progress(processed_files: int) -> None:
+            summary = dict(counts)
+            summary["_progress"] = {
+                "processed_files": max(0, int(processed_files or 0)),
+                "source_files": source_total,
+                "items_created": sum(
+                    int(v or 0) for k, v in counts.items() if not str(k).startswith("_")
+                ),
+            }
+            try:
+                dump_store.update_batch(db, batch["id"], summary=summary)
+            except Exception:
+                pass
+
         seq = 0
+        source_idx = 0
         for file_bytes, filename, content_type in files:
             try:
                 live_batch = dump_store.get_batch(db, batch["id"]) or {}
@@ -15163,6 +15193,7 @@ body {{ background:#f7f6f3 !important; }}
                     break
             except Exception:
                 pass
+            source_idx += 1
             seq += 1
             _receipt_started = time.perf_counter()
             _resize_s = _ocr_s = _split_s = _ai_s = _xero_s = _card_s = 0.0
@@ -15173,9 +15204,10 @@ body {{ background:#f7f6f3 !important; }}
             if full_hash in existing_batch_hashes:
                 print(
                     "[receipt-dump] resume skipped existing "
-                    f"{seq}/{total_count or '?'} hash={full_hash[:12]}",
+                    f"{source_idx}/{total_count or '?'} hash={full_hash[:12]}",
                     flush=True,
                 )
+                _write_dump_progress(source_idx)
                 continue
             _t_stage = time.perf_counter()
             file_bytes, filename, content_type = _exp_resize_for_ocr(
@@ -15384,7 +15416,11 @@ body {{ background:#f7f6f3 !important; }}
                         if xero_match.get("merchant_match"):
                             reason_bits.append("merchant/contact matched " + contact)
                         else:
-                            reason_bits.append("matched Xero contact " + contact)
+                            reason_bits.append(
+                                "Xero contact is " + contact
+                                + " (OCR merchant did not clearly match)"
+                            )
+                        reason_bits.append("receipt already attached in Xero")
                         if account:
                             reason_bits.append("account " + account)
                         dup_reason = " — ".join(reason_bits) + "."
@@ -15459,7 +15495,7 @@ body {{ background:#f7f6f3 !important; }}
             _receipt_total_s = time.perf_counter() - _receipt_started
             print(
                 "[receipt-dump] processed "
-                f"{seq}/{total_count or '?'} status={status} "
+                f"{source_idx}/{total_count or '?'} status={status} "
                 f"total={_receipt_total_s:.2f}s resize={_resize_s:.2f}s "
                 f"ocr={_ocr_s:.2f}s split_ai={_split_s:.2f}s "
                 f"account_ai={_ai_s:.2f}s xero_dedupe={_xero_s:.2f}s "
@@ -15491,6 +15527,7 @@ body {{ background:#f7f6f3 !important; }}
                 ocr_raw=(result.get("raw_text", "") or "")[:4000],
                 ocr_error=result.get("ocr_error", ""),
             )
+            _write_dump_progress(source_idx)
 
             # Remaining receipts found in the same photo become their own dump
             # items (own merchant/date/amount/account), sharing the image.
@@ -15535,14 +15572,25 @@ body {{ background:#f7f6f3 !important; }}
                         card_account=batch_card_acct,
                     )
                     if s_xero_match:
-                        s_status = dump_store.STATUS_DUPLICATE
-                        s_reason = (
-                            "Already submitted in Xero — same date "
-                            + _exp_uk_date(s_xero_match.get("date") or s_date)
-                            + ", same amount £"
-                            + format(float(s_xero_match.get("amount") or 0), ",.2f")
-                            + "."
-                        )
+                        if s_xero_match.get("has_attachment"):
+                            s_status = dump_store.STATUS_DUPLICATE
+                            s_reason = (
+                                "Already submitted in Xero — same date "
+                                + _exp_uk_date(s_xero_match.get("date") or s_date)
+                                + ", same amount £"
+                                + format(float(s_xero_match.get("amount") or 0), ",.2f")
+                                + ", receipt already attached in Xero."
+                            )
+                        else:
+                            s_reason = (
+                                "Already in Xero on "
+                                + _exp_uk_date(s_xero_match.get("date") or s_date)
+                                + " for £"
+                                + format(float(s_xero_match.get("amount") or 0), ",.2f")
+                                + ", but no receipt image is attached yet. Importing "
+                                "this row will attach this photo to that existing "
+                                "Xero spend only — no duplicate expense will be created."
+                            )
                     if s_status == dump_store.STATUS_NEW:
                         s_card = _dump_card_feed_check(
                             engineer, s_total, s_date,
@@ -15595,6 +15643,7 @@ body {{ background:#f7f6f3 !important; }}
                         ocr_raw=(s_text or "")[:4000],
                         ocr_error="",
                     )
+                    _write_dump_progress(source_idx)
 
             # Drop the large byte buffer before the next receipt. Gunicorn's
             # worker is small on Fly; without this, a batch of phone photos can
@@ -15612,11 +15661,17 @@ body {{ background:#f7f6f3 !important; }}
                 final_counts[st] = final_counts.get(st, 0) + 1
         final_batch = dump_store.get_batch(db, batch["id"]) or {}
         final_status = "cancelled" if final_batch.get("status") == "cancelled" else "ready"
+        final_source_total = source_total or int(final_batch.get("total_count") or 0) or len(final_items)
+        final_counts["_progress"] = {
+            "processed_files": final_source_total,
+            "source_files": final_source_total,
+            "items_created": len(final_items),
+        }
         dump_store.update_batch(
             db,
             batch["id"],
             status=final_status,
-            total_count=len(final_items),
+            total_count=final_source_total,
             summary=final_counts,
         )
 
@@ -16452,7 +16507,9 @@ body {{ background:#f7f6f3 !important; }}
             except Exception:
                 s = {}
             chips = " ".join(
-                k.replace("_", " ") + ": " + str(v) for k, v in (s.items() if isinstance(s, dict) else [])
+                k.replace("_", " ") + ": " + str(v)
+                for k, v in (s.items() if isinstance(s, dict) else [])
+                if not str(k).startswith("_")
             )
             is_test_b = bool(b.get("is_test"))
             if is_test_b:
@@ -17144,6 +17201,35 @@ body {{ background:#f7f6f3 !important; }}
             return dump_store.get_batch(db, batch["id"]) or batch
         return batch
 
+    def _dump_progress_numbers(batch, item_count: int = 0) -> tuple[int, int]:
+        """Return (source files processed, source files total).
+
+        A single uploaded photo can split into several receipt items, so progress
+        must be based on uploaded source files, not rows in expense_dump_items.
+        """
+        total = max(0, int((batch or {}).get("total_count") or 0))
+        summary = (batch or {}).get("summary") or {}
+        progress = summary.get("_progress") if isinstance(summary, dict) else None
+        done = 0
+        if isinstance(progress, dict):
+            try:
+                done = int(progress.get("processed_files") or 0)
+            except (TypeError, ValueError):
+                done = 0
+            try:
+                total = max(total, int(progress.get("source_files") or 0))
+            except (TypeError, ValueError):
+                pass
+        if not done:
+            done = min(int(item_count or 0), total) if total else int(item_count or 0)
+        if (batch or {}).get("status") not in ("processing", "finalizing"):
+            done = total or done
+        if total:
+            done = min(done, total)
+        else:
+            total = done
+        return max(0, done), max(0, total)
+
     @app.get("/receipts/expenses/dump/<batch_id>/status")
     @require_login
     def expense_dump_status(batch_id):
@@ -17154,8 +17240,8 @@ body {{ background:#f7f6f3 !important; }}
         if not batch:
             return jsonify({"ok": False}), 404
         batch = _dump_stuck_recover(db, batch)
-        done = len(dump_store.list_items(db, batch_id))
-        total = max(int(batch.get("total_count") or 0), done)
+        item_count = len(dump_store.list_items(db, batch_id))
+        done, total = _dump_progress_numbers(batch, item_count)
         return jsonify({
             "ok": True,
             "status": batch.get("status"),
@@ -17173,7 +17259,7 @@ body {{ background:#f7f6f3 !important; }}
     }
 
     def _dump_item_card(item, exp_accounts, eng_map, batch_id, detailed=False,
-                        recon_map=None):
+                        recon_map=None, selectable=False):
         sym = "\u00a3"
         amt = item.get("amount_inc")
         amt_s = (sym + format(float(amt), ",.2f")) if amt is not None else "—"
@@ -17380,10 +17466,23 @@ body {{ background:#f7f6f3 !important; }}
             extras = ai_html + seg_html + recon_sub + collapse + view_html
         else:
             extras = ai_html + seg_html + recon_sub + reason_html + ic_html + view_html
+        select_html = ""
+        if selectable and item["status"] == dump_store.STATUS_NEW:
+            select_html = (
+                "<label class='shrink-0 inline-flex items-center justify-center "
+                "w-8 h-8 rounded-lg border border-emerald-200 bg-emerald-50 "
+                "cursor-pointer' title='Untick if you do not want to import this "
+                "receipt in this submission'>"
+                "<input form='dump-import-form' type='checkbox' "
+                "name='selected_item_id' value='" + escape(item["id"]) + "' "
+                "checked class='rounded border-gray-300 text-emerald-600 "
+                "dump-import-check'></label>"
+            )
         return (
             "<div class='px-4 py-3 border-b border-gray-100'>"
             "<div class='flex items-center justify-between gap-3'>"
-            "<div class='min-w-0'><div class='text-sm font-medium text-gray-800 "
+            + select_html
+            + "<div class='min-w-0 flex-1'><div class='text-sm font-medium text-gray-800 "
             "truncate'>" + escape(item.get("merchant") or item.get("filename") or "Receipt")
             + "</div><div class='text-xs text-gray-500'>"
             + escape(_exp_uk_date(item.get("purchased_on") or "")) + " · "
@@ -17472,6 +17571,79 @@ body {{ background:#f7f6f3 !important; }}
             "</div>"
         )
 
+    def _dump_review_summary_panel(items) -> str:
+        if not items:
+            return ""
+        sym = "\u00a3"
+
+        def _tot(statuses):
+            chosen = [it for it in items if it.get("status") in statuses]
+            gross = 0.0
+            vat = 0.0
+            for it in chosen:
+                try:
+                    gross += float(it.get("amount_inc") or 0)
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    vat += float(it.get("vat_amount") or 0)
+                except (TypeError, ValueError):
+                    pass
+            return len(chosen), gross, vat
+
+        ready = _tot({dump_store.STATUS_NEW})
+        needs = _tot({
+            dump_store.STATUS_NEEDS_ACCOUNT,
+            dump_store.STATUS_POSSIBLE_DUP,
+            dump_store.STATUS_SUSPICIOUS,
+        })
+        ignored = _tot({dump_store.STATUS_DUPLICATE, dump_store.STATUS_IGNORED})
+        imported = _tot({dump_store.STATUS_IMPORTED})
+        not_submitted_gross = needs[1] + ignored[1]
+        not_submitted_vat = needs[2] + ignored[2]
+
+        def _card(title: str, data, cls: str, note: str) -> str:
+            n, gross, vat = data
+            return (
+                "<div class='rounded-lg border " + cls + " p-3'>"
+                "<div class='text-xs font-semibold uppercase tracking-wide'>"
+                + escape(title) + "</div>"
+                "<div class='mt-1 text-lg font-bold'>" + str(n) + "</div>"
+                "<div class='text-xs mt-1'>Gross " + sym
+                + format(gross, ",.2f") + " · VAT " + sym
+                + format(vat, ",.2f") + "</div>"
+                "<div class='text-[11px] mt-1 opacity-75'>" + escape(note)
+                + "</div></div>"
+            )
+
+        return (
+            "<div class='bg-white rounded-xl border border-gray-200 p-4 mb-6'>"
+            "<div class='flex items-start justify-between gap-4 mb-3'>"
+            "<div><h2 class='text-sm font-semibold text-gray-800'>Receipt dump "
+            "review report</h2>"
+            "<p class='text-xs text-gray-500 mt-0.5'>Use this to see what will "
+            "submit, what needs fixing, and what is being left out.</p></div>"
+            "<div class='text-right text-xs text-gray-500'>Not submitted from "
+            "this dump<br><span class='text-sm font-semibold text-gray-900'>"
+            + sym + format(not_submitted_gross, ",.2f") + " gross · "
+            + sym + format(not_submitted_vat, ",.2f") + " VAT</span></div>"
+            "</div>"
+            "<div class='grid grid-cols-1 sm:grid-cols-4 gap-2 text-gray-700'>"
+            + _card("Ready to submit", ready,
+                    "border-emerald-200 bg-emerald-50 text-emerald-800",
+                    "Ticked receipts import when you press the button.")
+            + _card("Needs review", needs,
+                    "border-amber-200 bg-amber-50 text-amber-800",
+                    "Pick an account, confirm duplicates, or review the warning.")
+            + _card("Ignored / already in Xero", ignored,
+                    "border-gray-200 bg-gray-50 text-gray-600",
+                    "These are not imported again.")
+            + _card("Imported", imported,
+                    "border-sky-200 bg-sky-50 text-sky-800",
+                    "Already moved into Field Expenses.")
+            + "</div></div>"
+        )
+
     @app.get("/receipts/expenses/dump/<batch_id>/item/<item_id>/image")
     @require_login
     def expense_dump_item_image(batch_id, item_id):
@@ -17508,11 +17680,12 @@ body {{ background:#f7f6f3 !important; }}
         # (e.g. the background thread was killed by an app restart), auto-recover.
         batch = _dump_stuck_recover(db, batch)
         if batch.get("status") in ("processing", "finalizing"):
-            done0 = len(dump_store.list_items(db, batch_id))
-            total0 = max(int(batch.get("total_count") or 0), done0)
+            done0, total0 = _dump_progress_numbers(
+                batch, len(dump_store.list_items(db, batch_id))
+            )
             pct0 = min(99, round(done0 / total0 * 100)) if total0 else 3
             count_line = (
-                ("Read " + str(done0) + " of " + str(total0) + " receipts")
+                ("Read " + str(done0) + " of " + str(total0) + " receipt files")
                 if total0 else "Getting your receipts ready…"
             )
             # No meta-refresh (that caused the whole page to flash). Instead we
@@ -17559,7 +17732,7 @@ body {{ background:#f7f6f3 !important; }}
                 "var total=Math.max(d.total||0,d.done||0),done=d.done||0;"
                 "var pct=total?Math.min(99,Math.round(done/total*100)):3;"
                 "if(bar)bar.style.width=pct+'%';"
-                "if(txt)txt.textContent=total?('Read '+done+' of '+total+' receipts'):'Reading receipts…';"
+                "if(txt)txt.textContent=total?('Read '+done+' of '+total+' receipt files'):'Reading receipts…';"
                 "setTimeout(poll,1500);"
                 "}).catch(function(){setTimeout(poll,2500);});"
                 "}setTimeout(poll,1200);})();</script>"
@@ -17574,6 +17747,8 @@ body {{ background:#f7f6f3 !important; }}
         except Exception:
             exp_accounts = []
         eng_map = {e["id"]: e["name"] for e in exp_store.list_engineers(db)}
+        sub_summary = _dump_sub_summary(batch, items)
+        is_sub = sub_summary is not None
 
         groups = [
             (dump_store.STATUS_NEEDS_ACCOUNT, "Needs an account — please pick one", "amber"),
@@ -17602,7 +17777,11 @@ body {{ background:#f7f6f3 !important; }}
                 continue
             cards = "".join(
                 _dump_item_card(it, exp_accounts, eng_map, batch_id,
-                                detailed=is_test, recon_map=recon_map)
+                                detailed=is_test, recon_map=recon_map,
+                                selectable=(
+                                    status == dump_store.STATUS_NEW
+                                    and not is_test and not is_sub
+                                ))
                 for it in sel
             )
             sections += (
@@ -17614,9 +17793,6 @@ body {{ background:#f7f6f3 !important; }}
                 "<div class='bg-white rounded-xl border border-gray-200 "
                 "overflow-hidden'>" + cards + "</div></div>"
             )
-
-        sub_summary = _dump_sub_summary(batch, items)
-        is_sub = sub_summary is not None
 
         ready = [it for it in items if it["status"] == dump_store.STATUS_NEW]
         import_bar = ""
@@ -17640,10 +17816,15 @@ body {{ background:#f7f6f3 !important; }}
                 )
             else:
                 import_bar = (
-                    "<form method='post' action='/receipts/expenses/dump/" + batch_id
+                    "<form id='dump-import-form' method='post' "
+                    "action='/receipts/expenses/dump/" + batch_id
                     + "/import' class='sticky bottom-4 bg-white rounded-xl border "
                     "border-emerald-200 shadow-lg p-4 flex items-center "
-                    "justify-between'>" + count_line
+                    "justify-between gap-4'><input type='hidden' "
+                    "name='selected_import' value='1'><div>" + count_line
+                    + "<div class='text-xs text-gray-500 mt-0.5'>Ready receipts "
+                    "are ticked above. Untick any you do not want to submit.</div>"
+                    "</div>"
                     + "<button class='bg-emerald-600 hover:bg-emerald-700 text-white "
                     "text-sm font-semibold px-4 py-2 rounded-lg'>Import into Field "
                     "Expenses</button></form>"
@@ -17698,7 +17879,7 @@ body {{ background:#f7f6f3 !important; }}
                "rounded-full bg-amber-100 text-amber-700'>TEST</span>" if is_test else "")
             + "</h1>"
             + delete_header + "</div>"
-            + test_banner + balance_html + card_prompt_html
+            + test_banner + balance_html + _dump_review_summary_panel(items) + card_prompt_html
             + (sections or "<p class='text-sm text-gray-500'>No "
             "receipts in this batch.</p>")
             + bottom_outstanding_html + import_bar
@@ -17756,7 +17937,15 @@ body {{ background:#f7f6f3 !important; }}
         sym = "\u00a3"
         rows = "".join(
             "<div class='flex items-center justify-between px-4 py-2 border-b "
-            "border-gray-100 text-sm'><div class='min-w-0'><div class='font-medium "
+            "border-gray-100 text-sm gap-3'>"
+            "<label class='shrink-0 inline-flex items-center justify-center "
+            "w-8 h-8 rounded-lg border border-emerald-200 bg-emerald-50 "
+            "cursor-pointer' title='Untick if you do not want to import this "
+            "receipt in this submission'>"
+            "<input form='dump-import-form' type='checkbox' name='selected_item_id' "
+            "value='" + escape(it["id"]) + "' checked "
+            "class='rounded border-gray-300 text-emerald-600 dump-import-check'>"
+            "</label><div class='min-w-0 flex-1'><div class='font-medium "
             "text-gray-800 truncate'>" + escape(it.get("merchant") or it.get("filename")
             or "Receipt") + "</div><div class='text-xs text-gray-500'>"
             + escape(_exp_uk_date(it.get("purchased_on") or "")) + " · "
@@ -17792,9 +17981,10 @@ body {{ background:#f7f6f3 !important; }}
             "mb-6'><div class='px-4 py-2 bg-gray-50 text-xs font-semibold "
             "text-gray-600'>" + str(len(ready)) + " receipt(s) to import · " + sym
             + format(total_ready, ",.2f") + "</div>" + rows + "</div>"
-            "<form method='post' action='/receipts/expenses/dump/" + batch_id
+            "<form id='dump-import-form' method='post' action='/receipts/expenses/dump/" + batch_id
             + "/import' class='sticky bottom-4 bg-white rounded-xl border "
             "border-emerald-200 shadow-lg p-4 flex items-center justify-between'>"
+            "<input type='hidden' name='selected_import' value='1'>"
             "<a href='/receipts/expenses/dump/" + batch_id + "' class='text-sm "
             "text-gray-600 hover:underline'>Cancel</a>"
             "<button class='bg-emerald-600 hover:bg-emerald-700 text-white text-sm "
@@ -17850,6 +18040,8 @@ body {{ background:#f7f6f3 !important; }}
             # Test-mode batches are dry-run only — never import.
             return redirect("/receipts/expenses/dump/" + batch_id)
         items = dump_store.list_items(db, batch_id)
+        explicit_selection = bool(request.form.get("selected_import"))
+        selected_ids = set(request.form.getlist("selected_item_id"))
         default_eid = batch.get("engineer_id")
         exp_accounts = []
         try:
@@ -17885,6 +18077,8 @@ body {{ background:#f7f6f3 !important; }}
 
         for it in items:
             if it["status"] != dump_store.STATUS_NEW:
+                continue
+            if explicit_selection and it.get("id") not in selected_ids:
                 continue
             eid = it.get("assigned_engineer_id") or default_eid
             if not eid:
