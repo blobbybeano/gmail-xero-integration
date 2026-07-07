@@ -3004,6 +3004,7 @@ def run() -> None:
                                     state = set_draft_sync_fingerprint(
                                         state, event_key, draft_fp
                                     )
+                                    state = save_state_merged(config.state_file, state)
                                     result = xero_client.create_invoice_from_event(
                                         details, contact=contact_ref, line_items=invoice_lines
                                     )
@@ -4195,6 +4196,7 @@ def run() -> None:
                                     state = set_draft_sync_fingerprint(
                                         state, event_key, draft_fp
                                     )
+                                    state = save_state_merged(config.state_file, state)
                                     result = xero_client.create_invoice_from_event(
                                         details, contact=contact_ref, line_items=invoice_lines
                                     )

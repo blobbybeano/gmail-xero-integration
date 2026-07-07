@@ -25,6 +25,23 @@ class DeferredXeroQueueSourceTests(unittest.TestCase):
         self.assertIn("if not _needs_xero_event_work:\n                    _clear_deferred_xero_target(event_key)", source)
         self.assertIn("_clear_deferred_xero_target(event_key)\n                    _xero_events_used += 1", source)
 
+    def test_draft_attempt_marker_is_persisted_before_xero_create(self):
+        source = (Path(__file__).resolve().parents[1] / "app" / "main.py").read_text()
+        create_call = "result = xero_client.create_invoice_from_event("
+        search_from = 0
+        count = 0
+        while True:
+            idx = source.find(create_call, search_from)
+            if idx == -1:
+                break
+            prelude = source[max(0, idx - 700) : idx]
+            self.assertIn("set_draft_sync_attempted_at(state, event_key, now_ts)", prelude)
+            self.assertIn("set_draft_sync_fingerprint(", prelude)
+            self.assertIn("state = save_state_merged(config.state_file, state)", prelude)
+            count += 1
+            search_from = idx + len(create_call)
+        self.assertGreaterEqual(count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

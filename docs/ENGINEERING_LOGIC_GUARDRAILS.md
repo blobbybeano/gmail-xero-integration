@@ -221,6 +221,10 @@ Primary controls:
 - Hourly reconcile windows and bounded cleanup queues.
 - Draft-sync fingerprints are persisted on attempted draft-create calls so
   unchanged events do not repeatedly re-submit drafts during transient Xero failures.
+- The attempted draft fingerprint must be written to persistent state before the
+  Xero draft-create HTTP call. Keeping it only in memory is not enough: a deploy
+  or process restart between the Xero response and the next state save can
+  create a duplicate draft.
 - Xero draft/send actions have a compact per-event action ledger:
   - human-readable line: `App status: ...`
   - machine-readable line: `[app]s=...;r=...;fp=...;x=...;w=...[/app]`
