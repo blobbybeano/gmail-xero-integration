@@ -113,6 +113,7 @@ def merge_state_for_save(latest: Dict, incoming: Dict) -> Dict:
         "event_cash_log_updates",
         "event_cash_global_log_updates",
         "recent_xero_webhook_events",
+        "deferred_xero_event_targets",
     ]
     for field in additive_maps:
         out = {}
@@ -466,6 +467,7 @@ def prune_state(state: Dict, keep_recent_events: int = 1500) -> Dict:
         "event_cash_log_updates",
         "event_cash_global_log_updates",
         "recent_xero_webhook_events",
+        "deferred_xero_event_targets",
     ]
     list_fields = [
         "processed_event_ids",

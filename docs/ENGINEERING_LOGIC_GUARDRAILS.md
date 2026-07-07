@@ -97,6 +97,9 @@ Permanent rules:
 - When the per-cycle Xero budget is full, skipped calendar work must be counted
   as deferred and sampled for the dashboard. Silent deferrals make save delays
   impossible to diagnose.
+- Deferred calendar-Xero work must be queued by exact event key and retried on a
+  short controlled delay. Do not rely on the next broad calendar scan to find it:
+  future jobs can sit outside the normal daily safety window.
 - The pressure card is an operational safety tool, not decoration. Do not remove
   or let it become stale when changing poller, receipt, Cashflows, or Xero
   throttling code.

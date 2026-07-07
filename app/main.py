@@ -228,6 +228,10 @@ def run() -> None:
         _XERO_EVENT_429_COOLDOWN_SECONDS,
     )
     _XERO_EVENTS_PER_CYCLE = max(int(os.getenv("XERO_EVENTS_PER_CYCLE", "4") or "4"), 1)
+    _XERO_DEFERRED_RETRY_SECONDS = max(
+        int(os.getenv("XERO_DEFERRED_RETRY_SECONDS", "60") or "60"),
+        30,
+    )
     _last_xero_429_notice_at: float = 0.0
 
     _headers_initialized: set[str] = set()  # sheet keys that have had ensure_header run
@@ -1684,10 +1688,28 @@ def run() -> None:
         )
         _refresh_calendar_name_cache(active_calendars)
 
+        _now_ts = time.time()
+        _deferred_target_rows = dict(state.get("deferred_xero_event_targets", {}) or {})
+        _due_deferred_event_targets: list[str] = []
+        for _key, _row in list(_deferred_target_rows.items()):
+            if ":" not in str(_key):
+                _deferred_target_rows.pop(_key, None)
+                continue
+            try:
+                _next_retry_at = float((_row or {}).get("next_retry_at") or 0.0)
+            except Exception:
+                _next_retry_at = 0.0
+            if _next_retry_at <= _now_ts:
+                _due_deferred_event_targets.append(str(_key))
+                _deferred_target_rows.pop(_key, None)
+        if _deferred_target_rows != (state.get("deferred_xero_event_targets", {}) or {}):
+            state["deferred_xero_event_targets"] = _deferred_target_rows
+
         _queued_calendar_targets = {
             c for c in consume_calendar_targets() if c in set(active_calendars)
         }
         _queued_event_targets = [e for e in consume_event_targets() if ":" in e]
+        _queued_event_targets.extend(_due_deferred_event_targets)
         _target_event_ids_by_calendar: dict[str, set[str]] = {}
         for _key in _queued_event_targets:
             _cal_id, _ev_id = _key.split(":", 1)
@@ -1702,7 +1724,6 @@ def run() -> None:
             for k in _queued_event_targets
             if (k.split(":", 1)[0] in set(active_calendars))
         }
-        _now_ts = time.time()
         _is_targeted_cycle = bool(_target_calendar_ids)
         _hourly_reconcile_due = (
             (_now_ts - _last_hourly_reconcile_ts) >= _HOURLY_RECONCILE_SECONDS
@@ -2343,6 +2364,16 @@ def run() -> None:
                 if _needs_xero_event_work:
                     if _xero_events_used >= _XERO_EVENTS_PER_CYCLE:
                         _xero_deferred_events += 1
+                        _deferred_targets = dict(
+                            state.get("deferred_xero_event_targets", {}) or {}
+                        )
+                        _deferred_targets[event_key] = {
+                            "next_retry_at": time.time() + _XERO_DEFERRED_RETRY_SECONDS,
+                            "summary": event.get("summary") or event_id,
+                            "updated": event.get("updated") or "",
+                            "reason": "xero_slot_limit",
+                        }
+                        state["deferred_xero_event_targets"] = _deferred_targets
                         if len(_xero_deferred_sample) < 5:
                             _xero_deferred_sample.append(
                                 {
@@ -5116,7 +5147,12 @@ def run() -> None:
 
         if config.run_once:
             break
-        if had_changes:
+        if _xero_deferred_events:
+            backoff_seconds = min(
+                max(config.poll_seconds, 5),
+                _XERO_DEFERRED_RETRY_SECONDS,
+            )
+        elif had_changes:
             backoff_seconds = max(config.poll_seconds, 5)
         else:
             backoff_seconds = min(backoff_seconds * 2, max_backoff)

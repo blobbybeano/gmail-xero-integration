@@ -102,6 +102,31 @@ class StateMergeTests(unittest.TestCase):
             )
         )
 
+    def test_merge_preserves_deferred_xero_targets(self):
+        event_key = "cal:event-delayed"
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        try:
+            save_state(
+                path,
+                {
+                    "deferred_xero_event_targets": {
+                        event_key: {"next_retry_at": 1000, "reason": "xero_slot_limit"}
+                    }
+                },
+            )
+            incoming = set_processed_update_marker({}, event_key, "2026-07-07T09:00:00Z")
+
+            merged = save_state_merged(path, incoming)
+
+            self.assertIn(event_key, merged["deferred_xero_event_targets"])
+            self.assertEqual(
+                merged["deferred_xero_event_targets"][event_key]["reason"],
+                "xero_slot_limit",
+            )
+        finally:
+            os.unlink(path)
+
 
 if __name__ == "__main__":
     unittest.main()
