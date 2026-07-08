@@ -1505,14 +1505,21 @@ def _ai_receipt_hints_block(db_path: str) -> str:
         "- Only use a fuel account when the receipt clearly looks like a petrol "
         "station / forecourt fuel receipt, with evidence such as litres, pump, "
         "unleaded, petrol, diesel, fuel grade, or a known fuel-station merchant.\n"
+        "- Diesel / DERV / AdBlue receipts are van or motor-vehicle fuel. Never "
+        "code diesel to machinery fuel or machinery expenses.\n"
+        "- Unleaded / petrol / E10 / E5 receipts are machinery fuel when that "
+        "account exists.\n"
         "- Tyre shops, garages, MOT, brakes, exhausts, batteries, wheel alignment "
-        "and autocentres should be coded to vehicle repairs / maintenance, not "
-        "materials and not fuel.\n"
+        "car parts, servicing and autocentres should be coded to vehicle repairs "
+        "/ maintenance or motor vehicle expenses, not materials and not fuel.\n"
         "- Screwfix, Toolstation, builders merchants and hardware stores are "
         "normally materials / tools / consumables unless the receipt clearly "
         "says otherwise.\n"
         "- Parking apps, car parks and meters should be coded to parking / motor "
-        "travel, not materials.\n\n"
+        "travel, not materials.\n"
+        "- Do not choose a common/default account just because it is available. "
+        "Use the receipt evidence. If the receipt is genuinely unclear, return "
+        "an empty code so the user can choose manually.\n\n"
     )
     if not hints:
         return builtin
@@ -1922,9 +1929,10 @@ def _looks_like_fuel_receipt(merchant: str = "", raw_text: str = "") -> bool:
         "shell", "esso", "bp", "texaco", "gulf", "jet", "applegreen",
         "harvest energy", "morrisons petrol", "tesco petrol", "sainsburys petrol",
         "asda petrol", "forecourt", "service station", "filling station",
+        "mfg", "motor fuel", "murco", "tokheim",
     )
     fuel_terms = (
-        "diesel", "unleaded", "petrol", "fuel", "litre", "litres", " ltr ",
+        "diesel", "derv", "unleaded", "petrol", "fuel", "litre", "litres", " ltr ",
         "pump", "adblue", "v power", "e10", "e5",
     )
     has_station = any(t in text for t in station_terms)
@@ -1944,6 +1952,9 @@ def _looks_like_vehicle_maintenance(merchant: str = "", raw_text: str = "") -> b
         "autocentre", "auto centre", "garage", "mot", "wheel alignment",
         "tracking", "brake", "brakes", "exhaust", "clutch", "battery",
         "windscreen", "wiper", "vehicle repair", "car repair", "van repair",
+        "car parts", "gsf car parts", "euro car parts", "autoglass",
+        "service repair", "vehicle service", "van service", "servicing",
+        "diagnostic", "breakdown", "recovery", "commercial repairs",
     )
     return any(t in text for t in terms)
 
@@ -1953,7 +1964,9 @@ def _looks_like_materials(merchant: str = "", raw_text: str = "") -> bool:
     terms = (
         "screwfix", "toolstation", "wickes", "travis perkins", "jewson",
         "selco", "b q", "bandq", "builder depot", "builders merchant",
-        "sealant", "screws", "fixings", "gutter", "downpipe",
+        "builders merchants", "roofing merchant", "roofing merchants",
+        "burton roofing", "tradepoint", "sealant", "screws", "fixings",
+        "gutter", "downpipe",
     )
     return any(t in text for t in terms)
 
@@ -1992,18 +2005,48 @@ def _find_fuel_accounts(accounts: list) -> "tuple[tuple[str, str], tuple[str, st
     return machinery, van
 
 
+def _find_vehicle_expense_account(accounts: list) -> "tuple[str, str]":
+    """Best general vehicle account when a precise fuel/repair account is absent."""
+    code, name = _find_account_by_terms(
+        accounts,
+        any_terms=("vehicle", "motor", "van"),
+        exclude_terms=("fuel", "parking"),
+    )
+    if code:
+        return code, name
+    return _find_account_by_terms(
+        accounts,
+        any_terms=("travel", "running"),
+        exclude_terms=("fuel", "parking"),
+    )
+
+
+def _find_vehicle_maintenance_account(accounts: list) -> "tuple[str, str]":
+    """Prefer repairs/maintenance over a broad motor account for garages/tyres."""
+    code, name = _find_account_by_terms(
+        accounts,
+        any_terms=("repair", "repairs", "maintenance", "servicing", "service"),
+        exclude_terms=("fuel", "parking"),
+    )
+    if code:
+        return code, name
+    return _find_vehicle_expense_account(accounts)
+
+
 def _pick_fuel_account(total, accounts, raw_text="") -> "tuple[str, str]":
     """Choose the right fuel account from deterministic receipt evidence."""
     (m_code, m_name), (v_code, v_name) = _find_fuel_accounts(accounts)
-    if not m_code and not v_code:
-        return "", ""
     text = _receipt_rule_text("", raw_text)
-    is_diesel = "diesel" in text
+    is_diesel = "diesel" in text or "derv" in text or "adblue" in text
     is_petrol = any(t in text for t in ("unleaded", "petrol", "e10", "e5", "v power"))
     if is_diesel:
-        return (v_code, v_name) if v_code else ("", "")
+        return (v_code, v_name) if v_code else _find_vehicle_expense_account(accounts)
     if is_petrol and m_code:
         return m_code, m_name
+    if is_petrol and not m_code:
+        return "", ""
+    if not m_code and not v_code:
+        return "", ""
     try:
         amt = float(total)
     except (TypeError, ValueError):
@@ -2082,13 +2125,16 @@ def _apply_receipt_account_guardrails(
             return
         cat_code, cat_name = code, name
 
+    def _clear_single():
+        nonlocal segments, cat_code, cat_name
+        if segments and len(segments) == 1:
+            segments[0]["account_code"] = ""
+            segments[0]["account_name"] = ""
+        cat_code, cat_name = "", ""
+
     if _looks_like_vehicle_maintenance(merchant, raw_text):
-        code, name = _find_account_by_terms(
-            accounts,
-            any_terms=("vehicle", "motor", "van", "repair", "maintenance", "running"),
-            exclude_terms=("fuel", "parking"),
-        )
-        _set_single(code, name)
+        code, name = _find_vehicle_maintenance_account(accounts)
+        _set_single(code, name) if code else _clear_single()
         return segments, cat_code, cat_name
 
     if _looks_like_parking(merchant, raw_text):
@@ -2102,12 +2148,15 @@ def _apply_receipt_account_guardrails(
 
     is_fuel_receipt = _looks_like_fuel_receipt(merchant, raw_text)
     (m_code, m_name), (v_code, v_name) = _find_fuel_accounts(accounts)
-    if is_fuel_receipt and (m_code or v_code):
+    if is_fuel_receipt:
         # If the receipt clearly is fuel, make it fuel even if the AI picked a
         # generic materials/default account. Then apply the machinery/van rule.
         pick_code, pick_name = _pick_fuel_account(total, accounts, raw_text)
-        _set_single(pick_code, pick_name)
-        return _apply_fuel_threshold(segments, cat_code, cat_name, total, accounts, raw_text)
+        if pick_code:
+            _set_single(pick_code, pick_name)
+            return _apply_fuel_threshold(segments, cat_code, cat_name, total, accounts, raw_text)
+        _clear_single()
+        return segments, cat_code, cat_name
 
     if _looks_like_materials(merchant, raw_text):
         code, name = _find_account_by_terms(
@@ -2121,10 +2170,7 @@ def _apply_receipt_account_guardrails(
     # If the AI chose a fuel account but the receipt has no fuel evidence, do
     # not silently submit it as van/machinery fuel. Force a human account pick.
     if _account_has_fuel_name(cat_code, cat_name) and not is_fuel_receipt:
-        if segments and len(segments) == 1:
-            segments[0]["account_code"] = ""
-            segments[0]["account_name"] = ""
-        cat_code, cat_name = "", ""
+        _clear_single()
         return segments, cat_code, cat_name
 
     return _apply_fuel_threshold(segments, cat_code, cat_name, total, accounts, raw_text)
@@ -13176,6 +13222,14 @@ body {{ background:#f7f6f3 !important; }}
                     return f"{_n} ••{_mask}" if _mask else _n
             return f"••{_mask}" if _mask else account_id
 
+        def _setup_mark(text: str) -> str:
+            return (
+                "<span title='" + escape(text) + "' "
+                "class='inline-flex items-center justify-center w-4 h-4 rounded-full "
+                "bg-amber-100 text-amber-700 border border-amber-300 text-[10px] "
+                "font-bold align-middle ml-1'>!</span>"
+            )
+
         eng_cards = []
         auto_xero_bill_budget = 5
         for e in engineers:
@@ -13349,10 +13403,48 @@ body {{ background:#f7f6f3 !important; }}
                 "Xero account options are unavailable right now; type the account code here."
             )
             has_pw = bool((e.get("password_hash") or "").strip())
+            _has_contact = bool((e.get("xero_contact_name") or "").strip())
+            _has_login = bool((e.get("username") or "").strip()) and has_pw
+            _has_expense_account = bool(
+                (e.get("expense_account_code") or "").strip()
+                or (settings.get("default_expense_account") or "").strip()
+            )
+            _has_payment_account = bool(
+                (e.get("payment_account_code") or "").strip()
+                or (settings.get("default_payment_account") or "").strip()
+            )
+            _has_linked_card = bool((e.get("plaid_account_id") or "").strip())
+            setup_missing = []
+            if active and not _has_login:
+                setup_missing.append("login username/password")
+            if active and not _has_contact:
+                setup_missing.append("Xero contact name")
+            if active and not _has_expense_account:
+                setup_missing.append("expense account fallback")
+            if active and kind == "company_card" and not _has_linked_card:
+                setup_missing.append("linked card")
+            if active and kind == "subcontractor" and not _has_payment_account:
+                setup_missing.append("payment/bank account")
+            if active and e.get("allow_owner_paid") and not owner_account_code:
+                setup_missing.append("owner-paid Xero account")
+            setup_badge = ""
+            if setup_missing:
+                _setup_title = "Missing: " + ", ".join(setup_missing)
+                setup_badge = (
+                    "<span title='" + escape(_setup_title) + "' "
+                    "class='text-xs px-2 py-0.5 rounded-full bg-amber-100 "
+                    "text-amber-800 border border-amber-200'>! setup</span>"
+                )
             pw_hint = (
                 "<span class='text-emerald-600 font-normal'>(set)</span>" if has_pw
                 else "<span class='text-amber-600 font-normal'>(not set)</span>"
             )
+            _login_mark = _setup_mark("Set login username and password for this person's receipt link.") if active and not _has_login else ""
+            _contact_mark = _setup_mark("Add the Xero contact name used for this person's receipts/submissions.") if active and not _has_contact else ""
+            _expense_mark = _setup_mark("Choose this person's fallback expense account, or set the global fallback in Settings.") if active and not _has_expense_account else ""
+            _payment_mark = _setup_mark("Choose the payment/bank account used for settlement or payment checks.") if active and kind == "subcontractor" and not _has_payment_account else ""
+            _card_mark = _setup_mark("Link this company-card engineer to the correct uploaded card/bank feed.") if active and kind == "company_card" and not _has_linked_card else ""
+            _owner_mark = _setup_mark("Choose the Xero account personal/owner-paid receipts should post to.") if active and e.get("allow_owner_paid") and not owner_account_code else ""
             if plaid_cards:
                 card_field = (
                     f"<select name='plaid_account_id' class='{_sel_cls}'>"
@@ -13371,7 +13463,7 @@ body {{ background:#f7f6f3 !important; }}
                 "<summary class='flex items-center justify-between gap-2 p-4 cursor-pointer "
                 "list-none select-none hover:bg-gray-50'>"
                 f"<div class='font-semibold text-gray-900 flex items-center gap-2'>{escape(e['name'])} "
-                f"{inactive_badge}</div>"
+                f"{inactive_badge}{setup_badge}</div>"
                 "<div class='flex items-center gap-2'>"
                 f"<span class='text-xs text-gray-500'>{count} receipt(s)</span>"
                 "<svg class='w-4 h-4 text-gray-400 transition-transform duration-200 "
@@ -13400,19 +13492,23 @@ body {{ background:#f7f6f3 !important; }}
                 "</select></div>"
                 f"<div class='sm:col-span-2' id='card-{e['id']}' style='{_card_style}'>"
                 "<label class='block text-xs text-gray-500 mb-1'>"
-                "Linked card <span class='text-gray-400 font-normal'>(which Plaid card does this person hold?)</span></label>"
+                "Linked card <span class='text-gray-400 font-normal'>(which Plaid card does this person hold?)</span>"
+                f"{_card_mark}</label>"
                 f"{card_field}</div>"
                 "<div><label class='block text-xs text-gray-500 mb-1'>Name</label>"
                 f"<input name='name' value='{escape(e['name'])}' "
                 "class='w-full rounded border border-gray-300 px-2 py-1 text-sm'></div>"
-                "<div><label class='block text-xs text-gray-500 mb-1'>Xero contact name</label>"
+                "<div><label class='block text-xs text-gray-500 mb-1'>Xero contact name"
+                f"{_contact_mark}</label>"
                 f"<input name='xero_contact_name' value='{escape(e.get('xero_contact_name') or '')}' "
                 "class='w-full rounded border border-gray-300 px-2 py-1 text-sm' "
                 "placeholder='e.g. John Smith'></div>"
                 "<div><label class='block text-xs text-gray-500 mb-1'>Expense account "
-                "<span class='text-gray-400 font-normal'>(default for this person)</span></label>"
+                "<span class='text-gray-400 font-normal'>(default for this person)</span>"
+                f"{_expense_mark}</label>"
                 f"{exp_field}</div>"
-                "<div><label class='block text-xs text-gray-500 mb-1'>Payment/bank account</label>"
+                "<div><label class='block text-xs text-gray-500 mb-1'>Payment/bank account"
+                f"{_payment_mark}</label>"
                 f"{pay_field}</div>"
                 "<div class='sm:col-span-2 rounded-lg border border-emerald-300 bg-emerald-50 p-3 space-y-2'>"
                 "<label class='flex items-start gap-2 text-sm font-semibold text-emerald-950'>"
@@ -13421,11 +13517,12 @@ body {{ background:#f7f6f3 !important; }}
                 "<p class='text-xs text-emerald-700 mt-1'>Only enabled engineers will see a personal-card choice on the photo screen.</p>"
                 "<div class='rounded-md border border-emerald-200 bg-white/80 p-2'>"
                 "<label class='block text-xs font-semibold text-emerald-900 mb-1'>"
-                "Xero account to post these personal receipts to</label>"
+                f"Xero account to post these personal receipts to{_owner_mark}</label>"
                 f"{owner_account_field}"
                 f"<p class='text-[11px] text-emerald-700 mt-1'>{escape(owner_picker_hint)}</p>"
                 "</div></div>"
-                "<div><label class='block text-xs text-gray-500 mb-1'>Login username</label>"
+                "<div><label class='block text-xs text-gray-500 mb-1'>Login username"
+                f"{_login_mark}</label>"
                 f"<input name='username' value='{escape(e.get('username') or '')}' "
                 "autocapitalize='none' class='w-full rounded border border-gray-300 px-2 py-1 "
                 "text-sm' placeholder='e.g. dave'></div>"
@@ -13612,7 +13709,9 @@ body {{ background:#f7f6f3 !important; }}
             "<div class='sm:col-span-3' id='create-card-row'>"
             "<label class='block text-xs text-gray-500 mb-1'>Linked card "
             "<span class='text-gray-400 font-normal'>"
-            "(company-card staff only)</span></label>"
+            "(company-card staff only)</span>"
+            + _setup_mark("Company-card engineers need a linked card/feed for receipt matching.")
+            + "</label>"
             + _create_card_inner
             + "</div>"
         )
@@ -13645,7 +13744,9 @@ body {{ background:#f7f6f3 !important; }}
             "<p class='text-xs text-emerald-700 mt-1'>Use this only for people who should be able to submit receipts paid from a non-company card.</p>"
             "<div class='rounded-md border border-emerald-200 bg-white/80 p-2'>"
             "<label class='block text-xs font-semibold text-emerald-900 mb-1'>"
-            "Xero account to post these personal receipts to</label>"
+            "Xero account to post these personal receipts to"
+            + _setup_mark("Required when the personal / owner-paid option is enabled.")
+            + "</label>"
             + _create_owner_account_inner
             + f"<p class='text-[11px] text-emerald-700 mt-1'>{escape(_create_owner_picker_hint)}</p>"
             + "</div></div>"

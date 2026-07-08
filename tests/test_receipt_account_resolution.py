@@ -83,6 +83,45 @@ class ReceiptAccountResolutionTests(unittest.TestCase):
         )
         self.assertEqual((code, name), ("451", "Machinery Fuel"))
 
+    def test_gsf_car_parts_overrides_fuel_to_repairs(self):
+        _segments, code, name = _apply_receipt_account_guardrails(
+            [], "450", "Van Fuel", 57.08, self.accounts,
+            "GSF Car Parts Limited", "car parts battery wiper blade",
+        )
+        self.assertEqual((code, name), ("404", "Vehicle Repairs and Maintenance"))
+
+    def test_vehicle_repairs_fallback_uses_repairs_account(self):
+        accounts = [
+            {"Code": "310", "Name": "Materials"},
+            {"Code": "449", "Name": "Motor Vehicle Expenses"},
+            {"Code": "473", "Name": "Repairs & Maintenance"},
+            {"Code": "450", "Name": "Van Fuel"},
+        ]
+        _segments, code, name = _apply_receipt_account_guardrails(
+            [], "310", "Materials", 72.00, accounts,
+            "E&M Commercial Repairs", "van service diagnostic repair",
+        )
+        self.assertEqual((code, name), ("473", "Repairs & Maintenance"))
+
+    def test_screwfix_overrides_vehicle_default_to_materials(self):
+        _segments, code, name = _apply_receipt_account_guardrails(
+            [], "449", "Motor Vehicle Expenses", 28.54, self.accounts,
+            "SCREWFIX", "sealant screws fixings",
+        )
+        self.assertEqual((code, name), ("310", "Materials"))
+
+    def test_diesel_without_van_fuel_uses_vehicle_not_machinery(self):
+        accounts = [
+            {"Code": "310", "Name": "Materials"},
+            {"Code": "449", "Name": "Motor Vehicle Expenses"},
+            {"Code": "451", "Name": "Machinery Fuel"},
+        ]
+        _segments, code, name = _apply_receipt_account_guardrails(
+            [], "451", "Machinery Fuel", 35.00, accounts,
+            "Shell", "diesel pump 4 litres",
+        )
+        self.assertEqual((code, name), ("449", "Motor Vehicle Expenses"))
+
 
 if __name__ == "__main__":
     unittest.main()

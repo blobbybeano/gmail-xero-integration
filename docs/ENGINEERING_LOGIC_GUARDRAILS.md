@@ -566,6 +566,14 @@ Current rule:
   Xero expense account code before a receipt can be approved or imported. Human
   labels such as "materials" are only accepted if they unambiguously match one
   real Xero account name; otherwise the receipt stays in "Needs account".
+- Fallback/default expense accounts are last resort only. Obvious receipt
+  classes must be enforced after AI categorisation: diesel/DERV/AdBlue must not
+  be posted to machinery fuel or machinery expenses; garages, tyres, car parts,
+  MOT, brakes, servicing and repairs must be posted to vehicle repairs or a
+  motor vehicle account; Screwfix/Toolstation/builders/roofing merchants should
+  be materials unless the receipt itself clearly says otherwise. If the required
+  Xero account cannot be found, hold the receipt for manual account selection
+  instead of silently using the fallback.
 - Do not let "Keep" or "Import" promote a receipt with a blank or invalid Xero
   category. Push it back to manual review instead.
 - Duplicate protection is image-first where possible: identical stored receipt
