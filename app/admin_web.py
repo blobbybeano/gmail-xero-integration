@@ -1453,6 +1453,96 @@ def _exp_acct_options(accounts: list, selected: str, *, default_label: str) -> s
     return out
 
 
+def _xero_bank_transaction_url(bank_transaction_id: str) -> str:
+    xid = str(bank_transaction_id or "").strip()
+    if not xid:
+        return ""
+    return (
+        "https://go.xero.com/Bank/ViewTransaction.aspx?bankTransactionID="
+        + urllib.parse.quote(xid, safe="")
+    )
+
+
+_OWNER_PAID_ACCOUNT_TYPES = {
+    "BANK",
+    "CURRENT",
+    "CURRLIAB",
+    "LIABILITY",
+    "EQUITY",
+}
+
+
+def _owner_paid_account_group(account: dict) -> str:
+    typ = str(account.get("Type") or "").upper()
+    if typ == "BANK":
+        return "Bank"
+    if typ == "CURRENT":
+        return "Assets"
+    if typ in {"CURRLIAB", "LIABILITY"}:
+        return "Liabilities"
+    if typ == "EQUITY":
+        return "Equity"
+    return "Other"
+
+
+def _owner_paid_accounts_from(accounts: list) -> list[dict]:
+    """Accounts suitable for personal/owner-paid receipt posting.
+
+    These are not receipt category accounts. They are the balance-sheet account
+    that represents how the expense was paid: a Xero bank/cash account, or an
+    owner/director liability/equity account such as Directors' Loan.
+    """
+    rows = []
+    seen_codes = set()
+    for account in accounts or []:
+        code = str(account.get("Code") or "").strip()
+        if not code or code in seen_codes:
+            continue
+        if str(account.get("Status") or "ACTIVE").upper() != "ACTIVE":
+            continue
+        typ = str(account.get("Type") or "").upper()
+        if typ not in _OWNER_PAID_ACCOUNT_TYPES:
+            continue
+        seen_codes.add(code)
+        rows.append(account)
+    order = {"Bank": 0, "Assets": 1, "Liabilities": 2, "Equity": 3, "Other": 4}
+    rows.sort(
+        key=lambda a: (
+            order.get(_owner_paid_account_group(a), 99),
+            str(a.get("Name") or "").lower(),
+            str(a.get("Code") or ""),
+        )
+    )
+    return rows
+
+
+def _owner_paid_acct_options(accounts: list, selected: str, *, default_label: str) -> str:
+    """Build grouped options for the owner-paid posting-account selector."""
+    sel = str(selected or "").strip()
+    out = f"<option value=''>{escape(default_label)}</option>"
+    found = False
+    current_group = ""
+    for a in _owner_paid_accounts_from(accounts):
+        code = str(a.get("Code") or "").strip()
+        if not code:
+            continue
+        group = _owner_paid_account_group(a)
+        if group != current_group:
+            if current_group:
+                out += "</optgroup>"
+            out += f"<optgroup label='{escape(group)}'>"
+            current_group = group
+        is_sel = " selected" if code == sel else ""
+        if is_sel:
+            found = True
+        out += f"<option value='{escape(code)}'{is_sel}>{escape(_exp_acct_label(a))}</option>"
+    if current_group:
+        out += "</optgroup>"
+    if sel and not found:
+        out += f"<option value='{escape(sel)}' selected>Saved code ({escape(sel)})</option>"
+    return out
+
+
 def _expense_owner_paid_enabled(eng: dict | None) -> bool:
     if not eng or eng.get("kind") != "company_card":
         return False
@@ -12951,29 +13041,34 @@ body {{ background:#f7f6f3 !important; }}
             bank_accounts = [
                 a for a in saved_all_accounts if a.get("Type") == "BANK"
             ]
-            owner_paid_accounts = saved_all_accounts
+            owner_paid_accounts = _owner_paid_accounts_from(saved_all_accounts)
             _owner_warn = "Using saved Xero account options."
         else:
-            owner_paid_accounts = saved_exp_accounts
-            _owner_warn = (
-                "Using saved Xero expense account options until the full account list can refresh."
-                if owner_paid_accounts else ""
-            )
+            _owner_warn = ""
             try:
                 _r, bank_accounts, _t, _bw = (
                     _get_tenant_acct_themes(_at, _tid)
-                    if (_at and _tid and not bank_accounts and not owner_paid_accounts)
+                    if (_at and _tid and not bank_accounts)
                     else ([], bank_accounts, [], "")
                 )
+                if bank_accounts:
+                    owner_paid_accounts = _owner_paid_accounts_from(bank_accounts)
+                    _owner_warn = _bw or "Using Xero bank account options."
             except Exception:
                 bank_accounts = []
-            if not owner_paid_accounts:
-                try:
-                    owner_paid_accounts, _owner_warn = (
-                        _get_xero_active_accounts(_at, _tid, config.admin_db_file)
-                        if (_at and _tid) else ([], "")
-                    )
-                except Exception:
+            try:
+                _all_owner_accounts, _active_warn = (
+                    _get_xero_active_accounts(_at, _tid, config.admin_db_file)
+                    if (_at and _tid) else ([], "")
+                )
+                _full_owner_paid_accounts = _owner_paid_accounts_from(_all_owner_accounts)
+                if _full_owner_paid_accounts:
+                    owner_paid_accounts = _full_owner_paid_accounts
+                    _owner_warn = _active_warn or _owner_warn
+                elif not owner_paid_accounts:
+                    _owner_warn = _active_warn
+            except Exception:
+                if not owner_paid_accounts:
                     owner_paid_accounts, _owner_warn = [], ""
         acct_warning = " ".join(
             dict.fromkeys([
@@ -13385,9 +13480,9 @@ body {{ background:#f7f6f3 !important; }}
             if owner_paid_accounts:
                 owner_account_field = (
                     f"<select name='owner_paid_account_code' class='{_sel_cls} bg-white'>"
-                    + _exp_acct_options(
+                    + _owner_paid_acct_options(
                         owner_paid_accounts, owner_account_code,
-                        default_label="Choose Xero account",
+                        default_label="Choose bank / owner account",
                     )
                     + "</select>"
                 )
@@ -13398,7 +13493,7 @@ body {{ background:#f7f6f3 !important; }}
                     f"class='{_sel_cls}' placeholder='e.g. Ben personal account code'>"
                 )
             owner_picker_hint = (
-                "Choose the Xero account these personal receipts should post to."
+                "Choose the Xero bank, cash, or owner/director account these personal receipts should post to."
                 if owner_paid_accounts else
                 "Xero account options are unavailable right now; type the account code here."
             )
@@ -13719,9 +13814,9 @@ body {{ background:#f7f6f3 !important; }}
             _create_owner_account_inner = (
                 "<select name='owner_paid_account_code' "
                 "class='w-full rounded border border-gray-300 bg-white px-3 py-2 text-sm'>"
-                + _exp_acct_options(
+                + _owner_paid_acct_options(
                     owner_paid_accounts, "",
-                    default_label="Choose Xero account",
+                    default_label="Choose bank / owner account",
                 )
                 + "</select>"
             )
@@ -13732,7 +13827,7 @@ body {{ background:#f7f6f3 !important; }}
                 "placeholder='e.g. Ben personal account code'>"
             )
         _create_owner_picker_hint = (
-            "Choose the Xero account these personal receipts should post to."
+            "Choose the Xero bank, cash, or owner/director account these personal receipts should post to."
             if owner_paid_accounts else
             "Xero account options are unavailable right now; type the account code here."
         )
@@ -15421,6 +15516,7 @@ body {{ background:#f7f6f3 !important; }}
             match_id = ""
             match_eid = None
             image_check: dict = {}
+            xero_bank_transaction_id = ""
             batch_card_acct = (batch.get("card_account") or "").strip()
 
             if digest16 and digest16 in existing_by_digest:
@@ -15505,6 +15601,7 @@ body {{ background:#f7f6f3 !important; }}
                 )
                 _xero_s += time.perf_counter() - _t_stage
                 if xero_match:
+                    xero_bank_transaction_id = str(xero_match.get("id") or "").strip()
                     contact = (xero_match.get("contact") or "Xero expense").strip()
                     account = (xero_match.get("account") or "bank account").strip()
                     if xero_match.get("has_attachment"):
@@ -15622,6 +15719,7 @@ body {{ background:#f7f6f3 !important; }}
                 match_engineer_id=match_eid,
                 image_check=image_check,
                 card_feed_status=card_status,
+                xero_bank_transaction_id=xero_bank_transaction_id,
                 stored_file=result.get("stored_file", ""),
                 filename=filename,
                 mime_type=content_type,
@@ -15672,7 +15770,11 @@ body {{ background:#f7f6f3 !important; }}
                         merchant=s_merchant,
                         card_account=batch_card_acct,
                     )
+                    s_xero_bank_transaction_id = ""
                     if s_xero_match:
+                        s_xero_bank_transaction_id = str(
+                            s_xero_match.get("id") or ""
+                        ).strip()
                         if s_xero_match.get("has_attachment"):
                             s_status = dump_store.STATUS_DUPLICATE
                             s_reason = (
@@ -15738,6 +15840,7 @@ body {{ background:#f7f6f3 !important; }}
                         match_engineer_id=None,
                         image_check={},
                         card_feed_status=s_card,
+                        xero_bank_transaction_id=s_xero_bank_transaction_id,
                         stored_file=result.get("stored_file", ""),
                         filename=filename,
                         mime_type=content_type,
@@ -17360,7 +17463,7 @@ body {{ background:#f7f6f3 !important; }}
     }
 
     def _dump_item_card(item, exp_accounts, eng_map, batch_id, detailed=False,
-                        recon_map=None, selectable=False):
+                        recon_map=None, selectable=False, batch=None):
         sym = "\u00a3"
         amt = item.get("amount_inc")
         amt_s = (sym + format(float(amt), ",.2f")) if amt is not None else "—"
@@ -17504,6 +17607,18 @@ body {{ background:#f7f6f3 !important; }}
             "<div class='text-xs text-gray-600 mt-1'>" + escape(reason) + "</div>"
             if reason else ""
         )
+        xero_hint_html = ""
+        if (
+            item.get("status") == dump_store.STATUS_DUPLICATE
+            and "ocr merchant did not clearly match" in reason.lower()
+        ):
+            m = re.search(r"Xero contact is ([^—.]+)", reason)
+            xero_contact = (m.group(1).strip() if m else "a different contact")
+            xero_hint_html = (
+                "<div class='text-xs text-sky-700 mt-1'>"
+                "Xero match is under <strong>" + escape(xero_contact)
+                + "</strong>, not the OCR merchant name above.</div>"
+            )
         ic = item.get("image_check") or {}
         ic_html = ""
         if ic.get("available") is not None and (ic.get("reason") or ic.get("same") is not None):
@@ -17529,6 +17644,47 @@ body {{ background:#f7f6f3 !important; }}
                 "<path stroke-linecap='round' stroke-linejoin='round' d='M15 12a3 3 0 "
                 "11-6 0 3 3 0 016 0z'/></svg>View receipt</a>"
             )
+        xero_link_html = ""
+        xero_bank_transaction_id = str(
+            item.get("xero_bank_transaction_id") or ""
+        ).strip()
+        if (
+            not xero_bank_transaction_id
+            and item.get("status") == dump_store.STATUS_DUPLICATE
+            and "already" in reason.lower()
+            and "xero" in reason.lower()
+        ):
+            try:
+                xero_match = _dump_xero_existing_spend_match(
+                    amount_inc=item.get("amount_inc"),
+                    purchased_on=item.get("purchased_on") or "",
+                    merchant=item.get("merchant") or "",
+                    card_account=(batch or {}).get("card_account") or "",
+                )
+            except Exception:
+                xero_match = None
+            xero_bank_transaction_id = str(
+                (xero_match or {}).get("id") or ""
+            ).strip()
+            if xero_bank_transaction_id:
+                try:
+                    dump_store.update_item(
+                        config.admin_db_file,
+                        item["id"],
+                        xero_bank_transaction_id=xero_bank_transaction_id,
+                    )
+                    item["xero_bank_transaction_id"] = xero_bank_transaction_id
+                except Exception:
+                    pass
+        xero_url = _xero_bank_transaction_url(xero_bank_transaction_id)
+        if xero_url:
+            xero_link_html = (
+                "<a href='" + escape(xero_url) + "' target='_blank' rel='noopener' "
+                "class='inline-flex items-center gap-1 ml-1 mt-2 px-2 py-1 text-[11px] "
+                "font-medium text-gray-500 hover:text-sky-700 hover:bg-sky-50 rounded-md' "
+                "title='Open the matched Xero bank transaction'>Open in Xero</a>"
+            )
+        links_html = view_html + xero_link_html
         controls = ""
         is_active = item["status"] in dump_store.ACTIVE_STATUSES
         if is_active:
@@ -17564,9 +17720,15 @@ body {{ background:#f7f6f3 !important; }}
                 + reason_html + ic_html
                 + "</details>"
             )
-            extras = ai_html + seg_html + recon_sub + collapse + view_html
+            extras = ai_html + seg_html + recon_sub + collapse + links_html
         else:
-            extras = ai_html + seg_html + recon_sub + reason_html + ic_html + view_html
+            extras = ai_html + seg_html + recon_sub + reason_html + ic_html + links_html
+        if xero_hint_html and xero_hint_html not in extras:
+            extras = ai_html + seg_html + recon_sub + xero_hint_html + (
+                collapse + links_html
+                if not is_active and (reason_html or ic_html)
+                else reason_html + ic_html + links_html
+            )
         select_html = ""
         if selectable and item["status"] == dump_store.STATUS_NEW:
             select_html = (
@@ -17879,6 +18041,7 @@ body {{ background:#f7f6f3 !important; }}
             cards = "".join(
                 _dump_item_card(it, exp_accounts, eng_map, batch_id,
                                 detailed=is_test, recon_map=recon_map,
+                                batch=batch,
                                 selectable=(
                                     status == dump_store.STATUS_NEW
                                     and not is_test and not is_sub

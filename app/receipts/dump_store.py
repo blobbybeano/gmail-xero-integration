@@ -80,6 +80,7 @@ def _ensure_tables(db_path: str) -> None:
                 match_engineer_id INTEGER,
                 image_check_json TEXT NOT NULL DEFAULT '{}',
                 card_feed_status TEXT NOT NULL DEFAULT '',
+                xero_bank_transaction_id TEXT NOT NULL DEFAULT '',
                 assigned_engineer_id INTEGER,
                 stored_file TEXT NOT NULL DEFAULT '',
                 filename TEXT NOT NULL DEFAULT '',
@@ -113,6 +114,14 @@ def _ensure_tables(db_path: str) -> None:
             conn.execute(
                 "ALTER TABLE expense_dump_batches "
                 "ADD COLUMN card_account TEXT NOT NULL DEFAULT ''"
+            )
+        item_cols = {
+            r[1] for r in conn.execute("PRAGMA table_info(expense_dump_items)")
+        }
+        if "xero_bank_transaction_id" not in item_cols:
+            conn.execute(
+                "ALTER TABLE expense_dump_items "
+                "ADD COLUMN xero_bank_transaction_id TEXT NOT NULL DEFAULT ''"
             )
         conn.commit()
 
@@ -223,6 +232,7 @@ def create_item(
     match_engineer_id: int | None = None,
     image_check: dict | None = None,
     card_feed_status: str = "",
+    xero_bank_transaction_id: str = "",
     assigned_engineer_id: int | None = None,
     stored_file: str = "",
     filename: str = "",
@@ -241,11 +251,12 @@ def create_item(
                  amount_inc, amount_ex, vat_amount, currency, is_split,
                  segments_json, category_account_code, category_account_name,
                  status, dup_reason, match_receipt_id, match_engineer_id,
-                 image_check_json, card_feed_status, assigned_engineer_id,
+                 image_check_json, card_feed_status, xero_bank_transaction_id,
+                 assigned_engineer_id,
                  stored_file, filename, mime_type, ocr_raw, ocr_error, notes,
                  created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 iid, batch_id, seq, content_sha256, merchant, purchased_on,
@@ -253,7 +264,8 @@ def create_item(
                 json.dumps(segments or []), category_account_code,
                 category_account_name, status, dup_reason, match_receipt_id,
                 match_engineer_id, json.dumps(image_check or {}), card_feed_status,
-                assigned_engineer_id, stored_file, filename, mime_type, ocr_raw,
+                xero_bank_transaction_id.strip(), assigned_engineer_id,
+                stored_file, filename, mime_type, ocr_raw,
                 ocr_error, notes, now, now,
             ),
         )
@@ -266,7 +278,8 @@ def update_item(db_path: str, item_id: str, **fields) -> dict[str, Any] | None:
         "merchant", "purchased_on", "amount_inc", "amount_ex", "vat_amount",
         "currency", "is_split", "category_account_code", "category_account_name",
         "status", "dup_reason", "match_receipt_id", "match_engineer_id",
-        "card_feed_status", "assigned_engineer_id", "notes",
+        "card_feed_status", "xero_bank_transaction_id",
+        "assigned_engineer_id", "notes",
     }
     sets: dict[str, Any] = {}
     for k, v in fields.items():

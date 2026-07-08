@@ -2058,6 +2058,99 @@ def _format_process_prompt_line(line: str) -> str:
 
 
 
+def _canonical_user_control_line(line: str) -> tuple[str, str]:
+    """Return (control-kind, canonical line) for editable calendar controls.
+
+    These are the few fields a human edits while the app may also be writing
+    totals/status. Keeping them canonical and de-duped prevents a stale app
+    save from flipping a just-entered Y back to blank, or preserving duplicate
+    Y lines after Google Calendar save races.
+    """
+    import re
+
+    plain = re.sub(r"<[^>]+>", "", line or "").strip()
+    if not plain:
+        return "", ""
+
+    def yn_answer(raw: str | None) -> str:
+        value = (raw or "").strip().lower()
+        if value in {"yes"} or (value and set(value) == {"y"}):
+            return "Y"
+        if value in {"no"} or (value and set(value) == {"n"}):
+            return "N"
+        return ""
+
+    m_process = re.fullmatch(
+        r"(?:process\s*draft\s*\(\s*y\s*/\s*n\s*\)|(?:done\s+)?y\s*/\s*n)"
+        r"\s*(?:=|:)\s*([yn]+|yes|no)?\s*",
+        plain,
+        flags=re.I,
+    )
+    if m_process:
+        answer = yn_answer(m_process.group(1))
+        return "process", f"{PROCESS_DRAFT_PROMPT}{answer}" if answer else PROCESS_DRAFT_PROMPT
+
+    m_send = re.fullmatch(
+        r"send(?:\s+now)?\s*(?:\(\s*y\s*/\s*n\s*\)|y\s*/\s*n)?"
+        r"\s*(?:=|:)\s*([yn]+|yes|no)?\s*",
+        plain,
+        flags=re.I,
+    )
+    if m_send:
+        answer = yn_answer(m_send.group(1))
+        return "send", f"{SEND_PROMPT} {answer}".rstrip()
+
+    m_payment = re.fullmatch(
+        r"(?:payment(?:\s*type)?|card\s*(?:or|/)\s*invoice(?:\s*(?:or|/)\s*cash)?)"
+        r"\s*(?:\([^)]*\))?\s*(?:=|:)\s*(card|invoice|cash)?\s*",
+        plain,
+        flags=re.I,
+    )
+    if m_payment:
+        answer = (m_payment.group(1) or "").upper()
+        return "payment", f"{PAYMENT_TYPE_PROMPT} {answer}".rstrip()
+
+    return "", ""
+
+
+def preserve_latest_user_controls(
+    proposed_description: str | None,
+    latest_description: str | None,
+) -> str:
+    """Merge the latest human-edited controls into an app-generated update."""
+    proposed = proposed_description or ""
+    latest = latest_description or ""
+    if not proposed or not latest or proposed == latest:
+        return proposed
+
+    latest_controls: dict[str, str] = {}
+    for line in _normalize_description(latest).splitlines():
+        kind, canonical = _canonical_user_control_line(line)
+        if kind:
+            latest_controls[kind] = canonical
+    if not latest_controls:
+        return proposed
+
+    out: list[str] = []
+    seen: set[str] = set()
+    changed = False
+    for line in proposed.splitlines():
+        kind, canonical = _canonical_user_control_line(line)
+        if kind and kind in latest_controls:
+            if kind in seen:
+                changed = True
+                continue
+            replacement = latest_controls[kind]
+            out.append(replacement)
+            seen.add(kind)
+            if replacement != canonical:
+                changed = True
+        else:
+            out.append(line)
+
+    return "\n".join(out) if changed else proposed
+
+
 def _extract_existing_payment_type(description: str) -> str:
     import re
 

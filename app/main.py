@@ -56,6 +56,7 @@ from .event_processor import (
     parse_event_address,
     payment_choice,
     parse_app_ledger,
+    preserve_latest_user_controls,
     upsert_invoice_profile_missing_hint,
     upsert_app_ledger,
     upsert_send_failure,
@@ -290,6 +291,40 @@ def run() -> None:
         summary_override: str | None = None,
     ):
         import re
+
+        try:
+            latest_event = (
+                build_calendar_service(config)
+                .events()
+                .get(
+                    calendarId=calendar_id or config.google_calendar_id,
+                    eventId=event_id,
+                )
+                .execute()
+            )
+        except Exception:
+            latest_event = None
+
+        if latest_event:
+            latest_description = latest_event.get("description") or ""
+            merged_description = preserve_latest_user_controls(
+                description,
+                latest_description,
+            )
+            if merged_description != description:
+                prefix = f"{label}: " if label else ""
+                print(
+                    f"{prefix}preserved newer calendar control lines for {event_id}",
+                    flush=True,
+                )
+                description = merged_description
+            latest_summary = latest_event.get("summary")
+            if (
+                latest_summary
+                and current_summary is not None
+                and latest_summary != current_summary
+            ):
+                current_summary = latest_summary
 
         summary = summary_override
         if summary is None and summary_status:

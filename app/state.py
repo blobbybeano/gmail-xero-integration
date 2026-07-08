@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict
@@ -19,9 +21,26 @@ def load_state(state_file: str) -> Dict:
 
 def save_state(state_file: str, state: Dict) -> None:
     path = Path(state_file)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(state, indent=2))
-    tmp.replace(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_name = ""
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(state, indent=2))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+    finally:
+        if tmp_name and os.path.exists(tmp_name):
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
 
 
 def _max_iso(left: str | None, right: str | None) -> str:

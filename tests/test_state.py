@@ -1,5 +1,6 @@
 import os
 import tempfile
+import threading
 import unittest
 
 from app.state import (
@@ -168,6 +169,31 @@ class StateMergeTests(unittest.TestCase):
             )
         finally:
             os.unlink(path)
+
+    def test_parallel_state_saves_do_not_share_one_tmp_file(self):
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        errors = []
+
+        def writer(idx):
+            try:
+                for n in range(20):
+                    save_state(path, {"writer": idx, "n": n})
+            except Exception as exc:  # pragma: no cover - assertion reports it
+                errors.append(exc)
+
+        threads = [threading.Thread(target=writer, args=(i,)) for i in range(8)]
+        try:
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            self.assertEqual(errors, [])
+            self.assertFalse(os.path.exists(path + ".tmp"))
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
 
 
 if __name__ == "__main__":

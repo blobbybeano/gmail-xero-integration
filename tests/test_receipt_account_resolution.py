@@ -2,6 +2,8 @@ import unittest
 
 from app.admin_web import (
     _apply_receipt_account_guardrails,
+    _owner_paid_acct_options,
+    _owner_paid_accounts_from,
     _resolve_expense_account_choice,
 )
 
@@ -121,6 +123,28 @@ class ReceiptAccountResolutionTests(unittest.TestCase):
             "Shell", "diesel pump 4 litres",
         )
         self.assertEqual((code, name), ("449", "Motor Vehicle Expenses"))
+
+    def test_owner_paid_accounts_are_bank_asset_or_liability_not_expense(self):
+        accounts = [
+            {"Code": "090", "Name": "Pow Wash", "Type": "BANK", "Status": "ACTIVE"},
+            {"Code": "091", "Name": "Ben - Personal Bank", "Type": "BANK", "Status": "ACTIVE"},
+            {"Code": "700", "Name": "Cash", "Type": "CURRENT", "Status": "ACTIVE"},
+            {"Code": "780", "Name": "Cashflow reconciliation", "Type": "CURRENT", "Status": "ACTIVE"},
+            {"Code": "835", "Name": "Directors' Loan Account", "Type": "CURRLIAB", "Status": "ACTIVE"},
+            {"Code": "310", "Name": "Materials", "Type": "EXPENSE", "Status": "ACTIVE"},
+            {"Code": "200", "Name": "Sales", "Type": "REVENUE", "Status": "ACTIVE"},
+        ]
+
+        rows = _owner_paid_accounts_from(accounts)
+        self.assertEqual([r["Code"] for r in rows], ["091", "090", "700", "780", "835"])
+
+        html = _owner_paid_acct_options(accounts, "835", default_label="Choose")
+        self.assertIn("<optgroup label='Bank'>", html)
+        self.assertIn("<optgroup label='Assets'>", html)
+        self.assertIn("<optgroup label='Liabilities'>", html)
+        self.assertIn("Directors&#x27; Loan Account (835)", html)
+        self.assertNotIn("Materials", html)
+        self.assertNotIn("Sales", html)
 
 
 if __name__ == "__main__":

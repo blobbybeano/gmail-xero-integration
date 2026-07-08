@@ -6,6 +6,7 @@ from app.event_processor import (
     extract_sales_lines,
     normalize_user_sections,
     parse_invoice_contact_overrides,
+    preserve_latest_user_controls,
     send_choice_is_no,
     send_choice_is_yes,
     sync_invoice_block_from_xero,
@@ -178,6 +179,49 @@ class InvoiceSalesParsingTests(unittest.TestCase):
         self.assertNotIn("Invoice send failed", updated)
         self.assertNotIn("Check customer e-mail", updated)
         self.assertIn("SEND NOW (Y/N) =", updated)
+
+    def test_preserve_latest_process_y_over_stale_app_update(self):
+        proposed = (
+            "[invoice]\nGC = \u00a3100+VAT\n[/invoice]\n"
+            "PROCESS DRAFT (Y/N) =\n\n"
+            "[app-status]\nInvoice total (inc VAT): \u00a3120.00\n[/app-status]"
+        )
+        latest = (
+            "[invoice]\nGC = \u00a3100+VAT\n[/invoice]\n"
+            "PROCESS DRAFT (Y/N) =Y"
+        )
+
+        merged = preserve_latest_user_controls(proposed, latest)
+
+        self.assertIn("PROCESS DRAFT (Y/N) =Y", merged)
+        self.assertNotIn("PROCESS DRAFT (Y/N) =\n", merged)
+
+    def test_preserve_latest_blank_process_over_stale_y(self):
+        proposed = (
+            "[invoice]\nGC = \u00a3100+VAT\n[/invoice]\n"
+            "PROCESS DRAFT (Y/N) =Y"
+        )
+        latest = (
+            "[invoice]\nGC = \u00a3100+VAT\n[/invoice]\n"
+            "PROCESS DRAFT (Y/N) ="
+        )
+
+        merged = preserve_latest_user_controls(proposed, latest)
+
+        self.assertIn("PROCESS DRAFT (Y/N) =", merged)
+        self.assertNotIn("PROCESS DRAFT (Y/N) =Y", merged)
+
+    def test_preserve_latest_controls_dedupes_duplicate_process_lines(self):
+        proposed = (
+            "[invoice]\nGC = \u00a3100+VAT\n[/invoice]\n"
+            "PROCESS DRAFT (Y/N) =Y\n"
+            "PROCESS DRAFT (Y/N) =Y"
+        )
+        latest = "PROCESS DRAFT (Y/N) =YY"
+
+        merged = preserve_latest_user_controls(proposed, latest)
+
+        self.assertEqual(merged.count("PROCESS DRAFT (Y/N) =Y"), 1)
 
     def test_email_send_failure_keeps_customer_email_guidance(self):
         updated = upsert_send_failure(
