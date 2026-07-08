@@ -1602,11 +1602,14 @@ def _ai_receipt_hints_block(db_path: str) -> str:
         "- Tyre shops, garages, MOT, brakes, exhausts, batteries, wheel alignment "
         "car parts, servicing and autocentres should be coded to vehicle repairs "
         "/ maintenance or motor vehicle expenses, not materials and not fuel.\n"
-        "- Screwfix, Toolstation, builders merchants and hardware stores are "
-        "normally materials / tools / consumables unless the purchased line "
-        "items clearly say otherwise. Guttering, brackets, outlets, angles, "
-        "pipe, fixings, sealant and screws are materials, not repairs and "
-        "maintenance.\n"
+        "- Screwfix, Toolstation, Wickes, B&Q, builders merchants and hardware "
+        "stores are materials / tools / consumables by default unless the "
+        "receipt clearly shows fuel, parking, vehicle parts or a garage/van "
+        "repair. Guttering, brackets, outlets, angles, pipe, fixings, sealant "
+        "and screws are materials, not repairs and maintenance.\n"
+        "- Halfords, car-parts shops, tyre shops and mechanics/garages are "
+        "vehicle repairs / maintenance or motor vehicle expenses, not "
+        "materials.\n"
         "- Parking apps, car parks and meters should be coded to parking / motor "
         "travel, not materials.\n"
         "- Do not choose a common/default account just because it is available. "
@@ -2041,7 +2044,7 @@ def _looks_like_vehicle_maintenance(merchant: str = "", raw_text: str = "") -> b
     terms = (
         "tyre", "tyres", "kwik fit", "ats euromaster", "protyre",
         "national tyres", "blackcircles", "formula one autocentre",
-        "autocentre", "auto centre", "garage", "mot", "wheel alignment",
+        "autocentre", "auto centre", "halfords", "garage", "mot", "wheel alignment",
         "tracking", "brake", "brakes", "exhaust", "clutch", "battery",
         "windscreen", "wiper", "vehicle repair", "car repair", "van repair",
         "car parts", "gsf car parts", "euro car parts", "autoglass",
@@ -2057,7 +2060,7 @@ def _looks_like_trade_materials_supplier(merchant: str = "", raw_text: str = "")
         "screwfix", "toolstation", "wickes", "travis perkins", "jewson",
         "selco", "b q", "bandq", "b&q", "builder depot", "builders merchant",
         "builders merchants", "roofing merchant", "roofing merchants",
-        "burton roofing", "tradepoint",
+        "burton roofing", "tradepoint", "homebase",
     )
     return any(t in text for t in suppliers)
 
@@ -2251,11 +2254,13 @@ def _apply_receipt_account_guardrails(
         cat_code, cat_name = "", ""
 
     # Supplier invoices often contain generic policy wording about repair or
-    # replacement. Purchased trade materials should override that boilerplate.
+    # replacement. Known trade suppliers default to Materials unless the actual
+    # receipt evidence says fuel, parking, vehicle parts, or garage/van work.
     if (
         _looks_like_trade_materials_supplier(merchant, raw_text)
-        and _looks_like_trade_materials_goods(merchant, raw_text)
         and not _looks_like_vehicle_maintenance(merchant, raw_text)
+        and not _looks_like_fuel_receipt(merchant, raw_text)
+        and not _looks_like_parking(merchant, raw_text)
     ):
         code, name = _find_account_by_terms(
             accounts,

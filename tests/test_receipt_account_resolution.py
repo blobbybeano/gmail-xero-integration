@@ -126,6 +126,39 @@ class ReceiptAccountResolutionTests(unittest.TestCase):
         )
         self.assertEqual((code, name), ("310", "Materials"))
 
+    def test_wickes_defaults_to_materials_not_repairs(self):
+        accounts = [
+            {"Code": "310", "Name": "Materials"},
+            {"Code": "473", "Name": "Repairs & Maintenance"},
+            {"Code": "404", "Name": "Vehicle Repairs and Maintenance"},
+        ]
+        _segments, code, name = _apply_receipt_account_guardrails(
+            [], "473", "Repairs & Maintenance", 42.18, accounts,
+            "Wickes",
+            "Trade receipt assorted sundries decorators caulk packers fittings",
+        )
+        self.assertEqual((code, name), ("310", "Materials"))
+
+    def test_b_and_q_defaults_to_materials_not_repairs(self):
+        accounts = [
+            {"Code": "310", "Name": "Materials"},
+            {"Code": "473", "Name": "Repairs & Maintenance"},
+            {"Code": "404", "Name": "Vehicle Repairs and Maintenance"},
+        ]
+        _segments, code, name = _apply_receipt_account_guardrails(
+            [], "473", "Repairs & Maintenance", 18.95, accounts,
+            "B&Q",
+            "paint brush roller tray wall plugs assorted hardware",
+        )
+        self.assertEqual((code, name), ("310", "Materials"))
+
+    def test_halfords_defaults_to_vehicle_maintenance_not_materials(self):
+        _segments, code, name = _apply_receipt_account_guardrails(
+            [], "310", "Materials", 26.50, self.accounts,
+            "Halfords", "screenwash wiper blade bulb",
+        )
+        self.assertEqual((code, name), ("404", "Vehicle Repairs and Maintenance"))
+
     def test_diesel_without_van_fuel_uses_vehicle_not_machinery(self):
         accounts = [
             {"Code": "310", "Name": "Materials"},
