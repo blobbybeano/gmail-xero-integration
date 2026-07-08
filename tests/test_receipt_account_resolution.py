@@ -112,6 +112,20 @@ class ReceiptAccountResolutionTests(unittest.TestCase):
         )
         self.assertEqual((code, name), ("310", "Materials"))
 
+    def test_screwfix_gutter_parts_override_repairs_to_materials(self):
+        accounts = [
+            {"Code": "310", "Name": "Materials"},
+            {"Code": "473", "Name": "Repairs & Maintenance"},
+            {"Code": "404", "Name": "Vehicle Repairs and Maintenance"},
+        ]
+        _segments, code, name = _apply_receipt_account_guardrails(
+            [], "473", "Repairs & Maintenance", 28.54, accounts,
+            "Screwfix Direct Ltd",
+            "Union Bracket 112mm Run Outlet Black 112mm 90 Angle Black 112mm "
+            "returns cancellation policy repair replacement faulty goods",
+        )
+        self.assertEqual((code, name), ("310", "Materials"))
+
     def test_diesel_without_van_fuel_uses_vehicle_not_machinery(self):
         accounts = [
             {"Code": "310", "Name": "Materials"},

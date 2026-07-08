@@ -1603,8 +1603,10 @@ def _ai_receipt_hints_block(db_path: str) -> str:
         "car parts, servicing and autocentres should be coded to vehicle repairs "
         "/ maintenance or motor vehicle expenses, not materials and not fuel.\n"
         "- Screwfix, Toolstation, builders merchants and hardware stores are "
-        "normally materials / tools / consumables unless the receipt clearly "
-        "says otherwise.\n"
+        "normally materials / tools / consumables unless the purchased line "
+        "items clearly say otherwise. Guttering, brackets, outlets, angles, "
+        "pipe, fixings, sealant and screws are materials, not repairs and "
+        "maintenance.\n"
         "- Parking apps, car parks and meters should be coded to parking / motor "
         "travel, not materials.\n"
         "- Do not choose a common/default account just because it is available. "
@@ -2049,14 +2051,40 @@ def _looks_like_vehicle_maintenance(merchant: str = "", raw_text: str = "") -> b
     return any(t in text for t in terms)
 
 
+def _looks_like_trade_materials_supplier(merchant: str = "", raw_text: str = "") -> bool:
+    text = _receipt_rule_text(merchant, raw_text)
+    suppliers = (
+        "screwfix", "toolstation", "wickes", "travis perkins", "jewson",
+        "selco", "b q", "bandq", "b&q", "builder depot", "builders merchant",
+        "builders merchants", "roofing merchant", "roofing merchants",
+        "burton roofing", "tradepoint",
+    )
+    return any(t in text for t in suppliers)
+
+
+def _looks_like_trade_materials_goods(merchant: str = "", raw_text: str = "") -> bool:
+    text = _receipt_rule_text(merchant, raw_text)
+    goods = (
+        "sealant", "screws", "screw ", "fixings", "fittings", "clips",
+        "bracket", "brackets", "union bracket", "run outlet", "outlet",
+        "angle", "90 angle", "gutter", "guttering", "downpipe", "pipe",
+        "elbow", "bend", "socket", "coupler", "adapter", "adhesive",
+        "silicone", "mastic", "nozzle", "blade", "drill bit", "bits",
+        "washer", "washers", "bolt", "bolts", "nut ", "nuts",
+    )
+    return any(t in text for t in goods)
+
+
 def _looks_like_materials(merchant: str = "", raw_text: str = "") -> bool:
     text = _receipt_rule_text(merchant, raw_text)
     terms = (
         "screwfix", "toolstation", "wickes", "travis perkins", "jewson",
         "selco", "b q", "bandq", "builder depot", "builders merchant",
         "builders merchants", "roofing merchant", "roofing merchants",
-        "burton roofing", "tradepoint", "sealant", "screws", "fixings",
-        "gutter", "downpipe",
+        "burton roofing", "tradepoint", "sealant", "screws", "screw ",
+        "fixings", "fittings", "bracket", "brackets", "union bracket",
+        "run outlet", "outlet", "angle", "90 angle", "gutter",
+        "guttering", "downpipe", "pipe",
     )
     return any(t in text for t in terms)
 
@@ -2221,6 +2249,21 @@ def _apply_receipt_account_guardrails(
             segments[0]["account_code"] = ""
             segments[0]["account_name"] = ""
         cat_code, cat_name = "", ""
+
+    # Supplier invoices often contain generic policy wording about repair or
+    # replacement. Purchased trade materials should override that boilerplate.
+    if (
+        _looks_like_trade_materials_supplier(merchant, raw_text)
+        and _looks_like_trade_materials_goods(merchant, raw_text)
+        and not _looks_like_vehicle_maintenance(merchant, raw_text)
+    ):
+        code, name = _find_account_by_terms(
+            accounts,
+            any_terms=("material", "materials", "tools", "consumable", "supplies"),
+            exclude_terms=("fuel", "vehicle", "motor", "parking"),
+        )
+        _set_single(code, name)
+        return segments, cat_code, cat_name
 
     if _looks_like_vehicle_maintenance(merchant, raw_text):
         code, name = _find_vehicle_maintenance_account(accounts)
