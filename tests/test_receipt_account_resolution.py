@@ -85,6 +85,23 @@ class ReceiptAccountResolutionTests(unittest.TestCase):
         )
         self.assertEqual((code, name), ("451", "Machinery Fuel"))
 
+    def test_shell_garages_unleaded_overrides_repairs_to_fuel(self):
+        _segments, code, name = _apply_receipt_account_guardrails(
+            [], "473", "Repairs & Maintenance", 9.81, self.accounts,
+            "Shell Rainbow Salford",
+            "Rainbow Garages Ltd CUSTOMER RECEIPT ARTICLE *FS Unleaded "
+            "PUMP 6 6.33 litres amount GBP 9.81",
+        )
+        self.assertEqual((code, name), ("403", "Machinery Fuel"))
+
+    def test_adblue_vehicle_fluid_overrides_van_fuel_to_maintenance(self):
+        _segments, code, name = _apply_receipt_account_guardrails(
+            [], "402", "Van Fuel", 7.99, self.accounts,
+            "Home Bargains",
+            "10L ADBLUE-SCR DIESEL VEHICLES total to pay 7.99",
+        )
+        self.assertEqual((code, name), ("404", "Vehicle Repairs and Maintenance"))
+
     def test_gsf_car_parts_overrides_fuel_to_repairs(self):
         _segments, code, name = _apply_receipt_account_guardrails(
             [], "450", "Van Fuel", 57.08, self.accounts,

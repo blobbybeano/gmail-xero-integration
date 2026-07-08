@@ -1594,9 +1594,14 @@ def _ai_receipt_hints_block(db_path: str) -> str:
         "Built-in Powwash coding rules:\n"
         "- Only use a fuel account when the receipt clearly looks like a petrol "
         "station / forecourt fuel receipt, with evidence such as litres, pump, "
-        "unleaded, petrol, diesel, fuel grade, or a known fuel-station merchant.\n"
-        "- Diesel / DERV / AdBlue receipts are van or motor-vehicle fuel. Never "
+        "unleaded, petrol, diesel, fuel grade, or a known fuel-station merchant "
+        "plus fuel-product evidence.\n"
+        "- Shell/BP/Esso/etc receipts showing FS Unleaded, diesel, litres, pump "
+        "or fuel grade are fuel even if the legal trading name contains Garage "
+        "or Garages.\n"
+        "- Diesel / DERV receipts are van or motor-vehicle fuel. Never "
         "code diesel to machinery fuel or machinery expenses.\n"
+        "- AdBlue / SCR diesel vehicle fluid is vehicle maintenance, not fuel.\n"
         "- Unleaded / petrol / E10 / E5 receipts are machinery fuel when that "
         "account exists.\n"
         "- Tyre shops, garages, MOT, brakes, exhausts, batteries, wheel alignment "
@@ -2020,6 +2025,8 @@ def _looks_like_fuel_receipt(merchant: str = "", raw_text: str = "") -> bool:
     text = _receipt_rule_text(merchant, raw_text)
     if not text:
         return False
+    if _looks_like_adblue_vehicle_fluid(merchant, raw_text):
+        return False
     station_terms = (
         "shell", "esso", "bp", "texaco", "gulf", "jet", "applegreen",
         "harvest energy", "morrisons petrol", "tesco petrol", "sainsburys petrol",
@@ -2028,7 +2035,7 @@ def _looks_like_fuel_receipt(merchant: str = "", raw_text: str = "") -> bool:
     )
     fuel_terms = (
         "diesel", "derv", "unleaded", "petrol", "fuel", "litre", "litres", " ltr ",
-        "pump", "adblue", "v power", "e10", "e5",
+        "pump", "fs unleaded", "v power", "e10", "e5",
     )
     has_station = any(t in text for t in station_terms)
     has_fuel = any(t in text for t in fuel_terms) or bool(
@@ -2037,6 +2044,14 @@ def _looks_like_fuel_receipt(merchant: str = "", raw_text: str = "") -> bool:
     # A petrol station shop receipt can be food only, so known merchant alone is
     # not enough. We need some product/forecourt evidence too.
     return has_fuel or ("forecourt" in text and has_station)
+
+
+def _looks_like_adblue_vehicle_fluid(merchant: str = "", raw_text: str = "") -> bool:
+    text = _receipt_rule_text(merchant, raw_text)
+    return any(t in text for t in (
+        "adblue", "ad blue", "ad-blue", "scr diesel vehicles",
+        "diesel exhaust fluid", "def fluid",
+    ))
 
 
 def _looks_like_vehicle_maintenance(merchant: str = "", raw_text: str = "") -> bool:
@@ -2050,6 +2065,8 @@ def _looks_like_vehicle_maintenance(merchant: str = "", raw_text: str = "") -> b
         "car parts", "gsf car parts", "euro car parts", "autoglass",
         "service repair", "vehicle service", "van service", "servicing",
         "diagnostic", "breakdown", "recovery", "commercial repairs",
+        "adblue", "ad blue", "ad-blue", "scr diesel vehicles",
+        "diesel exhaust fluid", "screenwash", "coolant", "engine oil",
     )
     return any(t in text for t in terms)
 
@@ -2158,7 +2175,7 @@ def _pick_fuel_account(total, accounts, raw_text="") -> "tuple[str, str]":
     """Choose the right fuel account from deterministic receipt evidence."""
     (m_code, m_name), (v_code, v_name) = _find_fuel_accounts(accounts)
     text = _receipt_rule_text("", raw_text)
-    is_diesel = "diesel" in text or "derv" in text or "adblue" in text
+    is_diesel = "diesel" in text or "derv" in text
     is_petrol = any(t in text for t in ("unleaded", "petrol", "e10", "e5", "v power"))
     if is_diesel:
         return (v_code, v_name) if v_code else _find_vehicle_expense_account(accounts)
@@ -2270,11 +2287,6 @@ def _apply_receipt_account_guardrails(
         _set_single(code, name)
         return segments, cat_code, cat_name
 
-    if _looks_like_vehicle_maintenance(merchant, raw_text):
-        code, name = _find_vehicle_maintenance_account(accounts)
-        _set_single(code, name) if code else _clear_single()
-        return segments, cat_code, cat_name
-
     if _looks_like_parking(merchant, raw_text):
         code, name = _find_account_by_terms(
             accounts,
@@ -2282,6 +2294,11 @@ def _apply_receipt_account_guardrails(
             exclude_terms=("fuel",),
         )
         _set_single(code, name)
+        return segments, cat_code, cat_name
+
+    if _looks_like_adblue_vehicle_fluid(merchant, raw_text):
+        code, name = _find_vehicle_maintenance_account(accounts)
+        _set_single(code, name) if code else _clear_single()
         return segments, cat_code, cat_name
 
     is_fuel_receipt = _looks_like_fuel_receipt(merchant, raw_text)
@@ -2294,6 +2311,11 @@ def _apply_receipt_account_guardrails(
             _set_single(pick_code, pick_name)
             return _apply_fuel_threshold(segments, cat_code, cat_name, total, accounts, raw_text)
         _clear_single()
+        return segments, cat_code, cat_name
+
+    if _looks_like_vehicle_maintenance(merchant, raw_text):
+        code, name = _find_vehicle_maintenance_account(accounts)
+        _set_single(code, name) if code else _clear_single()
         return segments, cat_code, cat_name
 
     if _looks_like_materials(merchant, raw_text):
@@ -17706,11 +17728,22 @@ body {{ background:#f7f6f3 !important; }}
             )
         view_html = ""
         if item.get("stored_file"):
+            img_url = (
+                "/receipts/expenses/dump/" + batch_id + "/item/"
+                + item["id"] + "/image"
+            )
+            is_preview_image = str(item.get("mime_type") or "").lower().startswith("image/")
+            preview_attrs = (
+                "data-preview-url='" + img_url + "' "
+                "data-preview-title='" + escape(item.get("merchant") or "Receipt") + "' "
+                if is_preview_image else ""
+            )
             view_html = (
-                "<a href='/receipts/expenses/dump/" + batch_id + "/item/"
-                + item["id"] + "/image' target='_blank' rel='noopener' "
+                "<a href='" + img_url + "' target='_blank' rel='noopener' "
+                + preview_attrs +
                 "class='inline-flex items-center gap-1 mt-2 px-2.5 py-1 text-xs "
-                "font-medium bg-sky-100 text-sky-800 rounded-lg hover:bg-sky-200'>"
+                "font-medium bg-sky-100 text-sky-800 rounded-lg hover:bg-sky-200 "
+                + ("dump-preview-link" if is_preview_image else "") + "'>"
                 "<svg class='w-3.5 h-3.5' fill='none' stroke='currentColor' "
                 "stroke-width='2' viewBox='0 0 24 24'><path stroke-linecap='round' "
                 "stroke-linejoin='round' d='M2.036 12.322a1.012 1.012 0 010-.639C3.423 "
@@ -17982,6 +18015,50 @@ body {{ background:#f7f6f3 !important; }}
             + "</div></div>"
         )
 
+    def _dump_refresh_account_guardrails(db: str, items: list, exp_accounts: list) -> list:
+        """Re-apply current deterministic coding rules to existing dump rows.
+
+        This lets a batch created before a guardrail improvement render with the
+        corrected account instead of preserving an older AI mistake forever.
+        Imported rows are left untouched because they already represent a Xero
+        submission.
+        """
+        if not exp_accounts:
+            return items
+        refreshed: list = []
+        for item in items:
+            if item.get("status") == dump_store.STATUS_IMPORTED:
+                refreshed.append(item)
+                continue
+            segments = item.get("segments") or []
+            new_segments, code, name = _apply_receipt_account_guardrails(
+                segments,
+                item.get("category_account_code") or "",
+                item.get("category_account_name") or "",
+                item.get("amount_inc"),
+                exp_accounts,
+                item.get("merchant") or "",
+                item.get("ocr_raw") or "",
+            )
+            changed = (
+                (code or "") != (item.get("category_account_code") or "")
+                or (name or "") != (item.get("category_account_name") or "")
+                or json.dumps(new_segments or [], sort_keys=True)
+                != json.dumps(segments or [], sort_keys=True)
+            )
+            if changed:
+                updated = dump_store.update_item(
+                    db,
+                    item["id"],
+                    category_account_code=code or "",
+                    category_account_name=name or "",
+                    segments=new_segments or [],
+                    is_split=bool(new_segments and len(new_segments) > 1),
+                )
+                item = updated or item
+            refreshed.append(item)
+        return refreshed
+
     @app.get("/receipts/expenses/dump/<batch_id>/item/<item_id>/image")
     @require_login
     def expense_dump_item_image(batch_id, item_id):
@@ -18084,6 +18161,7 @@ body {{ background:#f7f6f3 !important; }}
             exp_accounts, _ = _get_xero_expense_accounts(_at, _tid, db)
         except Exception:
             exp_accounts = []
+        items = _dump_refresh_account_guardrails(db, items, exp_accounts)
         eng_map = {e["id"]: e["name"] for e in exp_store.list_engineers(db)}
         sub_summary = _dump_sub_summary(batch, items)
         is_sub = sub_summary is not None
@@ -18209,6 +18287,38 @@ body {{ background:#f7f6f3 !important; }}
             "hover:text-rose-800 hover:bg-rose-50 px-2.5 py-1 rounded-lg'>"
             "Delete dump</button></form></div>"
         )
+        preview_modal = (
+            "<div id='dump-receipt-preview' class='hidden fixed inset-0 z-50 "
+            "bg-gray-950/70 items-center justify-center p-3 sm:p-6'>"
+            "<div class='relative w-full max-w-3xl bg-white rounded-xl shadow-2xl "
+            "border border-gray-200 overflow-hidden'>"
+            "<div class='flex items-center justify-between gap-3 px-4 py-3 "
+            "border-b border-gray-200'>"
+            "<div id='dump-preview-title' class='text-sm font-semibold text-gray-800 "
+            "truncate'>Receipt</div>"
+            "<button type='button' data-preview-close='1' class='w-8 h-8 rounded-lg "
+            "text-gray-500 hover:bg-gray-100 text-xl leading-none'>&times;</button>"
+            "</div>"
+            "<div class='bg-gray-100 p-2 sm:p-4 flex items-center justify-center'>"
+            "<img id='dump-preview-img' alt='Receipt preview' class='max-h-[78vh] "
+            "max-w-full object-contain bg-white rounded-lg shadow-sm'>"
+            "</div></div></div>"
+            "<script>(function(){"
+            "var modal=document.getElementById('dump-receipt-preview');"
+            "var img=document.getElementById('dump-preview-img');"
+            "var title=document.getElementById('dump-preview-title');"
+            "function closePreview(){if(!modal)return;modal.classList.add('hidden');"
+            "modal.classList.remove('flex');if(img)img.removeAttribute('src');}"
+            "document.addEventListener('click',function(e){"
+            "var a=e.target.closest&&e.target.closest('.dump-preview-link');"
+            "if(a){e.preventDefault();if(title)title.textContent=a.dataset.previewTitle||'Receipt';"
+            "if(img)img.src=a.dataset.previewUrl||a.href;modal.classList.remove('hidden');"
+            "modal.classList.add('flex');return;}"
+            "if(e.target===modal||(e.target.closest&&e.target.closest('[data-preview-close]'))){"
+            "closePreview();}});"
+            "document.addEventListener('keydown',function(e){if(e.key==='Escape')closePreview();});"
+            "})();</script>"
+        )
         body = (
             "<div class='max-w-3xl mx-auto px-4 py-8'>"
             "<div class='flex items-center justify-between mb-4'>"
@@ -18223,6 +18333,7 @@ body {{ background:#f7f6f3 !important; }}
             "receipts in this batch.</p>")
             + bottom_outstanding_html + import_bar
             + "</div>"
+            + preview_modal
         )
         return _page(body)
 
