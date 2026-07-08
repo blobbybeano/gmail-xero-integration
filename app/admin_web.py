@@ -17453,6 +17453,33 @@ body {{ background:#f7f6f3 !important; }}
             return dump_store.get_batch(db, batch["id"]) or batch
         return batch
 
+    def _dump_startup_recover_stuck_batches():
+        """On app boot, recover receipt dumps killed by deploy/restart.
+
+        The normal status-page recovery still exists, but it only runs when a
+        browser polls that exact batch. A Fly deploy can kill the background
+        reader after most files are processed, leaving the user staring at the
+        last completed number. This startup pass is deliberately conservative:
+        _dump_stuck_recover only relaunches batches whose heartbeat is stale,
+        and _dump_process skips staged files already recorded for the batch.
+        """
+        def _bg():
+            try:
+                time.sleep(3)
+                db_path = config.admin_db_file
+                for b in dump_store.list_batches(db_path, limit=20):
+                    if (b.get("status") or "") in ("processing", "finalizing"):
+                        _dump_stuck_recover(db_path, b)
+            except Exception as exc:
+                print(
+                    "[receipt-dump] startup recovery check failed: "
+                    + str(exc).splitlines()[0][:180],
+                    flush=True,
+                )
+        threading.Thread(target=_bg, daemon=True).start()
+
+    _dump_startup_recover_stuck_batches()
+
     def _dump_progress_numbers(batch, item_count: int = 0) -> tuple[int, int]:
         """Return (source files processed, source files total).
 
