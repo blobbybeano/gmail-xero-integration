@@ -212,6 +212,15 @@ _BASE_HTML = """<!DOCTYPE html>
   .status-dot-green {{ display:inline-block;width:10px;height:10px;border-radius:50%;background:#22c55e;margin-right:6px; }}
   .status-dot-red {{ display:inline-block;width:10px;height:10px;border-radius:50%;background:#ef4444;margin-right:6px; }}
   .status-dot-yellow {{ display:inline-block;width:10px;height:10px;border-radius:50%;background:#f59e0b;margin-right:6px; }}
+  main[data-receipt-page] {{ opacity:1; transform:translateY(0); transition:opacity .18s ease, transform .18s ease; animation:receiptPageIn .18s ease both; }}
+  body.receipt-page-leaving main[data-receipt-page] {{ opacity:0; transform:translateY(7px); }}
+  .receipt-mode-card {{ transition:height .2s ease, transform .2s ease, opacity .2s ease, background-color .2s ease, color .2s ease, border-color .2s ease, box-shadow .2s ease; }}
+  .receipt-mode-card.receipt-mode-selected {{ height:9rem!important; transform:scale(1)!important; opacity:1!important; box-shadow:0 1px 2px rgba(15,23,42,.08)!important; }}
+  .receipt-mode-card.receipt-mode-muted {{ height:7rem!important; transform:scale(.94)!important; opacity:.48!important; box-shadow:none!important; }}
+  @keyframes receiptPageIn {{ from {{ opacity:0; transform:translateY(7px); }} to {{ opacity:1; transform:translateY(0); }} }}
+  @media (prefers-reduced-motion: reduce) {{
+    main[data-receipt-page], .receipt-mode-card {{ transition:none!important; animation:none!important; }}
+  }}
 </style>
 <script>
 // Suppress JSON-parse SyntaxErrors that arise when a polling fetch follows a
@@ -230,6 +239,25 @@ window.addEventListener('error', function(e) {{
   if (msg.indexOf('end of input') !== -1 || msg.indexOf('Unexpected token') !== -1) {{
     e.preventDefault();
   }}
+}});
+document.addEventListener('click', function(e) {{
+  var link = e.target && e.target.closest ? e.target.closest('a[data-receipt-mode-link]') : null;
+  if (!link || e.defaultPrevented || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || link.target) return;
+  var href = link.getAttribute('href') || '';
+  if (!href || href === window.location.pathname) return;
+  e.preventDefault();
+  var targetMode = link.getAttribute('data-mode-target') || '';
+  document.querySelectorAll('.receipt-mode-card').forEach(function(card) {{
+    if (card.getAttribute('data-mode') === targetMode) {{
+      card.classList.add('receipt-mode-selected');
+      card.classList.remove('receipt-mode-muted');
+    }} else {{
+      card.classList.add('receipt-mode-muted');
+      card.classList.remove('receipt-mode-selected');
+    }}
+  }});
+  document.body.classList.add('receipt-page-leaving');
+  window.setTimeout(function() {{ window.location.href = href; }}, 170);
 }});
 </script>
 </head>
@@ -11813,9 +11841,10 @@ body {{ background:#f7f6f3 !important; }}
             title_cls = "text-base" if is_active else "text-sm"
             sub_cls = "text-xs opacity-80" if is_active else "text-[11px] opacity-70"
             return (
-                f"<a href='{escape(href)}' "
+                f"<a href='{escape(href)}' data-receipt-mode-link data-mode-target='{escape(mode)}' "
+                f"data-mode='{escape(mode)}' data-active='{'true' if is_active else 'false'}' "
                 "class='flex flex-col items-center justify-center w-full rounded-2xl "
-                f"cursor-pointer transition-all duration-200 ease-out {size} {bg}'>"
+                f"cursor-pointer receipt-mode-card transition-all duration-200 ease-out {size} {bg}'>"
                 f"<span class='{icon_cls}'>{icon}</span>"
                 f"<span class='mt-2 {title_cls} font-semibold'>{escape(title)}</span>"
                 f"<span class='{sub_cls} mt-0.5'>{escape(sub)}</span>"
@@ -12657,7 +12686,7 @@ body {{ background:#f7f6f3 !important; }}
 
         return _page(
             f"""
-            <main class="max-w-xl mx-auto p-4 space-y-4">
+            <main data-receipt-page class="max-w-xl mx-auto p-4 space-y-4">
               <div class="pt-2 flex items-start justify-between">
                 <div>
                   <div class="text-xs text-gray-500">Field Expenses</div>
@@ -12674,9 +12703,10 @@ body {{ background:#f7f6f3 !important; }}
                     enctype="multipart/form-data">
                 {paid_with_html}
                 <label for="exp-file"
+                       data-mode="expense" data-active="true"
                        class="flex flex-col items-center justify-center w-full h-36
                               rounded-2xl bg-indigo-600 text-white cursor-pointer
-                              active:bg-indigo-700 shadow-sm transition-all duration-200 ease-out">
+                              active:bg-indigo-700 shadow-sm receipt-mode-card transition-all duration-200 ease-out">
                   <span class="text-4xl">&#128247;</span>
                   <span class="mt-2 text-base font-semibold">Expense receipt</span>
                   <span class="text-xs opacity-80 mt-0.5">Fuel, parts, tools</span>
@@ -12686,9 +12716,10 @@ body {{ background:#f7f6f3 !important; }}
                        style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none">
               </form>
               <a href="/expenses/{escape(token)}/customer-receipts"
+                 data-receipt-mode-link data-mode-target="customer" data-mode="customer" data-active="false"
                  class="flex flex-col items-center justify-center w-full h-28 scale-[.94]
                         rounded-2xl bg-emerald-50 text-emerald-800 border border-emerald-100
-                        cursor-pointer opacity-55 transition-all duration-200 ease-out">
+                        cursor-pointer opacity-55 receipt-mode-card transition-all duration-200 ease-out">
                 <span class="text-3xl">&#128179;</span>
                 <span class="mt-2 text-sm font-semibold">Customer receipt</span>
                 <span class="text-[11px] opacity-70 mt-0.5">Card terminal photo</span>
@@ -12779,7 +12810,7 @@ body {{ background:#f7f6f3 !important; }}
             "text-center text-sm text-gray-500'>No nearby calendar jobs found.</div>"
         )
         return _page(f"""
-        <main class="max-w-xl mx-auto p-4 space-y-4">
+        <main data-receipt-page class="max-w-xl mx-auto p-4 space-y-4">
           <div class="pt-2 flex items-center justify-between">
             <a href="/expenses/{escape(token)}" class="text-sm text-indigo-600">&larr; Back</a>
             <span class="text-xs text-gray-500">Customer receipts</span>
@@ -12817,7 +12848,7 @@ body {{ background:#f7f6f3 !important; }}
             "This job does not have a linked invoice yet. The photo can only attach after the invoice exists.</div>"
         )
         return _page(f"""
-        <main class="max-w-xl mx-auto p-4 space-y-4">
+        <main data-receipt-page class="max-w-xl mx-auto p-4 space-y-4">
           <div class="pt-2 flex items-center justify-between">
             <a href="/expenses/{escape(token)}/customer-receipts" class="text-sm text-indigo-600">&larr; Jobs</a>
             <span class="text-xs text-gray-500">Customer receipt</span>
