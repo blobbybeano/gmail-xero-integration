@@ -12246,6 +12246,99 @@ body {{ background:#f7f6f3 !important; }}
             print(f"[expense-photo-pullback] failed: {e}", flush=True)
             return ""
 
+    def _customer_receipt_amount_hint(description: str) -> str:
+        text = description or ""
+        m = re.search(r"Invoice total\s*\(inc VAT\)\s*:\s*£?\s*([0-9]+(?:\.[0-9]{1,2})?)", text, re.I)
+        if m:
+            return f"£{float(m.group(1)):.2f}"
+        try:
+            lines = extract_sales_lines(text)
+        except Exception:
+            lines = []
+        total = 0.0
+        for li in lines or []:
+            try:
+                qty = float(li.get("Quantity") or 1)
+                unit = float(li.get("UnitAmount") or 0)
+            except (TypeError, ValueError):
+                continue
+            total += qty * unit
+        if total > 0:
+            return f"£{(total * 1.2):.2f}"
+        return ""
+
+    def _customer_receipt_jobs_for_engineer(eng, *, days_back: int = 14, days_forward: int = 14) -> list[dict]:
+        creds = load_admin_credentials(config)
+        if not creds:
+            return []
+        try:
+            svc = build_calendar_service(config)
+        except Exception as exc:
+            print(f"[customer-receipts] calendar unavailable: {exc}", flush=True)
+            return []
+        tz = dt.datetime.now().astimezone().tzinfo or dt.timezone.utc
+        now = dt.datetime.now(tz)
+        tmin = (now - dt.timedelta(days=days_back)).isoformat()
+        tmax = (now + dt.timedelta(days=days_forward)).isoformat()
+        state = load_state(config.state_file)
+        rows: list[dict] = []
+        for cal_id in _active_calendar_ids(config):
+            page_token = None
+            while True:
+                try:
+                    resp = (
+                        svc.events()
+                        .list(
+                            calendarId=cal_id,
+                            timeMin=tmin,
+                            timeMax=tmax,
+                            singleEvents=True,
+                            orderBy="startTime",
+                            maxResults=250,
+                            pageToken=page_token,
+                        )
+                        .execute()
+                    )
+                except Exception as exc:
+                    print(f"[customer-receipts] calendar read failed {cal_id}: {exc}", flush=True)
+                    break
+                for ev in resp.get("items") or []:
+                    if ev.get("status") == "cancelled":
+                        continue
+                    desc = ev.get("description") or ""
+                    pay = payment_choice(desc)
+                    # This is for terminal/card customer receipts. Keep likely
+                    # customer jobs visible even when payment type has not been
+                    # filled yet, but rank CARD entries first.
+                    fields = parse_customer_fields(desc)
+                    customer = fields.get("name") or ev.get("summary") or "Customer job"
+                    start_raw = (ev.get("start") or {}).get("dateTime") or (ev.get("start") or {}).get("date") or ""
+                    try:
+                        start_dt = dt.datetime.fromisoformat(start_raw.replace("Z", "+00:00")).astimezone(tz)
+                    except Exception:
+                        start_dt = now
+                    event_key = f"{cal_id}:{ev.get('id') or ''}"
+                    invoice_id = get_invoice_for_event(state, event_key) or ""
+                    rows.append({
+                        "calendar_id": cal_id,
+                        "event_id": ev.get("id") or "",
+                        "event_key": event_key,
+                        "summary": ev.get("summary") or "",
+                        "customer": customer,
+                        "start": start_dt,
+                        "amount": _customer_receipt_amount_hint(desc),
+                        "payment": pay,
+                        "invoice_id": invoice_id,
+                    })
+                page_token = resp.get("nextPageToken")
+                if not page_token:
+                    break
+        rows.sort(key=lambda r: (
+            0 if r.get("payment") == "card" else 1,
+            abs((r.get("start") - now).total_seconds()) if r.get("start") else 999999999,
+        ))
+        return rows[:80]
+
     @app.get("/expenses/<token>")
     def expense_engineer_home(token: str):
         db = config.admin_db_file
@@ -12276,6 +12369,12 @@ body {{ background:#f7f6f3 !important; }}
                 "<div class='rounded-xl border border-emerald-200 bg-emerald-50 "
                 "p-3 text-sm text-emerald-800 text-center'>&#10003; Receipt approved "
                 "&amp; saved.</div>"
+            )
+        elif flash == "customer_receipt":
+            flash_html = (
+                "<div class='rounded-xl border border-emerald-200 bg-emerald-50 "
+                "p-3 text-sm text-emerald-800 text-center'>&#10003; Customer "
+                "receipt attached to the invoice.</div>"
             )
         elif flash == "deleted":
             flash_html = (
@@ -12434,6 +12533,7 @@ body {{ background:#f7f6f3 !important; }}
               </div>
               {flash_html}
               {owed_html}
+              <div class="grid grid-cols-2 gap-3">
               <form id="exp-form" method="post"
                     action="/expenses/{escape(token)}/upload"
                     enctype="multipart/form-data">
@@ -12443,13 +12543,22 @@ body {{ background:#f7f6f3 !important; }}
                               rounded-2xl bg-indigo-600 text-white cursor-pointer
                               active:bg-indigo-700 shadow-sm">
                   <span class="text-4xl">&#128247;</span>
-                  <span class="mt-2 text-base font-semibold">Add a receipt</span>
-                  <span class="text-xs opacity-80 mt-0.5">Take a photo</span>
+                  <span class="mt-2 text-base font-semibold">Expense receipt</span>
+                  <span class="text-xs opacity-80 mt-0.5">Fuel, parts, tools</span>
                 </label>
                 <input id="exp-file" type="file" name="receipt_file"
                        accept="image/*" capture="environment"
                        style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none">
               </form>
+              <a href="/expenses/{escape(token)}/customer-receipts"
+                 class="flex flex-col items-center justify-center w-full h-36
+                        rounded-2xl bg-emerald-600 text-white cursor-pointer
+                        active:bg-emerald-700 shadow-sm">
+                <span class="text-4xl">&#128179;</span>
+                <span class="mt-2 text-base font-semibold">Customer receipt</span>
+                <span class="text-xs opacity-80 mt-0.5">Card terminal photo</span>
+              </a>
+              </div>
               {card_feed_html}
               <div>
                 <h2 class="text-sm font-semibold text-gray-500 uppercase tracking-wide
@@ -12482,6 +12591,175 @@ body {{ background:#f7f6f3 !important; }}
             </script>
             """
         )
+
+    @app.get("/expenses/<token>/customer-receipts")
+    def expense_customer_receipt_jobs(token: str):
+        db = config.admin_db_file
+        eng = exp_store.get_engineer_by_token(db, token)
+        if not eng or not eng.get("active"):
+            return _exp_error_page("This expenses link is not active.")
+        if session.get("engineer_id") != eng["id"]:
+            return redirect(url_for("portal_login"))
+        jobs = _customer_receipt_jobs_for_engineer(eng)
+        rows = []
+        for j in jobs:
+            start = j["start"].strftime("%a %-d %b, %H:%M")
+            amount = f"<span class='font-semibold text-gray-900'>{escape(j.get('amount') or '')}</span>" if j.get("amount") else ""
+            card = (
+                "<span class='inline-flex rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-700'>CARD</span>"
+                if j.get("payment") == "card" else
+                "<span class='inline-flex rounded-full bg-gray-100 px-2 py-0.5 text-[11px] font-semibold text-gray-500'>check payment type</span>"
+            )
+            inv = (
+                "<span class='inline-flex rounded-full bg-indigo-50 px-2 py-0.5 text-[11px] font-semibold text-indigo-700'>invoice linked</span>"
+                if j.get("invoice_id") else
+                "<span class='inline-flex rounded-full bg-amber-50 px-2 py-0.5 text-[11px] font-semibold text-amber-700'>invoice not linked yet</span>"
+            )
+            rows.append(
+                "<a class='block rounded-xl border border-gray-200 bg-white p-4 active:bg-gray-50' "
+                f"href='/expenses/{escape(token)}/customer-receipts/{escape(j['calendar_id'])}/{escape(j['event_id'])}'>"
+                "<div class='flex items-start justify-between gap-3'>"
+                "<div class='min-w-0'>"
+                f"<div class='font-semibold text-gray-900 truncate'>{escape(j['customer'])}</div>"
+                f"<div class='text-xs text-gray-500 mt-0.5'>{escape(j.get('summary') or '')}</div>"
+                f"<div class='text-xs text-gray-500 mt-1'>{escape(start)} {amount}</div>"
+                "</div>"
+                "<div class='text-right space-y-1 shrink-0'>"
+                f"{card}<br>{inv}"
+                "</div></div></a>"
+            )
+        body = "".join(rows) or (
+            "<div class='rounded-xl border border-dashed border-gray-300 bg-white p-6 "
+            "text-center text-sm text-gray-500'>No nearby calendar jobs found.</div>"
+        )
+        return _page(f"""
+        <main class="max-w-xl mx-auto p-4 space-y-4">
+          <div class="pt-2 flex items-center justify-between">
+            <a href="/expenses/{escape(token)}" class="text-sm text-indigo-600">&larr; Back</a>
+            <span class="text-xs text-gray-500">Customer receipts</span>
+          </div>
+          <div>
+            <h1 class="text-xl font-bold text-gray-900">Pick the customer job</h1>
+            <p class="text-sm text-gray-500 mt-1">Choose the diary entry, then photograph the card terminal receipt. It will be attached to that customer invoice.</p>
+          </div>
+          <div class="space-y-2">{body}</div>
+        </main>
+        """)
+
+    @app.get("/expenses/<token>/customer-receipts/<path:cal_id>/<event_id>")
+    def expense_customer_receipt_upload_page(token: str, cal_id: str, event_id: str):
+        db = config.admin_db_file
+        eng = exp_store.get_engineer_by_token(db, token)
+        if not eng or not eng.get("active"):
+            return _exp_error_page("This expenses link is not active.")
+        if session.get("engineer_id") != eng["id"]:
+            return redirect(url_for("portal_login"))
+        try:
+            ev = build_calendar_service(config).events().get(calendarId=cal_id, eventId=event_id).execute()
+        except Exception:
+            return _exp_error_page("Calendar job not found.")
+        desc = ev.get("description") or ""
+        fields = parse_customer_fields(desc)
+        customer = fields.get("name") or ev.get("summary") or "Customer job"
+        start_raw = (ev.get("start") or {}).get("dateTime") or (ev.get("start") or {}).get("date") or ""
+        amount = _customer_receipt_amount_hint(desc)
+        event_key = f"{cal_id}:{event_id}"
+        invoice_id = get_invoice_for_event(load_state(config.state_file), event_key) or ""
+        warn = "" if invoice_id else (
+            "<div class='rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800'>"
+            "This job does not have a linked invoice yet. The photo can only attach after the invoice exists.</div>"
+        )
+        return _page(f"""
+        <main class="max-w-xl mx-auto p-4 space-y-4">
+          <div class="pt-2 flex items-center justify-between">
+            <a href="/expenses/{escape(token)}/customer-receipts" class="text-sm text-indigo-600">&larr; Jobs</a>
+            <span class="text-xs text-gray-500">Customer receipt</span>
+          </div>
+          <div class="rounded-xl border border-gray-200 bg-white p-4">
+            <div class="text-xs text-gray-500">Attach card terminal receipt to</div>
+            <h1 class="text-xl font-bold text-gray-900 mt-1">{escape(customer)}</h1>
+            <div class="text-sm text-gray-500 mt-1">{escape(ev.get('summary') or '')}</div>
+            <div class="text-sm text-gray-500 mt-1">{escape(start_raw)} {escape(amount)}</div>
+          </div>
+          {warn}
+          <form id="cust-receipt-form" method="post"
+                action="/expenses/{escape(token)}/customer-receipts/{escape(cal_id)}/{escape(event_id)}"
+                enctype="multipart/form-data">
+            <label for="cust-receipt-file"
+                   class="flex flex-col items-center justify-center w-full h-44 rounded-2xl bg-emerald-600 text-white cursor-pointer active:bg-emerald-700 shadow-sm">
+              <span class="text-4xl">&#128247;</span>
+              <span class="mt-2 text-base font-semibold">Photograph customer receipt</span>
+              <span class="text-xs opacity-80 mt-0.5">Card terminal slip</span>
+            </label>
+            <input id="cust-receipt-file" type="file" name="receipt_file"
+                   accept="image/*" capture="environment"
+                   style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none">
+          </form>
+        </main>
+        <div id="cust-overlay"
+             style="display:none;position:fixed;inset:0;background:rgba(255,255,255,.92);
+                    z-index:50;align-items:center;justify-content:center;flex-direction:column;">
+          <svg class="animate-spin h-8 w-8 text-emerald-600" xmlns="http://www.w3.org/2000/svg"
+               fill="none" viewBox="0 0 24 24">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"></path>
+          </svg>
+          <div class="mt-3 text-sm font-medium text-gray-700">Attaching receipt&hellip;</div>
+        </div>
+        <script>
+        (function() {{
+          var inp = document.getElementById('cust-receipt-file');
+          var form = document.getElementById('cust-receipt-form');
+          var overlay = document.getElementById('cust-overlay');
+          inp.addEventListener('change', function() {{
+            if (!inp.files || !inp.files.length) return;
+            if (overlay) overlay.style.display = 'flex';
+            if (form.requestSubmit) {{ form.requestSubmit(); }} else {{ form.submit(); }}
+          }});
+        }})();
+        </script>
+        """)
+
+    @app.post("/expenses/<token>/customer-receipts/<path:cal_id>/<event_id>")
+    def expense_customer_receipt_upload(token: str, cal_id: str, event_id: str):
+        db = config.admin_db_file
+        eng = exp_store.get_engineer_by_token(db, token)
+        if not eng or not eng.get("active"):
+            return _exp_error_page("This expenses link is not active.")
+        if session.get("engineer_id") != eng["id"]:
+            return redirect(url_for("portal_login"))
+        file = request.files.get("receipt_file")
+        if not file or not file.filename:
+            return redirect(f"/expenses/{token}/customer-receipts/{cal_id}/{event_id}")
+        file_bytes = file.read() or b""
+        filename = file.filename or "customer-receipt.jpg"
+        content_type = _exp_sniff_mime(file_bytes[:16])
+        if content_type is None or not content_type.startswith("image/"):
+            return _exp_error_page("Please upload a photo of the customer receipt.", 400)
+        file_bytes, filename, content_type = _exp_resize_for_ocr(file_bytes, filename, content_type)
+        event_key = f"{cal_id}:{event_id}"
+        invoice_id = get_invoice_for_event(load_state(config.state_file), event_key) or ""
+        if not invoice_id:
+            return _exp_error_page("This calendar job does not have a linked invoice yet. Process the invoice first, then attach the receipt.", 400)
+        if xero_is_disabled():
+            return _exp_error_page("Xero is paused, so the receipt cannot be attached yet.", 400)
+        try:
+            client = build_xero_client(config)
+            client.attach_file_to_invoice(invoice_id, filename, content_type, file_bytes)
+            try:
+                ev = build_calendar_service(config).events().get(calendarId=cal_id, eventId=event_id).execute()
+                old_desc = ev.get("description") or ""
+                stamp = dt.datetime.now().strftime("%-d %b %Y %H:%M")
+                line = f"Customer receipt attached ✓ {stamp}"
+                new_desc = old_desc if line in old_desc else (old_desc.rstrip() + "\n" + line).strip()
+                if new_desc != old_desc:
+                    update_event_description(config, event_id, new_desc, calendar_id=cal_id)
+            except Exception as exc:
+                print(f"[customer-receipts] calendar note failed {event_key}: {exc}", flush=True)
+            _feed.push(f"Customer receipt attached to invoice for {event_key}", "success")
+        except Exception as exc:
+            return _exp_error_page("Customer receipt could not be attached: " + str(exc).splitlines()[0][:180], 500)
+        return redirect(f"/expenses/{token}?flash=customer_receipt")
 
     @app.post("/expenses/<token>/upload")
     def expense_engineer_upload(token: str):
