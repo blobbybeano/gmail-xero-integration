@@ -12267,6 +12267,12 @@ body {{ background:#f7f6f3 !important; }}
             return f"£{(total * 1.2):.2f}"
         return ""
 
+    def _customer_receipt_calendar_ids_for_engineer(eng) -> list[str]:
+        selected = str((eng or {}).get("customer_calendar_id") or "").strip()
+        if selected:
+            return [selected]
+        return _active_calendar_ids(config)
+
     def _customer_receipt_jobs_for_engineer(eng, *, days_back: int = 14, days_forward: int = 14) -> list[dict]:
         creds = load_admin_credentials(config)
         if not creds:
@@ -12282,7 +12288,7 @@ body {{ background:#f7f6f3 !important; }}
         tmax = (now + dt.timedelta(days=days_forward)).isoformat()
         state = load_state(config.state_file)
         rows: list[dict] = []
-        for cal_id in _active_calendar_ids(config):
+        for cal_id in _customer_receipt_calendar_ids_for_engineer(eng):
             page_token = None
             while True:
                 try:
@@ -12338,6 +12344,28 @@ body {{ background:#f7f6f3 !important; }}
             abs((r.get("start") - now).total_seconds()) if r.get("start") else 999999999,
         ))
         return rows[:80]
+
+    def _save_customer_receipt_match(event_key: str, details: dict) -> None:
+        if not event_key:
+            return
+        try:
+            rows = get_json_setting(config.admin_db_file, "customer_receipt_details", {}) or {}
+            rows[event_key] = {
+                **(rows.get(event_key) or {}),
+                **details,
+                "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            }
+            # Keep the store bounded; latest 1000 is plenty for Cashflows lookups.
+            if len(rows) > 1000:
+                ordered = sorted(
+                    rows.items(),
+                    key=lambda kv: str((kv[1] or {}).get("updated_at") or ""),
+                    reverse=True,
+                )
+                rows = dict(ordered[:1000])
+            set_json_setting(config.admin_db_file, "customer_receipt_details", rows)
+        except Exception as exc:
+            print(f"[customer-receipts] metadata save failed {event_key}: {exc}", flush=True)
 
     @app.get("/expenses/<token>")
     def expense_engineer_home(token: str):
@@ -12743,21 +12771,73 @@ body {{ background:#f7f6f3 !important; }}
             return _exp_error_page("This calendar job does not have a linked invoice yet. Process the invoice first, then attach the receipt.", 400)
         if xero_is_disabled():
             return _exp_error_page("Xero is paused, so the receipt cannot be attached yet.", 400)
+        stored_file = ""
         try:
+            parsed = {}
+            try:
+                svc = ReceiptService(config)
+                parsed = svc.analyze_upload(
+                    file_bytes=file_bytes,
+                    filename=filename,
+                    mime_type=content_type,
+                )
+                stored_file = str(parsed.get("stored_file") or "")
+                if not parsed.get("transaction_ref"):
+                    parsed["transaction_ref"] = (
+                        svc._parse_best_effort(parsed.get("raw_text") or "").get("transaction_ref", "")
+                    )
+            except Exception as exc:
+                parsed = {"ocr_error": str(exc).splitlines()[0][:180]}
             client = build_xero_client(config)
             client.attach_file_to_invoice(invoice_id, filename, content_type, file_bytes)
+            _save_customer_receipt_match(event_key, {
+                "invoice_id": invoice_id,
+                "calendar_id": cal_id,
+                "event_id": event_id,
+                "engineer_id": eng.get("id"),
+                "engineer_name": eng.get("name") or "",
+                "merchant": parsed.get("merchant") or "",
+                "amount": parsed.get("total"),
+                "date": parsed.get("date") or "",
+                "currency": parsed.get("currency") or "GBP",
+                "transaction_ref": parsed.get("transaction_ref") or "",
+                "raw_text": (parsed.get("raw_text") or "")[:3000],
+                "ocr_error": parsed.get("ocr_error") or "",
+            })
             try:
                 ev = build_calendar_service(config).events().get(calendarId=cal_id, eventId=event_id).execute()
                 old_desc = ev.get("description") or ""
                 stamp = dt.datetime.now().strftime("%-d %b %Y %H:%M")
-                line = f"Customer receipt attached ✓ {stamp}"
-                new_desc = old_desc if line in old_desc else (old_desc.rstrip() + "\n" + line).strip()
+                detail_bits = []
+                if parsed.get("total") is not None:
+                    try:
+                        detail_bits.append(f"£{float(parsed.get('total')):.2f}")
+                    except (TypeError, ValueError):
+                        pass
+                if parsed.get("date"):
+                    detail_bits.append(str(parsed.get("date")))
+                if parsed.get("transaction_ref"):
+                    detail_bits.append("ref " + str(parsed.get("transaction_ref")))
+                detail = (" — " + ", ".join(detail_bits)) if detail_bits else ""
+                line = f"Customer receipt attached ✓ {stamp}{detail}"
+                old_clean = re.sub(r"\n?Customer receipt attached ✓[^\n]*", "", old_desc).rstrip()
+                new_desc = (old_clean + "\n" + line).strip()
                 if new_desc != old_desc:
                     update_event_description(config, event_id, new_desc, calendar_id=cal_id)
             except Exception as exc:
                 print(f"[customer-receipts] calendar note failed {event_key}: {exc}", flush=True)
+            if stored_file:
+                try:
+                    os.remove(stored_file)
+                except OSError:
+                    pass
             _feed.push(f"Customer receipt attached to invoice for {event_key}", "success")
         except Exception as exc:
+            if stored_file:
+                try:
+                    os.remove(stored_file)
+                except OSError:
+                    pass
             return _exp_error_page("Customer receipt could not be attached: " + str(exc).splitlines()[0][:180], 500)
         return redirect(f"/expenses/{token}?flash=customer_receipt")
 
@@ -13979,6 +14059,39 @@ body {{ background:#f7f6f3 !important; }}
                     return f"{_n} ••{_mask}" if _mask else _n
             return f"••{_mask}" if _mask else account_id
 
+        active_calendar_ids = _active_calendar_ids(config)
+        calendar_labels: dict[str, str] = {}
+        try:
+            creds = load_admin_credentials(config)
+            if creds:
+                for cal in list_calendars(creds):
+                    cid = str(cal.get("id") or "").strip()
+                    if cid:
+                        calendar_labels[cid] = (
+                            cal.get("summary_display")
+                            or cal.get("summary")
+                            or cid
+                        )
+        except Exception:
+            calendar_labels = {}
+
+        for cid in active_calendar_ids:
+            calendar_labels.setdefault(cid, cid)
+
+        def _calendar_options_html(selected: str) -> str:
+            sel = str(selected or "").strip()
+            out = "<option value=''>All active calendars</option>"
+            found = False
+            for cid in active_calendar_ids:
+                label = calendar_labels.get(cid) or cid
+                is_sel = " selected" if cid == sel else ""
+                if is_sel:
+                    found = True
+                out += f"<option value='{escape(cid)}'{is_sel}>{escape(label)}</option>"
+            if sel and not found:
+                out += f"<option value='{escape(sel)}' selected>Saved calendar ({escape(sel)})</option>"
+            return out
+
         def _setup_mark(text: str) -> str:
             return (
                 "<span title='" + escape(text) + "' "
@@ -14268,6 +14381,14 @@ body {{ background:#f7f6f3 !important; }}
                 "Linked card <span class='text-gray-400 font-normal'>(which Plaid card does this person hold?)</span>"
                 f"{_card_mark}</label>"
                 f"{card_field}</div>"
+                "<div class='sm:col-span-2'>"
+                "<label class='block text-xs text-gray-500 mb-1'>Customer receipt calendar "
+                "<span class='text-gray-400 font-normal'>(used for the customer card-receipt job list)</span></label>"
+                f"<select name='customer_calendar_id' class='{_sel_cls}'>"
+                + _calendar_options_html(e.get("customer_calendar_id") or "")
+                + "</select>"
+                "<p class='text-[11px] text-gray-400 mt-1'>Set this to the engineer's own diary so their customer-receipt screen does not scan every calendar.</p>"
+                "</div>"
                 "<div><label class='block text-xs text-gray-500 mb-1'>Name</label>"
                 f"<input name='name' value='{escape(e['name'])}' "
                 "class='w-full rounded border border-gray-300 px-2 py-1 text-sm'></div>"
@@ -14500,6 +14621,16 @@ body {{ background:#f7f6f3 !important; }}
             + _create_card_inner
             + "</div>"
         )
+        _create_calendar_field_html = (
+            "<div class='sm:col-span-3'>"
+            "<label class='block text-xs text-gray-500 mb-1'>Customer receipt calendar</label>"
+            "<select name='customer_calendar_id' "
+            "class='w-full rounded border border-gray-300 bg-white px-3 py-2 text-sm'>"
+            + _calendar_options_html("")
+            + "</select>"
+            "<p class='text-[11px] text-gray-400 mt-1'>Choose the engineer's own calendar for card-terminal receipt uploads.</p>"
+            "</div>"
+        )
         if owner_paid_accounts:
             _create_owner_account_inner = (
                 "<select name='owner_paid_account_code' "
@@ -14594,6 +14725,7 @@ body {{ background:#f7f6f3 !important; }}
                     </select>
                   </div>
                   {_create_card_field_html}
+                  {_create_calendar_field_html}
                   {_create_owner_field_html}
                   <div class="sm:col-span-3">
                     <button type="submit"
@@ -14678,6 +14810,9 @@ body {{ background:#f7f6f3 !important; }}
             db,
             name=name,
             kind=kind,
+            customer_calendar_id=(
+                request.form.get("customer_calendar_id") or ""
+            ).strip(),
             allow_owner_paid=1 if request.form.get("allow_owner_paid") else 0,
             owner_paid_account_code=(
                 request.form.get("owner_paid_account_code") or ""
@@ -14708,6 +14843,7 @@ body {{ background:#f7f6f3 !important; }}
             xero_contact_name=(request.form.get("xero_contact_name") or "").strip(),
             expense_account_code=(request.form.get("expense_account_code") or "").strip(),
             payment_account_code=(request.form.get("payment_account_code") or "").strip(),
+            customer_calendar_id=(request.form.get("customer_calendar_id") or "").strip(),
             plaid_account_id=new_card,
             allow_owner_paid=1 if request.form.get("allow_owner_paid") else 0,
             owner_paid_account_code=(

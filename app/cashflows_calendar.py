@@ -294,6 +294,16 @@ def _score_parsed(
         elif diff <= _AMOUNT_NEAR:
             score += 0.2
 
+    receipt_gross = parsed.get("customer_receipt_amount")
+    if receipt_gross is not None:
+        diff = abs(receipt_gross - sale_gross)
+        if diff <= Decimal("0.01"):
+            score += 0.35
+        elif diff <= Decimal("1.00"):
+            score += 0.25
+        elif diff <= _AMOUNT_NEAR:
+            score += 0.12
+
     end = parsed.get("end_dt")
     if sale_dt and end:
         mins = _mins_apart(sale_dt, end)
@@ -429,24 +439,56 @@ class CalendarPool:
                 "event_date": ev_date.isoformat(),
                 "score": score,
                 "source": p.get("source") or "structured",
+                "customer_receipt_amount": (
+                    float(p.get("customer_receipt_amount"))
+                    if p.get("customer_receipt_amount") is not None
+                    else None
+                ),
+                "customer_receipt_date": p.get("customer_receipt_date") or "",
+                "customer_receipt_ref": p.get("customer_receipt_ref") or "",
             })
 
         out.sort(key=lambda s: s["score"], reverse=True)
         return out[:limit]
 
 
-def _pack_event(ev: dict, customer: str, event_gross: Decimal | None, source: str) -> dict:
+def _pack_event(
+    ev: dict,
+    customer: str,
+    event_gross: Decimal | None,
+    source: str,
+    customer_receipt: dict | None = None,
+) -> dict:
     start_dt = _event_start_dt(ev)
     end_dt = _event_end_dt(ev)
+    receipt_amount = None
+    if customer_receipt:
+        try:
+            if customer_receipt.get("amount") is not None:
+                receipt_amount = Decimal(str(customer_receipt.get("amount")))
+        except Exception:
+            receipt_amount = None
     return {
         "event": ev,
         "customer": customer,
         "event_gross": event_gross,
+        "customer_receipt_amount": receipt_amount,
+        "customer_receipt_date": str((customer_receipt or {}).get("date") or ""),
+        "customer_receipt_ref": str((customer_receipt or {}).get("transaction_ref") or ""),
         "source": source,
         "start_dt": start_dt,
         "end_dt": end_dt,
         "date": start_dt.date() if start_dt else None,
     }
+
+
+def _customer_receipt_index(config: Any) -> dict[str, dict]:
+    try:
+        from .admin_store import get_json_setting
+        rows = get_json_setting(config.admin_db_file, "customer_receipt_details", {}) or {}
+        return rows if isinstance(rows, dict) else {}
+    except Exception:
+        return {}
 
 
 def build_calendar_pool(
@@ -505,10 +547,23 @@ def build_calendar_pool(
 
     parsed: list[dict] = []
     needs_ai: list[dict] = []
+    receipt_index = _customer_receipt_index(config)
     for ev in events:
+        event_key = (
+            f"{ev.get('_calendar_id')}:{ev.get('id')}"
+            if ev.get("_calendar_id") and ev.get("id")
+            else ""
+        )
+        receipt_details = receipt_index.get(event_key) or {}
         p = _parse_event_structured(ev)
         if p["customer"] or p["event_gross"] is not None:
-            parsed.append(_pack_event(ev, p["customer"], p["event_gross"], "structured"))
+            parsed.append(_pack_event(
+                ev,
+                p["customer"],
+                p["event_gross"],
+                "customer_receipt" if receipt_details else "structured",
+                receipt_details,
+            ))
         else:
             needs_ai.append(ev)
 
@@ -538,7 +593,19 @@ def build_calendar_pool(
             # empty or whose name is only in the title (e.g. "-SM4 W.C Tony Byrne").
             if not customer:
                 customer = _customer_from_summary(ev.get("summary") or "") or (ev.get("summary") or "")[:80]
-            parsed.append(_pack_event(ev, customer, eg, "ai"))
+            event_key = (
+                f"{ev.get('_calendar_id')}:{ev.get('id')}"
+                if ev.get("_calendar_id") and ev.get("id")
+                else ""
+            )
+            receipt_details = receipt_index.get(event_key) or {}
+            parsed.append(_pack_event(
+                ev,
+                customer,
+                eg,
+                "customer_receipt" if receipt_details else "ai",
+                receipt_details,
+            ))
 
     return CalendarPool(parsed)
 

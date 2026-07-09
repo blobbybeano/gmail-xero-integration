@@ -1,6 +1,11 @@
 import unittest
+from decimal import Decimal
 
-from app.cashflows_calendar import _is_explicit_card_event, _parse_event_structured
+from app.cashflows_calendar import (
+    _is_explicit_card_event,
+    _parse_event_structured,
+    _score_parsed,
+)
 
 
 class CashflowsCalendarSuggestionTests(unittest.TestCase):
@@ -35,6 +40,24 @@ PAYMENT TYPE (CARD/INVOICE) = CARD
 
         self.assertEqual(parsed["customer"], "Adam May")
         self.assertEqual(str(parsed["event_gross"]), "174.00")
+
+    def test_customer_receipt_amount_is_strong_cashflows_signal(self):
+        no_receipt = _score_parsed(
+            {"customer": "Adam May", "event_gross": Decimal("150.00")},
+            Decimal("174.00"),
+            None,
+        )
+        with_receipt = _score_parsed(
+            {
+                "customer": "Adam May",
+                "event_gross": Decimal("150.00"),
+                "customer_receipt_amount": Decimal("174.00"),
+            },
+            Decimal("174.00"),
+            None,
+        )
+
+        self.assertGreater(with_receipt, no_receipt)
 
 
 if __name__ == "__main__":

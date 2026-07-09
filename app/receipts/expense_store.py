@@ -56,6 +56,7 @@ def _ensure_tables(db_path: str) -> None:
                 xero_contact_name TEXT NOT NULL DEFAULT '',
                 expense_account_code TEXT NOT NULL DEFAULT '',
                 payment_account_code TEXT NOT NULL DEFAULT '',
+                customer_calendar_id TEXT NOT NULL DEFAULT '',
                 allow_owner_paid INTEGER NOT NULL DEFAULT 0,
                 owner_paid_account_code TEXT NOT NULL DEFAULT '',
                 active INTEGER NOT NULL DEFAULT 1,
@@ -150,6 +151,8 @@ def _ensure_tables(db_path: str) -> None:
              "ALTER TABLE expense_engineers ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''"),
             ("plaid_account_id",
              "ALTER TABLE expense_engineers ADD COLUMN plaid_account_id TEXT NOT NULL DEFAULT ''"),
+            ("customer_calendar_id",
+             "ALTER TABLE expense_engineers ADD COLUMN customer_calendar_id TEXT NOT NULL DEFAULT ''"),
             ("allow_owner_paid",
              "ALTER TABLE expense_engineers ADD COLUMN allow_owner_paid INTEGER NOT NULL DEFAULT 0"),
             ("owner_paid_account_code",
@@ -215,6 +218,7 @@ def create_engineer(
     xero_contact_name: str = "",
     expense_account_code: str = "",
     payment_account_code: str = "",
+    customer_calendar_id: str = "",
     allow_owner_paid: bool | int = False,
     owner_paid_account_code: str = "",
 ) -> dict[str, Any]:
@@ -234,15 +238,17 @@ def create_engineer(
             """
             INSERT INTO expense_engineers
                 (token, name, kind, xero_contact_id, xero_contact_name,
-                 expense_account_code, payment_account_code, allow_owner_paid,
+                 expense_account_code, payment_account_code, customer_calendar_id,
+                 allow_owner_paid,
                  owner_paid_account_code, active, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
             """,
             (
                 token, name, kind, xero_contact_id.strip(),
                 xero_contact_name.strip(), expense_account_code.strip(),
-                payment_account_code.strip(), 1 if allow_owner_paid else 0,
-                owner_paid_account_code.strip(), _now_iso(),
+                payment_account_code.strip(), customer_calendar_id.strip(),
+                1 if allow_owner_paid else 0, owner_paid_account_code.strip(),
+                _now_iso(),
             ),
         )
         conn.commit()
@@ -255,7 +261,8 @@ def create_engineer(
 def update_engineer(db_path: str, engineer_id: int, **fields) -> dict[str, Any] | None:
     allowed = {
         "name", "kind", "xero_contact_id", "xero_contact_name",
-        "expense_account_code", "payment_account_code", "active",
+        "expense_account_code", "payment_account_code", "customer_calendar_id",
+        "active",
         "username", "password_hash", "plaid_account_id",
         "allow_owner_paid", "owner_paid_account_code",
     }
