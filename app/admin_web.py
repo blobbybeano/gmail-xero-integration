@@ -1111,6 +1111,47 @@ def _get_tenant_acct_themes(
                 warnings.append(f"Cannot load account list (HTTP {_ar.status_code}).")
     except Exception:
         warnings.append("Cannot load account list (request failed).")
+    try:
+        # Xero's unfiltered /Accounts response can omit code-less bank feed
+        # accounts, even though the filtered BANK query returns them. Load BANK
+        # explicitly so payment/owner-paid selectors match Xero's own Bank tab.
+        _throttle_xero_request()
+        _br = requests.get(
+            "https://api.xero.com/api.xro/2.0/Accounts",
+            headers=hdrs,
+            params={"where": 'Type=="BANK"'},
+            timeout=3,
+        )
+        _log_xero_request(
+            "GET",
+            _br.url or "https://api.xero.com/api.xro/2.0/Accounts?where=Type==BANK",
+            _br.status_code,
+            retry_after=str(_br.headers.get("Retry-After") or "").strip(),
+        )
+        record_xero_rate_limit_from_response(_br)
+        if _br.ok:
+            seen_bank = {
+                str(a.get("AccountID") or a.get("Code") or a.get("Name") or "")
+                for a in bank
+            }
+            seen_all = {
+                str(a.get("AccountID") or a.get("Code") or a.get("Name") or "")
+                for a in all_accounts
+            }
+            for _a in _br.json().get("Accounts", []):
+                if _a.get("Status") != "ACTIVE":
+                    continue
+                key = str(_a.get("AccountID") or _a.get("Code") or _a.get("Name") or "")
+                if key and key not in seen_bank:
+                    bank.append(_a)
+                    seen_bank.add(key)
+                if key and key not in seen_all:
+                    all_accounts.append(_a)
+                    seen_all.add(key)
+    except Exception:
+        # Non-fatal: the unfiltered account list above is still enough for
+        # revenue/theme setup and balance-sheet owner-paid accounts.
+        pass
     themes: list = []
     try:
         _throttle_xero_request()
@@ -1492,6 +1533,23 @@ def _owner_paid_account_group(account: dict) -> str:
     return "Other"
 
 
+def _owner_paid_account_value(account: dict) -> str:
+    """Stored value for owner-paid posting account.
+
+    Chart accounts use Code. True Xero bank/card accounts often have no code,
+    so store them as id:<AccountID>, matching the existing Xero payment-account
+    convention used elsewhere in the app.
+    """
+    code = str(account.get("Code") or "").strip()
+    if code:
+        return code
+    if str(account.get("Type") or "").upper() == "BANK":
+        aid = str(account.get("AccountID") or "").strip()
+        if aid:
+            return f"id:{aid}"
+    return ""
+
+
 def _owner_paid_accounts_from(accounts: list) -> list[dict]:
     """Accounts suitable for personal/owner-paid receipt posting.
 
@@ -1500,17 +1558,17 @@ def _owner_paid_accounts_from(accounts: list) -> list[dict]:
     owner/director liability/equity account such as Directors' Loan.
     """
     rows = []
-    seen_codes = set()
+    seen_values = set()
     for account in accounts or []:
-        code = str(account.get("Code") or "").strip()
-        if not code or code in seen_codes:
+        value = _owner_paid_account_value(account)
+        if not value or value in seen_values:
             continue
         if str(account.get("Status") or "ACTIVE").upper() != "ACTIVE":
             continue
         typ = str(account.get("Type") or "").upper()
         if typ not in _OWNER_PAID_ACCOUNT_TYPES:
             continue
-        seen_codes.add(code)
+        seen_values.add(value)
         rows.append(account)
     order = {"Bank": 0, "Assets": 1, "Liabilities": 2, "Equity": 3, "Other": 4}
     rows.sort(
@@ -1530,8 +1588,8 @@ def _owner_paid_acct_options(accounts: list, selected: str, *, default_label: st
     found = False
     current_group = ""
     for a in _owner_paid_accounts_from(accounts):
-        code = str(a.get("Code") or "").strip()
-        if not code:
+        value = _owner_paid_account_value(a)
+        if not value:
             continue
         group = _owner_paid_account_group(a)
         if group != current_group:
@@ -1539,10 +1597,10 @@ def _owner_paid_acct_options(accounts: list, selected: str, *, default_label: st
                 out += "</optgroup>"
             out += f"<optgroup label='{escape(group)}'>"
             current_group = group
-        is_sel = " selected" if code == sel else ""
+        is_sel = " selected" if value == sel else ""
         if is_sel:
             found = True
-        out += f"<option value='{escape(code)}'{is_sel}>{escape(_exp_acct_label(a))}</option>"
+        out += f"<option value='{escape(value)}'{is_sel}>{escape(_exp_acct_label(a))}</option>"
     if current_group:
         out += "</optgroup>"
     if sel and not found:
