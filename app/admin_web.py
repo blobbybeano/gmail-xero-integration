@@ -218,6 +218,7 @@ _BASE_HTML = """<!DOCTYPE html>
   .receipt-mode-card.receipt-mode-selected {{ height:9rem!important; transform:scale(1)!important; opacity:1!important; box-shadow:0 1px 2px rgba(15,23,42,.08)!important; }}
   .receipt-mode-card.receipt-mode-muted {{ height:7rem!important; transform:scale(.94)!important; opacity:.48!important; box-shadow:none!important; }}
   @keyframes receiptPageIn {{ from {{ opacity:0; transform:translateY(7px); }} to {{ opacity:1; transform:translateY(0); }} }}
+  @keyframes receiptSpin {{ to {{ transform:rotate(360deg); }} }}
   @media (prefers-reduced-motion: reduce) {{
     main[data-receipt-page], .receipt-mode-card {{ transition:none!important; animation:none!important; }}
   }}
@@ -247,6 +248,33 @@ document.addEventListener('click', function(e) {{
   if (!href || href === window.location.pathname) return;
   e.preventDefault();
   var targetMode = link.getAttribute('data-mode-target') || '';
+  swapReceiptPage(href, targetMode, true);
+}});
+window.addEventListener('popstate', function() {{
+  if (document.querySelector('main[data-receipt-page]')) {{
+    swapReceiptPage(window.location.href, '', false);
+  }}
+}});
+document.addEventListener('change', function(e) {{
+  var inp = e.target;
+  if (!inp || (inp.id !== 'exp-file' && inp.id !== 'cust-receipt-file')) return;
+  if (!inp.files || !inp.files.length) return;
+  var form = inp.closest('form');
+  var overlay = document.getElementById(inp.id === 'exp-file' ? 'exp-overlay' : 'cust-overlay');
+  if (!overlay) {{
+    overlay = document.createElement('div');
+    overlay.id = inp.id === 'exp-file' ? 'exp-overlay' : 'cust-overlay';
+    overlay.style.cssText = 'display:none;position:fixed;inset:0;background:rgba(255,255,255,.92);z-index:50;align-items:center;justify-content:center;flex-direction:column;';
+    overlay.innerHTML = '<div style="width:32px;height:32px;border:4px solid #d1d5db;border-top-color:#4f46e5;border-radius:9999px;animation:receiptSpin 1s linear infinite"></div><div style="margin-top:12px;font:500 14px system-ui;color:#374151">Uploading receipt&hellip;</div>';
+    document.body.appendChild(overlay);
+  }}
+  if (overlay) overlay.style.display = 'flex';
+  if (form) {{
+    if (form.requestSubmit) {{ form.requestSubmit(); }} else {{ form.submit(); }}
+  }}
+}});
+function setReceiptModeVisual(targetMode) {{
+  if (!targetMode) return;
   document.querySelectorAll('.receipt-mode-card').forEach(function(card) {{
     if (card.getAttribute('data-mode') === targetMode) {{
       card.classList.add('receipt-mode-selected');
@@ -256,9 +284,37 @@ document.addEventListener('click', function(e) {{
       card.classList.remove('receipt-mode-selected');
     }}
   }});
+}}
+function swapReceiptPage(href, targetMode, pushHistory) {{
+  var current = document.querySelector('main[data-receipt-page]');
+  if (!current || !window.fetch || !window.DOMParser) {{
+    window.location.href = href;
+    return;
+  }}
+  setReceiptModeVisual(targetMode);
   document.body.classList.add('receipt-page-leaving');
-  window.setTimeout(function() {{ window.location.href = href; }}, 170);
-}});
+  fetch(href, {{credentials:'same-origin', headers:{{'X-Requested-With':'fetch'}}}})
+    .then(function(resp) {{
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      return resp.text();
+    }})
+    .then(function(html) {{
+      var doc = new DOMParser().parseFromString(html, 'text/html');
+      var next = doc.querySelector('main[data-receipt-page]');
+      if (!next) {{
+        window.location.href = href;
+        return;
+      }}
+      window.setTimeout(function() {{
+        current.replaceWith(next);
+        document.body.classList.remove('receipt-page-leaving');
+        if (pushHistory) window.history.pushState({{receiptPage:true}}, '', href);
+      }}, 150);
+    }})
+    .catch(function() {{
+      window.location.href = href;
+    }});
+}}
 </script>
 </head>
 <body class="bg-gray-50 min-h-screen">
@@ -12743,18 +12799,6 @@ body {{ background:#f7f6f3 !important; }}
               </svg>
               <div class="mt-3 text-sm font-medium text-gray-700">Reading your receipt&hellip;</div>
             </div>
-            <script>
-            (function() {{
-              var inp = document.getElementById('exp-file');
-              var form = document.getElementById('exp-form');
-              var overlay = document.getElementById('exp-overlay');
-              inp.addEventListener('change', function() {{
-                if (!inp.files || !inp.files.length) return;
-                if (overlay) overlay.style.display = 'flex';
-                if (form.requestSubmit) {{ form.requestSubmit(); }} else {{ form.submit(); }}
-              }});
-            }})();
-            </script>
             """
         )
 
@@ -12885,18 +12929,6 @@ body {{ background:#f7f6f3 !important; }}
           </svg>
           <div class="mt-3 text-sm font-medium text-gray-700">Attaching receipt&hellip;</div>
         </div>
-        <script>
-        (function() {{
-          var inp = document.getElementById('cust-receipt-file');
-          var form = document.getElementById('cust-receipt-form');
-          var overlay = document.getElementById('cust-overlay');
-          inp.addEventListener('change', function() {{
-            if (!inp.files || !inp.files.length) return;
-            if (overlay) overlay.style.display = 'flex';
-            if (form.requestSubmit) {{ form.requestSubmit(); }} else {{ form.submit(); }}
-          }});
-        }})();
-        </script>
         """)
 
     @app.post("/expenses/<token>/customer-receipts/<path:cal_id>/<event_id>")
