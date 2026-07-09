@@ -1501,6 +1501,43 @@ def _exp_acct_options(accounts: list, selected: str, *, default_label: str) -> s
     return out
 
 
+def _xero_account_payment_value(account: dict) -> str:
+    """Stored value for payment-capable Xero accounts.
+
+    Xero bank/card accounts often have no chart code, so payment selectors store
+    those as id:<AccountID>. Accounts with a Code keep using the code.
+    """
+    code = str(account.get("Code") or "").strip()
+    if code:
+        return code
+    aid = str(account.get("AccountID") or "").strip()
+    if aid:
+        return f"id:{aid}"
+    return ""
+
+
+def _payment_acct_options(accounts: list, selected: str, *, default_label: str) -> str:
+    """Build <option>s for payment/bank account selectors.
+
+    Unlike expense category selectors, these must support Xero bank/card
+    accounts that only have AccountID values.
+    """
+    sel = str(selected or "").strip()
+    out = f"<option value=''>{escape(default_label)}</option>"
+    found = False
+    for a in sorted(accounts or [], key=lambda x: str(x.get("Name") or "").lower()):
+        value = _xero_account_payment_value(a)
+        if not value:
+            continue
+        is_sel = " selected" if value == sel else ""
+        if is_sel:
+            found = True
+        out += f"<option value='{escape(value)}'{is_sel}>{escape(_exp_acct_label(a))}</option>"
+    if sel and not found:
+        out += f"<option value='{escape(sel)}' selected>Saved account ({escape(sel)})</option>"
+    return out
+
+
 def _xero_bank_transaction_url(bank_transaction_id: str) -> str:
     xid = str(bank_transaction_id or "").strip()
     if not xid:
@@ -1540,14 +1577,7 @@ def _owner_paid_account_value(account: dict) -> str:
     so store them as id:<AccountID>, matching the existing Xero payment-account
     convention used elsewhere in the app.
     """
-    code = str(account.get("Code") or "").strip()
-    if code:
-        return code
-    if str(account.get("Type") or "").upper() == "BANK":
-        aid = str(account.get("AccountID") or "").strip()
-        if aid:
-            return f"id:{aid}"
-    return ""
+    return _xero_account_payment_value(account)
 
 
 def _owner_paid_accounts_from(accounts: list) -> list[dict]:
@@ -13580,12 +13610,20 @@ body {{ background:#f7f6f3 !important; }}
                 "text-gray-600'>Inactive</span>"
             )
             _sel_cls = "w-full rounded border border-gray-300 px-2 py-1 text-sm"
+            exp_default_label = (
+                "Use global fallback" if (settings.get("default_expense_account") or "").strip()
+                else "Choose expense account"
+            )
+            pay_default_label = (
+                "Use global payment account" if (settings.get("default_payment_account") or "").strip()
+                else "Choose payment/bank account"
+            )
             if exp_accounts:
                 exp_field = (
                     f"<select name='expense_account_code' class='{_sel_cls}'>"
                     + _exp_acct_options(
                         exp_accounts, e.get("expense_account_code") or "",
-                        default_label="Use default account",
+                        default_label=exp_default_label,
                     )
                     + "</select>"
                 )
@@ -13598,9 +13636,9 @@ body {{ background:#f7f6f3 !important; }}
             if bank_accounts:
                 pay_field = (
                     f"<select name='payment_account_code' class='{_sel_cls}'>"
-                    + _exp_acct_options(
+                    + _payment_acct_options(
                         bank_accounts, e.get("payment_account_code") or "",
-                        default_label="Use default account",
+                        default_label=pay_default_label,
                     )
                     + "</select>"
                 )
@@ -13796,9 +13834,9 @@ body {{ background:#f7f6f3 !important; }}
         if bank_accounts:
             default_pay_field = (
                 f"<select name='default_payment_account' class='{_set_cls}'>"
-                + _exp_acct_options(
+                + _payment_acct_options(
                     bank_accounts, settings["default_payment_account"],
-                    default_label="— none —",
+                    default_label="— choose payment/bank account —",
                 )
                 + "</select>"
             )

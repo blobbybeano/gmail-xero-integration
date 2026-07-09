@@ -4,6 +4,7 @@ from app.admin_web import (
     _apply_receipt_account_guardrails,
     _owner_paid_acct_options,
     _owner_paid_accounts_from,
+    _payment_acct_options,
     _resolve_expense_account_choice,
 )
 
@@ -227,6 +228,22 @@ class ReceiptAccountResolutionTests(unittest.TestCase):
         self.assertIn("Directors&#x27; Loan Account (835)", html)
         self.assertNotIn("Materials", html)
         self.assertNotIn("Sales", html)
+
+    def test_payment_account_options_support_xero_bank_account_ids(self):
+        accounts = [
+            {"AccountID": "dan-card-id", "Name": "Charge Card - Dan", "Type": "BANK", "Status": "ACTIVE"},
+            {"AccountID": "ben-bank-id", "Code": "", "Name": "Ben - Personal Bank", "Type": "BANK", "Status": "ACTIVE"},
+            {"Code": "700", "Name": "Cash", "Type": "CURRENT", "Status": "ACTIVE"},
+        ]
+
+        html = _payment_acct_options(
+            accounts, "id:ben-bank-id",
+            default_label="Choose payment/bank account",
+        )
+
+        self.assertIn("value='id:dan-card-id'>Charge Card - Dan", html)
+        self.assertIn("value='id:ben-bank-id' selected>Ben - Personal Bank", html)
+        self.assertIn("value='700'>Cash (700)", html)
 
 
 if __name__ == "__main__":
