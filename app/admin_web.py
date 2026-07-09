@@ -1049,7 +1049,9 @@ _XERO_CACHE_TTL = 300  # seconds (5 min)
 _XERO_CONN_CACHE_TTL = 300  # seconds
 
 
-def _get_tenant_acct_themes(at: str, tid: str) -> "tuple[list, list, list, str]":
+def _get_tenant_acct_themes(
+    at: str, tid: str, db_path: str | None = None
+) -> "tuple[list, list, list, str]":
     """Return (revenue_accounts, bank_accounts, branding_themes) for a Xero tenant.
     Results are cached for _XERO_CACHE_TTL seconds so the settings page doesn't
     make live API calls on every load."""
@@ -1158,6 +1160,11 @@ def _get_tenant_acct_themes(at: str, tid: str) -> "tuple[list, list, list, str]"
         _xero_acct_cache[key] = (time.time(), rev, bank, themes, warning)
     if all_accounts or warning:
         _xero_all_acct_cache[key] = (time.time(), all_accounts, warning)
+    if db_path and all_accounts:
+        try:
+            set_json_setting(db_path, _XERO_ALL_ACCT_SNAPSHOT_KEY, all_accounts)
+        except Exception:
+            pass
     return rev, bank, themes, warning
 
 
@@ -13117,7 +13124,7 @@ body {{ background:#f7f6f3 !important; }}
             _owner_warn = ""
             try:
                 _r, bank_accounts, _t, _bw = (
-                    _get_tenant_acct_themes(_at, _tid)
+                    _get_tenant_acct_themes(_at, _tid, config.admin_db_file)
                     if (_at and _tid and not bank_accounts)
                     else ([], bank_accounts, [], "")
                 )

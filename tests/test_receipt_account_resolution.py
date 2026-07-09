@@ -190,6 +190,9 @@ class ReceiptAccountResolutionTests(unittest.TestCase):
 
     def test_owner_paid_accounts_are_bank_asset_or_liability_not_expense(self):
         accounts = [
+            {"Code": "088", "Name": "Charge Card - Dan", "Type": "BANK", "Status": "ACTIVE"},
+            {"Code": "089", "Name": "GoCardless-GBP", "Type": "BANK", "Status": "ACTIVE"},
+            {"Code": "092", "Name": "Cash account", "Type": "BANK", "Status": "ACTIVE"},
             {"Code": "090", "Name": "Pow Wash", "Type": "BANK", "Status": "ACTIVE"},
             {"Code": "091", "Name": "Ben - Personal Bank", "Type": "BANK", "Status": "ACTIVE"},
             {"Code": "700", "Name": "Cash", "Type": "CURRENT", "Status": "ACTIVE"},
@@ -200,10 +203,25 @@ class ReceiptAccountResolutionTests(unittest.TestCase):
         ]
 
         rows = _owner_paid_accounts_from(accounts)
-        self.assertEqual([r["Code"] for r in rows], ["091", "090", "700", "780", "835"])
+        self.assertEqual(
+            [r["Name"] for r in rows[:5]],
+            [
+                "Ben - Personal Bank",
+                "Cash account",
+                "Charge Card - Dan",
+                "GoCardless-GBP",
+                "Pow Wash",
+            ],
+        )
+        self.assertEqual([r["Code"] for r in rows[-3:]], ["700", "780", "835"])
 
         html = _owner_paid_acct_options(accounts, "835", default_label="Choose")
         self.assertIn("<optgroup label='Bank'>", html)
+        self.assertIn("Charge Card - Dan (088)", html)
+        self.assertIn("GoCardless-GBP (089)", html)
+        self.assertIn("Cash account (092)", html)
+        self.assertIn("Ben - Personal Bank (091)", html)
+        self.assertIn("Pow Wash (090)", html)
         self.assertIn("<optgroup label='Assets'>", html)
         self.assertIn("<optgroup label='Liabilities'>", html)
         self.assertIn("Directors&#x27; Loan Account (835)", html)
