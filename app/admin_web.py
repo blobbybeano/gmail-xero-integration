@@ -11625,6 +11625,11 @@ body {{ background:#f7f6f3 !important; }}
         weeks: dict[dt.date, list[dict]] = {}
         for tx in txs:
             weeks.setdefault(_week_start(tx["date"]), []).append(tx)
+        # Always show the two current operating periods, even if the uploaded
+        # card feed has no rows yet. Otherwise a stale CSV makes the portal jump
+        # straight to "Week of ..." and it looks like this/last week disappeared.
+        weeks.setdefault(this_week, [])
+        weeks.setdefault(this_week - dt.timedelta(days=7), [])
 
         months: dict[str, list[dict]] = {}
         for tx in older_txs:
@@ -11670,8 +11675,13 @@ body {{ background:#f7f6f3 !important; }}
                 "<div>"
                 f"<div class='font-semibold text-gray-900'>{escape(_week_label(start))}</div>"
                 f"<div class='text-[11px] text-gray-400'>{escape(_date_span(start))}</div>"
-                f"<div class='text-xs text-gray-500'>{len(rows)} card payment(s) · "
-                f"{matched_count} matched</div>"
+                f"<div class='text-xs text-gray-500'>"
+                + (
+                    f"{len(rows)} card payment(s) · {matched_count} matched"
+                    if rows else
+                    "No card payments in this period"
+                )
+                + "</div>"
                 "</div>"
                 "<div class='text-right shrink-0'>"
                 f"<div class='text-sm font-bold text-gray-900'>{_exp_money(unmatched_total)}</div>"
