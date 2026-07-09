@@ -30,6 +30,7 @@ class _Events:
     def __init__(self, responses):
         self.responses = list(responses)
         self.calls = []
+        self.patch_calls = []
 
     def list(self, **kwargs):
         self.calls.append(kwargs)
@@ -37,6 +38,10 @@ class _Events:
         if isinstance(response, Exception):
             return _Request(exc=response)
         return _Request(response=response)
+
+    def patch(self, **kwargs):
+        self.patch_calls.append(kwargs)
+        return _Request(response={"ok": True})
 
 
 class _Service:
@@ -111,6 +116,25 @@ class GoogleCalendarIncrementalSyncTests(unittest.TestCase):
                 calendar_id="calendar-1",
             )
         self.assertEqual(events.calls[0]["syncToken"], "expired-token")
+
+    def test_update_event_description_can_patch_color(self):
+        events = self._with_service([])
+
+        google_calendar.update_event_description(
+            _Config(),
+            "event-1",
+            "notes",
+            summary="new title",
+            calendar_id="calendar-1",
+            color_id="2",
+        )
+
+        self.assertEqual(events.patch_calls[0]["calendarId"], "calendar-1")
+        self.assertEqual(events.patch_calls[0]["eventId"], "event-1")
+        self.assertEqual(
+            events.patch_calls[0]["body"],
+            {"description": "notes", "summary": "new title", "colorId": "2"},
+        )
 
 
 if __name__ == "__main__":

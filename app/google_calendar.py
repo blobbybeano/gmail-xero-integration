@@ -205,6 +205,7 @@ def update_event_description(
     description: str,
     summary: str | None = None,
     calendar_id: str | None = None,
+    color_id: str | None = None,
 ) -> Dict:
     service = build_calendar_service(config)
     for attempt in range(3):
@@ -212,6 +213,8 @@ def update_event_description(
             body = {"description": description}
             if summary is not None:
                 body["summary"] = summary
+            if color_id is not None:
+                body["colorId"] = color_id
             updated = (
                 service.events()
                 .patch(

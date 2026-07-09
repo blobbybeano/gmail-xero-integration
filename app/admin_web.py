@@ -12273,6 +12273,49 @@ body {{ background:#f7f6f3 !important; }}
             return [selected]
         return _active_calendar_ids(config)
 
+    CUSTOMER_RECEIPT_DONE_COLOR = "2"      # Google Calendar green/sage
+    CUSTOMER_RECEIPT_OVERDUE_COLOR = "4"   # Google Calendar pink/flamingo
+    CUSTOMER_RECEIPT_OVERDUE_DAYS = 4
+
+    def _customer_receipt_event_has_attachment(event_key: str, description: str = "") -> bool:
+        if re.search(r"Customer receipt attached\s*✓", description or "", re.I):
+            return True
+        try:
+            rows = get_json_setting(config.admin_db_file, "customer_receipt_details", {}) or {}
+            return event_key in rows
+        except Exception:
+            return False
+
+    def _customer_receipt_is_overdue(start_dt: dt.datetime, event_key: str, description: str) -> bool:
+        if _customer_receipt_event_has_attachment(event_key, description):
+            return False
+        if payment_choice(description or "") != "card":
+            return False
+        now = dt.datetime.now(start_dt.tzinfo or dt.timezone.utc)
+        return start_dt < (now - dt.timedelta(days=CUSTOMER_RECEIPT_OVERDUE_DAYS))
+
+    def _mark_customer_receipt_overdue_if_needed(cal_id: str, ev: dict, start_dt: dt.datetime) -> None:
+        event_id = str(ev.get("id") or "")
+        if not event_id:
+            return
+        desc = ev.get("description") or ""
+        event_key = f"{cal_id}:{event_id}"
+        if not _customer_receipt_is_overdue(start_dt, event_key, desc):
+            return
+        old_desc = desc
+        marker = "Customer receipt needed ⚠"
+        new_desc = old_desc if marker.lower() in old_desc.lower() else (old_desc.rstrip() + "\n" + marker).strip()
+        try:
+            update_event_description(
+                config,
+                event_id,
+                new_desc,
+                calendar_id=cal_id,
+                color_id=CUSTOMER_RECEIPT_OVERDUE_COLOR,
+            )
+        except Exception as exc:
+            print(f"[customer-receipts] overdue marker failed {event_key}: {exc}", flush=True)
+
     def _customer_receipt_jobs_for_engineer(eng, *, days_back: int = 14, days_forward: int = 14) -> list[dict]:
         creds = load_admin_credentials(config)
         if not creds:
@@ -12325,6 +12368,10 @@ body {{ background:#f7f6f3 !important; }}
                         start_dt = now
                     event_key = f"{cal_id}:{ev.get('id') or ''}"
                     invoice_id = get_invoice_for_event(state, event_key) or ""
+                    has_receipt = _customer_receipt_event_has_attachment(event_key, desc)
+                    overdue = _customer_receipt_is_overdue(start_dt, event_key, desc)
+                    if overdue:
+                        _mark_customer_receipt_overdue_if_needed(cal_id, ev, start_dt)
                     rows.append({
                         "calendar_id": cal_id,
                         "event_id": ev.get("id") or "",
@@ -12335,11 +12382,14 @@ body {{ background:#f7f6f3 !important; }}
                         "amount": _customer_receipt_amount_hint(desc),
                         "payment": pay,
                         "invoice_id": invoice_id,
+                        "has_receipt": has_receipt,
+                        "overdue": overdue,
                     })
                 page_token = resp.get("nextPageToken")
                 if not page_token:
                     break
         rows.sort(key=lambda r: (
+            0 if r.get("overdue") else 1,
             0 if r.get("payment") == "card" else 1,
             abs((r.get("start") - now).total_seconds()) if r.get("start") else 999999999,
         ))
@@ -12638,6 +12688,17 @@ body {{ background:#f7f6f3 !important; }}
                 if j.get("payment") == "card" else
                 "<span class='inline-flex rounded-full bg-gray-100 px-2 py-0.5 text-[11px] font-semibold text-gray-500'>check payment type</span>"
             )
+            receipt_badge = ""
+            if j.get("has_receipt"):
+                receipt_badge = (
+                    "<br><span class='inline-flex rounded-full bg-emerald-50 px-2 py-0.5 "
+                    "text-[11px] font-semibold text-emerald-700'>receipt attached</span>"
+                )
+            elif j.get("overdue"):
+                receipt_badge = (
+                    "<br><span class='inline-flex rounded-full bg-rose-50 px-2 py-0.5 "
+                    "text-[11px] font-semibold text-rose-700'>receipt overdue</span>"
+                )
             inv = (
                 "<span class='inline-flex rounded-full bg-indigo-50 px-2 py-0.5 text-[11px] font-semibold text-indigo-700'>invoice linked</span>"
                 if j.get("invoice_id") else
@@ -12653,7 +12714,7 @@ body {{ background:#f7f6f3 !important; }}
                 f"<div class='text-xs text-gray-500 mt-1'>{escape(start)} {amount}</div>"
                 "</div>"
                 "<div class='text-right space-y-1 shrink-0'>"
-                f"{card}<br>{inv}"
+                f"{card}<br>{inv}{receipt_badge}"
                 "</div></div></a>"
             )
         body = "".join(rows) or (
@@ -12821,9 +12882,27 @@ body {{ background:#f7f6f3 !important; }}
                 detail = (" — " + ", ".join(detail_bits)) if detail_bits else ""
                 line = f"Customer receipt attached ✓ {stamp}{detail}"
                 old_clean = re.sub(r"\n?Customer receipt attached ✓[^\n]*", "", old_desc).rstrip()
+                old_clean = re.sub(r"\n?Customer receipt needed ⚠[^\n]*", "", old_clean).rstrip()
                 new_desc = (old_clean + "\n" + line).strip()
+                new_summary = set_title_status_emoji(ev.get("summary") or "", "green")
                 if new_desc != old_desc:
-                    update_event_description(config, event_id, new_desc, calendar_id=cal_id)
+                    update_event_description(
+                        config,
+                        event_id,
+                        new_desc,
+                        summary=new_summary,
+                        calendar_id=cal_id,
+                        color_id=CUSTOMER_RECEIPT_DONE_COLOR,
+                    )
+                elif new_summary != (ev.get("summary") or "") or str(ev.get("colorId") or "") != CUSTOMER_RECEIPT_DONE_COLOR:
+                    update_event_description(
+                        config,
+                        event_id,
+                        new_desc,
+                        summary=new_summary,
+                        calendar_id=cal_id,
+                        color_id=CUSTOMER_RECEIPT_DONE_COLOR,
+                    )
             except Exception as exc:
                 print(f"[customer-receipts] calendar note failed {event_key}: {exc}", flush=True)
             if stored_file:
