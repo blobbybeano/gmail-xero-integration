@@ -11376,16 +11376,22 @@ body {{ background:#f7f6f3 !important; }}
 
         Returns ``None`` when Xero is paused/unavailable (status unknown), so
         the feed can keep lines visible rather than silently dropping them.
-        Cached ~10 minutes in admin settings to avoid hammering the API on
-        every phone page-load.
+        Cached in admin settings to avoid hammering the API on every phone
+        page-load. The cache records its covered date range; a wider request
+        will refresh, but a narrower request can safely reuse the wider data.
         """
         if xero_is_disabled():
             return None
         import time as _t
         now = _t.time()
+        start_s = start.isoformat() if hasattr(start, "isoformat") else str(start or "")
+        end_s = end.isoformat() if hasattr(end, "isoformat") else str(end or "")
         cache = get_json_setting(config.admin_db_file, "engineer_recon_cache", {}) or {}
         if cache.get("until", 0) > now and isinstance(cache.get("lines"), list):
-            return cache["lines"]
+            cached_start = str(cache.get("start") or "")
+            cached_end = str(cache.get("end") or "")
+            if cached_start <= start_s and cached_end >= end_s:
+                return cache["lines"]
         try:
             client = build_xero_client(config)
             payload = client.get_bank_transactions(start_date=start, end_date=end)
@@ -11407,7 +11413,12 @@ body {{ background:#f7f6f3 !important; }}
             lines.append([amt, _xero_date_to_iso(t.get("Date"))])
         set_json_setting(
             config.admin_db_file, "engineer_recon_cache",
-            {"until": now + 600, "lines": lines},
+            {
+                "until": now + 21600,  # 6 hours; historical card-feed status is slow-moving.
+                "start": start_s,
+                "end": end_s,
+                "lines": lines,
+            },
         )
         return lines
 
