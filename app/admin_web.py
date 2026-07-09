@@ -11490,30 +11490,6 @@ body {{ background:#f7f6f3 !important; }}
         for idx, tx in enumerate(txs + older_txs):
             tx["key"] = tx["id"] or f"{tx['date'].isoformat()}:{tx['amount']:.2f}:{idx}"
 
-        visible_dates = [tx["date"] for tx in txs + older_txs if tx.get("date")]
-        receipt_dates = [r["date"] for r in receipt_only_rows if r.get("date")]
-        recon_start = min(visible_dates + receipt_dates) if (visible_dates or receipt_dates) else cutoff
-        # Keep the portal honest for older CSV months too. Previously the UI
-        # displayed May/April/March rows but only checked Xero reconciliation for
-        # the last 35 days, so older reconciled spends could be shown as missing.
-        # Clamp to a year so one phone page-load cannot become a full-history
-        # Xero audit; the result is cached below.
-        recon_start = max(recon_start, today - dt.timedelta(days=365))
-        recon = _engineer_reconciled_lines(recon_start, today)
-
-        def _reconciled(amt, d):
-            if not recon:
-                return False
-            for ln in recon:
-                try:
-                    ra = float(ln[0])
-                except (TypeError, ValueError, IndexError):
-                    continue
-                rd = _d(ln[1]) if len(ln) > 1 else None
-                if abs(ra - amt) <= 1.0 and (rd is None or abs((rd - d).days) <= 10):
-                    return True
-            return False
-
         def _receipt_candidates(amt, d):
             candidates = []
             for r in receipts:
@@ -11568,6 +11544,30 @@ body {{ background:#f7f6f3 !important; }}
                 "key": f"receipt:{rid}",
                 "receipt": r,
             })
+
+        visible_dates = [tx["date"] for tx in txs + older_txs if tx.get("date")]
+        receipt_dates = [r["date"] for r in receipt_only_rows if r.get("date")]
+        recon_start = min(visible_dates + receipt_dates) if (visible_dates or receipt_dates) else cutoff
+        # Keep the portal honest for older CSV months too. Previously the UI
+        # displayed May/April/March rows but only checked Xero reconciliation for
+        # the last 35 days, so older reconciled spends could be shown as missing.
+        # Clamp to a year so one phone page-load cannot become a full-history
+        # Xero audit; the result is cached below.
+        recon_start = max(recon_start, today - dt.timedelta(days=365))
+        recon = _engineer_reconciled_lines(recon_start, today)
+
+        def _reconciled(amt, d):
+            if not recon:
+                return False
+            for ln in recon:
+                try:
+                    ra = float(ln[0])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                rd = _d(ln[1]) if len(ln) > 1 else None
+                if abs(ra - amt) <= 1.0 and (rd is None or abs((rd - d).days) <= 10):
+                    return True
+            return False
 
         def _matching_receipt(tx):
             if tx.get("kind") == "receipt_only":
