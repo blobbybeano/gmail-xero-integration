@@ -11524,7 +11524,7 @@ body {{ background:#f7f6f3 !important; }}
 
         matched_by_tx: dict[str, dict] = {}
         used_receipts: set[str] = set()
-        for tx in sorted(txs, key=lambda x: x["date"]):
+        for tx in sorted(txs + older_txs, key=lambda x: x["date"]):
             for rec in _receipt_candidates(tx["amount"], tx["date"]):
                 rid = str(rec.get("id") or "")
                 if rid and rid in used_receipts:
@@ -11596,6 +11596,8 @@ body {{ background:#f7f6f3 !important; }}
             d = tx["date"]
             amt = tx["amount"]
             name = tx["name"]
+            full_name = escape(str(name or ""))
+            short_name = escape(str(name or "Card payment"))
             rec = _matching_receipt(tx)
             receipt_only = tx.get("kind") == "receipt_only"
             reconciled = False if receipt_only else _reconciled(amt, d)
@@ -11641,7 +11643,13 @@ body {{ background:#f7f6f3 !important; }}
                 "<div class='px-4 py-3 border-b last:border-0 flex "
                 f"items-center justify-between gap-3 {row_cls}'>"
                 "<div class='min-w-0'>"
-                f"<div class='font-medium text-gray-900 truncate'>{escape(name)}</div>"
+                "<details class='group/tx min-w-0'>"
+                "<summary class='list-none cursor-pointer font-medium text-gray-900 "
+                "truncate hover:text-indigo-700'>"
+                f"{short_name}</summary>"
+                "<div class='mt-1 rounded-md border border-gray-100 bg-white/80 "
+                f"px-2 py-1 text-[11px] text-gray-600 break-words'>{full_name}</div>"
+                "</details>"
                 f"<div class='text-xs text-gray-500'>"
                 f"{escape(_exp_day_label(d.isoformat()))}</div>"
                 f"{rec_line}"
