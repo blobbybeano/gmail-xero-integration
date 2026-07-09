@@ -11475,6 +11475,7 @@ body {{ background:#f7f6f3 !important; }}
             if d is None:
                 continue
             row = {
+                "kind": "card",
                 "date": d,
                 "amount": amt,
                 "name": str(t.get("name") or "Card payment"),
@@ -11488,12 +11489,6 @@ body {{ background:#f7f6f3 !important; }}
         older_txs.sort(key=lambda x: x["date"], reverse=True)
         for idx, tx in enumerate(txs + older_txs):
             tx["key"] = tx["id"] or f"{tx['date'].isoformat()}:{tx['amount']:.2f}:{idx}"
-        if not txs:
-            return (
-                "<div class='rounded-xl border border-dashed border-gray-300 bg-white "
-                "p-4 text-center text-xs text-gray-500'>No card payments in the last "
-                "month.</div>"
-            )
 
         recon = _engineer_reconciled_lines(cutoff, today)
 
@@ -11539,7 +11534,35 @@ body {{ background:#f7f6f3 !important; }}
                     used_receipts.add(rid)
                 break
 
+        receipt_only_rows = []
+        for r in receipts:
+            if (r.get("payment_source") or "company_card") != "company_card":
+                continue
+            rid = str(r.get("id") or "")
+            if rid and rid in used_receipts:
+                continue
+            try:
+                amt = float(r.get("amount_inc") or 0)
+            except (TypeError, ValueError):
+                amt = 0.0
+            if amt <= 0:
+                continue
+            d = _d(r.get("purchased_on") or (r.get("created_at") or "")[:10])
+            if d is None:
+                continue
+            receipt_only_rows.append({
+                "kind": "receipt_only",
+                "date": d,
+                "amount": amt,
+                "name": r.get("merchant") or r.get("ocr_merchant") or "Submitted receipt",
+                "id": f"receipt:{rid}",
+                "key": f"receipt:{rid}",
+                "receipt": r,
+            })
+
         def _matching_receipt(tx):
+            if tx.get("kind") == "receipt_only":
+                return tx.get("receipt") or {}
             return matched_by_tx.get(str(tx.get("key") or ""))
 
         def _week_start(d: dt.date) -> dt.date:
@@ -11574,13 +11597,15 @@ body {{ background:#f7f6f3 !important; }}
             amt = tx["amount"]
             name = tx["name"]
             rec = _matching_receipt(tx)
-            reconciled = _reconciled(amt, d)
+            receipt_only = tx.get("kind") == "receipt_only"
+            reconciled = False if receipt_only else _reconciled(amt, d)
             matched = bool(rec)
             if matched:
                 badge = (
                     "<span class='inline-flex items-center rounded-full bg-emerald-50 "
                     "px-2 py-0.5 text-[11px] font-semibold text-emerald-700'>"
-                    "receipt matched</span>"
+                    + ("waiting for bank feed" if receipt_only else "receipt matched")
+                    + "</span>"
                 )
             elif reconciled:
                 badge = (
@@ -11605,7 +11630,12 @@ body {{ background:#f7f6f3 !important; }}
                 status = escape(str(rec.get("status") or "saved"))
                 rec_line = (
                     f"<div class='text-[11px] text-emerald-700 mt-0.5'>"
-                    f"Matched to {merchant} · {status}</div>"
+                    + (
+                        f"Submitted receipt · {status} · CSV not updated yet"
+                        if receipt_only else
+                        f"Matched to {merchant} · {status}"
+                    )
+                    + "</div>"
                 )
             return (
                 "<div class='px-4 py-3 border-b last:border-0 flex "
@@ -11623,7 +11653,7 @@ body {{ background:#f7f6f3 !important; }}
             )
 
         weeks: dict[dt.date, list[dict]] = {}
-        for tx in txs:
+        for tx in txs + [r for r in receipt_only_rows if r["date"] >= cutoff]:
             weeks.setdefault(_week_start(tx["date"]), []).append(tx)
         # Always show the two current operating periods, even if the uploaded
         # card feed has no rows yet. Otherwise a stale CSV makes the portal jump
@@ -11632,19 +11662,20 @@ body {{ background:#f7f6f3 !important; }}
         weeks.setdefault(this_week - dt.timedelta(days=7), [])
 
         months: dict[str, list[dict]] = {}
-        for tx in older_txs:
+        for tx in older_txs + [r for r in receipt_only_rows if r["date"] < cutoff]:
             months.setdefault(tx["date"].strftime("%Y-%m"), []).append(tx)
 
         def _summary(rows):
+            card_rows = [tx for tx in rows if tx.get("kind") != "receipt_only"]
             unmatched = [
-                tx for tx in rows
+                tx for tx in card_rows
                 if not _matching_receipt(tx)
                 and not _reconciled(tx["amount"], tx["date"])
             ]
             matched_count = sum(1 for tx in rows if _matching_receipt(tx))
-            unmatched_total = round(sum(float(tx["amount"] or 0) for tx in unmatched), 2)
-            vat_at_risk = round(unmatched_total / 6, 2) if unmatched_total > 0 else 0.0
-            return unmatched, matched_count, unmatched_total, vat_at_risk
+            total_inc_vat = round(sum(float(tx["amount"] or 0) for tx in rows), 2)
+            leftover_vat = round(sum(float(tx["amount"] or 0) for tx in unmatched) / 6, 2) if unmatched else 0.0
+            return unmatched, matched_count, total_inc_vat, leftover_vat
 
         out = [
             "<div class='space-y-2'>",
@@ -11661,11 +11692,11 @@ body {{ background:#f7f6f3 !important; }}
             )
         for idx, start in enumerate(sorted(weeks.keys(), reverse=True)):
             rows = weeks[start]
-            _unmatched, matched_count, unmatched_total, vat_at_risk = _summary(rows)
-            open_attr = " open" if idx == 0 and unmatched_total > 0 else ""
+            _unmatched, matched_count, total_inc_vat, leftover_vat = _summary(rows)
+            open_attr = " open" if idx == 0 and rows else ""
             tone = (
                 "border-emerald-200 bg-emerald-50"
-                if unmatched_total <= 0 else
+                if not _unmatched else
                 "border-amber-200 bg-amber-50"
             )
             out.append(
@@ -11684,8 +11715,8 @@ body {{ background:#f7f6f3 !important; }}
                 + "</div>"
                 "</div>"
                 "<div class='text-right shrink-0'>"
-                f"<div class='text-sm font-bold text-gray-900'>{_exp_money(unmatched_total)}</div>"
-                f"<div class='text-[11px] text-gray-600'>left over · VAT {_exp_money(vat_at_risk)}</div>"
+                f"<div class='text-sm font-bold text-gray-900'>{_exp_money(total_inc_vat)}</div>"
+                f"<div class='text-[11px] text-gray-600'>total inc VAT · left over VAT {_exp_money(leftover_vat)}</div>"
                 "</div></summary>"
                 "<div class='border-t border-white/70 bg-white'>"
                 + "".join(_row(tx) for tx in rows)
@@ -11700,10 +11731,10 @@ body {{ background:#f7f6f3 !important; }}
             )
             for month_key in sorted(months.keys(), reverse=True):
                 rows = months[month_key]
-                _unmatched, matched_count, unmatched_total, vat_at_risk = _summary(rows)
+                _unmatched, matched_count, total_inc_vat, leftover_vat = _summary(rows)
                 tone = (
                     "border-emerald-200 bg-emerald-50"
-                    if unmatched_total <= 0 else
+                    if not _unmatched else
                     "border-gray-200 bg-white"
                 )
                 out.append(
@@ -11716,8 +11747,8 @@ body {{ background:#f7f6f3 !important; }}
                     f"{matched_count} matched</div>"
                     "</div>"
                     "<div class='text-right shrink-0'>"
-                    f"<div class='text-sm font-bold text-gray-900'>{_exp_money(unmatched_total)}</div>"
-                    f"<div class='text-[11px] text-gray-600'>left over · VAT {_exp_money(vat_at_risk)}</div>"
+                    f"<div class='text-sm font-bold text-gray-900'>{_exp_money(total_inc_vat)}</div>"
+                    f"<div class='text-[11px] text-gray-600'>total inc VAT · left over VAT {_exp_money(leftover_vat)}</div>"
                     "</div></summary>"
                     "<div class='border-t border-gray-100 bg-white'>"
                     + "".join(_row(tx) for tx in rows)
