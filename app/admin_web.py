@@ -11414,11 +11414,10 @@ body {{ background:#f7f6f3 !important; }}
     def _engineer_card_feed_html(eng, receipts):
         """Card-holder feed for a company-card engineer.
 
-        Shows the engineer's OWN card transactions (filtered by their linked
-        Plaid account) for roughly the last month. A green tick appears once a
-        matching receipt has been uploaded; a line moves to a muted
-        "Reconciled" list (and out of the active feed) once it is reconciled in
-        Xero. Read-only and degrades gracefully when Plaid/Xero are off.
+        Shows the engineer's own card transactions as weekly bars. Each week
+        highlights the gross value still missing receipts and the estimated VAT
+        at risk. Matching receipts can come from this portal, receipt dumps, or
+        email imports because they all end up in ``expense_receipts``.
         """
         if (eng.get("kind") or "") != "company_card":
             return ""
@@ -11432,6 +11431,22 @@ body {{ background:#f7f6f3 !important; }}
                 "p-4 text-center text-xs text-gray-500'>Card feed paused &mdash; the "
                 "office hasn&rsquo;t linked the bank yet.</div>"
             )
+
+        try:
+            feed_status = cardfeed.connection_status(db) or {}
+        except Exception:
+            feed_status = {}
+        last_updated = (
+            feed_status.get("last_sync_at")
+            or ((feed_status.get("csv") or {}).get("last_upload_at") if isinstance(feed_status.get("csv"), dict) else "")
+            or feed_status.get("connected_at")
+            or ""
+        )
+        last_updated_html = (
+            f"<span>Bank feed updated {escape(str(last_updated))}</span>"
+            if last_updated else
+            "<span>Bank feed update time unavailable</span>"
+        )
 
         def _d(v):
             try:
@@ -11458,8 +11473,15 @@ body {{ background:#f7f6f3 !important; }}
             d = _d(t.get("date"))
             if d is None or d < cutoff:
                 continue
-            txs.append((d, amt, str(t.get("name") or "Card payment")))
-        txs.sort(key=lambda x: x[0], reverse=True)
+            txs.append({
+                "date": d,
+                "amount": amt,
+                "name": str(t.get("name") or "Card payment"),
+                "id": str(t.get("transaction_id") or ""),
+            })
+        txs.sort(key=lambda x: x["date"], reverse=True)
+        for idx, tx in enumerate(txs):
+            tx["key"] = tx["id"] or f"{tx['date'].isoformat()}:{tx['amount']:.2f}:{idx}"
         if not txs:
             return (
                 "<div class='rounded-xl border border-dashed border-gray-300 bg-white "
@@ -11482,7 +11504,8 @@ body {{ background:#f7f6f3 !important; }}
                     return True
             return False
 
-        def _ticked(amt, d):
+        def _receipt_candidates(amt, d):
+            candidates = []
             for r in receipts:
                 if (r.get("payment_source") or "company_card") != "company_card":
                     continue
@@ -11494,65 +11517,143 @@ body {{ background:#f7f6f3 !important; }}
                     continue
                 rd = _d(r.get("purchased_on") or (r.get("created_at") or "")[:10])
                 if rd is None or abs((rd - d).days) <= 31:
-                    return True
-            return False
+                    candidates.append((abs((rd - d).days) if rd else 999, r))
+            candidates.sort(key=lambda x: x[0])
+            return [r for _, r in candidates]
 
-        def _row(d, amt, name, ticked, muted=False):
-            tick = (
-                "<span class='text-emerald-600 text-lg leading-none' "
-                "title='Receipt uploaded'>&#10003;</span>"
-                if ticked else
-                "<span class='text-xs text-amber-600'>no receipt</span>"
+        matched_by_tx: dict[str, dict] = {}
+        used_receipts: set[str] = set()
+        for tx in sorted(txs, key=lambda x: x["date"]):
+            for rec in _receipt_candidates(tx["amount"], tx["date"]):
+                rid = str(rec.get("id") or "")
+                if rid and rid in used_receipts:
+                    continue
+                matched_by_tx[str(tx["key"])] = rec
+                if rid:
+                    used_receipts.add(rid)
+                break
+
+        def _matching_receipt(tx):
+            return matched_by_tx.get(str(tx.get("key") or ""))
+
+        def _week_start(d: dt.date) -> dt.date:
+            return d - dt.timedelta(days=d.weekday())
+
+        def _week_label(start: dt.date) -> str:
+            end = start + dt.timedelta(days=6)
+            return f"{start.strftime('%d %b')} - {end.strftime('%d %b')}"
+
+        def _row(tx):
+            d = tx["date"]
+            amt = tx["amount"]
+            name = tx["name"]
+            rec = _matching_receipt(tx)
+            reconciled = _reconciled(amt, d)
+            matched = bool(rec)
+            if matched:
+                badge = (
+                    "<span class='inline-flex items-center rounded-full bg-emerald-50 "
+                    "px-2 py-0.5 text-[11px] font-semibold text-emerald-700'>"
+                    "receipt matched</span>"
+                )
+            elif reconciled:
+                badge = (
+                    "<span class='inline-flex items-center rounded-full bg-gray-100 "
+                    "px-2 py-0.5 text-[11px] font-semibold text-gray-600'>"
+                    "reconciled in Xero</span>"
+                )
+            else:
+                badge = (
+                    "<span class='inline-flex items-center rounded-full bg-amber-50 "
+                    "px-2 py-0.5 text-[11px] font-semibold text-amber-700'>"
+                    "receipt needed</span>"
+                )
+            row_cls = (
+                "bg-emerald-50/60 border-emerald-100"
+                if matched else
+                ("bg-gray-50/70 border-gray-100 opacity-75" if reconciled else "bg-white border-gray-100")
             )
-            opacity = " opacity-60" if muted else ""
+            rec_line = ""
+            if rec:
+                merchant = escape(rec.get("merchant") or rec.get("ocr_merchant") or "Receipt")
+                status = escape(str(rec.get("status") or "saved"))
+                rec_line = (
+                    f"<div class='text-[11px] text-emerald-700 mt-0.5'>"
+                    f"Matched to {merchant} · {status}</div>"
+                )
             return (
-                "<div class='px-4 py-3 border-b border-gray-100 last:border-0 flex "
-                f"items-center justify-between gap-3{opacity}'>"
+                "<div class='px-4 py-3 border-b last:border-0 flex "
+                f"items-center justify-between gap-3 {row_cls}'>"
                 "<div class='min-w-0'>"
                 f"<div class='font-medium text-gray-900 truncate'>{escape(name)}</div>"
                 f"<div class='text-xs text-gray-500'>"
                 f"{escape(_exp_day_label(d.isoformat()))}</div>"
+                f"{rec_line}"
                 "</div>"
                 "<div class='text-right whitespace-nowrap'>"
                 f"<div class='font-semibold text-gray-900'>{_exp_money(amt)}</div>"
-                f"<div class='mt-0.5'>{tick}</div>"
+                f"<div class='mt-0.5'>{badge}</div>"
                 "</div></div>"
             )
 
-        active_rows, done_rows = [], []
-        for (d, amt, name) in txs:
-            if _reconciled(amt, d):
-                done_rows.append(_row(d, amt, name, _ticked(amt, d), muted=True))
-            else:
-                active_rows.append(_row(d, amt, name, _ticked(amt, d)))
+        weeks: dict[dt.date, list[dict]] = {}
+        for tx in txs:
+            weeks.setdefault(_week_start(tx["date"]), []).append(tx)
 
         out = [
-            "<div class='space-y-2'>"
-            "<h2 class='text-sm font-semibold text-gray-500 uppercase tracking-wide "
-            "px-1'>Your card &mdash; needs reconciling</h2>"
+            "<div class='space-y-2'>",
+            "<div class='flex items-end justify-between gap-2 px-1'>"
+            "<h2 class='text-sm font-semibold text-gray-500 uppercase tracking-wide'>"
+            "Your card by week</h2>"
+            f"<div class='text-[11px] text-gray-400 text-right'>{last_updated_html}</div>"
+            "</div>",
         ]
         if recon is None:
             out.append(
                 "<p class='text-xs text-gray-400 px-1'>Reconciliation status paused "
                 "&mdash; lines stay here until the office turns Xero back on.</p>"
             )
-        if active_rows:
-            out.append(
-                "<div class='rounded-xl border border-gray-200 bg-white "
-                "overflow-hidden'>" + "".join(active_rows) + "</div>"
+        for idx, start in enumerate(sorted(weeks.keys(), reverse=True)):
+            rows = weeks[start]
+            unmatched = [
+                tx for tx in rows
+                if not _matching_receipt(tx)
+                and not _reconciled(tx["amount"], tx["date"])
+            ]
+            matched_count = sum(
+                1 for tx in rows
+                if _matching_receipt(tx)
             )
-        else:
+            unmatched_total = round(sum(float(tx["amount"] or 0) for tx in unmatched), 2)
+            vat_at_risk = round(unmatched_total / 6, 2) if unmatched_total > 0 else 0.0
+            open_attr = " open" if idx == 0 and unmatched_total > 0 else ""
+            tone = (
+                "border-emerald-200 bg-emerald-50"
+                if unmatched_total <= 0 else
+                "border-amber-200 bg-amber-50"
+            )
+            out.append(
+                f"<details class='rounded-xl border {tone} overflow-hidden'{open_attr}>"
+                "<summary class='list-none cursor-pointer px-4 py-3 flex items-center "
+                "justify-between gap-3'>"
+                "<div>"
+                f"<div class='font-semibold text-gray-900'>{escape(_week_label(start))}</div>"
+                f"<div class='text-xs text-gray-500'>{len(rows)} card payment(s) · "
+                f"{matched_count} matched</div>"
+                "</div>"
+                "<div class='text-right shrink-0'>"
+                f"<div class='text-sm font-bold text-gray-900'>{_exp_money(unmatched_total)}</div>"
+                f"<div class='text-[11px] text-gray-600'>left over · VAT {_exp_money(vat_at_risk)}</div>"
+                "</div></summary>"
+                "<div class='border-t border-white/70 bg-white'>"
+                + "".join(_row(tx) for tx in rows)
+                + "</div></details>"
+            )
+        if not weeks:
             out.append(
                 "<div class='rounded-xl border border-dashed border-gray-300 bg-white "
                 "p-4 text-center text-xs text-gray-500'>All caught up &mdash; nothing "
                 "waiting.</div>"
-            )
-        if done_rows:
-            out.append(
-                "<h2 class='text-sm font-semibold text-gray-500 uppercase tracking-wide "
-                "px-1 pt-2'>Reconciled (last month)</h2>"
-                "<div class='rounded-xl border border-gray-200 bg-white "
-                "overflow-hidden'>" + "".join(done_rows) + "</div>"
             )
         out.append("</div>")
         return "".join(out)
