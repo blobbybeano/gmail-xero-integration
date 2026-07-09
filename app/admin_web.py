@@ -11344,6 +11344,10 @@ body {{ background:#f7f6f3 !important; }}
             session.pop("engineer_id", None)
         return _portal_login_page()
 
+    @app.get("/expenses/login")
+    def expenses_login():
+        return portal_login()
+
     @app.post("/portal")
     def portal_login_post():
         db = config.admin_db_file
@@ -13492,6 +13496,7 @@ body {{ background:#f7f6f3 !important; }}
 
         eng_cards = []
         auto_xero_bill_budget = 5
+        portal_url = f"{base_url}/expenses/login"
         for e in engineers:
             link = f"{base_url}/expenses/{e['token']}"
             receipts = exp_store.list_receipts_for_engineer(db, e["id"])
@@ -13739,14 +13744,21 @@ body {{ background:#f7f6f3 !important; }}
                 "viewBox='0 0 24 24'><path stroke-linecap='round' stroke-linejoin='round' "
                 "stroke-width='2' d='M19 9l-7 7-7-7'/></svg></div></summary>"
                 "<div class='px-4 pb-4 pt-1 border-t border-gray-100 space-y-3'>"
+                "<div class='rounded-lg border border-indigo-100 bg-indigo-50 px-3 py-2'>"
+                "<div class='flex items-center justify-between gap-2 flex-wrap'>"
+                "<div>"
+                "<div class='text-xs font-semibold text-indigo-950'>Engineer portal login</div>"
+                "<div class='text-[11px] text-indigo-700'>Give everyone this same link, then use their username and password below.</div>"
+                "</div>"
                 "<div class='flex items-center gap-2'>"
-                f"<input readonly value='{escape(link)}' "
-                "class='flex-1 text-xs bg-gray-50 border border-gray-200 rounded px-2 py-1 "
-                f"text-gray-600' id='lnk-{e['id']}'>"
-                f"<button type='button' onclick=\"navigator.clipboard.writeText('{escape(link)}')\" "
-                "class='text-xs px-2 py-1 rounded bg-indigo-600 text-white'>Copy</button>"
-                f"<a href='{escape(link)}' target='_blank' "
-                "class='text-xs px-2 py-1 rounded border border-gray-300 text-gray-700'>Open</a>"
+                f"<button type='button' onclick=\"navigator.clipboard.writeText('{escape(portal_url)}')\" "
+                "class='text-xs px-2 py-1 rounded bg-indigo-600 text-white'>Copy login link</button>"
+                f"<a href='{escape(portal_url)}' target='_blank' "
+                "class='text-xs px-2 py-1 rounded border border-indigo-300 bg-white text-indigo-700'>Open</a>"
+                "</div></div>"
+                f"<input readonly value='{escape(portal_url)}' "
+                "class='mt-2 w-full text-xs bg-white border border-indigo-100 rounded px-2 py-1 "
+                "text-indigo-900'>"
                 "</div>"
                 f"<div class='flex items-center gap-3 text-sm'><span>{escape(kind_label)}</span>{owed_html}</div>"
                 f"{receipts_summary_html}"
@@ -13805,6 +13817,18 @@ body {{ background:#f7f6f3 !important; }}
                 "<button type='submit' class='px-3 py-1.5 rounded bg-gray-900 text-white text-sm'>"
                 "Save</button></div>"
                 "</form>"
+                "<details class='rounded-lg border border-gray-200 bg-gray-50/60'>"
+                "<summary class='px-3 py-2 cursor-pointer list-none text-xs font-medium text-gray-600'>"
+                "Backup personal link</summary>"
+                "<div class='px-3 pb-3 flex items-center gap-2'>"
+                f"<input readonly value='{escape(link)}' "
+                "class='flex-1 text-xs bg-white border border-gray-200 rounded px-2 py-1 "
+                f"text-gray-600' id='lnk-{e['id']}'>"
+                f"<button type='button' onclick=\"navigator.clipboard.writeText('{escape(link)}')\" "
+                "class='text-xs px-2 py-1 rounded bg-gray-700 text-white'>Copy</button>"
+                f"<a href='{escape(link)}' target='_blank' "
+                "class='text-xs px-2 py-1 rounded border border-gray-300 text-gray-700 bg-white'>Open</a>"
+                "</div></details>"
                 "</div>"
                 "</details>"
             )
