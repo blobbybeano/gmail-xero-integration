@@ -11490,7 +11490,16 @@ body {{ background:#f7f6f3 !important; }}
         for idx, tx in enumerate(txs + older_txs):
             tx["key"] = tx["id"] or f"{tx['date'].isoformat()}:{tx['amount']:.2f}:{idx}"
 
-        recon = _engineer_reconciled_lines(cutoff, today)
+        visible_dates = [tx["date"] for tx in txs + older_txs if tx.get("date")]
+        receipt_dates = [r["date"] for r in receipt_only_rows if r.get("date")]
+        recon_start = min(visible_dates + receipt_dates) if (visible_dates or receipt_dates) else cutoff
+        # Keep the portal honest for older CSV months too. Previously the UI
+        # displayed May/April/March rows but only checked Xero reconciliation for
+        # the last 35 days, so older reconciled spends could be shown as missing.
+        # Clamp to a year so one phone page-load cannot become a full-history
+        # Xero audit; the result is cached below.
+        recon_start = max(recon_start, today - dt.timedelta(days=365))
+        recon = _engineer_reconciled_lines(recon_start, today)
 
         def _reconciled(amt, d):
             if not recon:
@@ -11771,6 +11780,43 @@ body {{ background:#f7f6f3 !important; }}
             )
         out.append("</div>")
         return "".join(out)
+
+    def _expense_portal_mode_nav(token: str, active: str) -> str:
+        """Two large mode buttons for engineer receipts.
+
+        The active task stays physically larger. The inactive task stays visible
+        but smaller/faded so engineers can always tell which screen they are on
+        and switch without hunting for a back link.
+        """
+        active = active if active in {"expense", "customer"} else "expense"
+
+        def _card(mode: str, href: str, icon: str, title: str, sub: str, color: str) -> str:
+            is_active = active == mode
+            size = "h-36 scale-100 opacity-100 shadow-sm" if is_active else "h-28 scale-[.94] opacity-55 shadow-none"
+            bg = (
+                f"bg-{color}-600 text-white active:bg-{color}-700"
+                if is_active else
+                f"bg-{color}-50 text-{color}-800 border border-{color}-100"
+            )
+            icon_cls = "text-4xl" if is_active else "text-3xl"
+            title_cls = "text-base" if is_active else "text-sm"
+            sub_cls = "text-xs opacity-80" if is_active else "text-[11px] opacity-70"
+            return (
+                f"<a href='{escape(href)}' "
+                "class='flex flex-col items-center justify-center w-full rounded-2xl "
+                f"cursor-pointer transition-all duration-200 ease-out {size} {bg}'>"
+                f"<span class='{icon_cls}'>{icon}</span>"
+                f"<span class='mt-2 {title_cls} font-semibold'>{escape(title)}</span>"
+                f"<span class='{sub_cls} mt-0.5'>{escape(sub)}</span>"
+                "</a>"
+            )
+
+        return (
+            "<div class='grid grid-cols-2 gap-3'>"
+            + _card("expense", f"/expenses/{token}", "&#128247;", "Expense receipt", "Fuel, parts, tools", "indigo")
+            + _card("customer", f"/expenses/{token}/customer-receipts", "&#128179;", "Customer receipt", "Card terminal photo", "emerald")
+            + "</div>"
+        )
 
     def _subcontractor_reference(eng):
         """Stable payment reference the office quotes when paying a
@@ -12619,7 +12665,7 @@ body {{ background:#f7f6f3 !important; }}
                 <label for="exp-file"
                        class="flex flex-col items-center justify-center w-full h-36
                               rounded-2xl bg-indigo-600 text-white cursor-pointer
-                              active:bg-indigo-700 shadow-sm">
+                              active:bg-indigo-700 shadow-sm transition-all duration-200 ease-out">
                   <span class="text-4xl">&#128247;</span>
                   <span class="mt-2 text-base font-semibold">Expense receipt</span>
                   <span class="text-xs opacity-80 mt-0.5">Fuel, parts, tools</span>
@@ -12629,12 +12675,12 @@ body {{ background:#f7f6f3 !important; }}
                        style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none">
               </form>
               <a href="/expenses/{escape(token)}/customer-receipts"
-                 class="flex flex-col items-center justify-center w-full h-36
-                        rounded-2xl bg-emerald-600 text-white cursor-pointer
-                        active:bg-emerald-700 shadow-sm">
-                <span class="text-4xl">&#128179;</span>
-                <span class="mt-2 text-base font-semibold">Customer receipt</span>
-                <span class="text-xs opacity-80 mt-0.5">Card terminal photo</span>
+                 class="flex flex-col items-center justify-center w-full h-28 scale-[.94]
+                        rounded-2xl bg-emerald-50 text-emerald-800 border border-emerald-100
+                        cursor-pointer opacity-55 transition-all duration-200 ease-out">
+                <span class="text-3xl">&#128179;</span>
+                <span class="mt-2 text-sm font-semibold">Customer receipt</span>
+                <span class="text-[11px] opacity-70 mt-0.5">Card terminal photo</span>
               </a>
               </div>
               {card_feed_html}
@@ -12727,6 +12773,7 @@ body {{ background:#f7f6f3 !important; }}
             <a href="/expenses/{escape(token)}" class="text-sm text-indigo-600">&larr; Back</a>
             <span class="text-xs text-gray-500">Customer receipts</span>
           </div>
+          {_expense_portal_mode_nav(token, "customer")}
           <div>
             <h1 class="text-xl font-bold text-gray-900">Pick the customer job</h1>
             <p class="text-sm text-gray-500 mt-1">Choose the diary entry, then photograph the card terminal receipt. It will be attached to that customer invoice.</p>
@@ -12764,6 +12811,7 @@ body {{ background:#f7f6f3 !important; }}
             <a href="/expenses/{escape(token)}/customer-receipts" class="text-sm text-indigo-600">&larr; Jobs</a>
             <span class="text-xs text-gray-500">Customer receipt</span>
           </div>
+          {_expense_portal_mode_nav(token, "customer")}
           <div class="rounded-xl border border-gray-200 bg-white p-4">
             <div class="text-xs text-gray-500">Attach card terminal receipt to</div>
             <h1 class="text-xl font-bold text-gray-900 mt-1">{escape(customer)}</h1>
