@@ -11461,6 +11461,7 @@ body {{ background:#f7f6f3 !important; }}
         today = dt.datetime.now(dt.timezone.utc).date()
         cutoff = today - dt.timedelta(days=35)
         txs = []
+        older_txs = []
         for t in all_tx:
             if (t.get("account_id") or "") != acct:
                 continue
@@ -11471,16 +11472,21 @@ body {{ background:#f7f6f3 !important; }}
             if amt <= 0:  # ignore refunds / incoming credits
                 continue
             d = _d(t.get("date"))
-            if d is None or d < cutoff:
+            if d is None:
                 continue
-            txs.append({
+            row = {
                 "date": d,
                 "amount": amt,
                 "name": str(t.get("name") or "Card payment"),
                 "id": str(t.get("transaction_id") or ""),
-            })
+            }
+            if d >= cutoff:
+                txs.append(row)
+            else:
+                older_txs.append(row)
         txs.sort(key=lambda x: x["date"], reverse=True)
-        for idx, tx in enumerate(txs):
+        older_txs.sort(key=lambda x: x["date"], reverse=True)
+        for idx, tx in enumerate(txs + older_txs):
             tx["key"] = tx["id"] or f"{tx['date'].isoformat()}:{tx['amount']:.2f}:{idx}"
         if not txs:
             return (
@@ -11539,9 +11545,29 @@ body {{ background:#f7f6f3 !important; }}
         def _week_start(d: dt.date) -> dt.date:
             return d - dt.timedelta(days=d.weekday())
 
+        this_week = _week_start(today)
+
         def _week_label(start: dt.date) -> str:
             end = start + dt.timedelta(days=6)
+            if start == this_week:
+                return "This week"
+            if start == this_week - dt.timedelta(days=7):
+                return "Last week"
+            if start.year == today.year:
+                return f"Week of {start.strftime('%d %b')}"
+            return f"Week of {start.strftime('%d %b %Y')}"
+
+        def _date_span(start: dt.date) -> str:
+            end = start + dt.timedelta(days=6)
             return f"{start.strftime('%d %b')} - {end.strftime('%d %b')}"
+
+        def _month_label(month_key: str) -> str:
+            try:
+                y, m = month_key.split("-", 1)
+                d = dt.date(int(y), int(m), 1)
+                return d.strftime("%B") if d.year == today.year else d.strftime("%B %Y")
+            except Exception:
+                return month_key
 
         def _row(tx):
             d = tx["date"]
@@ -11600,6 +11626,21 @@ body {{ background:#f7f6f3 !important; }}
         for tx in txs:
             weeks.setdefault(_week_start(tx["date"]), []).append(tx)
 
+        months: dict[str, list[dict]] = {}
+        for tx in older_txs:
+            months.setdefault(tx["date"].strftime("%Y-%m"), []).append(tx)
+
+        def _summary(rows):
+            unmatched = [
+                tx for tx in rows
+                if not _matching_receipt(tx)
+                and not _reconciled(tx["amount"], tx["date"])
+            ]
+            matched_count = sum(1 for tx in rows if _matching_receipt(tx))
+            unmatched_total = round(sum(float(tx["amount"] or 0) for tx in unmatched), 2)
+            vat_at_risk = round(unmatched_total / 6, 2) if unmatched_total > 0 else 0.0
+            return unmatched, matched_count, unmatched_total, vat_at_risk
+
         out = [
             "<div class='space-y-2'>",
             "<div class='flex items-end justify-between gap-2 px-1'>"
@@ -11615,17 +11656,7 @@ body {{ background:#f7f6f3 !important; }}
             )
         for idx, start in enumerate(sorted(weeks.keys(), reverse=True)):
             rows = weeks[start]
-            unmatched = [
-                tx for tx in rows
-                if not _matching_receipt(tx)
-                and not _reconciled(tx["amount"], tx["date"])
-            ]
-            matched_count = sum(
-                1 for tx in rows
-                if _matching_receipt(tx)
-            )
-            unmatched_total = round(sum(float(tx["amount"] or 0) for tx in unmatched), 2)
-            vat_at_risk = round(unmatched_total / 6, 2) if unmatched_total > 0 else 0.0
+            _unmatched, matched_count, unmatched_total, vat_at_risk = _summary(rows)
             open_attr = " open" if idx == 0 and unmatched_total > 0 else ""
             tone = (
                 "border-emerald-200 bg-emerald-50"
@@ -11638,6 +11669,7 @@ body {{ background:#f7f6f3 !important; }}
                 "justify-between gap-3'>"
                 "<div>"
                 f"<div class='font-semibold text-gray-900'>{escape(_week_label(start))}</div>"
+                f"<div class='text-[11px] text-gray-400'>{escape(_date_span(start))}</div>"
                 f"<div class='text-xs text-gray-500'>{len(rows)} card payment(s) · "
                 f"{matched_count} matched</div>"
                 "</div>"
@@ -11649,6 +11681,39 @@ body {{ background:#f7f6f3 !important; }}
                 + "".join(_row(tx) for tx in rows)
                 + "</div></details>"
             )
+        if months:
+            out.append(
+                "<div class='pt-3'>"
+                "<h3 class='text-xs font-semibold text-gray-400 uppercase tracking-wide "
+                "px-1 mb-2'>Older months</h3>"
+                "<div class='grid grid-cols-1 gap-2'>"
+            )
+            for month_key in sorted(months.keys(), reverse=True):
+                rows = months[month_key]
+                _unmatched, matched_count, unmatched_total, vat_at_risk = _summary(rows)
+                tone = (
+                    "border-emerald-200 bg-emerald-50"
+                    if unmatched_total <= 0 else
+                    "border-gray-200 bg-white"
+                )
+                out.append(
+                    f"<details class='rounded-xl border {tone} overflow-hidden'>"
+                    "<summary class='list-none cursor-pointer px-4 py-3 flex items-center "
+                    "justify-between gap-3'>"
+                    "<div>"
+                    f"<div class='font-semibold text-gray-900'>{escape(_month_label(month_key))}</div>"
+                    f"<div class='text-xs text-gray-500'>{len(rows)} card payment(s) · "
+                    f"{matched_count} matched</div>"
+                    "</div>"
+                    "<div class='text-right shrink-0'>"
+                    f"<div class='text-sm font-bold text-gray-900'>{_exp_money(unmatched_total)}</div>"
+                    f"<div class='text-[11px] text-gray-600'>left over · VAT {_exp_money(vat_at_risk)}</div>"
+                    "</div></summary>"
+                    "<div class='border-t border-gray-100 bg-white'>"
+                    + "".join(_row(tx) for tx in rows)
+                    + "</div></details>"
+                )
+            out.append("</div></div>")
         if not weeks:
             out.append(
                 "<div class='rounded-xl border border-dashed border-gray-300 bg-white "
