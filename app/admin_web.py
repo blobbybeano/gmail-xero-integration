@@ -19889,6 +19889,25 @@ body {{ background:#f7f6f3 !important; }}
         badge = _escan_status_badge(st)
         amt   = it.get("amount_inc")
         amt_s = f"£{amt:,.2f}" if amt is not None else "—"
+        amount_ex = it.get("amount_ex")
+        vat_amount = it.get("vat_amount")
+        ex_s = f"£{float(amount_ex):,.2f}" if amount_ex is not None else "—"
+        vat_s = f"£{float(vat_amount):,.2f}" if vat_amount is not None else "—"
+        vat_included = bool(
+            amt is not None
+            and amount_ex is not None
+            and vat_amount is not None
+            and abs(float(vat_amount or 0)) >= 0.005
+        )
+        vat_mode = "inc" if vat_included else "no_vat"
+        vat_summary = (
+            f"<span class='font-semibold text-gray-700'>{ex_s}</span> ex VAT"
+            + (
+                f" <span class='text-gray-300'>+</span> <span class='font-semibold text-gray-700'>{vat_s}</span> VAT"
+                if vat_included else
+                " <span class='text-gray-400'>(no VAT)</span>"
+            )
+        )
         merchant  = it.get("merchant", "") or it.get("sender_name", "") or it.get("sender_from", "")
         purchased = it.get("purchased_on", "") or it.get("email_date", "")
         subject   = it.get("subject", "")[:80]
@@ -19970,10 +19989,6 @@ body {{ background:#f7f6f3 !important; }}
   <span class="text-xs text-gray-400">Scanning downloads and reads this email's attachments in full.</span>
 </div>"""
         elif is_test and st not in ("imported", "own_company", "duplicate"):
-            amount_ex = it.get("amount_ex")
-            vat_amount = it.get("vat_amount")
-            ex_s = f"£{float(amount_ex):,.2f}" if amount_ex is not None else "—"
-            vat_s = f"£{float(vat_amount):,.2f}" if vat_amount is not None else "—"
             raw = (it.get("ocr_raw") or "").strip().replace("\n", " ")
             raw = raw[:220] + ("..." if len(raw) > 220 else "")
             raw_html = f'<p class="text-xs text-gray-500 mt-2">OCR preview: {escape(raw)}</p>' if raw else ""
@@ -20042,6 +20057,14 @@ body {{ background:#f7f6f3 !important; }}
       {status_opts}
     </select>
   </div>
+  <div>
+    <label class="block text-xs text-gray-500 mb-1">VAT</label>
+    <select name="vat_mode" class="text-xs border border-gray-200 rounded px-2 py-1">
+      <option value="">keep</option>
+      <option value="inc" {"selected" if vat_mode == "inc" else ""}>total includes VAT</option>
+      <option value="no_vat" {"selected" if vat_mode == "no_vat" else ""}>no VAT</option>
+    </select>
+  </div>
   <button class="px-3 py-1.5 text-xs bg-indigo-600 text-white rounded hover:bg-indigo-500">Save</button>
 </form>
 {cross_btn}
@@ -20101,6 +20124,7 @@ body {{ background:#f7f6f3 !important; }}
         <span class="text-sm font-semibold text-gray-800 truncate">{merchant}</span>
       </div>
       <p class="text-xs text-gray-500 mt-0.5 truncate">{from_addr} · {subject}</p>
+      <p class="text-xs text-gray-500 mt-1">{vat_summary}</p>
       {dup_html}{recon_sub}{err_html}{view_html}
     </div>
     <div class="text-right shrink-0">
@@ -21079,6 +21103,7 @@ document.addEventListener('submit', function(e) {{
         is_test_batch = bool(batch.get("is_test"))
         new_status   = (_req.form.get("status") or "").strip()
         account_raw  = (_req.form.get("account") or "").strip()
+        vat_mode     = (_req.form.get("vat_mode") or "").strip()
 
         updates: dict = {}
         if new_status in ("new", "ignored", "possible_dup"):
@@ -21090,6 +21115,19 @@ document.addEventListener('submit', function(e) {{
             updates["category_account_name"] = name.strip()
             if updates.get("status") != "ignored":
                 updates["status"] = "new"
+        if vat_mode in ("inc", "no_vat"):
+            item = em_store.get_item(config.admin_db_file, item_id) or {}
+            try:
+                gross = round(float(item.get("amount_inc") or 0), 2)
+            except (TypeError, ValueError):
+                gross = 0.0
+            if gross > 0:
+                if vat_mode == "inc":
+                    updates["amount_ex"] = round(gross / 1.2, 2)
+                    updates["vat_amount"] = round(gross - updates["amount_ex"], 2)
+                else:
+                    updates["amount_ex"] = gross
+                    updates["vat_amount"] = 0.0
         if updates:
             em_store.update_item(config.admin_db_file, item_id, **updates)
 
