@@ -12817,27 +12817,22 @@ body {{ background:#f7f6f3 !important; }}
         for j in jobs:
             start = j["start"].strftime("%a %-d %b, %H:%M")
             amount = f"<span class='font-semibold text-gray-900'>{escape(j.get('amount') or '')}</span>" if j.get("amount") else ""
-            card = (
-                "<span class='inline-flex rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-700'>CARD</span>"
-                if j.get("payment") == "card" else
-                "<span class='inline-flex rounded-full bg-gray-100 px-2 py-0.5 text-[11px] font-semibold text-gray-500'>check payment type</span>"
-            )
             receipt_badge = ""
             if j.get("has_receipt"):
                 receipt_badge = (
-                    "<br><span class='inline-flex rounded-full bg-emerald-50 px-2 py-0.5 "
+                    "<span class='inline-flex rounded-full bg-emerald-50 px-2 py-0.5 "
                     "text-[11px] font-semibold text-emerald-700'>receipt attached</span>"
                 )
             elif j.get("overdue"):
                 receipt_badge = (
-                    "<br><span class='inline-flex rounded-full bg-rose-50 px-2 py-0.5 "
+                    "<span class='inline-flex rounded-full bg-rose-50 px-2 py-0.5 "
                     "text-[11px] font-semibold text-rose-700'>receipt overdue</span>"
                 )
-            inv = (
-                "<span class='inline-flex rounded-full bg-indigo-50 px-2 py-0.5 text-[11px] font-semibold text-indigo-700'>invoice linked</span>"
-                if j.get("invoice_id") else
-                "<span class='inline-flex rounded-full bg-amber-50 px-2 py-0.5 text-[11px] font-semibold text-amber-700'>invoice not linked yet</span>"
-            )
+            else:
+                receipt_badge = (
+                    "<span class='inline-flex rounded-full bg-gray-100 px-2 py-0.5 "
+                    "text-[11px] font-semibold text-gray-600'>needs receipt</span>"
+                )
             rows.append(
                 "<a class='block rounded-xl border border-gray-200 bg-white p-4 active:bg-gray-50' "
                 f"href='/expenses/{escape(token)}/customer-receipts/{escape(j['calendar_id'])}/{escape(j['event_id'])}'>"
@@ -12847,8 +12842,8 @@ body {{ background:#f7f6f3 !important; }}
                 f"<div class='text-xs text-gray-500 mt-0.5'>{escape(j.get('summary') or '')}</div>"
                 f"<div class='text-xs text-gray-500 mt-1'>{escape(start)} {amount}</div>"
                 "</div>"
-                "<div class='text-right space-y-1 shrink-0'>"
-                f"{card}<br>{inv}{receipt_badge}"
+                "<div class='text-right shrink-0'>"
+                f"{receipt_badge}"
                 "</div></div></a>"
             )
         body = "".join(rows) or (
