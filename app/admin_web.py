@@ -20065,8 +20065,11 @@ body {{ background:#f7f6f3 !important; }}
                              f'&#128462; Download Word document</a>')
             else:
                 view_html = (
-                    f'<a href="{img_url}" target="_blank" rel="noopener" '
-                    f'onclick="escanView({json.dumps(preview_url)}, {json.dumps(preview_title)}, {str(is_preview_image).lower()});return false;" '
+                    f'<button type="button" data-escan-preview="1" '
+                    f'data-preview-url="{escape(preview_url)}" '
+                    f'data-full-url="{escape(img_url)}" '
+                    f'data-preview-title="{escape(preview_title)}" '
+                    f'data-preview-image="{str(is_preview_image).lower()}" '
                     f'class="inline-flex items-center gap-1 mt-2 px-2.5 py-1 text-xs '
                     f'font-medium bg-sky-100 text-sky-800 rounded-lg hover:bg-sky-200">'
                     "<svg class='w-3.5 h-3.5' fill='none' stroke='currentColor' "
@@ -20075,7 +20078,7 @@ body {{ background:#f7f6f3 !important; }}
                     "7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 "
                     ".639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178z'/>"
                     "<path stroke-linecap='round' stroke-linejoin='round' d='M15 12a3 3 0 "
-                    "11-6 0 3 3 0 016 0z'/></svg>View invoice</a>"
+                    "11-6 0 3 3 0 016 0z'/></svg>View invoice</button>"
                 )
         acct_html = ""
         if acct_code:
@@ -20958,7 +20961,7 @@ body {{ background:#f7f6f3 !important; }}
   </div>
 </div>
 <script>
-function escanView(url, title, isImage) {{
+function escanView(url, title, isImage, fullUrl) {{
   var panel = document.getElementById('escan-preview-panel');
   var img = document.getElementById('escan-preview-img');
   var fr = document.getElementById('escan-preview-frame');
@@ -20966,7 +20969,7 @@ function escanView(url, title, isImage) {{
   var open = document.getElementById('escan-preview-open');
   if (!panel || !img || !fr) return;
   if (tl) tl.textContent = title || 'Invoice';
-  if (open) open.href = url.replace(/[?&]preview=1\b/, '');
+  if (open) open.href = fullUrl || url;
   if (isImage) {{
     fr.classList.add('hidden');
     fr.removeAttribute('src');
@@ -20991,6 +20994,17 @@ function escanClose() {{
 }}
 document.addEventListener('keydown', function(e) {{
   if (e.key === 'Escape') escanClose();
+}});
+document.addEventListener('click', function(e) {{
+  var btn = e.target.closest && e.target.closest('[data-escan-preview]');
+  if (!btn) return;
+  e.preventDefault();
+  escanView(
+    btn.dataset.previewUrl || '',
+    btn.dataset.previewTitle || 'Invoice',
+    btn.dataset.previewImage === 'true',
+    btn.dataset.fullUrl || ''
+  );
 }});
 
 // AJAX cross-off / restore — no page reload
