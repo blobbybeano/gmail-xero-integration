@@ -20024,14 +20024,26 @@ body {{ background:#f7f6f3 !important; }}
             att_mime = (it.get("attachment_mime") or "").lower()
             img_url = f"/receipts/emails/{batch_id}/item/{sid}/image"
             is_docx = att_name.endswith(".docx") or "wordprocessing" in att_mime
+            preview_title = it.get("attachment_name") or merchant or "Invoice"
             if is_docx:
                 view_html = (f'<a href="{img_url}" download '
-                             f'class="inline-block text-xs text-indigo-600 hover:underline mt-1">'
+                             f'class="inline-flex items-center gap-1 mt-2 px-2.5 py-1 text-xs '
+                             f'font-medium bg-sky-100 text-sky-800 rounded-lg hover:bg-sky-200">'
                              f'&#128462; Download Word document</a>')
             else:
-                view_html = (f'<a href="#" onclick="escanView({json.dumps(img_url)});return false;" '
-                             f'class="inline-block text-xs text-indigo-600 hover:underline mt-1">'
-                             f'View attachment &rarr;</a>')
+                view_html = (
+                    f'<a href="{img_url}" target="_blank" rel="noopener" '
+                    f'onclick="escanView({json.dumps(img_url)}, {json.dumps(preview_title)});return false;" '
+                    f'class="inline-flex items-center gap-1 mt-2 px-2.5 py-1 text-xs '
+                    f'font-medium bg-sky-100 text-sky-800 rounded-lg hover:bg-sky-200">'
+                    "<svg class='w-3.5 h-3.5' fill='none' stroke='currentColor' "
+                    "stroke-width='2' viewBox='0 0 24 24'><path stroke-linecap='round' "
+                    "stroke-linejoin='round' d='M2.036 12.322a1.012 1.012 0 010-.639C3.423 "
+                    "7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 "
+                    ".639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178z'/>"
+                    "<path stroke-linecap='round' stroke-linejoin='round' d='M15 12a3 3 0 "
+                    "11-6 0 3 3 0 016 0z'/></svg>View invoice</a>"
+                )
         acct_html = ""
         if acct_code:
             acct_html = (f'<span class="text-xs font-medium text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded" '
@@ -20248,6 +20260,43 @@ body {{ background:#f7f6f3 !important; }}
 </tr>"""
 
         has_test_batches = any(b.get("is_test") for b in batches)
+        latest_scan_banner = ""
+        if batches:
+            latest = batches[0]
+            raw_summary = latest.get("summary") or latest.get("summary_json") or {}
+            if isinstance(raw_summary, str):
+                try:
+                    raw_summary = __import__("json").loads(raw_summary)
+                except Exception:
+                    raw_summary = {}
+            found_latest = raw_summary.get("found", latest.get("total_found", 0))
+            new_latest = raw_summary.get("new", 0)
+            dup_latest = raw_summary.get("duplicate", 0)
+            latest_status = str(latest.get("status") or "").strip()
+            latest_cls = (
+                "bg-blue-50 border-blue-200 text-blue-800"
+                if latest_status == "processing"
+                else "bg-emerald-50 border-emerald-200 text-emerald-800"
+                if latest_status in ("ready", "done")
+                else "bg-red-50 border-red-200 text-red-800"
+                if latest_status == "error"
+                else "bg-gray-50 border-gray-200 text-gray-800"
+            )
+            latest_scan_banner = f"""
+  <div class="{latest_cls} border rounded-xl p-4 flex flex-col sm:flex-row sm:items-center gap-3">
+    <div class="flex-1">
+      <p class="text-sm font-semibold">Continue latest email scan</p>
+      <p class="text-xs opacity-80 mt-0.5">
+        {escape(latest.get("label") or latest.get("id") or "Latest scan")}
+        · {escape(latest.get("status") or "")}
+        · {found_latest} found · {new_latest} new · {dup_latest} duplicate
+      </p>
+    </div>
+    <a href="/receipts/emails/{escape(latest['id'])}"
+       class="inline-flex justify-center px-3 py-1.5 text-sm rounded bg-white/80 text-gray-900 border border-white hover:bg-white shadow-sm">
+      Open latest results
+    </a>
+  </div>"""
 
         if not batches:
             batch_rows = """<tr><td colspan="6" class="px-4 py-8 text-center">
@@ -20338,6 +20387,7 @@ body {{ background:#f7f6f3 !important; }}
   {gmail_banner}
   {scan_err_banner}
   {inbox_panel}
+  {latest_scan_banner}
 
   <!-- New scan form -->
   <div class="bg-white border border-gray-200 rounded-xl p-5 shadow-sm">
@@ -20868,13 +20918,13 @@ body {{ background:#f7f6f3 !important; }}
   </div>
 </div>
 <script>
-function escanView(url) {{
+function escanView(url, title) {{
   var bd = document.getElementById('escan-lb-backdrop');
   var fr = document.getElementById('escan-lb-frame');
   var tl = document.getElementById('escan-lb-title');
   if (!bd || !fr) return;
   fr.src = url;
-  tl.textContent = url.split('/').pop() || 'Attachment';
+  if (tl) tl.textContent = title || 'Invoice';
   bd.style.display = 'flex';
   document.body.style.overflow = 'hidden';
 }}
