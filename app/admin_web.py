@@ -20829,7 +20829,20 @@ body {{ background:#f7f6f3 !important; }}
         # candidate invoices are matched: own-company / AI-filtered / ignored
         # items never count as receipts against the card.
         outstanding_html = ""
-        if status in ("ready", "done"):
+        run_bank_check = request.args.get("check_bank") == "1"
+        if status in ("ready", "done") and not run_bank_check:
+            outstanding_html = f"""
+<div class="bg-white border border-gray-200 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center gap-3">
+  <div class="flex-1">
+    <p class="text-sm font-semibold text-gray-800">Bank-feed match check is paused</p>
+    <p class="text-xs text-gray-500 mt-0.5">Invoice viewing loads without asking Xero for bank transactions. Run this only when you want to compare these invoices against the card/bank feed.</p>
+  </div>
+  <a href="/receipts/emails/{escape(batch_id)}?check_bank=1"
+     class="inline-flex justify-center px-3 py-1.5 text-sm rounded bg-indigo-600 text-white hover:bg-indigo-500">
+    Check bank matches
+  </a>
+</div>"""
+        elif status in ("ready", "done"):
             _recon_items = [
                 i for i in items
                 if i.get("status") not in ("own_company", "not_invoice",
