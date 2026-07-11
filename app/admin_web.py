@@ -12498,9 +12498,12 @@ body {{ background:#f7f6f3 !important; }}
                         continue
                     desc = ev.get("description") or ""
                     pay = payment_choice(desc)
-                    # This is for terminal/card customer receipts. Keep likely
-                    # customer jobs visible even when payment type has not been
-                    # filled yet, but rank CARD entries first.
+                    # Customer receipt upload is only relevant to terminal/card
+                    # payments. Do not show blank/INVOICE/CASH jobs here; those
+                    # just confuse engineers and can make the overdue marker look
+                    # like it is chasing the wrong work.
+                    if pay != "card":
+                        continue
                     fields = parse_customer_fields(desc)
                     customer = fields.get("name") or ev.get("summary") or "Customer job"
                     start_raw = (ev.get("start") or {}).get("dateTime") or (ev.get("start") or {}).get("date") or ""
@@ -12532,7 +12535,6 @@ body {{ background:#f7f6f3 !important; }}
                     break
         rows.sort(key=lambda r: (
             0 if r.get("overdue") else 1,
-            0 if r.get("payment") == "card" else 1,
             abs((r.get("start") - now).total_seconds()) if r.get("start") else 999999999,
         ))
         return rows[:80]
@@ -12851,7 +12853,7 @@ body {{ background:#f7f6f3 !important; }}
             )
         body = "".join(rows) or (
             "<div class='rounded-xl border border-dashed border-gray-300 bg-white p-6 "
-            "text-center text-sm text-gray-500'>No nearby calendar jobs found.</div>"
+            "text-center text-sm text-gray-500'>No nearby CARD jobs found.</div>"
         )
         return _page(f"""
         <main data-receipt-page class="max-w-xl mx-auto p-4 space-y-4">
