@@ -499,6 +499,33 @@ def _exp_resize_for_ocr(data: bytes, filename: str, mime: str):
         return data, filename, mime
 
 
+def _exp_resize_for_preview(data: bytes, mime: str, *, max_dim: int = 900):
+    """Return a smaller JPEG preview for image-only quick checks.
+
+    This is deliberately lower quality than the stored attachment: it keeps the
+    email invoice list quick to browse without changing the original file that
+    may later be imported or attached to Xero.
+    """
+    if not (mime or "").lower().startswith("image/"):
+        return data, mime
+    try:
+        import io
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as img:
+            img.load()
+            w, h = img.size
+            scale = min(1.0, max_dim / max(w, h))
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            if scale < 1.0:
+                img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=72, optimize=True)
+        return buf.getvalue(), "image/jpeg"
+    except Exception:
+        return data, mime
+
+
 def _exp_compute_vat(amount_inc, vat_rate: float):
     """Given an inc-VAT total and a rate (%), return (ex, vat) rounded to 2dp."""
     try:
@@ -19027,6 +19054,10 @@ body {{ background:#f7f6f3 !important; }}
             head = fh.read(16)
         safe_mime = _exp_sniff_mime(head)
         if safe_mime and safe_mime.startswith("image/"):
+            if request.args.get("preview") == "1":
+                with open(path, "rb") as fh:
+                    preview_bytes, preview_mime = _exp_resize_for_preview(fh.read(), safe_mime)
+                return Response(preview_bytes, mimetype=preview_mime)
             return send_file(path, mimetype=safe_mime)
         if safe_mime == "application/pdf":
             return send_file(
@@ -20025,6 +20056,8 @@ body {{ background:#f7f6f3 !important; }}
             img_url = f"/receipts/emails/{batch_id}/item/{sid}/image"
             is_docx = att_name.endswith(".docx") or "wordprocessing" in att_mime
             preview_title = it.get("attachment_name") or merchant or "Invoice"
+            is_preview_image = att_mime.startswith("image/")
+            preview_url = img_url + ("?preview=1" if is_preview_image else "")
             if is_docx:
                 view_html = (f'<a href="{img_url}" download '
                              f'class="inline-flex items-center gap-1 mt-2 px-2.5 py-1 text-xs '
@@ -20033,7 +20066,7 @@ body {{ background:#f7f6f3 !important; }}
             else:
                 view_html = (
                     f'<a href="{img_url}" target="_blank" rel="noopener" '
-                    f'onclick="escanView({json.dumps(img_url)}, {json.dumps(preview_title)});return false;" '
+                    f'onclick="escanView({json.dumps(preview_url)}, {json.dumps(preview_title)}, {str(is_preview_image).lower()});return false;" '
                     f'class="inline-flex items-center gap-1 mt-2 px-2.5 py-1 text-xs '
                     f'font-medium bg-sky-100 text-sky-800 rounded-lg hover:bg-sky-200">'
                     "<svg class='w-3.5 h-3.5' fill='none' stroke='currentColor' "
@@ -20905,49 +20938,56 @@ body {{ background:#f7f6f3 !important; }}
   {outstanding_html}
 </div>
 
-<!-- ── Attachment lightbox ──────────────────────────────────────────────── -->
-<div id="escan-lb-backdrop"
-     onclick="escanClose()"
-     style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:9000;
-            display:none;align-items:center;justify-content:center;">
-  <div onclick="event.stopPropagation()"
-       style="position:relative;width:92vw;max-width:960px;height:88vh;
-              background:#fff;border-radius:12px;overflow:hidden;
-              display:flex;flex-direction:column;box-shadow:0 25px 60px rgba(0,0,0,.5);">
-    <div style="display:flex;align-items:center;justify-content:space-between;
-                padding:10px 14px;border-bottom:1px solid #e5e7eb;background:#f9fafb;
-                flex-shrink:0;">
-      <span id="escan-lb-title" style="font-size:13px;font-weight:600;color:#374151;
-            max-width:calc(100% - 36px);overflow:hidden;text-overflow:ellipsis;
-            white-space:nowrap;"></span>
-      <button onclick="escanClose()"
-              style="width:28px;height:28px;border:none;background:#e5e7eb;border-radius:50%;
-                     cursor:pointer;font-size:16px;line-height:1;color:#6b7280;">&#215;</button>
+<!-- ── Compact attachment preview ───────────────────────────────────────── -->
+<div id="escan-preview-panel"
+     class="hidden fixed right-3 bottom-3 z-50 w-[min(92vw,440px)] max-h-[72vh]
+            bg-white border border-gray-200 rounded-xl shadow-2xl overflow-hidden">
+  <div class="flex items-center justify-between gap-3 px-3 py-2 border-b border-gray-200 bg-gray-50">
+    <span id="escan-preview-title" class="text-xs font-semibold text-gray-700 truncate">Invoice</span>
+    <div class="flex items-center gap-1 shrink-0">
+      <a id="escan-preview-open" href="#" target="_blank" rel="noopener"
+         class="text-xs text-indigo-600 hover:underline">Open full</a>
+      <button type="button" onclick="escanClose()"
+              class="w-7 h-7 rounded-lg text-gray-500 hover:bg-gray-200 text-lg leading-none">&times;</button>
     </div>
-    <iframe id="escan-lb-frame"
-            src=""
-            style="flex:1;width:100%;border:none;"
-            allow="fullscreen"></iframe>
+  </div>
+  <div class="bg-gray-100 p-2 max-h-[calc(72vh-42px)] overflow-auto">
+    <img id="escan-preview-img" alt="Invoice preview"
+         class="hidden max-h-[64vh] max-w-full mx-auto object-contain bg-white rounded-lg shadow-sm">
+    <iframe id="escan-preview-frame" src="" class="hidden w-full h-[64vh] border-0 bg-white rounded-lg"></iframe>
   </div>
 </div>
 <script>
-function escanView(url, title) {{
-  var bd = document.getElementById('escan-lb-backdrop');
-  var fr = document.getElementById('escan-lb-frame');
-  var tl = document.getElementById('escan-lb-title');
-  if (!bd || !fr) return;
-  fr.src = url;
+function escanView(url, title, isImage) {{
+  var panel = document.getElementById('escan-preview-panel');
+  var img = document.getElementById('escan-preview-img');
+  var fr = document.getElementById('escan-preview-frame');
+  var tl = document.getElementById('escan-preview-title');
+  var open = document.getElementById('escan-preview-open');
+  if (!panel || !img || !fr) return;
   if (tl) tl.textContent = title || 'Invoice';
-  bd.style.display = 'flex';
-  document.body.style.overflow = 'hidden';
+  if (open) open.href = url.replace(/[?&]preview=1\b/, '');
+  if (isImage) {{
+    fr.classList.add('hidden');
+    fr.removeAttribute('src');
+    img.src = url;
+    img.classList.remove('hidden');
+  }} else {{
+    img.classList.add('hidden');
+    img.removeAttribute('src');
+    fr.src = url;
+    fr.classList.remove('hidden');
+  }}
+  panel.classList.remove('hidden');
 }}
 function escanClose() {{
-  var bd = document.getElementById('escan-lb-backdrop');
-  var fr = document.getElementById('escan-lb-frame');
-  if (!bd) return;
-  bd.style.display = 'none';
-  document.body.style.overflow = '';
-  if (fr) fr.src = '';
+  var panel = document.getElementById('escan-preview-panel');
+  var img = document.getElementById('escan-preview-img');
+  var fr = document.getElementById('escan-preview-frame');
+  if (!panel) return;
+  panel.classList.add('hidden');
+  if (img) img.removeAttribute('src');
+  if (fr) fr.removeAttribute('src');
 }}
 document.addEventListener('keydown', function(e) {{
   if (e.key === 'Escape') escanClose();
@@ -21164,6 +21204,10 @@ document.addEventListener('submit', function(e) {{
             head = fh.read(16)
         safe_mime = _exp_sniff_mime(head)
         if safe_mime and safe_mime.startswith("image/"):
+            if request.args.get("preview") == "1":
+                with open(path, "rb") as fh:
+                    preview_bytes, preview_mime = _exp_resize_for_preview(fh.read(), safe_mime)
+                return Response(preview_bytes, mimetype=preview_mime)
             return send_file(path, mimetype=safe_mime)
         if safe_mime == "application/pdf":
             return send_file(path, mimetype="application/pdf")
