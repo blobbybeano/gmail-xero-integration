@@ -21030,6 +21030,13 @@ document.addEventListener('click', function(e) {{
     btn.dataset.fullUrl || ''
   );
 }});
+document.addEventListener('click', function(e) {{
+  var a = e.target.closest && e.target.closest('a[href*="/receipts/emails/"][href*="/image"]');
+  if (!a || a.id === 'escan-preview-open') return;
+  e.preventDefault();
+  e.stopPropagation();
+  escanView(a.href, a.textContent ? a.textContent.trim() : 'Invoice', false, a.href);
+}}, true);
 
 // AJAX cross-off / restore — no page reload
 document.addEventListener('submit', function(e) {{
