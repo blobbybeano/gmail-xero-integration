@@ -20768,6 +20768,75 @@ body {{ background:#f7f6f3 !important; }}
 
         recon_map: dict = {}
 
+        def _email_cached_card_recon_map() -> dict:
+            """Cheap, read-only match badges from the cached card/CSV feed.
+
+            The full bank-feed panel can still be run separately, but invoice
+            cards should show whether the selected card CSV already contains a
+            likely payment without needing another Xero BankTransactions scan.
+            """
+            chosen = (batch.get("card_account") or "").strip()
+            if not chosen:
+                return {}
+            try:
+                txs = cardfeed.get_cached_transactions(config.admin_db_file)
+            except Exception:
+                txs = []
+            if not txs:
+                return {}
+            try:
+                labels = cardfeed.get_account_labels(config.admin_db_file) or {}
+            except Exception:
+                labels = {}
+            chosen_norm = re.sub(r"[^a-z0-9]+", " ", chosen.lower()).strip()
+            account_ids = {
+                str(aid)
+                for aid, meta in labels.items()
+                if chosen_norm
+                and (
+                    chosen_norm
+                    == re.sub(
+                        r"[^a-z0-9]+", " ",
+                        str((meta or {}).get("xero_account_name") or "").lower(),
+                    ).strip()
+                )
+            }
+            if labels and not account_ids:
+                return {}
+            out = {}
+            for it in items:
+                if it.get("status") in (
+                    "own_company", "not_invoice", "ignored", "skipped_email"
+                ):
+                    continue
+                res = plaid_match.match_receipt(
+                    it.get("amount_inc"),
+                    it.get("purchased_on"),
+                    it.get("merchant"),
+                    txs,
+                    account_ids=account_ids or None,
+                )
+                status_name = res.get("status")
+                if status_name == "matched":
+                    kind = "matched"
+                elif status_name == "review":
+                    kind = "suggested"
+                elif status_name == "no_match":
+                    kind = "no_match"
+                else:
+                    continue
+                out[it["id"]] = {
+                    "item": it,
+                    "tx": res.get("transaction"),
+                    "kind": kind,
+                    "ambiguous": status_name == "review",
+                    "n_sugg": len(res.get("candidates") or []),
+                }
+            return out
+
+        if status in ("ready", "done"):
+            recon_map.update(_email_cached_card_recon_map())
+
         def _group_section(title: str, color: str, items_list: list, collapsed: bool = False) -> str:
             if not items_list:
                 return ""
