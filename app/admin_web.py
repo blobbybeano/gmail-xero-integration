@@ -19947,7 +19947,7 @@ body {{ background:#f7f6f3 !important; }}
         vat_summary = (
             f"<div class='font-semibold text-gray-800'>Total {amt_s}</div>"
             + (
-                f"<div class='text-xs text-gray-500 mt-0.5'>{ex_s} + {vat_s} VAT</div>"
+                f"<div class='text-xs text-gray-500 mt-0.5'>{ex_s} + VAT</div>"
                 if vat_included else
                 "<div class='text-xs text-gray-400 mt-0.5'>no VAT</div>"
             )
@@ -20066,7 +20066,7 @@ body {{ background:#f7f6f3 !important; }}
 <div class="mt-3 border-t border-amber-100 pt-3 bg-amber-50/50 rounded-lg p-3">
   <div class="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs text-gray-700 mb-2">
     <div><span class="text-gray-400">Attachment</span><br><span class="font-medium">{escape(it.get("attachment_name","") or "invoice")}</span></div>
-    <div><span class="text-gray-400">VAT</span><br><span class="font-medium">inc {amt_s} · ex {ex_s} · VAT {vat_s}</span></div>
+    <div><span class="text-gray-400">VAT</span><br><span class="font-medium">Total {amt_s} · {ex_s} + VAT</span></div>
     <div><span class="text-gray-400">Import action</span><br><span class="font-medium text-amber-700">Test only — nothing imported</span></div>
   </div>
   {raw_html}
