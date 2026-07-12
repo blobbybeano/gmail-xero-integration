@@ -18578,6 +18578,7 @@ body {{ background:#f7f6f3 !important; }}
         "matched": ("Matched to card", "bg-emerald-100 text-emerald-700"),
         "suggested": ("Possible match — confirm", "bg-amber-100 text-amber-800"),
         "price_only": ("Possible match by price — check", "bg-amber-100 text-amber-800"),
+        "expected": ("Expected soon", "bg-blue-100 text-blue-700"),
         "no_match": ("No card match", "bg-slate-100 text-slate-600"),
         "already_xero": ("Already in Xero", "bg-sky-100 text-sky-700"),
         "dup_upload": ("Duplicate upload", "bg-gray-100 text-gray-500"),
@@ -20004,6 +20005,12 @@ body {{ background:#f7f6f3 !important; }}
                         "payment: " + tline + (" \u00b7 " + td if td else "")
                         + " — please confirm.</div>"
                     )
+            elif recon_kind == "expected":
+                recon_sub = (
+                    "<div class='text-xs text-blue-700 mt-1'>"
+                    + escape(recon_row.get("note") or "Payment is expected after the latest uploaded card feed.")
+                    + "</div>"
+                )
             elif recon_tx:
                 tline = escape(recon_tx.get("contact") or "card transaction")
                 td = escape(_exp_uk_date(recon_tx.get("date") or ""))
@@ -20796,6 +20803,44 @@ body {{ background:#f7f6f3 !important; }}
                 txs = []
             if not txs:
                 return {}
+
+            def _parse_invoice_date(text: str) -> dt.date | None:
+                s = (text or "").strip()
+                for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+                    try:
+                        return dt.datetime.strptime(s[:10], fmt).date()
+                    except (ValueError, TypeError):
+                        pass
+                return None
+
+            def _add_business_days(day: dt.date, n: int) -> dt.date:
+                out = day
+                added = 0
+                while added < n:
+                    out += dt.timedelta(days=1)
+                    if out.weekday() < 5:
+                        added += 1
+                return out
+
+            def _expected_payment_window(raw_text: str) -> tuple[dt.date, dt.date] | None:
+                text = raw_text or ""
+                due_match = re.search(
+                    r"\bdue\s+date\b\s*([0-3]?\d[/-][01]?\d[/-]\d{4})",
+                    text,
+                    flags=re.IGNORECASE,
+                )
+                if not due_match:
+                    return None
+                due = _parse_invoice_date(due_match.group(1))
+                if not due:
+                    return None
+                lowered = text.lower()
+                if "direct debit" in lowered and "within 5 working days" in lowered:
+                    return due, _add_business_days(due, 5)
+                if "direct debit" in lowered:
+                    return due, _add_business_days(due, 3)
+                return due, due
+
             try:
                 labels = cardfeed.get_account_labels(config.admin_db_file) or {}
             except Exception:
@@ -20815,6 +20860,16 @@ body {{ background:#f7f6f3 !important; }}
             }
             if labels and not account_ids:
                 return {}
+            selected_txs = [
+                t for t in txs
+                if not account_ids or str(t.get("account_id") or "") in account_ids
+            ]
+            tx_dates = [
+                _parse_invoice_date(str(t.get("date") or ""))
+                for t in selected_txs
+                if t.get("date")
+            ]
+            latest_tx_date = max([d for d in tx_dates if d], default=None)
             out = {}
             for it in items:
                 if it.get("status") in (
@@ -20825,7 +20880,7 @@ body {{ background:#f7f6f3 !important; }}
                     it.get("amount_inc"),
                     it.get("purchased_on"),
                     it.get("merchant"),
-                    txs,
+                    selected_txs,
                     account_ids=account_ids or None,
                 )
                 status_name = res.get("status")
@@ -20835,6 +20890,19 @@ body {{ background:#f7f6f3 !important; }}
                     kind = "suggested"
                 elif status_name == "no_match":
                     kind = "no_match"
+                    expected = _expected_payment_window(it.get("ocr_raw") or "")
+                    if expected and latest_tx_date and expected[1] > latest_tx_date:
+                        start_s = _exp_uk_date(expected[0].isoformat())
+                        end_s = _exp_uk_date(expected[1].isoformat())
+                        feed_s = _exp_uk_date(latest_tx_date.isoformat())
+                        note = (
+                            f"Invoice says Direct Debit is expected "
+                            f"{start_s} to {end_s}; uploaded card feed only "
+                            f"goes up to {feed_s}."
+                        )
+                        kind = "expected"
+                    else:
+                        note = ""
                 else:
                     continue
                 out[it["id"]] = {
@@ -20843,6 +20911,7 @@ body {{ background:#f7f6f3 !important; }}
                     "kind": kind,
                     "ambiguous": status_name == "review",
                     "n_sugg": len(res.get("candidates") or []),
+                    "note": note if status_name == "no_match" else "",
                 }
             return out
 
