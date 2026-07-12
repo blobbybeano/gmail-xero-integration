@@ -70,6 +70,20 @@ def derive_supplier_merchant(
       3. the sender's email domain (e.g. racbusinessclub.co.uk)
     Falls back to the original merchant if nothing better is found.
     """
+    def _sender_domain(addr: str) -> str:
+        return (addr or "").rsplit("@", 1)[-1].strip().lower()
+
+    known_domains = {
+        "screwfix.com": "Screwfix",
+        "screwfixdirect.com": "Screwfix",
+    }
+    dom = _sender_domain(from_addr)
+    if dom in known_domains:
+        preferred = known_domains[dom]
+        # Sender domain is stronger than OCR for common trade suppliers where
+        # OCR can misread logos, e.g. SCREVFIX instead of Screwfix.
+        return preferred
+
     own_norms = [normalize_merchant(n) for n in (own_names or [])]
     own_norms = [n for n in own_norms if n]
 
@@ -91,7 +105,7 @@ def derive_supplier_merchant(
     if from_name and not _is_own(from_name):
         return from_name.strip()
 
-    dom = (from_addr or "").rsplit("@", 1)[-1].strip().lower()
+    dom = _sender_domain(from_addr)
     if dom and "." in dom and not _is_own(dom):
         return dom
 

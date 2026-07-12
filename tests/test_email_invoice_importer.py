@@ -2,6 +2,7 @@ import unittest
 import tempfile
 
 from app.receipts.email_pipeline import (
+    derive_supplier_merchant,
     explicit_total_from_text,
     import_batch_items,
     is_own_company_sender,
@@ -79,6 +80,18 @@ class EmailInvoiceImporterTests(unittest.TestCase):
                 own_names=OWN_NAMES,
                 own_domains=OWN_DOMAINS,
             )
+        )
+
+    def test_supplier_domain_fixes_ocr_merchant_typo(self):
+        self.assertEqual(
+            derive_supplier_merchant(
+                "SCREVFIX",
+                from_name="Screwfix",
+                from_addr="online@screwfix.com",
+                subject="Copy of invoice A26025085697. Please find your invoice attached.",
+                own_names=OWN_NAMES,
+            ),
+            "Screwfix",
         )
 
     def test_impossible_tax_does_not_make_positive_invoice_net_negative(self):
