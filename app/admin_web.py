@@ -20133,29 +20133,25 @@ body {{ background:#f7f6f3 !important; }}
             is_docx = att_name.endswith(".docx") or "wordprocessing" in att_mime
             preview_title = it.get("attachment_name") or merchant or "Invoice"
             is_preview_image = att_mime.startswith("image/")
-            preview_url = img_url + ("?preview=1" if is_preview_image else "")
-            if is_docx:
-                view_html = (f'<a href="{img_url}" download '
-                             f'class="inline-flex items-center gap-1 mt-2 px-2.5 py-1 text-xs '
-                             f'font-medium bg-sky-100 text-sky-800 rounded-lg hover:bg-sky-200">'
-                             f'&#128462; Download Word document</a>')
-            else:
-                view_html = (
-                    f'<button type="button" data-escan-preview="1" '
-                    f'data-preview-url="{escape(preview_url)}" '
-                    f'data-full-url="{escape(img_url)}" '
-                    f'data-preview-title="{escape(preview_title)}" '
-                    f'data-preview-image="{str(is_preview_image).lower()}" '
-                    f'class="inline-flex items-center gap-1 mt-2 px-2.5 py-1 text-xs '
-                    f'font-medium bg-sky-100 text-sky-800 rounded-lg hover:bg-sky-200">'
-                    "<svg class='w-3.5 h-3.5' fill='none' stroke='currentColor' "
-                    "stroke-width='2' viewBox='0 0 24 24'><path stroke-linecap='round' "
-                    "stroke-linejoin='round' d='M2.036 12.322a1.012 1.012 0 010-.639C3.423 "
-                    "7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 "
-                    ".639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178z'/>"
-                    "<path stroke-linecap='round' stroke-linejoin='round' d='M15 12a3 3 0 "
-                    "11-6 0 3 3 0 016 0z'/></svg>View invoice</button>"
-                )
+            preview_url = img_url + ("?preview=1" if (is_preview_image or is_docx) else "")
+            view_html = (
+                f'<button type="button" data-escan-preview="1" '
+                f'data-preview-url="{escape(preview_url)}" '
+                f'data-full-url="{escape(img_url)}" '
+                f'data-preview-title="{escape(preview_title)}" '
+                f'data-preview-image="{str(is_preview_image).lower()}" '
+                f'class="inline-flex items-center gap-1 mt-2 px-2.5 py-1 text-xs '
+                f'font-medium bg-sky-100 text-sky-800 rounded-lg hover:bg-sky-200">'
+                "<svg class='w-3.5 h-3.5' fill='none' stroke='currentColor' "
+                "stroke-width='2' viewBox='0 0 24 24'><path stroke-linecap='round' "
+                "stroke-linejoin='round' d='M2.036 12.322a1.012 1.012 0 010-.639C3.423 "
+                "7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 "
+                ".639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178z'/>"
+                "<path stroke-linecap='round' stroke-linejoin='round' d='M15 12a3 3 0 "
+                "11-6 0 3 3 0 016 0z'/></svg>"
+                + ("View Word preview" if is_docx else "View invoice")
+                + "</button>"
+            )
         acct_html = ""
         if acct_code:
             acct_html = (f'<span class="text-xs font-medium text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded" '
@@ -21454,6 +21450,60 @@ document.addEventListener('submit', function(e) {{
                     "import (the original is attached to the receipt in Xero).", 404)
         with open(path, "rb") as fh:
             head = fh.read(16)
+        name_l = (item.get("attachment_name") or os.path.basename(path) or "").lower()
+        mime_l = (item.get("attachment_mime") or "").lower()
+        is_docx = name_l.endswith(".docx") or "wordprocessing" in mime_l
+        if is_docx and request.args.get("preview") == "1":
+            try:
+                from docx import Document
+                doc = Document(path)
+                parts: list[str] = []
+                for p in doc.paragraphs:
+                    text = (p.text or "").strip()
+                    if text:
+                        parts.append(
+                            "<p style='margin:0 0 8px;white-space:pre-wrap;'>"
+                            + escape(text)
+                            + "</p>"
+                        )
+                for tbl in doc.tables:
+                    rows = []
+                    for row in tbl.rows:
+                        cells = "".join(
+                            "<td style='border:1px solid #e5e7eb;padding:5px 7px;vertical-align:top;'>"
+                            + escape((cell.text or "").strip()).replace("\n", "<br>")
+                            + "</td>"
+                            for cell in row.cells
+                        )
+                        rows.append("<tr>" + cells + "</tr>")
+                    if rows:
+                        parts.append(
+                            "<table style='border-collapse:collapse;width:100%;"
+                            "font-size:12px;margin:10px 0;'>"
+                            + "".join(rows)
+                            + "</table>"
+                        )
+                body = "".join(parts) or "<p>No readable text found in this Word document.</p>"
+                html_doc = (
+                    "<!doctype html><html><head><meta charset='utf-8'>"
+                    "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+                    "<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
+                    "font-size:13px;line-height:1.45;color:#111827;background:white;margin:0;"
+                    "padding:16px;}p:first-child{font-weight:600;font-size:15px;}"
+                    "</style></head><body>"
+                    + body
+                    + "</body></html>"
+                )
+                return Response(html_doc, mimetype="text/html")
+            except Exception as exc:
+                return Response(
+                    "<!doctype html><html><body style='font-family:sans-serif;"
+                    "font-size:13px;padding:16px;color:#991b1b;'>Could not preview "
+                    "this Word document: "
+                    + escape(str(exc).splitlines()[0][:160])
+                    + "</body></html>",
+                    mimetype="text/html",
+                )
         safe_mime = _exp_sniff_mime(head)
         if safe_mime and safe_mime.startswith("image/"):
             if request.args.get("preview") == "1":
