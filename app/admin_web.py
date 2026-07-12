@@ -1862,11 +1862,21 @@ def _ai_receipt_hints_block(db_path: str) -> str:
     learned = _account_learning_hints(db_path)
     builtin = (
         "Built-in Powwash coding rules:\n"
+        "Decision order: supplier identity + actual items/services on the "
+        "document beat generic account names. Do not pick 'Cleaning' simply "
+        "because the supplier sells cleaning products; Powwash is an exterior "
+        "cleaning business, so cleaning chemicals, gutter parts and job "
+        "consumables are usually Materials / Consumables.\n"
         "- Checkatrade is advertising / lead generation / marketing, not "
         "cleaning and not materials.\n"
+        "- Other lead/ad suppliers such as Bark, Rated People, Google Ads, Meta/"
+        "Facebook ads, Yell, directories and sponsored listings are advertising "
+        "/ marketing.\n"
         "- RAC / breakdown cover is motor vehicle expenses, not insurance.\n"
         "- Tender POS / card terminal / card transaction platform costs are "
         "merchant fees / bank charges / payment processing, not IT/software.\n"
+        "- Stripe, SumUp, Zettle, Square, Worldpay, Cashflows fees and similar "
+        "payment processors are merchant fees / bank charges, not IT/software.\n"
         "- RingGo, parking apps, car parks and meters are motor vehicle / travel "
         "expenses, not materials.\n"
         "- Cleaning-product suppliers such as ECA Cleaning are materials / job "
@@ -1879,6 +1889,10 @@ def _ai_receipt_hints_block(db_path: str) -> str:
         "- Shell/BP/Esso/etc receipts showing FS Unleaded, diesel, litres, pump "
         "or fuel grade are fuel even if the legal trading name contains Garage "
         "or Garages.\n"
+        "- Supermarkets with forecourt evidence follow the same fuel rules: "
+        "Tesco/Asda/Sainsbury's/Morrisons/Costco fuel, pay-at-pump, litres, pump "
+        "or fuel grade means fuel. Diesel/DERV is van fuel; unleaded/petrol/E10/"
+        "E5 is machinery fuel.\n"
         "- Diesel / DERV receipts are van or motor-vehicle fuel. Never "
         "code diesel to machinery fuel or machinery expenses.\n"
         "- AdBlue / SCR diesel vehicle fluid is vehicle maintenance, not fuel.\n"
@@ -1895,6 +1909,9 @@ def _ai_receipt_hints_block(db_path: str) -> str:
         "- Halfords, car-parts shops, tyre shops and mechanics/garages are "
         "vehicle repairs / maintenance or motor vehicle expenses, not "
         "materials.\n"
+        "- Software/subscription suppliers such as Microsoft, Google Workspace, "
+        "Adobe, OpenAI, GitHub, Replit and Fly.io are IT/software unless the "
+        "document is clearly for card processing or merchant fees.\n"
         "- Parking apps, car parks and meters should be coded to parking / motor "
         "travel, not materials.\n"
         "- Do not choose a common/default account just because it is available. "
@@ -2310,8 +2327,10 @@ def _looks_like_fuel_receipt(merchant: str = "", raw_text: str = "") -> bool:
     station_terms = (
         "shell", "esso", "bp", "texaco", "gulf", "jet", "applegreen",
         "harvest energy", "morrisons petrol", "tesco petrol", "sainsburys petrol",
-        "asda petrol", "forecourt", "service station", "filling station",
-        "mfg", "motor fuel", "murco", "tokheim",
+        "sainsbury petrol", "asda petrol", "costco fuel", "costco petrol",
+        "tesco pay at pump", "asda pay at pump", "sainsburys pay at pump",
+        "morrisons pay at pump", "pay at pump", "forecourt", "service station",
+        "filling station", "mfg", "motor fuel", "murco", "tokheim",
     )
     fuel_terms = (
         "diesel", "derv", "unleaded", "petrol", "fuel", "litre", "litres", " ltr ",
@@ -2477,11 +2496,21 @@ def _find_merchant_fee_account(accounts: list) -> "tuple[str, str]":
     )
 
 
+def _find_software_account(accounts: list) -> "tuple[str, str]":
+    return _find_account_by_terms(
+        accounts,
+        any_terms=("software", "computer", "it ", "subscription"),
+        exclude_terms=("merchant", "bank charge", "vehicle", "fuel", "material", "clean"),
+    )
+
+
 def _looks_like_advertising_supplier(merchant: str = "", raw_text: str = "") -> bool:
     text = _receipt_rule_text(merchant, raw_text)
     return any(t in text for t in (
         "checkatrade", "check a trade", "lead generation",
-        "advertising", "marketing", "directory listing",
+        "advertising", "marketing", "directory listing", "google ads",
+        "google adwords", "facebook ads", "meta ads", "bark com", "rated people",
+        "yell", "directory", "sponsored listing", "lead fee",
     ))
 
 
@@ -2490,7 +2519,9 @@ def _looks_like_merchant_fee_supplier(merchant: str = "", raw_text: str = "") ->
     return any(t in text for t in (
         "tender pos", "tenderpos", "tender payment", "card terminal",
         "card transaction", "merchant service", "merchant services",
-        "payment processing", "terminal rental",
+        "payment processing", "terminal rental", "stripe", "sumup", "sum up",
+        "zettle", "izettle", "squareup", "square ", "worldpay", "paypal fees",
+        "cashflows fee", "cashflows fees", "card processing",
     ))
 
 
@@ -2508,6 +2539,18 @@ def _looks_like_cleaning_materials_supplier(merchant: str = "", raw_text: str = 
         "eca cleaning", "cleaning supplies", "window cleaning warehouse",
         "softwash", "hypo", "sodium hypochlorite", "biocide",
         "gutter joint", "gutter seal", "cleaning solution", "pressure washing chemical",
+    ))
+
+
+def _looks_like_software_supplier(merchant: str = "", raw_text: str = "") -> bool:
+    text = _receipt_rule_text(merchant, raw_text)
+    if _looks_like_merchant_fee_supplier(merchant, raw_text):
+        return False
+    return any(t in text for t in (
+        "microsoft", "office 365", "google workspace", "google cloud",
+        "adobe", "openai", "github", "replit", "fly io", "fly.io",
+        "digitalocean", "aws", "amazon web services", "dropbox",
+        "software subscription", "saas",
     ))
 
 
@@ -2620,6 +2663,11 @@ def _apply_receipt_account_guardrails(
 
     if _looks_like_merchant_fee_supplier(merchant, raw_text):
         code, name = _find_merchant_fee_account(accounts)
+        _set_single(code, name)
+        return segments, cat_code, cat_name
+
+    if _looks_like_software_supplier(merchant, raw_text):
+        code, name = _find_software_account(accounts)
         _set_single(code, name)
         return segments, cat_code, cat_name
 

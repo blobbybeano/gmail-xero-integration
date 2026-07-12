@@ -28,6 +28,8 @@ ACCOUNTS = [
     {"Code": "430", "Name": "Motor Vehicle Expenses"},
     {"Code": "440", "Name": "Bank Charges"},
     {"Code": "450", "Name": "IT and Software Consumables"},
+    {"Code": "460", "Name": "Machinery Fuel"},
+    {"Code": "470", "Name": "Van Fuel"},
 ]
 
 
@@ -176,6 +178,18 @@ class EmailInvoiceImporterTests(unittest.TestCase):
         self.assertEqual(
             rule_based_categorise("ECA Cleaning Ltd", "Softwash cleaning solution", ACCOUNTS),
             ("410", "Materials"),
+        )
+        self.assertEqual(
+            rule_based_categorise("Google Ads", "Search advertising campaign", ACCOUNTS),
+            ("420", "Advertising"),
+        )
+        self.assertEqual(
+            rule_based_categorise("Stripe", "Payment processing fees", ACCOUNTS),
+            ("440", "Bank Charges"),
+        )
+        self.assertEqual(
+            rule_based_categorise("Microsoft", "Microsoft 365 subscription", ACCOUNTS),
+            ("450", "IT and Software Consumables"),
         )
 
 

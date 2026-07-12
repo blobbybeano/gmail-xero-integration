@@ -474,7 +474,11 @@ def rule_based_categorise(
     if not text or not exp_accounts:
         return "", ""
 
-    if any(t in text for t in ("checkatrade", "check a trade", "lead generation")):
+    if any(t in text for t in (
+        "checkatrade", "check a trade", "lead generation", "google ads",
+        "google adwords", "facebook ads", "meta ads", "bark com", "rated people",
+        "yell", "directory listing", "sponsored listing", "lead fee",
+    )):
         return _find_account_by_terms(
             exp_accounts,
             any_terms=("advertis", "marketing", "lead", "promotion"),
@@ -484,7 +488,9 @@ def rule_based_categorise(
     if any(t in text for t in (
         "tender pos", "tenderpos", "card terminal", "card transaction",
         "merchant service", "merchant services", "payment processing",
-        "terminal rental",
+        "terminal rental", "stripe", "sumup", "sum up", "zettle", "izettle",
+        "squareup", "square ", "worldpay", "paypal fees", "cashflows fee",
+        "cashflows fees", "card processing",
     )):
         code, name = _find_account_by_terms(
             exp_accounts,
@@ -520,12 +526,25 @@ def rule_based_categorise(
     if any(t in text for t in (
         "eca cleaning", "cleaning supplies", "window cleaning warehouse",
         "softwash", "hypo", "sodium hypochlorite", "biocide",
-        "cleaning solution", "pressure washing chemical",
+        "cleaning solution", "pressure washing chemical", "gutter joint",
+        "gutter seal",
     )):
         return _find_account_by_terms(
             exp_accounts,
             any_terms=("material", "materials", "tools", "consumable", "supplies"),
             exclude_terms=("fuel", "vehicle", "motor", "parking", "clean"),
+        )
+
+    if any(t in text for t in (
+        "microsoft", "office 365", "google workspace", "google cloud",
+        "adobe", "openai", "github", "replit", "fly io", "fly.io",
+        "digitalocean", "aws", "amazon web services", "dropbox",
+        "software subscription", "saas",
+    )):
+        return _find_account_by_terms(
+            exp_accounts,
+            any_terms=("software", "computer", "it ", "subscription"),
+            exclude_terms=("merchant", "bank charge", "vehicle", "fuel", "material", "clean"),
         )
 
     return "", ""
@@ -601,13 +620,21 @@ def ai_categorise(
         prompt = (
             "You are a bookkeeper. Pick the single most appropriate Xero expense "
             "account code for this supplier invoice.\n\n"
-            "Powwash-specific rules: Checkatrade is advertising/lead generation, "
-            "not cleaning. RAC/breakdown cover is motor vehicle expenses, not "
-            "insurance. Tender POS/card-terminal costs are merchant fees/bank "
-            "charges/payment processing, not IT/software. RingGo/parking is "
-            "vehicle/travel expense. Cleaning-product suppliers such as ECA "
-            "Cleaning are materials/job consumables for our exterior cleaning "
-            "work, not the Cleaning account.\n\n"
+            "Powwash-specific account map: supplier identity plus actual line "
+            "items/services beats generic account names. Checkatrade, Bark, "
+            "Rated People, Google Ads, Meta/Facebook ads, Yell and directory/"
+            "lead suppliers are advertising/marketing, not Cleaning. RAC/"
+            "breakdown cover is motor vehicle expenses, not insurance. Tender "
+            "POS, Stripe, SumUp, Zettle, Square, Worldpay, Cashflows fees and "
+            "card-terminal/payment-processing costs are merchant fees/bank "
+            "charges, not IT/software. RingGo/parking/car parks are vehicle/"
+            "travel expenses. Cleaning-product suppliers such as ECA Cleaning "
+            "are materials/job consumables for our exterior cleaning work, not "
+            "the Cleaning account. Microsoft, Google Workspace/Cloud, Adobe, "
+            "OpenAI, GitHub, Replit and Fly.io are IT/software unless the "
+            "document is clearly for card processing. If a supermarket/forecourt "
+            "invoice shows fuel: diesel/DERV is van fuel; unleaded/petrol/E10/"
+            "E5 is machinery fuel.\n\n"
             f"Merchant / sender: {merchant}\n\n"
             f"OCR text (first 600 chars):\n{raw_text[:600]}\n\n"
             f"Available accounts:\n{acct_lines}\n\n"
