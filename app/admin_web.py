@@ -4722,7 +4722,18 @@ def create_app() -> Flask:
             google_ok = bool(load_admin_credentials(config))
         except Exception:
             google_ok = False
-        xero_ok = bool(xero_tok and not token_is_expired(xero_tok))
+        # Connected means we CAN talk to Xero: either the short-lived (30 min)
+        # access token is still fresh, or we hold a refresh token + tenant so
+        # the next request will silently refresh (as every Xero call does).
+        # Checking only token_is_expired() made the dashboard cry "Xero not
+        # connected" whenever the page was opened >30 min after the last call.
+        xero_ok = bool(
+            xero_tok
+            and (
+                not token_is_expired(xero_tok)
+                or (xero_tok.get("refresh_token") and xero_tok.get("tenant_id"))
+            )
+        )
         watch_count = len(watches)
         enabled = get_enabled(config.admin_db_file)
         receipt_settings = get_receipts_settings(config.admin_db_file)
@@ -15000,8 +15011,8 @@ body {{ background:#f7f6f3 !important; }}
                   <h2 class="font-semibold text-gray-900">Settings</h2>
                   <svg class="w-4 h-4 text-gray-400 transition-transform duration-200 group-open:rotate-180 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
                 </summary>
-	                <form method="post" action="/receipts/expenses/save-settings"
-	                      class="grid grid-cols-1 sm:grid-cols-3 gap-3 px-4 pb-4 pt-2 border-t border-gray-100">
+                        <form method="post" action="/receipts/expenses/save-settings"
+                              class="grid grid-cols-1 sm:grid-cols-3 gap-3 px-4 pb-4 pt-2 border-t border-gray-100">
                   <div>
                     <label class="block text-xs text-gray-500 mb-1">Default VAT rate (%)</label>
                     <input name="vat_rate" type="number" step="0.1" value="{settings['vat_rate']}"
@@ -15012,40 +15023,40 @@ body {{ background:#f7f6f3 !important; }}
                     {default_exp_field}
                     <p class="text-xs text-gray-400 mt-1">Only used as a fallback when the AI can&rsquo;t work out a receipt&rsquo;s account &mdash; those receipts are held for you to confirm or change before importing.</p>
                   </div>
-	                  <div>
-	                    <label class="block text-xs text-gray-500 mb-1">Default payment/bank account</label>
-	                    {default_pay_field}
-	                  </div>
-	                  <div class="sm:col-span-3 rounded-lg border border-blue-200 bg-blue-50 p-3 space-y-3">
-	                    <div class="flex items-center justify-between gap-2 flex-wrap">
-	                      <div>
-	                        <label class="block text-xs font-semibold text-blue-950 mb-1">Field Expenses Xero submission timing</label>
-	                        <p class="text-xs text-blue-800">Receipt photos and approvals save immediately. This only controls lower-priority Xero bill/payment writes for settled subcontractor receipts.</p>
-	                      </div>
-	                      {xero_submit_status_html}
-	                    </div>
-	                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
-	                      <div class="sm:col-span-2">
-	                        <select name="xero_submission_mode" class="w-full rounded border border-blue-200 px-3 py-2 text-sm bg-white">
-	                          {xero_submit_options}
-	                        </select>
-	                      </div>
-	                      <div>
-	                        <input name="xero_submission_time" type="time" value="{escape(xero_submit_time)}"
-	                               class="w-full rounded border border-blue-200 px-3 py-2 text-sm bg-white">
-	                      </div>
-	                    </div>
-	                    <div class="flex items-center gap-2 flex-wrap">
-	                      <button type="submit" formaction="/receipts/expenses/process-xero-submissions"
-	                              class="px-3 py-1.5 rounded border border-blue-300 bg-white text-blue-800 text-xs font-semibold hover:bg-blue-100">
-	                        Run due Xero submissions now
-	                      </button>
-	                      <span class="text-xs text-blue-700">Runs at most 5 settlement bills per click to avoid a burst of Xero requests.</span>
-	                    </div>
-	                  </div>
-	                  <div class="sm:col-span-3">
-	                    <button type="submit"
-	                            class="px-4 py-2 rounded bg-gray-900 text-white text-sm font-medium">
+                          <div>
+                            <label class="block text-xs text-gray-500 mb-1">Default payment/bank account</label>
+                            {default_pay_field}
+                          </div>
+                          <div class="sm:col-span-3 rounded-lg border border-blue-200 bg-blue-50 p-3 space-y-3">
+                            <div class="flex items-center justify-between gap-2 flex-wrap">
+                              <div>
+                                <label class="block text-xs font-semibold text-blue-950 mb-1">Field Expenses Xero submission timing</label>
+                                <p class="text-xs text-blue-800">Receipt photos and approvals save immediately. This only controls lower-priority Xero bill/payment writes for settled subcontractor receipts.</p>
+                              </div>
+                              {xero_submit_status_html}
+                            </div>
+                            <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                              <div class="sm:col-span-2">
+                                <select name="xero_submission_mode" class="w-full rounded border border-blue-200 px-3 py-2 text-sm bg-white">
+                                  {xero_submit_options}
+                                </select>
+                              </div>
+                              <div>
+                                <input name="xero_submission_time" type="time" value="{escape(xero_submit_time)}"
+                                       class="w-full rounded border border-blue-200 px-3 py-2 text-sm bg-white">
+                              </div>
+                            </div>
+                            <div class="flex items-center gap-2 flex-wrap">
+                              <button type="submit" formaction="/receipts/expenses/process-xero-submissions"
+                                      class="px-3 py-1.5 rounded border border-blue-300 bg-white text-blue-800 text-xs font-semibold hover:bg-blue-100">
+                                Run due Xero submissions now
+                              </button>
+                              <span class="text-xs text-blue-700">Runs at most 5 settlement bills per click to avoid a burst of Xero requests.</span>
+                            </div>
+                          </div>
+                          <div class="sm:col-span-3">
+                            <button type="submit"
+                                    class="px-4 py-2 rounded bg-gray-900 text-white text-sm font-medium">
                       Save settings
                     </button>
                   </div>
