@@ -121,6 +121,16 @@ class EmailInvoiceImporterTests(unittest.TestCase):
         )
         self.assertEqual(reason, "")
 
+    def test_insurance_renewal_quote_is_not_imported_as_invoice(self):
+        reason = non_payable_document_reason(
+            "David Llewelyn",
+            "Fleet Insurance Thank you for insuring with us for the last 12 months "
+            "your policy is due for renewal. I recommend that you move your "
+            "insurance to Zurich. Statement of Demands and Needs. Quote Schedule. "
+            "We require confirmation that you wish to proceed with the renewal.",
+        )
+        self.assertIn("Insurance renewal quote", reason)
+
     def test_contract_document_is_not_imported_as_supplier_invoice(self):
         reason = non_payable_document_reason(
             "Indigo Service Solutions",

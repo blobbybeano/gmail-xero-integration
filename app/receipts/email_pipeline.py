@@ -598,6 +598,30 @@ def non_payable_document_reason(merchant: str, raw_text: str) -> str:
     if any(t in text for t in reminder_terms):
         return "Payment reminder, not original invoice"
 
+    insurance_terms = (
+        "insurance", "insurer", "policy", "premium", "fleet insurance",
+        "motor fleet", "vehicle insurance", "van insurance",
+    )
+    renewal_quote_terms = (
+        "quote schedule", "quotation", "quote", "proposal", "recommend that you",
+        "recommended a change of insurer", "if you would like to proceed",
+        "wish to proceed with the renewal", "confirmation that you wish to proceed",
+        "please check the enclosed documents", "statement of demands and needs",
+        "optional products and services", "premium finance option",
+    )
+    actual_insurance_charge_terms = (
+        "invoice number", "invoice no", "tax invoice", "vat invoice",
+        "outstanding policy fee", "outstanding direct debit mandate",
+        "confirmation of payment", "receipt", "paid", "payment received",
+        "certificate of motor insurance", "policy schedule",
+    )
+    if (
+        any(t in text for t in insurance_terms)
+        and any(t in text for t in renewal_quote_terms)
+        and not any(t in text for t in actual_insurance_charge_terms)
+    ):
+        return "Insurance renewal quote/proposal, not invoice"
+
     if any(t in text for t in (
         "insurance premium tax", "motor fleet insurance", "fleet insurance",
         "vehicle insurance", "van insurance", "certificate of motor insurance",
@@ -875,12 +899,18 @@ def ai_validate_invoice_doc(
             "accumulate old invoices; those should not be imported as new bills. "
             "Exception: membership/subscription statements that are themselves "
             "the charge can be YES.\n"
+            "For insurance, answer NO for renewal invitations, quotes, quote "
+            "schedules, proposals, statement-of-demands-and-needs packs, or "
+            "documents asking whether we want to proceed. Answer YES only when "
+            "it is an actual invoice, policy fee demand, confirmed policy/payment "
+            "document, or direct-debit/payment obligation.\n"
             "Answer NO ONLY when it is clearly one of: a quote/estimate/proforma "
             "that is not yet owed, a contract/agreement rather than a payable "
-            "invoice, a supplier statement/reminder rather than the original "
-            "invoice, a tax computation/tax return rather than a supplier charge, "
-            "a pure marketing/advert page, a logo or non-document image, or a "
-            "document plainly addressed to a DIFFERENT, unrelated company "
+            "invoice, an insurance renewal quote/proposal rather than an actual "
+            "policy fee/invoice, a supplier statement/reminder rather than the "
+            "original invoice, a tax computation/tax return rather than a supplier "
+            "charge, a pure marketing/advert page, a logo or non-document image, "
+            "or a document plainly addressed to a DIFFERENT, unrelated company "
             "(neither us nor our staff). When in any doubt, answer YES.\n"
             "Reply with exactly: YES or NO, then a 3-6 word reason. "
             "Example: 'NO — quotation, not an invoice'."
