@@ -554,16 +554,32 @@ def rule_based_categorise(
     return "", ""
 
 
-def tax_computation_not_supplier_invoice(merchant: str, raw_text: str) -> str:
-    """Return a reason when this is a tax-return/computation, not a supplier bill.
+def non_payable_document_reason(merchant: str, raw_text: str) -> str:
+    """Return a reason when this document should not be imported as a bill.
 
     Accountants often send documents showing how much is owed to HMRC. Those can
     contain amounts, due dates and payment wording, but they are not a charge
     for the accountant's services and should not be imported as an expense.
+    Likewise, contracts/agreements can contain dates, rates and payment terms
+    without being a payable invoice.
     """
     text = _rule_text(merchant, raw_text)
     if not text:
         return ""
+    payable_terms = (
+        "invoice number", "invoice no", "tax invoice", "vat invoice",
+        "amount due", "balance due", "total due", "payment due",
+        "please pay", "remittance", "professional fee", "professional fees",
+        "accountancy fee", "accountancy fees", "our fee", "our fees",
+        "services provided", "fee note",
+    )
+    contract_terms = (
+        "contract", "service contract", "contract agreement", "agreement",
+        "terms and conditions", "schedule of services", "scope of works",
+    )
+    if any(t in text for t in contract_terms) and not any(t in text for t in payable_terms):
+        return "Contract/agreement document, not supplier invoice"
+
     if any(t in text for t in (
         "insurance premium tax", "motor fleet insurance", "fleet insurance",
         "vehicle insurance", "van insurance", "certificate of motor insurance",
@@ -592,6 +608,11 @@ def tax_computation_not_supplier_invoice(merchant: str, raw_text: str) -> str:
     if is_tax_doc and not any(t in text for t in service_fee_terms):
         return "Tax computation/return document, not supplier charge"
     return ""
+
+
+def tax_computation_not_supplier_invoice(merchant: str, raw_text: str) -> str:
+    """Backward-compatible wrapper for older callers/tests."""
+    return non_payable_document_reason(merchant, raw_text)
 
 
 # ── Deduplication ─────────────────────────────────────────────────────────────
@@ -828,11 +849,15 @@ def ai_validate_invoice_doc(
             "return, CT600, SA302, or document telling us how much tax is owed "
             "to HMRC, answer NO unless the document is clearly the accountant's "
             "own invoice/fee note for their professional services.\n"
+            "Also answer NO for contracts, service agreements, terms, proposals "
+            "or contract schedules unless the document clearly demands payment "
+            "now as an invoice/bill/fee note.\n"
             "Answer NO ONLY when it is clearly one of: a quote/estimate/proforma "
-            "that is not yet owed, a tax computation/tax return rather than a "
-            "supplier charge, a pure marketing/advert page, a logo or non-document "
-            "image, or a document plainly addressed to a DIFFERENT, unrelated "
-            "company (neither us nor our staff). When in any doubt, answer YES.\n"
+            "that is not yet owed, a contract/agreement rather than a payable "
+            "invoice, a tax computation/tax return rather than a supplier charge, "
+            "a pure marketing/advert page, a logo or non-document image, or a "
+            "document plainly addressed to a DIFFERENT, unrelated company "
+            "(neither us nor our staff). When in any doubt, answer YES.\n"
             "Reply with exactly: YES or NO, then a 3-6 word reason. "
             "Example: 'NO — quotation, not an invoice'."
         )
@@ -1166,7 +1191,7 @@ def scan_email_batch(
                 final_status = status
                 cat_code, cat_name = "", ""
                 if status == STATUS_NEW:
-                    why_not = tax_computation_not_supplier_invoice(
+                    why_not = non_payable_document_reason(
                         merchant or from_name, raw_text
                     )
                     is_invoice = not bool(why_not)

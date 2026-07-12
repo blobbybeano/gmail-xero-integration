@@ -5,6 +5,7 @@ from app.receipts.email_pipeline import (
     explicit_total_from_text,
     import_batch_items,
     is_own_company_sender,
+    non_payable_document_reason,
     reconcile_amounts,
     reconcile_email_amounts_from_text,
     rule_based_categorise,
@@ -117,6 +118,21 @@ class EmailInvoiceImporterTests(unittest.TestCase):
             "David Llewelyn",
             "Motor Fleet Insurance Renewal outstanding direct debit mandate "
             "including insurance premium tax",
+        )
+        self.assertEqual(reason, "")
+
+    def test_contract_document_is_not_imported_as_supplier_invoice(self):
+        reason = non_payable_document_reason(
+            "Indigo Service Solutions",
+            "INDIGO SERVICE SOLUTIONS - CONTRACT.pdf Indigo Contracts "
+            "service contract agreement schedule of services start date 21/04/2026",
+        )
+        self.assertIn("Contract/agreement", reason)
+
+    def test_service_invoice_with_amount_due_is_still_allowed(self):
+        reason = non_payable_document_reason(
+            "Indigo Service Solutions",
+            "Invoice number 8841 service contract monthly charge amount due £120.00",
         )
         self.assertEqual(reason, "")
 
