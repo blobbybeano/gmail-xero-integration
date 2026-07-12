@@ -21310,9 +21310,14 @@ body {{ background:#f7f6f3 !important; }}
             if _imp_n > 0:
                 imported_notice = (
                     "<div class='bg-emerald-50 border border-emerald-200 rounded-xl p-4 "
-                    f"text-sm text-emerald-800'>Imported {_imp_n} invoice(s) into "
-                    "Field Expenses. Review/approve them there, then Xero gets the "
-                    "expense plus the stored invoice attachment.</div>"
+                    "flex flex-col sm:flex-row sm:items-center gap-3'>"
+                    "<div class='flex-1'>"
+                    f"<p class='text-sm font-bold text-emerald-900'>Success — imported {_imp_n} invoice(s) into Field Expenses</p>"
+                    "<p class='text-xs text-emerald-800 mt-0.5'>They are not in Xero yet. Review/approve them in Field Expenses, then Xero gets the expense plus the stored invoice attachment.</p>"
+                    "</div>"
+                    "<a href='/receipts/expenses' class='inline-flex justify-center px-3 py-1.5 rounded bg-emerald-700 text-white text-sm font-semibold hover:bg-emerald-600'>"
+                    "Review in Field Expenses →</a>"
+                    "</div>"
                 )
             else:
                 imported_notice = (
@@ -21321,6 +21326,24 @@ body {{ background:#f7f6f3 !important; }}
                     "at least one invoice is ticked and an owner is selected.</div>"
                 )
         n_importable = len([i for i in items if i.get("status") == "new"])
+        if (
+            not imported_notice
+            and not is_test
+            and n_importable == 0
+            and groups.get("imported")
+            and status in ("ready", "done")
+        ):
+            imported_notice = (
+                "<div class='bg-emerald-50 border border-emerald-200 rounded-xl p-4 "
+                "flex flex-col sm:flex-row sm:items-center gap-3'>"
+                "<div class='flex-1'>"
+                f"<p class='text-sm font-bold text-emerald-900'>Import complete — {len(groups['imported'])} invoice(s) from this scan are in Field Expenses</p>"
+                "<p class='text-xs text-emerald-800 mt-0.5'>They still need review/approval before Xero is written.</p>"
+                "</div>"
+                "<a href='/receipts/expenses' class='inline-flex justify-center px-3 py-1.5 rounded bg-emerald-700 text-white text-sm font-semibold hover:bg-emerald-600'>"
+                "Review in Field Expenses →</a>"
+                "</div>"
+            )
         if is_test and n_importable > 0 and status in ("ready", "done"):
             import_bar = f"""
 <div class="bg-amber-50 border border-amber-200 rounded-xl p-4 flex flex-wrap items-center gap-4">
