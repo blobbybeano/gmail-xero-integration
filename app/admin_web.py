@@ -1877,8 +1877,9 @@ def _ai_receipt_hints_block(db_path: str) -> str:
         "merchant fees / bank charges / payment processing, not IT/software.\n"
         "- Stripe, SumUp, Zettle, Square, Worldpay, Cashflows fees and similar "
         "payment processors are merchant fees / bank charges, not IT/software.\n"
-        "- RingGo, parking apps, car parks and meters are motor vehicle / travel "
-        "expenses, not materials.\n"
+        "- RingGo, parking apps, car parks, meters, residents parking permits, "
+        "visitor permits and CPZ/controlled-parking-zone charges are motor "
+        "vehicle / travel expenses, not Rates and not materials.\n"
         "- Cleaning-product suppliers such as ECA Cleaning are materials / job "
         "consumables for this exterior cleaning business, not the Cleaning "
         "expense account.\n"
@@ -1912,8 +1913,8 @@ def _ai_receipt_hints_block(db_path: str) -> str:
         "- Software/subscription suppliers such as Microsoft, Google Workspace, "
         "Adobe, OpenAI, GitHub, Replit and Fly.io are IT/software unless the "
         "document is clearly for card processing or merchant fees.\n"
-        "- Parking apps, car parks and meters should be coded to parking / motor "
-        "travel, not materials.\n"
+        "- Parking apps, car parks, meters and parking/residents permits should "
+        "be coded to parking / motor travel, not Rates and not materials.\n"
         "- Do not choose a common/default account just because it is available. "
         "Use the receipt evidence. If the receipt is genuinely unclear, return "
         "an empty code so the user can choose manually.\n\n"
@@ -2410,7 +2411,11 @@ def _looks_like_materials(merchant: str = "", raw_text: str = "") -> bool:
 
 def _looks_like_parking(merchant: str = "", raw_text: str = "") -> bool:
     text = _receipt_rule_text(merchant, raw_text)
-    terms = ("parking", "car park", "paybyphone", "ringgo", "justpark", "ncp", "meter")
+    terms = (
+        "parking", "car park", "paybyphone", "ringgo", "justpark", "ncp",
+        "meter", "residents permit", "resident permit", "parking permit",
+        "visitor permit", "cpz", "controlled parking zone",
+    )
     return any(t in text for t in terms)
 
 
@@ -2447,14 +2452,14 @@ def _find_vehicle_expense_account(accounts: list) -> "tuple[str, str]":
     code, name = _find_account_by_terms(
         accounts,
         any_terms=("vehicle", "motor", "van"),
-        exclude_terms=("fuel", "parking"),
+        exclude_terms=("fuel", "parking", "rates", "rateable", "business rates", "council tax"),
     )
     if code:
         return code, name
     return _find_account_by_terms(
         accounts,
         any_terms=("travel", "running"),
-        exclude_terms=("fuel", "parking"),
+        exclude_terms=("fuel", "parking", "rates", "rateable", "business rates", "council tax"),
     )
 
 

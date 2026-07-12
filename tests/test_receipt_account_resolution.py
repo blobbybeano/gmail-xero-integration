@@ -18,6 +18,7 @@ class ReceiptAccountResolutionTests(unittest.TestCase):
             {"Code": "402", "Name": "Van Fuel"},
             {"Code": "403", "Name": "Machinery Fuel"},
             {"Code": "404", "Name": "Vehicle Repairs and Maintenance"},
+            {"Code": "480", "Name": "Rates"},
         ]
 
     def test_accepts_real_xero_code(self):
@@ -176,6 +177,14 @@ class ReceiptAccountResolutionTests(unittest.TestCase):
             "Halfords", "screenwash wiper blade bulb",
         )
         self.assertEqual((code, name), ("404", "Vehicle Repairs and Maintenance"))
+
+    def test_residents_permit_overrides_rates_to_vehicle(self):
+        _segments, code, name = _apply_receipt_account_guardrails(
+            [], "480", "Rates", 71.00, self.accounts,
+            "Merton Council",
+            "Residents Permit (Pricing Band 6) controlled parking zone",
+        )
+        self.assertEqual((code, name), ("400", "Motor Vehicle Expenses"))
 
     def test_diesel_without_van_fuel_uses_vehicle_not_machinery(self):
         accounts = [

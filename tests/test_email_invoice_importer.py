@@ -30,6 +30,7 @@ ACCOUNTS = [
     {"Code": "450", "Name": "IT and Software Consumables"},
     {"Code": "460", "Name": "Machinery Fuel"},
     {"Code": "470", "Name": "Van Fuel"},
+    {"Code": "480", "Name": "Rates"},
 ]
 
 
@@ -190,6 +191,14 @@ class EmailInvoiceImporterTests(unittest.TestCase):
         self.assertEqual(
             rule_based_categorise("Microsoft", "Microsoft 365 subscription", ACCOUNTS),
             ("450", "IT and Software Consumables"),
+        )
+        self.assertEqual(
+            rule_based_categorise(
+                "Merton Council",
+                "Residents Permit (Pricing Band 6) controlled parking zone",
+                ACCOUNTS,
+            ),
+            ("430", "Motor Vehicle Expenses"),
         )
 
 

@@ -516,11 +516,15 @@ def rule_based_categorise(
             exclude_terms=("fuel", "parking", "insurance"),
         )
 
-    if any(t in text for t in ("ringgo", "ring go", "parking", "car park", "ncp", "paybyphone", "justpark")):
+    if any(t in text for t in (
+        "ringgo", "ring go", "parking", "car park", "ncp", "paybyphone",
+        "justpark", "residents permit", "resident permit", "parking permit",
+        "visitor permit", "cpz", "controlled parking zone", "merton council",
+    )):
         return _find_account_by_terms(
             exp_accounts,
             any_terms=("vehicle", "motor", "van", "travel"),
-            exclude_terms=("fuel",),
+            exclude_terms=("fuel", "rates", "rateable", "business rates", "council tax"),
         )
 
     if any(t in text for t in (
@@ -627,8 +631,9 @@ def ai_categorise(
             "breakdown cover is motor vehicle expenses, not insurance. Tender "
             "POS, Stripe, SumUp, Zettle, Square, Worldpay, Cashflows fees and "
             "card-terminal/payment-processing costs are merchant fees/bank "
-            "charges, not IT/software. RingGo/parking/car parks are vehicle/"
-            "travel expenses. Cleaning-product suppliers such as ECA Cleaning "
+            "charges, not IT/software. RingGo/parking/car parks, residents "
+            "parking permits, visitor permits and CPZ/controlled-parking-zone "
+            "charges are vehicle/travel expenses, not Rates. Cleaning-product suppliers such as ECA Cleaning "
             "are materials/job consumables for our exterior cleaning work, not "
             "the Cleaning account. Microsoft, Google Workspace/Cloud, Adobe, "
             "OpenAI, GitHub, Replit and Fly.io are IT/software unless the "
