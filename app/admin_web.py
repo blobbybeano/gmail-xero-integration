@@ -20386,12 +20386,12 @@ body {{ background:#f7f6f3 !important; }}
         if st == "new" and not is_test:
             select_html = f"""
     <label class="inline-flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 cursor-pointer"
-           title="Ticked invoices are included when you press Import selected">
+           title="Ticked invoices are included when you press Submit selected to Xero">
       <input type="checkbox" name="selected_item_id" value="{escape(sid)}"
              form="escan-import-form" checked
              class="h-4 w-4 rounded border-emerald-300 text-emerald-600"
              data-escan-select>
-      <span class="text-xs font-semibold text-emerald-800">Selected for import</span>
+      <span class="text-xs font-semibold text-emerald-800">Selected for Xero</span>
     </label>"""
         view_html = ""
         if it.get("stored_file"):
@@ -21307,16 +21307,46 @@ body {{ background:#f7f6f3 !important; }}
                 _imp_n = int(request.args.get("imported") or 0)
             except ValueError:
                 _imp_n = 0
+            try:
+                _xero_sent_n = int(request.args.get("xero_submitted") or 0)
+            except ValueError:
+                _xero_sent_n = 0
+            try:
+                _xero_blocked_n = int(request.args.get("xero_blocked") or 0)
+            except ValueError:
+                _xero_blocked_n = 0
             if _imp_n > 0:
+                if _xero_sent_n and not _xero_blocked_n:
+                    headline = f"Success — {_xero_sent_n} invoice(s) submitted to Xero"
+                    detail = "The selected invoices were created as Xero supplier bills and the invoice files were attached."
+                    tone = "emerald"
+                elif _xero_sent_n and _xero_blocked_n:
+                    headline = f"Part submitted — {_xero_sent_n} sent to Xero, {_xero_blocked_n} need a check"
+                    detail = "The blocked invoice(s) stayed in Field Expenses with the exact reason shown there."
+                    tone = "amber"
+                else:
+                    headline = f"{_imp_n} invoice(s) moved to Field Expenses"
+                    detail = "Nothing reached Xero. Check Field Expenses for the reason before trying again."
+                    tone = "amber"
+                tone_cls = (
+                    "bg-emerald-50 border-emerald-200 text-emerald-900"
+                    if tone == "emerald" else
+                    "bg-amber-50 border-amber-200 text-amber-900"
+                )
+                btn_cls = (
+                    "bg-emerald-700 hover:bg-emerald-600"
+                    if tone == "emerald" else
+                    "bg-amber-700 hover:bg-amber-600"
+                )
                 imported_notice = (
-                    "<div class='bg-emerald-50 border border-emerald-200 rounded-xl p-4 "
+                    f"<div class='{tone_cls} border rounded-xl p-4 "
                     "flex flex-col sm:flex-row sm:items-center gap-3'>"
                     "<div class='flex-1'>"
-                    f"<p class='text-sm font-bold text-emerald-900'>Success — imported {_imp_n} invoice(s) into Field Expenses</p>"
-                    "<p class='text-xs text-emerald-800 mt-0.5'>They are not in Xero yet. Review/approve them in Field Expenses, then Xero gets the expense plus the stored invoice attachment.</p>"
+                    f"<p class='text-sm font-bold'>{escape(headline)}</p>"
+                    f"<p class='text-xs mt-0.5'>{escape(detail)}</p>"
                     "</div>"
-                    "<a href='/receipts/expenses' class='inline-flex justify-center px-3 py-1.5 rounded bg-emerald-700 text-white text-sm font-semibold hover:bg-emerald-600'>"
-                    "Review in Field Expenses →</a>"
+                    f"<a href='/receipts/expenses' class='inline-flex justify-center px-3 py-1.5 rounded {btn_cls} text-white text-sm font-semibold'>"
+                    "Open Field Expenses →</a>"
                     "</div>"
                 )
             else:
@@ -21337,11 +21367,11 @@ body {{ background:#f7f6f3 !important; }}
                 "<div class='bg-emerald-50 border border-emerald-200 rounded-xl p-4 "
                 "flex flex-col sm:flex-row sm:items-center gap-3'>"
                 "<div class='flex-1'>"
-                f"<p class='text-sm font-bold text-emerald-900'>Import complete — {len(groups['imported'])} invoice(s) from this scan are in Field Expenses</p>"
-                "<p class='text-xs text-emerald-800 mt-0.5'>They still need review/approval before Xero is written.</p>"
+                f"<p class='text-sm font-bold text-emerald-900'>Import complete — {len(groups['imported'])} invoice(s) from this scan have already been handled</p>"
+                "<p class='text-xs text-emerald-800 mt-0.5'>Open Field Expenses if you need to see their Xero status or any blocked reason.</p>"
                 "</div>"
                 "<a href='/receipts/expenses' class='inline-flex justify-center px-3 py-1.5 rounded bg-emerald-700 text-white text-sm font-semibold hover:bg-emerald-600'>"
-                "Review in Field Expenses →</a>"
+                "Open Field Expenses →</a>"
                 "</div>"
             )
         if is_test and n_importable > 0 and status in ("ready", "done"):
@@ -21360,8 +21390,8 @@ body {{ background:#f7f6f3 !important; }}
             import_bar = f"""
 <div class="bg-emerald-50 border border-emerald-200 rounded-xl p-4 flex flex-wrap items-center gap-4">
   <p class="text-sm font-medium text-emerald-800 flex-1">
-    <span data-escan-selected-count>{n_importable}</span> of {n_importable} invoice(s) selected for Field Expenses
-    <span class="block text-xs text-emerald-700 mt-0.5">Ticked cards below will be imported. Untick anything you are not ready to send forward.</span>
+    <span data-escan-selected-count>{n_importable}</span> of {n_importable} invoice(s) selected for Xero
+    <span class="block text-xs text-emerald-700 mt-0.5">Ticked cards below are your final review and will be submitted to Xero where safe. Untick anything you are not ready to send.</span>
   </p>
   <form id="escan-import-form" method="post" action="/receipts/emails/{batch_id}/import" class="flex items-center gap-2">
     <input type="hidden" name="selected_import" value="1">
@@ -21370,7 +21400,7 @@ body {{ background:#f7f6f3 !important; }}
     </select>
     <button class="px-4 py-1.5 text-sm bg-emerald-600 text-white rounded hover:bg-emerald-500"
             data-escan-import-button>
-      Import <span data-escan-selected-count>{n_importable}</span> selected →
+      Submit <span data-escan-selected-count>{n_importable}</span> selected to Xero →
     </button>
   </form>
 </div>"""
@@ -21747,6 +21777,132 @@ document.addEventListener('submit', function(e) {{
             print(f"[escan] rescan {item_id} failed: {e}", flush=True)
         return redirect(f"/receipts/emails/{batch_id}")
 
+    def _submit_email_receipts_to_xero(receipt_ids: list[str]) -> dict:
+        """Create Xero supplier bills for reviewed email-imported invoices.
+
+        The Email Invoice Importer screen is the admin review step.  Rows that
+        reached this point have been ticked, account-coded, and not marked as
+        duplicates/suspicious.  We still block incomplete rows here so a bad OCR
+        read cannot become a bad Xero bill.
+        """
+        result = {"submitted": 0, "blocked": 0, "errors": []}
+        if not receipt_ids:
+            return result
+        if xero_is_disabled():
+            msg = "Xero is paused — imported into Field Expenses only."
+            for rid in receipt_ids:
+                exp_store.update_receipt(
+                    config.admin_db_file, rid,
+                    status="approved", xero_error=msg,
+                )
+            result["blocked"] = len(receipt_ids)
+            result["errors"].append(msg)
+            return result
+        try:
+            client = build_xero_client(config)
+        except Exception as exc:
+            client = None
+            result["errors"].append(
+                "Xero connection failed: " + str(exc).splitlines()[0][:180]
+            )
+        if client is None:
+            msg = "Xero not connected — imported into Field Expenses only."
+            for rid in receipt_ids:
+                exp_store.update_receipt(
+                    config.admin_db_file, rid,
+                    status="approved", xero_error=msg,
+                )
+            result["blocked"] = len(receipt_ids)
+            if msg not in result["errors"]:
+                result["errors"].append(msg)
+            return result
+
+        for rid in receipt_ids:
+            rec = exp_store.get_receipt(config.admin_db_file, rid)
+            if not rec:
+                result["blocked"] += 1
+                continue
+            merchant = (rec.get("merchant") or rec.get("ocr_merchant") or "").strip()
+            account_code = (rec.get("category_account_code") or "").strip()
+            purchased_on = (rec.get("purchased_on") or "")[:10]
+            try:
+                amount_inc = round(float(rec.get("amount_inc") or 0), 2)
+            except (TypeError, ValueError):
+                amount_inc = 0.0
+            missing = []
+            if not merchant:
+                missing.append("supplier")
+            if not purchased_on:
+                missing.append("invoice date")
+            if amount_inc <= 0:
+                missing.append("total")
+            if not account_code:
+                missing.append("Xero account")
+            if missing:
+                msg = "Cannot submit to Xero yet — missing " + ", ".join(missing) + "."
+                exp_store.update_receipt(
+                    config.admin_db_file, rid,
+                    status="approved", xero_error=msg,
+                )
+                result["blocked"] += 1
+                result["errors"].append(f"{merchant or rid}: {msg}")
+                continue
+
+            filename = (rec.get("filename") or "email-invoice").strip()
+            reference = ("Email invoice " + filename)[:255]
+            desc_bits = [merchant]
+            if filename:
+                desc_bits.append(filename)
+            line = {
+                "Description": " - ".join(desc_bits)[:4000],
+                "Quantity": 1,
+                "UnitAmount": amount_inc,
+                "AccountCode": account_code,
+            }
+            try:
+                bill = client.create_bill(
+                    contact={"Name": merchant},
+                    line_items=[line],
+                    reference=reference,
+                    bill_date=purchased_on,
+                    due_date=purchased_on,
+                    status="AUTHORISED",
+                    line_amount_types="Inclusive",
+                )
+                if client.dry_run:
+                    exp_store.update_receipt(
+                        config.admin_db_file, rid,
+                        status="approved",
+                        xero_error="DRY_RUN — Xero bill simulated, not written.",
+                    )
+                    result["blocked"] += 1
+                    continue
+                bill_id = str((bill or {}).get("InvoiceID") or "").strip()
+                if not bill_id:
+                    raise RuntimeError("Xero bill create returned no InvoiceID")
+                payload = _xero_attachment_bytes_for_receipt(rec)
+                if payload:
+                    att_name, mime, data = payload
+                    client.attach_file_to_invoice(bill_id, att_name, mime, data)
+                exp_store.update_receipt(
+                    config.admin_db_file, rid,
+                    status="submitted",
+                    xero_type="ACCPAY",
+                    xero_id=bill_id,
+                    xero_error="",
+                )
+                result["submitted"] += 1
+            except Exception as exc:
+                msg = str(exc).splitlines()[0][:220]
+                exp_store.update_receipt(
+                    config.admin_db_file, rid,
+                    status="approved",
+                    xero_error="Xero submit failed: " + msg,
+                )
+                result["blocked"] += 1
+                result["errors"].append(f"{merchant}: {msg}")
+        return result
+
     # ── POST /receipts/emails/<batch_id>/import ──────────────────────────────
 
     @app.post("/receipts/emails/<batch_id>/import")
@@ -21775,16 +21931,23 @@ document.addEventListener('submit', function(e) {{
         if explicit_selection and not selected_ids:
             return redirect(f"/receipts/emails/{batch_id}?imported=0")
 
-        imported = em_pipe.import_batch_items(
+        imported, receipt_ids = em_pipe.import_batch_items(
             batch_id,
             config.admin_db_file,
             default_engineer_id=int(eid),
+            receipt_status="approved",
+            return_receipt_ids=True,
             selected_item_ids=selected_ids if explicit_selection else None,
         )
+        xero_result = _submit_email_receipts_to_xero(receipt_ids)
         # Imported invoices now ride into Xero via the expense receipt; drop the
         # local copies we no longer need so images aren't retained on disk.
         _escan_purge_done_files(batch_id)
-        return redirect(f"/receipts/emails/{batch_id}?imported={imported}")
+        return redirect(
+            f"/receipts/emails/{batch_id}?imported={imported}"
+            f"&xero_submitted={xero_result.get('submitted', 0)}"
+            f"&xero_blocked={xero_result.get('blocked', 0)}"
+        )
 
     # ── POST /receipts/emails/delete-tests ──────────────────────────────────
     @app.post("/receipts/emails/delete-tests")

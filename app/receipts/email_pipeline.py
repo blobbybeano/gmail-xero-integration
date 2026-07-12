@@ -1650,13 +1650,16 @@ def import_batch_items(
     *,
     default_engineer_id: int,
     selected_item_ids: set[str] | None = None,
-) -> int:
+    receipt_status: str = "pending_review",
+    return_receipt_ids: bool = False,
+) -> int | tuple[int, list[str]]:
     """Write STATUS_NEW email_scan_items into expense_receipts.
 
     Returns number of rows imported.
     """
     items    = list_items(db_path, batch_id)
     imported = 0
+    receipt_ids: list[str] = []
     existing_receipts = list_all_receipts(db_path, limit=1_000_000)
     for it in items:
         if it["status"] != STATUS_NEW:
@@ -1713,14 +1716,18 @@ def import_batch_items(
                 mime_type=it.get("attachment_mime", ""),
                 category_account_code=it.get("category_account_code", ""),
                 category_account_name=it.get("category_account_name", ""),
-                status="pending_review",
+                status=receipt_status,
             )
             if rec:
                 existing_receipts.insert(0, rec)
+                if rec.get("id"):
+                    receipt_ids.append(str(rec["id"]))
             update_item(db_path, it["id"], status=STATUS_IMPORTED)
             imported += 1
         except Exception as exc:
             _log.warning("import item %s: %s", it["id"], exc)
 
     update_batch(db_path, batch_id, status="done")
+    if return_receipt_ids:
+        return imported, receipt_ids
     return imported
