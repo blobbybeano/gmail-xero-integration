@@ -20382,7 +20382,8 @@ body {{ background:#f7f6f3 !important; }}
                          'No account yet — pick one below</span>')
 
         return f"""
-<div class="bg-white border border-gray-200 rounded-xl p-4 shadow-sm" id="escan-card-{sid}">
+<div class="bg-white border border-gray-200 rounded-xl p-4 shadow-sm"
+     id="escan-card-{sid}" data-escan-status="{escape(st)}">
   <div class="flex flex-wrap items-start gap-2 justify-between">
     <div class="flex-1 min-w-0">
       <div class="flex items-center gap-2 flex-wrap">
@@ -21260,13 +21261,16 @@ body {{ background:#f7f6f3 !important; }}
                 eng_opts2 += f'<option value="{e["id"]}" {sel}>{e.get("name","?")} ({e.get("kind","?")})</option>'
             import_bar = f"""
 <div class="bg-emerald-50 border border-emerald-200 rounded-xl p-4 flex flex-wrap items-center gap-4">
-  <p class="text-sm font-medium text-emerald-800 flex-1">{n_importable} invoice(s) ready to import into Field Expenses</p>
+  <p class="text-sm font-medium text-emerald-800 flex-1" data-escan-import-label>
+    <span data-escan-import-count>{n_importable}</span> invoice(s) ready to import into Field Expenses
+  </p>
   <form method="post" action="/receipts/emails/{batch_id}/import" class="flex items-center gap-2">
     <select name="engineer_id" class="text-sm border border-gray-200 rounded px-2 py-1.5">
       {eng_opts2}
     </select>
-    <button class="px-4 py-1.5 text-sm bg-emerald-600 text-white rounded hover:bg-emerald-500">
-      Import {n_importable} invoice(s) →
+    <button class="px-4 py-1.5 text-sm bg-emerald-600 text-white rounded hover:bg-emerald-500"
+            data-escan-import-button>
+      Import <span data-escan-import-count>{n_importable}</span> invoice(s) →
     </button>
   </form>
 </div>"""
@@ -21446,6 +21450,20 @@ document.addEventListener('click', function(e) {{
   escanView(a.href, a.textContent ? a.textContent.trim() : 'Invoice', false, a.href);
 }}, true);
 
+function escanSetImportCount(delta) {{
+  var nodes = document.querySelectorAll('[data-escan-import-count]');
+  if (!nodes.length) return;
+  var first = nodes[0];
+  var cur = parseInt((first.textContent || '0').replace(/[^0-9]/g, ''), 10) || 0;
+  var next = Math.max(0, cur + delta);
+  nodes.forEach(function(n) {{ n.textContent = String(next); }});
+  var btn = document.querySelector('[data-escan-import-button]');
+  if (btn && next <= 0) {{
+    btn.disabled = true;
+    btn.classList.add('opacity-50', 'cursor-not-allowed');
+  }}
+}}
+
 // AJAX cross-off / restore — no page reload
 document.addEventListener('submit', function(e) {{
   var form = e.target;
@@ -21471,7 +21489,9 @@ document.addEventListener('submit', function(e) {{
     if (!data || !data.ok) {{ if (btn) btn.disabled = false; return; }}
     var card = document.getElementById('escan-card-' + sid);
     if (!card) return;
+    var oldStatus = card.getAttribute('data-escan-status') || '';
     if (data.status === 'ignored') {{
+      if (oldStatus === 'new') escanSetImportCount(-1);
       card.style.transition = 'opacity 0.25s';
       card.style.opacity = '0';
       setTimeout(function() {{ card.remove(); }}, 260);
