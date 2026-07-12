@@ -1,6 +1,11 @@
 import unittest
 
-from app.receipts.email_pipeline import is_own_company_sender, reconcile_amounts
+from app.receipts.email_pipeline import (
+    explicit_total_from_text,
+    is_own_company_sender,
+    reconcile_amounts,
+    reconcile_email_amounts_from_text,
+)
 
 
 OWN_NAMES = ["Power Wash", "Power Wash Ltd", "Pow Wash", "Powwash"]
@@ -68,6 +73,33 @@ class EmailInvoiceImporterTests(unittest.TestCase):
         self.assertEqual(
             reconcile_amounts(-13.79, -11.49, -2.30, vat_rate=20.0),
             (-13.79, -11.49, -2.30),
+        )
+
+    def test_rac_final_total_wins_over_repeated_line_totals(self):
+        raw = """
+        CONFIRMATION OF PAYMENT
+        Cover Period
+        Total
+        FD66LSK
+        13/07/2026 - 12/08/2026
+        £13.83
+        CK12CZS
+        13/07/2026 - 12/08/2026
+        £13.83
+        NV69DZL
+        13/07/2026 - 12/08/2026
+        £13.83
+        NV21EJL
+        13/07/2026 - 12/08/2026
+        £13.83
+        Premiums include IPT at the prevailing rate.
+        Total including all applicable taxes
+        £55.32
+        """
+        self.assertEqual(explicit_total_from_text(raw), 55.32)
+        self.assertEqual(
+            reconcile_email_amounts_from_text(13.83, None, 55.32, raw),
+            (55.32, 55.32, 0.0),
         )
 
 

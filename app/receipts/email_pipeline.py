@@ -236,6 +236,94 @@ def reconcile_amounts(
     return inc, ex, vat
 
 
+_MONEY_RE = r"([+-]?\d{1,6}(?:,\d{3})*(?:\.\d{2})?)"
+
+
+def _to_money(value: str) -> float | None:
+    try:
+        return round(float((value or "").replace(",", "")), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def explicit_total_from_text(raw_text: str) -> float | None:
+    """Return an explicit document-level total from OCR text when present.
+
+    Document AI sometimes extracts the first row total from a table instead of
+    the final amount due.  Supplier PDFs often print the real total with a
+    phrase like "Total including all applicable taxes"; prefer those labelled
+    final totals over table line totals.
+    """
+    text = raw_text or ""
+    strong_patterns = [
+        r"total\s+including\s+all\s+applicable\s+taxes\s*(?:[:\-])?\s*(?:GBP|£)?\s*" + _MONEY_RE,
+        r"total\s+(?:including|incl\.?|inc\.?)\s+(?:vat|tax(?:es)?)\s*(?:[:\-])?\s*(?:GBP|£)?\s*" + _MONEY_RE,
+        r"(?:balance|amount)\s+due\s*(?:[:\-])?\s*(?:GBP|£)?\s*" + _MONEY_RE,
+        r"grand\s+total\s*(?:[:\-])?\s*(?:GBP|£)?\s*" + _MONEY_RE,
+        r"invoice\s+total\s*(?:[:\-])?\s*(?:GBP|£)?\s*" + _MONEY_RE,
+        r"total\s+(?:payable|paid)\s*(?:[:\-])?\s*(?:GBP|£)?\s*" + _MONEY_RE,
+    ]
+    for pat in strong_patterns:
+        matches = re.findall(pat, text, flags=re.IGNORECASE)
+        vals = [_to_money(m) for m in matches]
+        vals = [v for v in vals if v is not None]
+        if vals:
+            return vals[-1]
+
+    # Weaker fallback: if the word "Total" appears several times, the last
+    # total-like amount is normally the document total, not an earlier row.
+    weak = re.findall(
+        r"\btotal\b\s*(?:[:\-])?\s*(?:GBP|£)?\s*" + _MONEY_RE,
+        text,
+        flags=re.IGNORECASE,
+    )
+    vals = [_to_money(m) for m in weak]
+    vals = [v for v in vals if v is not None]
+    return vals[-1] if vals else None
+
+
+def reconcile_email_amounts_from_text(
+    total: float | None,
+    net: float | None,
+    tax: float | None,
+    raw_text: str,
+    *,
+    vat_rate: float = 20.0,
+) -> tuple[float | None, float | None, float | None]:
+    """Reconcile email invoice amounts with a final-total OCR sanity pass."""
+    explicit_total = explicit_total_from_text(raw_text)
+    if explicit_total is not None:
+        current_total = _to_money(str(total)) if total is not None else None
+        # Prefer a labelled final total when OCR picked a smaller table row.
+        if current_total is None or abs(explicit_total - current_total) > 0.01:
+            total = explicit_total
+            supplied_tax = _to_money(str(tax)) if tax is not None else None
+            supplied_net = _to_money(str(net)) if net is not None else None
+            # If the old "tax" field is actually the same as the explicit
+            # final total, it was not a VAT amount. Drop it.
+            if supplied_tax is not None and abs(supplied_tax - explicit_total) <= 0.01:
+                tax = None
+            if (
+                supplied_net is not None
+                and supplied_tax is not None
+                and abs((supplied_net + supplied_tax) - explicit_total) > 0.02
+            ):
+                net = None
+                tax = None
+
+    lowered = (raw_text or "").lower()
+    if explicit_total is not None and (
+        "insurance premium tax" in lowered
+        or re.search(r"\bipt\b", lowered)
+        or "premiums include ipt" in lowered
+    ):
+        # IPT is not VAT.  For RAC/insurance notices, record the full gross as
+        # no-VAT so the app does not invent reclaimable VAT.
+        return round(float(explicit_total), 2), round(float(explicit_total), 2), 0.0
+
+    return reconcile_amounts(total, net, tax, vat_rate=vat_rate)
+
+
 # ── SHA-256 ───────────────────────────────────────────────────────────────────
 
 def sha256_hex(data: bytes) -> str:
@@ -824,10 +912,11 @@ def scan_email_batch(
                 stored_file = result.get("stored_file", "")
                 ocr_error   = result.get("ocr_error", "")
 
-                inc, ex, vat = reconcile_amounts(
+                inc, ex, vat = reconcile_email_amounts_from_text(
                     result.get("total") or result.get("amount_inc"),
                     result.get("net")   or result.get("amount_ex"),
                     result.get("tax")   or result.get("vat_amount"),
+                    raw_text,
                     vat_rate=vat_rate,
                 )
                 # Fallback: if Document AI couldn't parse a structured amount
@@ -1095,10 +1184,11 @@ def rescan_message(
         stored_file = result.get("stored_file", "")
         ocr_error   = result.get("ocr_error", "")
 
-        inc, ex, vat = reconcile_amounts(
+        inc, ex, vat = reconcile_email_amounts_from_text(
             result.get("total") or result.get("amount_inc"),
             result.get("net")   or result.get("amount_ex"),
             result.get("tax")   or result.get("vat_amount"),
+            raw_text,
             vat_rate=vat_rate,
         )
         if inc is None and raw_text and not ocr_error:
