@@ -703,19 +703,21 @@ def dedup_against_receipts(
 
     Returns (status, dup_reason, match_id).
     """
-    sha_prefix = content_sha[:16]
+    sha_prefix = content_sha[:16] if content_sha else ""
 
     # 1 — exact image match in prior email scan items
-    for it in existing_scan_items:
-        sf = it.get("stored_file", "")
-        if sf and sha_prefix in sf:
-            return STATUS_DUPLICATE, "Identical attachment already scanned", it["id"]
+    if sha_prefix:
+        for it in existing_scan_items:
+            sf = it.get("stored_file", "")
+            if sf and sha_prefix in sf:
+                return STATUS_DUPLICATE, "Identical attachment already scanned", it["id"]
 
     # 2 — exact image match in expense_receipts
-    for r in existing_receipts:
-        sf = r.get("stored_file", "")
-        if sf and sha_prefix in sf:
-            return STATUS_DUPLICATE, "Identical image already in Field Expenses", r["id"]
+    if sha_prefix:
+        for r in existing_receipts:
+            sf = r.get("stored_file", "")
+            if sf and sha_prefix in sf:
+                return STATUS_DUPLICATE, "Identical image already in Field Expenses", r["id"]
 
     # 3 — logical match (merchant + date + amount ±£0.02)
     if merchant_norm and purchased_on and amount_inc is not None:

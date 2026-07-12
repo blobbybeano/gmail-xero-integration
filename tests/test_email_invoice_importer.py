@@ -2,6 +2,7 @@ import unittest
 import tempfile
 
 from app.receipts.email_pipeline import (
+    dedup_against_receipts,
     derive_supplier_merchant,
     explicit_total_from_text,
     import_batch_items,
@@ -318,6 +319,27 @@ class EmailInvoiceImporterTests(unittest.TestCase):
             }
             self.assertEqual(rows[chosen["id"]]["status"], "imported")
             self.assertEqual(rows[skipped["id"]]["status"], "new")
+
+    def test_blank_hash_does_not_make_everything_duplicate(self):
+        status, reason, match_id = dedup_against_receipts(
+            "",
+            "racsupplier",
+            "2026-07-13",
+            55.32,
+            [
+                {
+                    "id": "exp-existing",
+                    "stored_file": "/data/receipt_uploads/1234_abcd.jpg",
+                    "merchant": "B&Q",
+                    "purchased_on": "2026-04-03",
+                    "amount_inc": 96.15,
+                }
+            ],
+            [],
+        )
+        self.assertEqual(status, "new")
+        self.assertEqual(reason, "")
+        self.assertEqual(match_id, "")
 
     def test_supplier_rules_override_bad_generic_accounts(self):
         self.assertEqual(
