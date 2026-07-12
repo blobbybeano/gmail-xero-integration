@@ -19953,6 +19953,9 @@ body {{ background:#f7f6f3 !important; }}
         )
         merchant  = it.get("merchant", "") or it.get("sender_name", "") or it.get("sender_from", "")
         purchased = it.get("purchased_on", "") or it.get("email_date", "")
+        purchased_display = _exp_uk_date(purchased) if purchased else "No date"
+        email_display = _exp_uk_date(it.get("email_date") or "") if it.get("email_date") else ""
+        attachment_display = it.get("attachment_name", "") or "invoice"
         subject   = it.get("subject", "")[:80]
         from_addr = it.get("sender_from", "")
         acct_code = it.get("category_account_code", "")
@@ -20166,13 +20169,22 @@ body {{ background:#f7f6f3 !important; }}
         {acct_html}
         <span class="text-sm font-semibold text-gray-800 truncate">{merchant}</span>
       </div>
+      <div class="mt-2 flex flex-wrap items-center gap-2 text-xs">
+        <span class="inline-flex items-center rounded-md bg-gray-100 px-2 py-1 font-semibold text-gray-800">
+          Invoice date: {escape(purchased_display)}
+        </span>
+        {f'<span class="inline-flex items-center rounded-md bg-gray-50 px-2 py-1 text-gray-500">Email: {escape(email_display)}</span>' if email_display and email_display != purchased_display else ''}
+        <span class="inline-flex items-center rounded-md bg-gray-50 px-2 py-1 text-gray-500 truncate max-w-full">
+          File: {escape(attachment_display)}
+        </span>
+      </div>
       <p class="text-xs text-gray-500 mt-0.5 truncate">{from_addr} · {subject}</p>
       <p class="text-xs text-gray-500 mt-1">{vat_summary}</p>
       {dup_html}{recon_sub}{err_html}{view_html}
     </div>
     <div class="text-right shrink-0">
       <p class="text-lg font-bold text-gray-900">{amt_s}</p>
-      <p class="text-xs text-gray-400">{purchased}</p>
+      <p class="text-xs font-medium text-gray-500">{escape(purchased_display)}</p>
     </div>
   </div>
   {action_row}
