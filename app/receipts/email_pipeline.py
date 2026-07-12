@@ -207,12 +207,25 @@ def reconcile_amounts(
         return None, None, None
     if total is not None:
         inc = round(float(total), 2)
-        if net is not None:
-            ex  = round(float(net), 2)
+        supplied_net = round(float(net), 2) if net is not None else None
+        supplied_tax = round(float(tax), 2) if tax is not None else None
+
+        # OCR sometimes lifts a VAT/tax figure from the wrong part of a PDF
+        # (for example a statement summary) while the invoice total is correct.
+        # Never let an impossible positive VAT amount make a positive invoice
+        # have a negative net amount.
+        if inc > 0:
+            if supplied_tax is not None and (supplied_tax < 0 or supplied_tax > inc):
+                supplied_tax = None
+            if supplied_net is not None and (supplied_net < 0 or supplied_net > inc):
+                supplied_net = None
+
+        if supplied_net is not None:
+            ex = supplied_net
             vat = round(inc - ex, 2)
-        elif tax is not None:
-            vat = round(float(tax), 2)
-            ex  = round(inc - vat, 2)
+        elif supplied_tax is not None:
+            vat = supplied_tax
+            ex = round(inc - vat, 2)
         else:
             ex  = round(inc / (1 + vat_rate / 100), 2)
             vat = round(inc - ex, 2)

@@ -1,6 +1,6 @@
 import unittest
 
-from app.receipts.email_pipeline import is_own_company_sender
+from app.receipts.email_pipeline import is_own_company_sender, reconcile_amounts
 
 
 OWN_NAMES = ["Power Wash", "Power Wash Ltd", "Pow Wash", "Powwash"]
@@ -50,6 +50,24 @@ class EmailInvoiceImporterTests(unittest.TestCase):
                 own_names=OWN_NAMES,
                 own_domains=OWN_DOMAINS,
             )
+        )
+
+    def test_impossible_tax_does_not_make_positive_invoice_net_negative(self):
+        self.assertEqual(
+            reconcile_amounts(13.83, None, 55.32, vat_rate=20.0),
+            (13.83, 11.53, 2.30),
+        )
+
+    def test_impossible_net_does_not_make_positive_invoice_vat_too_large(self):
+        self.assertEqual(
+            reconcile_amounts(13.83, -41.49, 55.32, vat_rate=20.0),
+            (13.83, 11.53, 2.30),
+        )
+
+    def test_negative_credit_note_amounts_are_preserved(self):
+        self.assertEqual(
+            reconcile_amounts(-13.79, -11.49, -2.30, vat_rate=20.0),
+            (-13.79, -11.49, -2.30),
         )
 
 
