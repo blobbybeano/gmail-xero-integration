@@ -32,9 +32,11 @@ from .email_store import (
     update_batch,
     update_item,
 )
+from ..admin_store import get_json_setting
 from .expense_store import list_all_receipts, create_receipt
 
 _log = logging.getLogger(__name__)
+_ACCOUNT_LEARNING_KEY = "account_category_learning"
 
 # One scan at a time (shared across web + scheduler calls)
 _scan_lock = threading.Lock()
@@ -400,6 +402,135 @@ def smart_categorise(
     return "", ""
 
 
+def _account_learning_key(merchant: str) -> str:
+    key = re.sub(r"[^a-z0-9]+", "", (merchant or "").lower())
+    for suffix in ("limited", "ltd", "uk", "gb"):
+        if key.endswith(suffix) and len(key) > len(suffix) + 3:
+            key = key[: -len(suffix)]
+            break
+    return key
+
+
+def learned_categorise(db_path: str, merchant: str) -> tuple[str, str]:
+    key = _account_learning_key(merchant)
+    if not key:
+        return "", ""
+    try:
+        learned = get_json_setting(db_path, _ACCOUNT_LEARNING_KEY, {}) or {}
+    except Exception:
+        learned = {}
+    if not isinstance(learned, dict):
+        return "", ""
+    hit = learned.get(key) or {}
+    if not isinstance(hit, dict):
+        return "", ""
+    return str(hit.get("code") or "").strip(), str(hit.get("name") or "").strip()
+
+
+def _norm_account(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+
+
+def _find_account_by_terms(
+    accounts: list[dict],
+    *,
+    any_terms: tuple[str, ...],
+    exclude_terms: tuple[str, ...] = (),
+) -> tuple[str, str]:
+    best: tuple[int, str, str] | None = None
+    for a in accounts or []:
+        code = str(a.get("Code") or "").strip()
+        name = str(a.get("Name") or "").strip()
+        if not code:
+            continue
+        norm = _norm_account(name)
+        if exclude_terms and any(t in norm for t in exclude_terms):
+            continue
+        hits = sum(1 for t in any_terms if t in norm)
+        if not hits:
+            continue
+        score = hits * 10
+        if "vehicle" in norm or "motor" in norm or "van" in norm:
+            score += 4
+        if "advertis" in norm or "marketing" in norm:
+            score += 4
+        if "bank" in norm or "merchant" in norm:
+            score += 4
+        if best is None or score > best[0]:
+            best = (score, code, name)
+    return ("", "") if best is None else (best[1], best[2])
+
+
+def _rule_text(merchant: str, raw_text: str) -> str:
+    return " ".join((merchant or "", raw_text or "")).lower()
+
+
+def rule_based_categorise(
+    merchant: str,
+    raw_text: str,
+    exp_accounts: list[dict],
+) -> tuple[str, str]:
+    text = _rule_text(merchant, raw_text)
+    if not text or not exp_accounts:
+        return "", ""
+
+    if any(t in text for t in ("checkatrade", "check a trade", "lead generation")):
+        return _find_account_by_terms(
+            exp_accounts,
+            any_terms=("advertis", "marketing", "lead", "promotion"),
+            exclude_terms=("clean", "material", "fuel", "vehicle", "motor"),
+        )
+
+    if any(t in text for t in (
+        "tender pos", "tenderpos", "card terminal", "card transaction",
+        "merchant service", "merchant services", "payment processing",
+        "terminal rental",
+    )):
+        code, name = _find_account_by_terms(
+            exp_accounts,
+            any_terms=(
+                "merchant", "bank charge", "bank charges", "card fee",
+                "card fees", "payment processing", "transaction fee",
+                "fees", "charges",
+            ),
+            exclude_terms=("software", "computer", "it ", "material", "clean"),
+        )
+        if code:
+            return code, name
+        return _find_account_by_terms(
+            exp_accounts,
+            any_terms=("bank", "finance charge", "charges"),
+            exclude_terms=("software", "computer", "it ", "material", "clean"),
+        )
+
+    if "rac" in text and any(t in text for t in ("breakdown", "business club", "vehicle", "cover")):
+        return _find_account_by_terms(
+            exp_accounts,
+            any_terms=("vehicle", "motor", "van", "travel"),
+            exclude_terms=("fuel", "parking", "insurance"),
+        )
+
+    if any(t in text for t in ("ringgo", "ring go", "parking", "car park", "ncp", "paybyphone", "justpark")):
+        return _find_account_by_terms(
+            exp_accounts,
+            any_terms=("vehicle", "motor", "van", "travel"),
+            exclude_terms=("fuel",),
+        )
+
+    if any(t in text for t in (
+        "eca cleaning", "cleaning supplies", "window cleaning warehouse",
+        "softwash", "hypo", "sodium hypochlorite", "biocide",
+        "cleaning solution", "pressure washing chemical",
+    )):
+        return _find_account_by_terms(
+            exp_accounts,
+            any_terms=("material", "materials", "tools", "consumable", "supplies"),
+            exclude_terms=("fuel", "vehicle", "motor", "parking", "clean"),
+        )
+
+    return "", ""
+
+
 # ── Deduplication ─────────────────────────────────────────────────────────────
 
 def dedup_against_receipts(
@@ -470,6 +601,13 @@ def ai_categorise(
         prompt = (
             "You are a bookkeeper. Pick the single most appropriate Xero expense "
             "account code for this supplier invoice.\n\n"
+            "Powwash-specific rules: Checkatrade is advertising/lead generation, "
+            "not cleaning. RAC/breakdown cover is motor vehicle expenses, not "
+            "insurance. Tender POS/card-terminal costs are merchant fees/bank "
+            "charges/payment processing, not IT/software. RingGo/parking is "
+            "vehicle/travel expense. Cleaning-product suppliers such as ECA "
+            "Cleaning are materials/job consumables for our exterior cleaning "
+            "work, not the Cleaning account.\n\n"
             f"Merchant / sender: {merchant}\n\n"
             f"OCR text (first 600 chars):\n{raw_text[:600]}\n\n"
             f"Available accounts:\n{acct_lines}\n\n"
@@ -963,11 +1101,17 @@ def scan_email_batch(
 
                 # Categorise (history first, then AI) only for confirmed invoices
                 if final_status == STATUS_NEW:
-                    cat_code, cat_name = smart_categorise(
-                        merchant_norm,
-                        exp_receipts=existing_receipts,
-                        email_items=existing_items,
-                    )
+                    cat_code, cat_name = learned_categorise(db_path, merchant or from_name)
+                    if not cat_code:
+                        cat_code, cat_name = rule_based_categorise(
+                            merchant or from_name, raw_text, exp_accounts
+                        )
+                    if not cat_code:
+                        cat_code, cat_name = smart_categorise(
+                            merchant_norm,
+                            exp_receipts=existing_receipts,
+                            email_items=existing_items,
+                        )
                     if not cat_code:
                         cat_code, cat_name = ai_categorise(
                             merchant or from_name, raw_text, exp_accounts,
@@ -1216,11 +1360,17 @@ def rescan_message(
         final_status = status
         cat_code, cat_name = "", ""
         if status == STATUS_NEW:
-            cat_code, cat_name = smart_categorise(
-                merchant_norm,
-                exp_receipts=existing_receipts,
-                email_items=existing_items,
-            )
+            cat_code, cat_name = learned_categorise(db_path, merchant or from_name)
+            if not cat_code:
+                cat_code, cat_name = rule_based_categorise(
+                    merchant or from_name, raw_text, exp_accounts
+                )
+            if not cat_code:
+                cat_code, cat_name = smart_categorise(
+                    merchant_norm,
+                    exp_receipts=existing_receipts,
+                    email_items=existing_items,
+                )
             if not cat_code:
                 cat_code, cat_name = ai_categorise(
                     merchant or from_name, raw_text, exp_accounts,

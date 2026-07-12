@@ -7,6 +7,7 @@ from app.receipts.email_pipeline import (
     is_own_company_sender,
     reconcile_amounts,
     reconcile_email_amounts_from_text,
+    rule_based_categorise,
 )
 from app.receipts.email_store import (
     STATUS_POSSIBLE_DUP,
@@ -19,6 +20,15 @@ from app.receipts.expense_store import create_receipt
 
 OWN_NAMES = ["Power Wash", "Power Wash Ltd", "Pow Wash", "Powwash"]
 OWN_DOMAINS = ["powwash.co.uk"]
+
+ACCOUNTS = [
+    {"Code": "400", "Name": "Cleaning"},
+    {"Code": "410", "Name": "Materials"},
+    {"Code": "420", "Name": "Advertising"},
+    {"Code": "430", "Name": "Motor Vehicle Expenses"},
+    {"Code": "440", "Name": "Bank Charges"},
+    {"Code": "450", "Name": "IT and Software Consumables"},
+]
 
 
 class EmailInvoiceImporterTests(unittest.TestCase):
@@ -145,6 +155,28 @@ class EmailInvoiceImporterTests(unittest.TestCase):
             }[item["id"]]
             self.assertEqual(refreshed["status"], STATUS_POSSIBLE_DUP)
             self.assertIn("Same merchant/date/amount", refreshed["dup_reason"])
+
+    def test_supplier_rules_override_bad_generic_accounts(self):
+        self.assertEqual(
+            rule_based_categorise(
+                "noreply@checkatrade.com",
+                "Your latest Checkatrade membership statement",
+                ACCOUNTS,
+            ),
+            ("420", "Advertising"),
+        )
+        self.assertEqual(
+            rule_based_categorise("RAC Business Club", "Breakdown cover", ACCOUNTS),
+            ("430", "Motor Vehicle Expenses"),
+        )
+        self.assertEqual(
+            rule_based_categorise("Tender POS", "Card terminal transaction fee", ACCOUNTS),
+            ("440", "Bank Charges"),
+        )
+        self.assertEqual(
+            rule_based_categorise("ECA Cleaning Ltd", "Softwash cleaning solution", ACCOUNTS),
+            ("410", "Materials"),
+        )
 
 
 if __name__ == "__main__":

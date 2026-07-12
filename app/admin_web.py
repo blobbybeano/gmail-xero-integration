@@ -1779,6 +1779,7 @@ def _expense_normalise_payment_source(
 
 
 _AI_HINTS_KEY = "ai_receipt_hints"
+_ACCOUNT_LEARNING_KEY = "account_category_learning"
 
 
 def get_ai_receipt_hints(db_path: str) -> str:
@@ -1793,11 +1794,84 @@ def set_ai_receipt_hints(db_path: str, hints: str) -> None:
     set_json_setting(db_path, _AI_HINTS_KEY, (hints or "").strip())
 
 
+def _account_learning_key(merchant: str) -> str:
+    key = re.sub(r"[^a-z0-9]+", "", (merchant or "").lower())
+    for suffix in ("limited", "ltd", "uk", "gb"):
+        if key.endswith(suffix) and len(key) > len(suffix) + 3:
+            key = key[: -len(suffix)]
+            break
+    return key
+
+
+def _record_account_learning(db_path: str, merchant: str, code: str, name: str) -> None:
+    key = _account_learning_key(merchant)
+    if not key or not code:
+        return
+    try:
+        learned = get_json_setting(db_path, _ACCOUNT_LEARNING_KEY, {}) or {}
+        if not isinstance(learned, dict):
+            learned = {}
+        learned[key] = {
+            "merchant": (merchant or "").strip()[:120],
+            "code": str(code or "").strip(),
+            "name": str(name or "").strip(),
+            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        if len(learned) > 500:
+            rows = sorted(
+                learned.items(),
+                key=lambda kv: str((kv[1] or {}).get("updated_at") or ""),
+                reverse=True,
+            )
+            learned = dict(rows[:500])
+        set_json_setting(db_path, _ACCOUNT_LEARNING_KEY, learned)
+    except Exception:
+        pass
+
+
+def _account_learning_hints(db_path: str) -> str:
+    try:
+        learned = get_json_setting(db_path, _ACCOUNT_LEARNING_KEY, {}) or {}
+    except Exception:
+        learned = {}
+    if not isinstance(learned, dict) or not learned:
+        return ""
+    rows = []
+    for data in list(learned.values())[-30:]:
+        if not isinstance(data, dict):
+            continue
+        merchant = str(data.get("merchant") or "").strip()
+        code = str(data.get("code") or "").strip()
+        name = str(data.get("name") or "").strip()
+        if merchant and code:
+            rows.append(f"- {merchant}: use {code}" + (f" — {name}" if name else ""))
+    if not rows:
+        return ""
+    return (
+        "Account choices previously corrected by the business owner. Prefer "
+        "these for the same supplier unless this document clearly proves a "
+        "different type of spend:\n"
+        + "\n".join(rows)
+        + "\n\n"
+    )
+
+
 def _ai_receipt_hints_block(db_path: str) -> str:
     """Prompt fragment injecting the admin's coding hints, or '' when none."""
     hints = get_ai_receipt_hints(db_path)
+    learned = _account_learning_hints(db_path)
     builtin = (
         "Built-in Powwash coding rules:\n"
+        "- Checkatrade is advertising / lead generation / marketing, not "
+        "cleaning and not materials.\n"
+        "- RAC / breakdown cover is motor vehicle expenses, not insurance.\n"
+        "- Tender POS / card terminal / card transaction platform costs are "
+        "merchant fees / bank charges / payment processing, not IT/software.\n"
+        "- RingGo, parking apps, car parks and meters are motor vehicle / travel "
+        "expenses, not materials.\n"
+        "- Cleaning-product suppliers such as ECA Cleaning are materials / job "
+        "consumables for this exterior cleaning business, not the Cleaning "
+        "expense account.\n"
         "- Only use a fuel account when the receipt clearly looks like a petrol "
         "station / forecourt fuel receipt, with evidence such as litres, pump, "
         "unleaded, petrol, diesel, fuel grade, or a known fuel-station merchant "
@@ -1828,9 +1902,9 @@ def _ai_receipt_hints_block(db_path: str) -> str:
         "an empty code so the user can choose manually.\n\n"
     )
     if not hints:
-        return builtin
+        return builtin + learned
     return (
-        builtin +
+        builtin + learned +
         "The business owner has provided the following bookkeeping hints. "
         "Apply each hint ONLY when its stated conditions are clearly and "
         "specifically met by THIS receipt — do NOT generalise a conditional "
@@ -2377,6 +2451,66 @@ def _find_vehicle_maintenance_account(accounts: list) -> "tuple[str, str]":
     return _find_vehicle_expense_account(accounts)
 
 
+def _find_advertising_account(accounts: list) -> "tuple[str, str]":
+    return _find_account_by_terms(
+        accounts,
+        any_terms=("advertis", "marketing", "lead", "promotion"),
+        exclude_terms=("clean", "material", "fuel", "vehicle", "motor"),
+    )
+
+
+def _find_merchant_fee_account(accounts: list) -> "tuple[str, str]":
+    code, name = _find_account_by_terms(
+        accounts,
+        any_terms=(
+            "merchant", "bank charge", "bank charges", "card fee", "card fees",
+            "payment processing", "transaction fee", "fees", "charges",
+        ),
+        exclude_terms=("software", "computer", "it ", "materials", "clean"),
+    )
+    if code:
+        return code, name
+    return _find_account_by_terms(
+        accounts,
+        any_terms=("bank", "finance charge", "charges"),
+        exclude_terms=("software", "computer", "it ", "materials", "clean"),
+    )
+
+
+def _looks_like_advertising_supplier(merchant: str = "", raw_text: str = "") -> bool:
+    text = _receipt_rule_text(merchant, raw_text)
+    return any(t in text for t in (
+        "checkatrade", "check a trade", "lead generation",
+        "advertising", "marketing", "directory listing",
+    ))
+
+
+def _looks_like_merchant_fee_supplier(merchant: str = "", raw_text: str = "") -> bool:
+    text = _receipt_rule_text(merchant, raw_text)
+    return any(t in text for t in (
+        "tender pos", "tenderpos", "tender payment", "card terminal",
+        "card transaction", "merchant service", "merchant services",
+        "payment processing", "terminal rental",
+    ))
+
+
+def _looks_like_rac_breakdown(merchant: str = "", raw_text: str = "") -> bool:
+    text = _receipt_rule_text(merchant, raw_text)
+    return (
+        "rac" in text
+        and any(t in text for t in ("breakdown", "business club", "vehicle", "cover"))
+    )
+
+
+def _looks_like_cleaning_materials_supplier(merchant: str = "", raw_text: str = "") -> bool:
+    text = _receipt_rule_text(merchant, raw_text)
+    return any(t in text for t in (
+        "eca cleaning", "cleaning supplies", "window cleaning warehouse",
+        "softwash", "hypo", "sodium hypochlorite", "biocide",
+        "gutter joint", "gutter seal", "cleaning solution", "pressure washing chemical",
+    ))
+
+
 def _pick_fuel_account(total, accounts, raw_text="") -> "tuple[str, str]":
     """Choose the right fuel account from deterministic receipt evidence."""
     (m_code, m_name), (v_code, v_name) = _find_fuel_accounts(accounts)
@@ -2479,6 +2613,30 @@ def _apply_receipt_account_guardrails(
     # Supplier invoices often contain generic policy wording about repair or
     # replacement. Known trade suppliers default to Materials unless the actual
     # receipt evidence says fuel, parking, vehicle parts, or garage/van work.
+    if _looks_like_advertising_supplier(merchant, raw_text):
+        code, name = _find_advertising_account(accounts)
+        _set_single(code, name)
+        return segments, cat_code, cat_name
+
+    if _looks_like_merchant_fee_supplier(merchant, raw_text):
+        code, name = _find_merchant_fee_account(accounts)
+        _set_single(code, name)
+        return segments, cat_code, cat_name
+
+    if _looks_like_rac_breakdown(merchant, raw_text):
+        code, name = _find_vehicle_expense_account(accounts)
+        _set_single(code, name)
+        return segments, cat_code, cat_name
+
+    if _looks_like_cleaning_materials_supplier(merchant, raw_text):
+        code, name = _find_account_by_terms(
+            accounts,
+            any_terms=("material", "materials", "tools", "consumable", "supplies"),
+            exclude_terms=("fuel", "vehicle", "motor", "parking"),
+        )
+        _set_single(code, name)
+        return segments, cat_code, cat_name
+
     if (
         _looks_like_trade_materials_supplier(merchant, raw_text)
         and not _looks_like_vehicle_maintenance(merchant, raw_text)
@@ -2494,11 +2652,7 @@ def _apply_receipt_account_guardrails(
         return segments, cat_code, cat_name
 
     if _looks_like_parking(merchant, raw_text):
-        code, name = _find_account_by_terms(
-            accounts,
-            any_terms=("parking", "car park", "travel", "motor"),
-            exclude_terms=("fuel",),
-        )
+        code, name = _find_vehicle_expense_account(accounts)
         _set_single(code, name)
         return segments, cat_code, cat_name
 
@@ -13465,6 +13619,12 @@ body {{ background:#f7f6f3 !important; }}
                 )
             updates["category_account_code"] = category_code
             updates["category_account_name"] = category_name
+            _record_account_learning(
+                config.admin_db_file,
+                updates.get("merchant") or rec.get("merchant") or rec.get("ocr_merchant") or "",
+                category_code,
+                category_name,
+            )
 
         exp_store.update_receipt(db, rid, **updates)
         return redirect(f"/expenses/{token}?flash=approved")
@@ -19496,6 +19656,12 @@ body {{ background:#f7f6f3 !important; }}
             if resolved_code and resolved_code != (item.get("category_account_code") or ""):
                 fields["category_account_code"] = resolved_code
                 fields["category_account_name"] = resolved_name
+                _record_account_learning(
+                    db,
+                    item.get("merchant") or "",
+                    resolved_code,
+                    resolved_name,
+                )
         if action == "ignore":
             fields["status"] = dump_store.STATUS_IGNORED
         elif not resolved_code:
@@ -21309,6 +21475,16 @@ document.addEventListener('submit', function(e) {{
             code, name = account_raw.split("|", 1)
             updates["category_account_code"] = code.strip()
             updates["category_account_name"] = name.strip()
+            item_for_learning = em_store.get_item(config.admin_db_file, item_id) or {}
+            _record_account_learning(
+                config.admin_db_file,
+                item_for_learning.get("merchant")
+                or item_for_learning.get("sender_name")
+                or item_for_learning.get("sender_from")
+                or "",
+                updates["category_account_code"],
+                updates["category_account_name"],
+            )
             if updates.get("status") != "ignored":
                 updates["status"] = "new"
         if vat_mode in ("inc", "no_vat"):
