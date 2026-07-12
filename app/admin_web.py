@@ -19945,11 +19945,11 @@ body {{ background:#f7f6f3 !important; }}
         )
         vat_mode = "inc" if vat_included else "no_vat"
         vat_summary = (
-            f"<span class='font-semibold text-gray-700'>{ex_s}</span> ex VAT"
+            f"<div class='font-semibold text-gray-800'>Total {amt_s}</div>"
             + (
-                f" <span class='text-gray-300'>+</span> <span class='font-semibold text-gray-700'>{vat_s}</span> VAT"
+                f"<div class='text-xs text-gray-500 mt-0.5'>{ex_s} + {vat_s} VAT</div>"
                 if vat_included else
-                " <span class='text-gray-400'>(no VAT)</span>"
+                "<div class='text-xs text-gray-400 mt-0.5'>no VAT</div>"
             )
         )
         merchant  = it.get("merchant", "") or it.get("sender_name", "") or it.get("sender_from", "")

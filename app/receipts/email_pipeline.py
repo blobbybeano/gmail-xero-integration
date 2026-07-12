@@ -1305,11 +1305,33 @@ def import_batch_items(
     """
     items    = list_items(db_path, batch_id)
     imported = 0
+    existing_receipts = list_all_receipts(db_path, limit=1_000_000)
     for it in items:
         if it["status"] != STATUS_NEW:
             continue
         try:
-            create_receipt(
+            fresh_status, fresh_reason, fresh_match_id = dedup_against_receipts(
+                "",
+                normalize_merchant(it.get("merchant", "")),
+                (it.get("purchased_on") or "")[:10],
+                it.get("amount_inc"),
+                existing_receipts,
+                [],
+            )
+            if fresh_status != STATUS_NEW:
+                update_item(
+                    db_path,
+                    it["id"],
+                    status=fresh_status,
+                    dup_reason=(
+                        fresh_reason
+                        or "Duplicate found during final import check"
+                    ),
+                    match_receipt_id=fresh_match_id,
+                )
+                continue
+
+            rec = create_receipt(
                 db_path,
                 engineer_id=default_engineer_id,
                 merchant=it.get("merchant", ""),
@@ -1330,6 +1352,8 @@ def import_batch_items(
                 category_account_name=it.get("category_account_name", ""),
                 status="pending_review",
             )
+            if rec:
+                existing_receipts.insert(0, rec)
             update_item(db_path, it["id"], status=STATUS_IMPORTED)
             imported += 1
         except Exception as exc:

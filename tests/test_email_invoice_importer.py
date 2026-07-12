@@ -1,11 +1,20 @@
 import unittest
+import tempfile
 
 from app.receipts.email_pipeline import (
     explicit_total_from_text,
+    import_batch_items,
     is_own_company_sender,
     reconcile_amounts,
     reconcile_email_amounts_from_text,
 )
+from app.receipts.email_store import (
+    STATUS_POSSIBLE_DUP,
+    create_batch,
+    create_item,
+    list_items,
+)
+from app.receipts.expense_store import create_receipt
 
 
 OWN_NAMES = ["Power Wash", "Power Wash Ltd", "Pow Wash", "Powwash"]
@@ -101,6 +110,41 @@ class EmailInvoiceImporterTests(unittest.TestCase):
             reconcile_email_amounts_from_text(13.83, None, 55.32, raw),
             (55.32, 55.32, 0.0),
         )
+
+    def test_import_rechecks_duplicates_before_creating_receipt(self):
+        with tempfile.NamedTemporaryFile(suffix=".sqlite") as tmp:
+            create_receipt(
+                tmp.name,
+                engineer_id=1,
+                merchant="Macmillan",
+                purchased_on="2026-05-07",
+                amount_inc=15.74,
+                status="submitted",
+            )
+            batch = create_batch(tmp.name, label="Email scan")
+            item = create_item(
+                tmp.name,
+                batch_id=batch["id"],
+                seq=1,
+                status="new",
+                merchant="Macmillan",
+                purchased_on="2026-05-07",
+                amount_inc=15.74,
+                amount_ex=13.12,
+                vat_amount=2.62,
+                currency="GBP",
+            )
+
+            self.assertEqual(
+                import_batch_items(batch["id"], tmp.name, default_engineer_id=1),
+                0,
+            )
+            refreshed = {
+                row["id"]: row
+                for row in list_items(tmp.name, batch["id"])
+            }[item["id"]]
+            self.assertEqual(refreshed["status"], STATUS_POSSIBLE_DUP)
+            self.assertIn("Same merchant/date/amount", refreshed["dup_reason"])
 
 
 if __name__ == "__main__":
