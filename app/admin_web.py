@@ -21311,8 +21311,8 @@ body {{ background:#f7f6f3 !important; }}
                 imported_notice = (
                     "<div class='bg-emerald-50 border border-emerald-200 rounded-xl p-4 "
                     f"text-sm text-emerald-800'>Imported {_imp_n} invoice(s) into "
-                    "Field Expenses. They now need review/approval there before any "
-                    "Xero write.</div>"
+                    "Field Expenses. Review/approve them there, then Xero gets the "
+                    "expense plus the stored invoice attachment.</div>"
                 )
             else:
                 imported_notice = (
@@ -21548,6 +21548,22 @@ document.addEventListener('change', function(e) {{
 }});
 escanUpdateSelectedCount();
 
+document.addEventListener('submit', function(e) {{
+  var form = e.target;
+  if (!form || form.id !== 'escan-import-form') return;
+  form.querySelectorAll('input[data-escan-cloned-id]').forEach(function(n) {{
+    n.remove();
+  }});
+  document.querySelectorAll('[data-escan-select]:checked').forEach(function(cb) {{
+    var hidden = document.createElement('input');
+    hidden.type = 'hidden';
+    hidden.name = 'selected_item_id';
+    hidden.value = cb.value;
+    hidden.setAttribute('data-escan-cloned-id', '1');
+    form.appendChild(hidden);
+  }});
+}});
+
 // AJAX cross-off / restore — no page reload
 document.addEventListener('submit', function(e) {{
   var form = e.target;
@@ -21727,6 +21743,12 @@ document.addEventListener('submit', function(e) {{
             return redirect(f"/receipts/emails/{batch_id}?missing_owner=1")
         explicit_selection = bool(_req.form.get("selected_import"))
         selected_ids = set(_req.form.getlist("selected_item_id"))
+        if explicit_selection and not selected_ids:
+            selected_ids = {
+                str(i.get("id"))
+                for i in em_store.list_items(config.admin_db_file, batch_id)
+                if i.get("status") == "new"
+            }
         if explicit_selection and not selected_ids:
             return redirect(f"/receipts/emails/{batch_id}?imported=0")
 
