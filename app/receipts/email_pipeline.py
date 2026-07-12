@@ -554,6 +554,33 @@ def rule_based_categorise(
     return "", ""
 
 
+def tax_computation_not_supplier_invoice(merchant: str, raw_text: str) -> str:
+    """Return a reason when this is a tax-return/computation, not a supplier bill.
+
+    Accountants often send documents showing how much is owed to HMRC. Those can
+    contain amounts, due dates and payment wording, but they are not a charge
+    for the accountant's services and should not be imported as an expense.
+    """
+    text = _rule_text(merchant, raw_text)
+    if not text:
+        return ""
+    tax_terms = (
+        "tax computation", "corporation tax computation", "income tax computation",
+        "self assessment tax return", "tax return", "ct600", "sa302",
+        "hmrc", "corporation tax due", "tax payable", "amount due to hmrc",
+        "payment due to hmrc", "tax calculation",
+    )
+    service_fee_terms = (
+        "invoice number", "invoice no", "tax invoice", "vat invoice",
+        "professional fee", "professional fees", "accountancy fee",
+        "accountancy fees", "our fee", "our fees", "services provided",
+        "fee note",
+    )
+    if any(t in text for t in tax_terms) and not any(t in text for t in service_fee_terms):
+        return "Tax computation/return document, not supplier charge"
+    return ""
+
+
 # ── Deduplication ─────────────────────────────────────────────────────────────
 
 def dedup_against_receipts(
@@ -784,11 +811,15 @@ def ai_validate_invoice_doc(
             "Answer YES for invoices, bills, statements of account, membership/"
             "subscription charges, insurance premiums/policy fees, and direct "
             "debit mandates/notices showing an amount. When in any doubt, YES.\n"
+            "Important exception: if an accountant sends a tax computation, tax "
+            "return, CT600, SA302, or document telling us how much tax is owed "
+            "to HMRC, answer NO unless the document is clearly the accountant's "
+            "own invoice/fee note for their professional services.\n"
             "Answer NO ONLY when it is clearly one of: a quote/estimate/proforma "
-            "that is not yet owed, a pure marketing/advert page, a logo or "
-            "non-document image, or a document plainly addressed to a DIFFERENT, "
-            "unrelated company (neither us nor our staff). When in any doubt, "
-            "answer YES.\n"
+            "that is not yet owed, a tax computation/tax return rather than a "
+            "supplier charge, a pure marketing/advert page, a logo or non-document "
+            "image, or a document plainly addressed to a DIFFERENT, unrelated "
+            "company (neither us nor our staff). When in any doubt, answer YES.\n"
             "Reply with exactly: YES or NO, then a 3-6 word reason. "
             "Example: 'NO — quotation, not an invoice'."
         )
@@ -1122,10 +1153,15 @@ def scan_email_batch(
                 final_status = status
                 cat_code, cat_name = "", ""
                 if status == STATUS_NEW:
-                    is_invoice, why_not = ai_validate_invoice_doc(
-                        merchant or from_name, raw_text,
-                        own_names=own_names, openai_key=openai_key,
+                    why_not = tax_computation_not_supplier_invoice(
+                        merchant or from_name, raw_text
                     )
+                    is_invoice = not bool(why_not)
+                    if is_invoice:
+                        is_invoice, why_not = ai_validate_invoice_doc(
+                            merchant or from_name, raw_text,
+                            own_names=own_names, openai_key=openai_key,
+                        )
                     if not is_invoice:
                         final_status = STATUS_NOT_INVOICE
                         dup_reason = why_not or "AI: not an invoice to Power Wash"

@@ -8,6 +8,7 @@ from app.receipts.email_pipeline import (
     reconcile_amounts,
     reconcile_email_amounts_from_text,
     rule_based_categorise,
+    tax_computation_not_supplier_invoice,
 )
 from app.receipts.email_store import (
     STATUS_POSSIBLE_DUP,
@@ -96,6 +97,20 @@ class EmailInvoiceImporterTests(unittest.TestCase):
             reconcile_amounts(-13.79, -11.49, -2.30, vat_rate=20.0),
             (-13.79, -11.49, -2.30),
         )
+
+    def test_tax_computation_is_not_imported_as_supplier_invoice(self):
+        reason = tax_computation_not_supplier_invoice(
+            "Example Accountants",
+            "Corporation Tax Computation CT600 tax payable amount due to HMRC £4,812.00",
+        )
+        self.assertIn("Tax computation", reason)
+
+    def test_accountant_fee_invoice_is_still_allowed(self):
+        reason = tax_computation_not_supplier_invoice(
+            "Example Accountants",
+            "Invoice number 1092 professional fees for preparing corporation tax return £450.00",
+        )
+        self.assertEqual(reason, "")
 
     def test_rac_final_total_wins_over_repeated_line_totals(self):
         raw = """
