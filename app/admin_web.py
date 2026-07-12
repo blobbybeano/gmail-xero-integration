@@ -11482,6 +11482,10 @@ body {{ background:#f7f6f3 !important; }}
         session.pop("engineer_id", None)
         return redirect("/portal")
 
+    # Guards against launching more than one background recon-refresh at a time.
+    _recon_refresh_lock = threading.Lock()
+    _recon_refresh_running = False
+
     def _engineer_reconciled_lines(start, end):
         """Reconciled SPEND lines (amount, iso_date) from Xero in a date window.
 
@@ -11490,7 +11494,16 @@ body {{ background:#f7f6f3 !important; }}
         Cached in admin settings to avoid hammering the API on every phone
         page-load. The cache records its covered date range; a wider request
         will refresh, but a narrower request can safely reuse the wider data.
+
+        IMPORTANT: if the cache is cold we do NOT block the request. Fetching
+        up to a year of paginated Xero bank-transactions can take 30+ seconds
+        and would make the first page-load after a server restart appear
+        unresponsive to engineers on their phones. Instead we kick off a
+        background thread and return None immediately; the caller treats None
+        as "reconciliation status unknown" and keeps all rows visible.
         """
+        nonlocal _recon_refresh_running
+
         if xero_is_disabled():
             return None
         import time as _t
@@ -11503,35 +11516,54 @@ body {{ background:#f7f6f3 !important; }}
             cached_end = str(cache.get("end") or "")
             if cached_start <= start_s and cached_end >= end_s:
                 return cache["lines"]
-        try:
-            client = build_xero_client(config)
-            payload = client.get_bank_transactions(start_date=start, end_date=end)
-            raw = (payload or {}).get("BankTransactions") or []
-        except Exception as e:
-            print(f"[engineer-card-feed] Xero reconciliation fetch failed: {e}",
-                  flush=True)
-            return None
-        lines = []
-        for t in raw:
-            if str(t.get("Type") or "").upper() != "SPEND":
-                continue
-            if not t.get("IsReconciled"):
-                continue
+
+        def _bg_refresh(s, e, ss, es):
+            nonlocal _recon_refresh_running
             try:
-                amt = float(t.get("Total") or 0)
-            except (TypeError, ValueError):
-                continue
-            lines.append([amt, _xero_date_to_iso(t.get("Date"))])
-        set_json_setting(
-            config.admin_db_file, "engineer_recon_cache",
-            {
-                "until": now + 21600,  # 6 hours; historical card-feed status is slow-moving.
-                "start": start_s,
-                "end": end_s,
-                "lines": lines,
-            },
-        )
-        return lines
+                client = build_xero_client(config)
+                payload = client.get_bank_transactions(start_date=s, end_date=e)
+                raw = (payload or {}).get("BankTransactions") or []
+                lines = []
+                for t in raw:
+                    if str(t.get("Type") or "").upper() != "SPEND":
+                        continue
+                    if not t.get("IsReconciled"):
+                        continue
+                    try:
+                        amt = float(t.get("Total") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    lines.append([amt, _xero_date_to_iso(t.get("Date"))])
+                set_json_setting(
+                    config.admin_db_file, "engineer_recon_cache",
+                    {
+                        "until": _t.time() + 21600,
+                        "start": ss,
+                        "end": es,
+                        "lines": lines,
+                    },
+                )
+                print(
+                    f"[engineer-recon-cache] warmed: {len(lines)} reconciled lines "
+                    f"({ss} -> {es})",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"[engineer-recon-cache] background refresh failed: {exc}", flush=True)
+            finally:
+                with _recon_refresh_lock:
+                    _recon_refresh_running = False
+
+        with _recon_refresh_lock:
+            if not _recon_refresh_running:
+                _recon_refresh_running = True
+                threading.Thread(
+                    target=_bg_refresh,
+                    args=(start, end, start_s, end_s),
+                    daemon=True,
+                ).start()
+
+        return None
 
     def _engineer_card_feed_html(eng, receipts):
         """Card-holder feed for a company-card engineer.
