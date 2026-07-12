@@ -112,6 +112,14 @@ class EmailInvoiceImporterTests(unittest.TestCase):
         )
         self.assertEqual(reason, "")
 
+    def test_motor_insurance_with_tax_wording_is_still_allowed(self):
+        reason = tax_computation_not_supplier_invoice(
+            "David Llewelyn",
+            "Motor Fleet Insurance Renewal outstanding direct debit mandate "
+            "including insurance premium tax",
+        )
+        self.assertEqual(reason, "")
+
     def test_rac_final_total_wins_over_repeated_line_totals(self):
         raw = """
         CONFIRMATION OF PAYMENT

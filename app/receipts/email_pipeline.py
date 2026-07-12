@@ -564,11 +564,20 @@ def tax_computation_not_supplier_invoice(merchant: str, raw_text: str) -> str:
     text = _rule_text(merchant, raw_text)
     if not text:
         return ""
-    tax_terms = (
+    if any(t in text for t in (
+        "insurance premium tax", "motor fleet insurance", "fleet insurance",
+        "vehicle insurance", "van insurance", "certificate of motor insurance",
+        "policy schedule", "insurance renewal",
+    )):
+        return ""
+    direct_tax_doc_terms = (
         "tax computation", "corporation tax computation", "income tax computation",
-        "self assessment tax return", "tax return", "ct600", "sa302",
-        "hmrc", "corporation tax due", "tax payable", "amount due to hmrc",
-        "payment due to hmrc", "tax calculation",
+        "self assessment tax return", "corporation tax return", "tax return",
+        "ct600", "sa302", "tax calculation", "vat return", "vat calculation",
+    )
+    hmrc_due_terms = (
+        "corporation tax due", "tax payable", "amount due to hmrc",
+        "payment due to hmrc", "pay hmrc", "hmrc payment",
     )
     service_fee_terms = (
         "invoice number", "invoice no", "tax invoice", "vat invoice",
@@ -576,7 +585,11 @@ def tax_computation_not_supplier_invoice(merchant: str, raw_text: str) -> str:
         "accountancy fees", "our fee", "our fees", "services provided",
         "fee note",
     )
-    if any(t in text for t in tax_terms) and not any(t in text for t in service_fee_terms):
+    is_tax_doc = (
+        any(t in text for t in direct_tax_doc_terms)
+        or ("hmrc" in text and any(t in text for t in hmrc_due_terms))
+    )
+    if is_tax_doc and not any(t in text for t in service_fee_terms):
         return "Tax computation/return document, not supplier charge"
     return ""
 
