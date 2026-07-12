@@ -580,6 +580,24 @@ def non_payable_document_reason(merchant: str, raw_text: str) -> str:
     if any(t in text for t in contract_terms) and not any(t in text for t in payable_terms):
         return "Contract/agreement document, not supplier invoice"
 
+    statement_terms = (
+        "statement from", "statement for", "statement of account",
+        "account statement", "as at",
+    )
+    reminder_terms = (
+        "payment reminder", "invoice reminder", "overdue reminder",
+        "overdue invoice", "outstanding invoice reminder",
+    )
+    membership_terms = ("membership statement", "subscription statement")
+    if (
+        any(t in text for t in statement_terms)
+        and not any(t in text for t in membership_terms)
+        and not any(t in text for t in ("invoice number", "invoice no", "tax invoice", "vat invoice"))
+    ):
+        return "Supplier statement, not original invoice"
+    if any(t in text for t in reminder_terms):
+        return "Payment reminder, not original invoice"
+
     if any(t in text for t in (
         "insurance premium tax", "motor fleet insurance", "fleet insurance",
         "vehicle insurance", "van insurance", "certificate of motor insurance",
@@ -852,8 +870,14 @@ def ai_validate_invoice_doc(
             "Also answer NO for contracts, service agreements, terms, proposals "
             "or contract schedules unless the document clearly demands payment "
             "now as an invoice/bill/fee note.\n"
+            "Also answer NO for supplier statements of account, aged statements, "
+            "payment reminders and overdue reminders where they summarise or "
+            "accumulate old invoices; those should not be imported as new bills. "
+            "Exception: membership/subscription statements that are themselves "
+            "the charge can be YES.\n"
             "Answer NO ONLY when it is clearly one of: a quote/estimate/proforma "
             "that is not yet owed, a contract/agreement rather than a payable "
+            "invoice, a supplier statement/reminder rather than the original "
             "invoice, a tax computation/tax return rather than a supplier charge, "
             "a pure marketing/advert page, a logo or non-document image, or a "
             "document plainly addressed to a DIFFERENT, unrelated company "

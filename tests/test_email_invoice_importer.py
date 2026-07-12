@@ -136,6 +136,21 @@ class EmailInvoiceImporterTests(unittest.TestCase):
         )
         self.assertEqual(reason, "")
 
+    def test_supplier_statement_is_not_imported_as_new_invoice(self):
+        reason = non_payable_document_reason(
+            "CJH",
+            "Statement from Redwood Wales Limited T/a CJH for POW Services Limited "
+            "Statement for POW Services Limited As At 15Jun2026 balance 356.00",
+        )
+        self.assertIn("Supplier statement", reason)
+
+    def test_membership_statement_can_still_be_payable(self):
+        reason = non_payable_document_reason(
+            "Checkatrade",
+            "Your latest Checkatrade membership statement subscription charge amount due £1599.58",
+        )
+        self.assertEqual(reason, "")
+
     def test_rac_final_total_wins_over_repeated_line_totals(self):
         raw = """
         CONFIRMATION OF PAYMENT
