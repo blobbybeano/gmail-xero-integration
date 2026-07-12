@@ -275,6 +275,50 @@ class EmailInvoiceImporterTests(unittest.TestCase):
             self.assertEqual(refreshed["status"], STATUS_SUSPICIOUS)
             self.assertIn("No invoice total found", refreshed["dup_reason"])
 
+    def test_import_only_selected_email_invoice_items(self):
+        with tempfile.NamedTemporaryFile(suffix=".sqlite") as tmp:
+            batch = create_batch(tmp.name, label="Email scan")
+            chosen = create_item(
+                tmp.name,
+                batch_id=batch["id"],
+                seq=1,
+                status="new",
+                merchant="Chosen Supplier",
+                purchased_on="2026-07-01",
+                amount_inc=12.0,
+                amount_ex=10.0,
+                vat_amount=2.0,
+                currency="GBP",
+            )
+            skipped = create_item(
+                tmp.name,
+                batch_id=batch["id"],
+                seq=2,
+                status="new",
+                merchant="Skipped Supplier",
+                purchased_on="2026-07-02",
+                amount_inc=18.0,
+                amount_ex=15.0,
+                vat_amount=3.0,
+                currency="GBP",
+            )
+
+            self.assertEqual(
+                import_batch_items(
+                    batch["id"],
+                    tmp.name,
+                    default_engineer_id=1,
+                    selected_item_ids={chosen["id"]},
+                ),
+                1,
+            )
+            rows = {
+                row["id"]: row
+                for row in list_items(tmp.name, batch["id"])
+            }
+            self.assertEqual(rows[chosen["id"]]["status"], "imported")
+            self.assertEqual(rows[skipped["id"]]["status"], "new")
+
     def test_supplier_rules_override_bad_generic_accounts(self):
         self.assertEqual(
             rule_based_categorise(

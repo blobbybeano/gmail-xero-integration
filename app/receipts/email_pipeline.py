@@ -1647,6 +1647,7 @@ def import_batch_items(
     db_path: str,
     *,
     default_engineer_id: int,
+    selected_item_ids: set[str] | None = None,
 ) -> int:
     """Write STATUS_NEW email_scan_items into expense_receipts.
 
@@ -1657,6 +1658,8 @@ def import_batch_items(
     existing_receipts = list_all_receipts(db_path, limit=1_000_000)
     for it in items:
         if it["status"] != STATUS_NEW:
+            continue
+        if selected_item_ids is not None and it.get("id") not in selected_item_ids:
             continue
         try:
             if it.get("amount_inc") is None:

@@ -12420,6 +12420,20 @@ body {{ background:#f7f6f3 !important; }}
                       f"ref={ref}", flush=True)
                 return ""
 
+            attach_failures = []
+            for r in billable:
+                payload = _xero_attachment_bytes_for_receipt(r)
+                if not payload:
+                    continue
+                filename, mime, data = payload
+                try:
+                    client.attach_file_to_invoice(bill_id, filename, mime, data)
+                except Exception as ae:
+                    attach_failures.append(
+                        f"{r.get('merchant') or r.get('id')}: "
+                        + str(ae).splitlines()[0][:120]
+                    )
+
             # Record the payment against the new bill so it shows as paid.
             pay_acct = (eng.get("payment_account_code") or "").strip()
             if bill_id and amount_paid > 0:
@@ -12440,7 +12454,12 @@ body {{ background:#f7f6f3 !important; }}
 
             exp_store.update_settlement(
                 config.admin_db_file, settlement["id"],
-                xero_bill_id=bill_id, xero_error="",
+                xero_bill_id=bill_id,
+                xero_error=(
+                    "Bill raised, but some receipt attachments failed: "
+                    + "; ".join(attach_failures[:3])
+                    if attach_failures else ""
+                ),
             )
             # Link the bill onto each settled receipt for traceability/pull-back.
             for r in billable:
@@ -16572,26 +16591,14 @@ body {{ background:#f7f6f3 !important; }}
             return False, "Matching Xero spend has no BankTransactionID."
         if xero_is_disabled():
             return False, "Xero is paused — receipt image not attached."
-        path = os.path.abspath(str(item.get("stored_file") or ""))
-        if not path or not os.path.exists(path):
+        payload = _xero_attachment_bytes_for_receipt({
+            "stored_file": item.get("stored_file", ""),
+            "filename": item.get("filename", ""),
+            "mime_type": item.get("mime_type", ""),
+        })
+        if not payload:
             return False, "Receipt image is not available locally."
-        try:
-            data = Path(path).read_bytes()
-        except OSError as exc:
-            return False, "Could not read receipt image: " + str(exc).splitlines()[0][:120]
-        if not data:
-            return False, "Receipt image file is empty."
-        filename = (
-            Path(str(item.get("filename") or "")).name
-            or Path(path).name
-            or "receipt.jpg"
-        )
-        mime = (
-            str(item.get("mime_type") or "").strip()
-            or _dump_mime_for(path)
-            or _exp_sniff_mime(data[:16])
-            or "application/octet-stream"
-        )
+        filename, mime, data = payload
         try:
             client = build_xero_client(config)
             client.attach_file_to_bank_transaction(xid, filename, mime, data)
@@ -16602,6 +16609,37 @@ body {{ background:#f7f6f3 !important; }}
             return True, "Receipt image attached to existing Xero card spend."
         except Exception as exc:
             return False, "Xero attachment failed: " + str(exc).splitlines()[0][:180]
+
+    def _xero_attachment_bytes_for_receipt(rec: dict) -> tuple[str, str, bytes] | None:
+        """Return a Xero-ready attachment for a stored receipt/invoice.
+
+        Images are resized before upload so Field Expenses does not push huge
+        phone photos into Xero. PDFs are left as PDFs because they are already
+        document files and converting them would require a renderer.
+        """
+        path = os.path.abspath(str(rec.get("stored_file") or ""))
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            data = Path(path).read_bytes()
+        except OSError:
+            return None
+        if not data:
+            return None
+        filename = (
+            Path(str(rec.get("filename") or "")).name
+            or Path(path).name
+            or "receipt.jpg"
+        )
+        mime = (
+            str(rec.get("mime_type") or "").strip()
+            or _dump_mime_for(path)
+            or _exp_sniff_mime(data[:16])
+            or "application/octet-stream"
+        )
+        if (mime or "").lower().startswith("image/"):
+            data, filename, mime = _exp_resize_for_ocr(data, filename, mime)
+        return filename, mime, data
 
     def _dump_process(batch, files, *, total_count: int | None = None):
         """Process an uploaded batch: OCR + AI-code + dedupe + classify each file,
@@ -20344,6 +20382,17 @@ body {{ background:#f7f6f3 !important; }}
 
         dup_html = f'<p class="text-xs text-amber-600 mt-1">⚠ {dup_msg}</p>' if dup_msg else ""
         err_html = f'<p class="text-xs text-red-500 mt-1">OCR error: {ocr_err[:120]}</p>' if ocr_err else ""
+        select_html = ""
+        if st == "new" and not is_test:
+            select_html = f"""
+    <label class="inline-flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 cursor-pointer"
+           title="Ticked invoices are included when you press Import selected">
+      <input type="checkbox" name="selected_item_id" value="{escape(sid)}"
+             form="escan-import-form" checked
+             class="h-4 w-4 rounded border-emerald-300 text-emerald-600"
+             data-escan-select>
+      <span class="text-xs font-semibold text-emerald-800">Selected for import</span>
+    </label>"""
         view_html = ""
         if it.get("stored_file"):
             att_name = (it.get("attachment_name") or "").lower()
@@ -20406,6 +20455,7 @@ body {{ background:#f7f6f3 !important; }}
       {dup_html}{recon_sub}{err_html}{view_html}
     </div>
     <div class="text-right shrink-0">
+      {select_html}
       <p class="text-lg font-bold text-gray-900">{amt_s}</p>
       <p class="text-xs font-medium text-gray-500">{escape(purchased_display)}</p>
     </div>
@@ -21245,6 +21295,31 @@ body {{ background:#f7f6f3 !important; }}
 </div>"""
 
         import_bar = ""
+        imported_notice = ""
+        if request.args.get("missing_owner") == "1":
+            imported_notice = (
+                "<div class='bg-red-50 border border-red-200 rounded-xl p-4 "
+                "text-sm text-red-700'>Import did not run: choose an engineer / "
+                "owner first, then press Import selected again.</div>"
+            )
+        elif "imported" in request.args:
+            try:
+                _imp_n = int(request.args.get("imported") or 0)
+            except ValueError:
+                _imp_n = 0
+            if _imp_n > 0:
+                imported_notice = (
+                    "<div class='bg-emerald-50 border border-emerald-200 rounded-xl p-4 "
+                    f"text-sm text-emerald-800'>Imported {_imp_n} invoice(s) into "
+                    "Field Expenses. They now need review/approval there before any "
+                    "Xero write.</div>"
+                )
+            else:
+                imported_notice = (
+                    "<div class='bg-amber-50 border border-amber-200 rounded-xl p-4 "
+                    "text-sm text-amber-800'>No invoices were imported. Check that "
+                    "at least one invoice is ticked and an owner is selected.</div>"
+                )
         n_importable = len([i for i in items if i.get("status") == "new"])
         if is_test and n_importable > 0 and status in ("ready", "done"):
             import_bar = f"""
@@ -21261,16 +21336,18 @@ body {{ background:#f7f6f3 !important; }}
                 eng_opts2 += f'<option value="{e["id"]}" {sel}>{e.get("name","?")} ({e.get("kind","?")})</option>'
             import_bar = f"""
 <div class="bg-emerald-50 border border-emerald-200 rounded-xl p-4 flex flex-wrap items-center gap-4">
-  <p class="text-sm font-medium text-emerald-800 flex-1" data-escan-import-label>
-    <span data-escan-import-count>{n_importable}</span> invoice(s) ready to import into Field Expenses
+  <p class="text-sm font-medium text-emerald-800 flex-1">
+    <span data-escan-selected-count>{n_importable}</span> of {n_importable} invoice(s) selected for Field Expenses
+    <span class="block text-xs text-emerald-700 mt-0.5">Ticked cards below will be imported. Untick anything you are not ready to send forward.</span>
   </p>
-  <form method="post" action="/receipts/emails/{batch_id}/import" class="flex items-center gap-2">
-    <select name="engineer_id" class="text-sm border border-gray-200 rounded px-2 py-1.5">
+  <form id="escan-import-form" method="post" action="/receipts/emails/{batch_id}/import" class="flex items-center gap-2">
+    <input type="hidden" name="selected_import" value="1">
+    <select name="engineer_id" required class="text-sm border border-gray-200 rounded px-2 py-1.5">
       {eng_opts2}
     </select>
     <button class="px-4 py-1.5 text-sm bg-emerald-600 text-white rounded hover:bg-emerald-500"
             data-escan-import-button>
-      Import <span data-escan-import-count>{n_importable}</span> invoice(s) →
+      Import <span data-escan-selected-count>{n_importable}</span> selected →
     </button>
   </form>
 </div>"""
@@ -21356,6 +21433,7 @@ body {{ background:#f7f6f3 !important; }}
   {processing_banner}
   {test_banner}
   {err_banner}
+  {imported_notice}
   {import_bar}
 
   <!-- Items grouped by status -->
@@ -21450,19 +21528,25 @@ document.addEventListener('click', function(e) {{
   escanView(a.href, a.textContent ? a.textContent.trim() : 'Invoice', false, a.href);
 }}, true);
 
-function escanSetImportCount(delta) {{
-  var nodes = document.querySelectorAll('[data-escan-import-count]');
-  if (!nodes.length) return;
-  var first = nodes[0];
-  var cur = parseInt((first.textContent || '0').replace(/[^0-9]/g, ''), 10) || 0;
-  var next = Math.max(0, cur + delta);
-  nodes.forEach(function(n) {{ n.textContent = String(next); }});
+function escanUpdateSelectedCount() {{
+  var selected = document.querySelectorAll('[data-escan-select]:checked').length;
+  document.querySelectorAll('[data-escan-selected-count]').forEach(function(n) {{
+    n.textContent = String(selected);
+  }});
   var btn = document.querySelector('[data-escan-import-button]');
-  if (btn && next <= 0) {{
-    btn.disabled = true;
-    btn.classList.add('opacity-50', 'cursor-not-allowed');
+  if (btn) {{
+    var off = selected <= 0;
+    btn.disabled = off;
+    btn.classList.toggle('opacity-50', off);
+    btn.classList.toggle('cursor-not-allowed', off);
   }}
 }}
+document.addEventListener('change', function(e) {{
+  if (e.target && e.target.matches('[data-escan-select]')) {{
+    escanUpdateSelectedCount();
+  }}
+}});
+escanUpdateSelectedCount();
 
 // AJAX cross-off / restore — no page reload
 document.addEventListener('submit', function(e) {{
@@ -21491,10 +21575,9 @@ document.addEventListener('submit', function(e) {{
     if (!card) return;
     var oldStatus = card.getAttribute('data-escan-status') || '';
     if (data.status === 'ignored') {{
-      if (oldStatus === 'new') escanSetImportCount(-1);
       card.style.transition = 'opacity 0.25s';
       card.style.opacity = '0';
-      setTimeout(function() {{ card.remove(); }}, 260);
+      setTimeout(function() {{ card.remove(); escanUpdateSelectedCount(); }}, 260);
     }} else {{
       window.location.reload();
     }}
@@ -21641,10 +21724,17 @@ document.addEventListener('submit', function(e) {{
         settings = _escan_settings()
         eid      = int(eid_raw) if eid_raw else settings.get("default_engineer_id")
         if not eid:
-            return redirect(f"/receipts/emails/{batch_id}")
+            return redirect(f"/receipts/emails/{batch_id}?missing_owner=1")
+        explicit_selection = bool(_req.form.get("selected_import"))
+        selected_ids = set(_req.form.getlist("selected_item_id"))
+        if explicit_selection and not selected_ids:
+            return redirect(f"/receipts/emails/{batch_id}?imported=0")
 
         imported = em_pipe.import_batch_items(
-            batch_id, config.admin_db_file, default_engineer_id=int(eid)
+            batch_id,
+            config.admin_db_file,
+            default_engineer_id=int(eid),
+            selected_item_ids=selected_ids if explicit_selection else None,
         )
         # Imported invoices now ride into Xero via the expense receipt; drop the
         # local copies we no longer need so images aren't retained on disk.
