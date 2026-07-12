@@ -14,6 +14,7 @@ from app.receipts.email_pipeline import (
 )
 from app.receipts.email_store import (
     STATUS_POSSIBLE_DUP,
+    STATUS_SUSPICIOUS,
     create_batch,
     create_item,
     list_items,
@@ -235,6 +236,35 @@ class EmailInvoiceImporterTests(unittest.TestCase):
             }[item["id"]]
             self.assertEqual(refreshed["status"], STATUS_POSSIBLE_DUP)
             self.assertIn("Same merchant/date/amount", refreshed["dup_reason"])
+
+    def test_import_refuses_ready_item_without_total(self):
+        with tempfile.NamedTemporaryFile(suffix=".sqlite") as tmp:
+            batch = create_batch(tmp.name, label="Email scan")
+            item = create_item(
+                tmp.name,
+                batch_id=batch["id"],
+                seq=1,
+                status="new",
+                merchant="P&P Pumps and Pressure",
+                purchased_on="2026-05-06",
+                amount_inc=None,
+                amount_ex=None,
+                vat_amount=None,
+                currency="GBP",
+                category_account_code="410",
+                category_account_name="Materials",
+            )
+
+            self.assertEqual(
+                import_batch_items(batch["id"], tmp.name, default_engineer_id=1),
+                0,
+            )
+            refreshed = {
+                row["id"]: row
+                for row in list_items(tmp.name, batch["id"])
+            }[item["id"]]
+            self.assertEqual(refreshed["status"], STATUS_SUSPICIOUS)
+            self.assertIn("No invoice total found", refreshed["dup_reason"])
 
     def test_supplier_rules_override_bad_generic_accounts(self):
         self.assertEqual(

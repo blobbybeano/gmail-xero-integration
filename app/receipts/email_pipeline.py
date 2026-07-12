@@ -37,6 +37,7 @@ from .expense_store import list_all_receipts, create_receipt
 
 _log = logging.getLogger(__name__)
 _ACCOUNT_LEARNING_KEY = "account_category_learning"
+_MISSING_TOTAL_REASON = "No invoice total found - review before import"
 
 # One scan at a time (shared across web + scheduler calls)
 _scan_lock = threading.Lock()
@@ -1258,7 +1259,11 @@ def scan_email_batch(
                 # duplicates (already known) to save AI cost.
                 final_status = status
                 cat_code, cat_name = "", ""
-                if status == STATUS_NEW:
+                if status == STATUS_NEW and inc is None:
+                    final_status = STATUS_SUSPICIOUS
+                    dup_reason = _MISSING_TOTAL_REASON
+                    counts["suspicious"] = counts.get("suspicious", 0) + 1
+                if final_status == STATUS_NEW:
                     why_not = non_payable_document_reason(
                         merchant or from_name, raw_text
                     )
@@ -1533,7 +1538,10 @@ def rescan_message(
 
         final_status = status
         cat_code, cat_name = "", ""
-        if status == STATUS_NEW:
+        if status == STATUS_NEW and inc is None:
+            final_status = STATUS_SUSPICIOUS
+            dup_reason = _MISSING_TOTAL_REASON
+        if final_status == STATUS_NEW:
             cat_code, cat_name = learned_categorise(db_path, merchant or from_name)
             if not cat_code:
                 cat_code, cat_name = rule_based_categorise(
@@ -1634,6 +1642,15 @@ def import_batch_items(
         if it["status"] != STATUS_NEW:
             continue
         try:
+            if it.get("amount_inc") is None:
+                update_item(
+                    db_path,
+                    it["id"],
+                    status=STATUS_SUSPICIOUS,
+                    dup_reason=_MISSING_TOTAL_REASON,
+                )
+                continue
+
             fresh_status, fresh_reason, fresh_match_id = dedup_against_receipts(
                 "",
                 normalize_merchant(it.get("merchant", "")),
