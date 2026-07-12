@@ -168,6 +168,15 @@ class EmailInvoiceImporterTests(unittest.TestCase):
         )
         self.assertIn("Supplier statement", reason)
 
+    def test_bank_statement_is_not_imported_as_supplier_invoice(self):
+        reason = non_payable_document_reason(
+            "Lloyds",
+            "LLOYDS BUSINESS ACCOUNT Your Transactions Sort Code Account Number "
+            "Money In Money Out Balance on 01 March 2026 Statement period "
+            "01 March 2026 to 31 March 2026",
+        )
+        self.assertIn("Bank statement", reason)
+
     def test_membership_statement_can_still_be_payable(self):
         reason = non_payable_document_reason(
             "Checkatrade",

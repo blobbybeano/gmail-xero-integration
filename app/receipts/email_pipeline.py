@@ -595,6 +595,23 @@ def non_payable_document_reason(merchant: str, raw_text: str) -> str:
     if any(t in text for t in contract_terms) and not any(t in text for t in payable_terms):
         return "Contract/agreement document, not supplier invoice"
 
+    bank_statement_terms = (
+        "business account", "bank statement", "your transactions",
+        "your account", "sort code", "account number", "money in",
+        "money out", "balance on", "statement period",
+    )
+    bank_names = (
+        "lloyds", "barclays", "natwest", "hsbc", "santander",
+        "monzo", "starling", "revolut", "cashplus", "metro bank",
+        "bank of scotland", "halifax",
+    )
+    if (
+        any(t in text for t in bank_statement_terms)
+        and any(t in text for t in bank_names)
+        and not any(t in text for t in payable_terms)
+    ):
+        return "Bank statement, not supplier invoice"
+
     statement_terms = (
         "statement from", "statement for", "statement of account",
         "account statement", "as at",
