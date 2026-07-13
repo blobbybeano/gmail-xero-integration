@@ -2,7 +2,9 @@ import unittest
 
 from app.admin_web import (
     _apply_receipt_account_guardrails,
+    _exp_apply_vat_mode,
     _exp_reconcile_amounts_from_text,
+    _exp_vat_mode,
     _owner_paid_acct_options,
     _owner_paid_accounts_from,
     _payment_acct_options,
@@ -218,6 +220,25 @@ class ReceiptAccountResolutionTests(unittest.TestCase):
             20.0,
         )
         self.assertEqual((total, net, tax, zero_rated), (15.49, 12.91, 2.58, 0.0))
+
+    def test_vat_mode_detects_no_standard_and_mixed(self):
+        self.assertEqual(_exp_vat_mode(12.00, 12.00, 0.00, 20.0), "no_vat")
+        self.assertEqual(_exp_vat_mode(120.00, 100.00, 20.00, 20.0), "standard")
+        self.assertEqual(_exp_vat_mode(20.00, 10.00, 2.00, 20.0), "mixed")
+
+    def test_vat_mode_save_applies_user_choice(self):
+        self.assertEqual(
+            _exp_apply_vat_mode(15.49, 12.91, 2.58, "no_vat", 20.0),
+            (15.49, 15.49, 0.0),
+        )
+        self.assertEqual(
+            _exp_apply_vat_mode(120.00, 111.11, 8.89, "standard", 20.0),
+            (120.00, 100.00, 20.00),
+        )
+        self.assertEqual(
+            _exp_apply_vat_mode(20.00, 10.00, 2.00, "mixed", 20.0),
+            (20.00, 10.00, 2.00),
+        )
 
     def test_owner_paid_accounts_are_bank_asset_or_liability_not_expense(self):
         accounts = [

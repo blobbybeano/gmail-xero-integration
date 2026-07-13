@@ -603,6 +603,62 @@ def _exp_reconcile_amounts_from_text(total, net, tax, raw_text, vat_rate):
     return _exp_reconcile_amounts(total, net, tax, vat_rate)
 
 
+def _exp_vat_mode(amount_inc, amount_ex, vat_amount, vat_rate: float) -> str:
+    """Classify a receipt's VAT treatment for the engineer review UI."""
+    try:
+        inc = None if amount_inc is None else round(float(amount_inc), 2)
+        ex = None if amount_ex is None else round(float(amount_ex), 2)
+        vat = None if vat_amount is None else round(float(vat_amount), 2)
+    except (TypeError, ValueError):
+        return "standard"
+    if inc is None:
+        return "standard"
+    if vat is None or abs(vat) <= 0.005:
+        return "no_vat"
+    rate = (vat_rate or 0) / 100.0
+    if rate <= 0:
+        return "mixed"
+    expected_ex = round(inc / (1 + rate), 2)
+    expected_vat = round(inc - expected_ex, 2)
+    if ex is not None and abs(ex - expected_ex) <= 0.02 and abs(vat - expected_vat) <= 0.02:
+        return "standard"
+    return "mixed"
+
+
+def _exp_apply_vat_mode(amount_inc, amount_ex, vat_amount, vat_mode: str, vat_rate: float):
+    """Return reviewed (inc, ex, vat) after the user's VAT mode choice."""
+    try:
+        inc = None if amount_inc is None else round(float(amount_inc), 2)
+    except (TypeError, ValueError):
+        inc = None
+    try:
+        ex = None if amount_ex is None else round(float(amount_ex), 2)
+    except (TypeError, ValueError):
+        ex = None
+    try:
+        vat = None if vat_amount is None else round(float(vat_amount), 2)
+    except (TypeError, ValueError):
+        vat = None
+
+    mode = (vat_mode or "").strip().lower()
+    if inc is None:
+        return inc, ex, vat
+    if mode == "no_vat":
+        return inc, inc, 0.0
+    if mode == "standard":
+        ex, vat = _exp_compute_vat(inc, vat_rate)
+        return inc, ex, vat
+    # Mixed VAT means keep the parser/user-entered net and VAT because only
+    # part of the receipt may be standard-rated. Fill one missing side if safe.
+    if mode == "mixed":
+        if ex is not None and vat is None:
+            vat = round(inc - ex, 2)
+        elif vat is not None and ex is None:
+            ex = round(inc - vat, 2)
+        return inc, ex, vat
+    return inc, ex, vat
+
+
 def _exp_uk_date(value: str) -> str:
     """Render an ISO (yyyy-mm-dd) date as UK ``dd/mm/yyyy``.
 
@@ -13562,6 +13618,32 @@ body {{ background:#f7f6f3 !important; }}
         inc_v = "" if inc is None else f"{float(inc):.2f}"
         ex_v = "" if ex is None else f"{float(ex):.2f}"
         vat_v = "" if vat is None else f"{float(vat):.2f}"
+        vat_mode = _exp_vat_mode(inc, ex, vat, vat_rate)
+
+        def _vat_mode_card(value: str, title: str, detail: str) -> str:
+            checked = "checked" if vat_mode == value else ""
+            return (
+                "<label class='cursor-pointer'>"
+                f"<input type='radio' name='vat_mode' value='{value}' class='peer sr-only' {checked}>"
+                "<span class='block rounded-lg border border-gray-200 px-3 py-2 "
+                "peer-checked:border-emerald-600 peer-checked:bg-emerald-50'>"
+                f"<span class='block text-sm font-semibold text-gray-800'>{title}</span>"
+                f"<span class='block text-[11px] text-gray-500 mt-0.5'>{detail}</span>"
+                "</span>"
+                "</label>"
+            )
+        vat_mode_html = (
+            "<div>"
+            "<label class='block text-xs font-medium text-gray-500 mb-1'>VAT treatment "
+            "<span class='text-gray-400 font-normal'>&mdash; prefilled from receipt, change if wrong</span></label>"
+            "<div class='grid grid-cols-3 gap-2'>"
+            + _vat_mode_card("standard", "VAT applied", "normal 20%")
+            + _vat_mode_card("no_vat", "No VAT", "sets VAT to £0")
+            + _vat_mode_card("mixed", "Mixed VAT", "some items only")
+            + "</div>"
+            "<p id='vat_mode_hint' class='text-xs text-gray-400 mt-1'></p>"
+            "</div>"
+        )
 
         ocr_note = ""
         if rec.get("ocr_error"):
@@ -13650,6 +13732,7 @@ body {{ background:#f7f6f3 !important; }}
                          class="w-full rounded-lg border border-gray-300 px-3 py-2 text-lg font-semibold"
                          placeholder="0.00">
                 </div>
+                {vat_mode_html}
                 <div class="grid grid-cols-2 gap-3">
                   <div>
                     <label class="block text-xs font-medium text-gray-500 mb-1">Ex VAT</label>
@@ -13677,14 +13760,46 @@ body {{ background:#f7f6f3 !important; }}
               var ex = document.getElementById('amount_ex');
               var vat = document.getElementById('vat_amount');
               var meta = document.getElementById('vat_meta');
+              var hint = document.getElementById('vat_mode_hint');
               var rate = parseFloat(meta.getAttribute('data-rate')) || 0;
-              inc.addEventListener('input', function() {{
+              function mode() {{
+                var picked = document.querySelector('input[name="vat_mode"]:checked');
+                return picked ? picked.value : 'standard';
+              }}
+              function updateHint() {{
+                var m = mode();
+                if (!hint) return;
+                if (m === 'no_vat') {{
+                  hint.textContent = 'Use this when the receipt does not show reclaimable VAT.';
+                }} else if (m === 'mixed') {{
+                  hint.textContent = 'Use this when only some receipt lines have VAT. Check the Ex VAT and VAT boxes before saving.';
+                }} else {{
+                  hint.textContent = 'Use this for ordinary VAT receipts where the whole total is standard-rated.';
+                }}
+              }}
+              function recalc(force) {{
                 var v = parseFloat(inc.value) || 0;
                 if (v <= 0) {{ return; }}
-                var exVal = rate ? (v / (1 + rate / 100)) : v;
-                ex.value = exVal.toFixed(2);
-                vat.value = (v - exVal).toFixed(2);
+                var m = mode();
+                if (m === 'no_vat') {{
+                  ex.value = v.toFixed(2);
+                  vat.value = '0.00';
+                }} else if (m === 'standard') {{
+                  var exVal = rate ? (v / (1 + rate / 100)) : v;
+                  ex.value = exVal.toFixed(2);
+                  vat.value = (v - exVal).toFixed(2);
+                }} else if (force) {{
+                  // Mixed VAT is editable because only part of the receipt may
+                  // be VAT-rated. Do not overwrite the parser/user values on
+                  // normal total edits.
+                }}
+                updateHint();
+              }}
+              inc.addEventListener('input', function() {{ recalc(false); }});
+              document.querySelectorAll('input[name="vat_mode"]').forEach(function(r) {{
+                r.addEventListener('change', function() {{ recalc(true); }});
               }});
+              updateHint();
             }})();
             </script>
             """
@@ -13711,12 +13826,20 @@ body {{ background:#f7f6f3 !important; }}
             except ValueError:
                 return None
 
+        amount_inc, amount_ex, vat_amount = _exp_apply_vat_mode(
+            _num("amount_inc"),
+            _num("amount_ex"),
+            _num("vat_amount"),
+            request.form.get("vat_mode"),
+            get_expense_settings(db)["vat_rate"],
+        )
+
         updates = dict(
             merchant=(request.form.get("merchant") or "").strip()[:120],
             purchased_on=(request.form.get("purchased_on") or "").strip(),
-            amount_inc=_num("amount_inc"),
-            amount_ex=_num("amount_ex"),
-            vat_amount=_num("vat_amount"),
+            amount_inc=amount_inc,
+            amount_ex=amount_ex,
+            vat_amount=vat_amount,
             status="approved",
         )
         payment_source, owner_paid_account_code = _expense_normalise_payment_source(
