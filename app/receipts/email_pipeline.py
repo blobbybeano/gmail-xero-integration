@@ -555,6 +555,21 @@ def rule_based_categorise(
         )
 
     if any(t in text for t in (
+        "screwfix", "toolstation", "wickes", "b&q", "b q", "bandq",
+        "tradepoint", "travis perkins", "jewson", "selco", "builder depot",
+        "builders merchant", "builders merchants", "homebase",
+    )) and not any(t in text for t in (
+        "diesel", "unleaded", "petrol", "fuel", "litre", "litres", "pump",
+        "parking", "car park", "tyre", "tyres", "mot", "brake", "garage",
+        "vehicle repair", "van repair", "car parts", "autocentre",
+    )):
+        return _find_account_by_terms(
+            exp_accounts,
+            any_terms=("material", "materials", "tools", "consumable", "supplies"),
+            exclude_terms=("fuel", "vehicle", "motor", "parking", "clean"),
+        )
+
+    if any(t in text for t in (
         "microsoft", "office 365", "google workspace", "google cloud",
         "adobe", "openai", "github", "replit", "fly io", "fly.io",
         "digitalocean", "aws", "amazon web services", "dropbox",

@@ -363,6 +363,14 @@ class EmailInvoiceImporterTests(unittest.TestCase):
             ("410", "Materials"),
         )
         self.assertEqual(
+            rule_based_categorise("B&Q", "paint brush roller tray wall plugs", ACCOUNTS),
+            ("410", "Materials"),
+        )
+        self.assertEqual(
+            rule_based_categorise("Screwfix", "gutter sealant screws fixings", ACCOUNTS),
+            ("410", "Materials"),
+        )
+        self.assertEqual(
             rule_based_categorise("Google Ads", "Search advertising campaign", ACCOUNTS),
             ("420", "Advertising"),
         )

@@ -2,6 +2,7 @@ import unittest
 
 from app.admin_web import (
     _apply_receipt_account_guardrails,
+    _exp_reconcile_amounts_from_text,
     _owner_paid_acct_options,
     _owner_paid_accounts_from,
     _payment_acct_options,
@@ -197,6 +198,26 @@ class ReceiptAccountResolutionTests(unittest.TestCase):
             "Shell", "diesel pump 4 litres",
         )
         self.assertEqual((code, name), ("449", "Motor Vehicle Expenses"))
+
+    def test_receipt_amount_uses_final_total_not_first_row(self):
+        total, net, tax, zero_rated = _exp_reconcile_amounts_from_text(
+            6.50,
+            None,
+            None,
+            "B&Q\nLine item £6.50\nLine item £15.20\nTotal £96.15",
+            20.0,
+        )
+        self.assertEqual((total, net, tax, zero_rated), (96.15, 80.13, 16.02, 0.0))
+
+    def test_receipt_amount_drops_impossible_vat_from_ocr(self):
+        total, net, tax, zero_rated = _exp_reconcile_amounts_from_text(
+            15.49,
+            12.91,
+            26.00,
+            "MFG Foxley Service Station\nPump4 10.2L\nTotal £15.49\nVAT Rate Ex.VAT Inc. VAT",
+            20.0,
+        )
+        self.assertEqual((total, net, tax, zero_rated), (15.49, 12.91, 2.58, 0.0))
 
     def test_owner_paid_accounts_are_bank_asset_or_liability_not_expense(self):
         accounts = [

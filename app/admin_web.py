@@ -583,6 +583,26 @@ def _exp_reconcile_amounts(total, net, tax, vat_rate):
     return total, net, tax, zero_rated
 
 
+def _exp_reconcile_amounts_from_text(total, net, tax, raw_text, vat_rate):
+    """Receipt amount reconciliation with the email-invoice final-total checks.
+
+    The receipt and email invoice importers both receive Document AI's
+    structured ``total/net/tax`` guesses.  When those guesses pick a table row
+    or an impossible VAT value, the email importer already corrects them from
+    the labelled final total in the OCR text.  Keep engineer receipts and bulk
+    receipt dumps on that same path before applying receipt-specific zero-rated
+    handling.
+    """
+    total, net, tax = em_pipe.reconcile_email_amounts_from_text(
+        total,
+        net,
+        tax,
+        raw_text or "",
+        vat_rate=vat_rate,
+    )
+    return _exp_reconcile_amounts(total, net, tax, vat_rate)
+
+
 def _exp_uk_date(value: str) -> str:
     """Render an ISO (yyyy-mm-dd) date as UK ``dd/mm/yyyy``.
 
@@ -2010,6 +2030,40 @@ def _ai_categorize_receipt(
     except Exception:
         return "", ""
     return "", ""
+
+
+def _exp_categorize_receipt(
+    db_path: str,
+    merchant: str,
+    raw_text: str,
+    amount,
+    accounts: list,
+) -> "tuple[str, str]":
+    """Pick an expense account using the same first-pass logic as email invoices.
+
+    Deterministic learned/rule-based choices run before the LLM.  The LLM is
+    still available for genuinely unclear receipts, and the existing guardrails
+    run after this helper in the calling code.
+    """
+    if not accounts:
+        return "", ""
+    try:
+        code, name = em_pipe.learned_categorise(db_path, merchant or "")
+        if code:
+            return code, name
+    except Exception:
+        pass
+    try:
+        code, name = em_pipe.rule_based_categorise(
+            merchant or "",
+            raw_text or "",
+            accounts,
+        )
+        if code:
+            return code, name
+    except Exception:
+        pass
+    return _ai_categorize_receipt(db_path, merchant, raw_text, amount, accounts)
 
 
 def _ai_analyze_receipt(db_path, merchant, raw_text, total, accounts, vat_rate):
@@ -13388,8 +13442,8 @@ body {{ background:#f7f6f3 !important; }}
         total = result.get("total")
         net = result.get("net")
         tax = result.get("tax")
-        total, net, tax, _zero_rated = _exp_reconcile_amounts(
-            total, net, tax, vat_rate
+        total, net, tax, _zero_rated = _exp_reconcile_amounts_from_text(
+            total, net, tax, result.get("raw_text", ""), vat_rate
         )
 
         # Auto-categorise: ask the AI to code the receipt against one of the
@@ -13399,7 +13453,7 @@ body {{ background:#f7f6f3 !important; }}
         try:
             _at, _tid, _ = _load_xero_at_tid(config)
             _exp_accounts, _ = _get_xero_expense_accounts(_at, _tid, config.admin_db_file)
-            cat_code, cat_name = _ai_categorize_receipt(
+            cat_code, cat_name = _exp_categorize_receipt(
                 db,
                 result.get("merchant", ""),
                 result.get("raw_text", ""),
@@ -13880,8 +13934,9 @@ body {{ background:#f7f6f3 !important; }}
         ocr_net = result.get("net")
         ocr_tax = result.get("tax")
         ocr_had_breakdown = ocr_net is not None or ocr_tax is not None
-        total, net, tax, zero_rated = _exp_reconcile_amounts(
-            result.get("total"), ocr_net, ocr_tax, vat_rate
+        total, net, tax, zero_rated = _exp_reconcile_amounts_from_text(
+            result.get("total"), ocr_net, ocr_tax,
+            result.get("raw_text", ""), vat_rate
         )
 
         eng = None
@@ -13924,7 +13979,7 @@ body {{ background:#f7f6f3 !important; }}
                         sum(s["gross"] - s["net"] - s["vat"] for s in segments), 2
                     )
             else:
-                cat_code, cat_name = _ai_categorize_receipt(
+                cat_code, cat_name = _exp_categorize_receipt(
                     db, result.get("merchant", ""), result.get("raw_text", ""),
                     total, exp_accounts,
                 )
@@ -16799,8 +16854,9 @@ body {{ background:#f7f6f3 !important; }}
 
             ocr_net, ocr_tax = result.get("net"), result.get("tax")
             ocr_had_breakdown = ocr_net is not None or ocr_tax is not None
-            total, net, tax, zero_rated = _exp_reconcile_amounts(
-                result.get("total"), ocr_net, ocr_tax, vat_rate
+            total, net, tax, zero_rated = _exp_reconcile_amounts_from_text(
+                result.get("total"), ocr_net, ocr_tax,
+                result.get("raw_text", ""), vat_rate
             )
 
             segments = []
@@ -16821,7 +16877,7 @@ body {{ background:#f7f6f3 !important; }}
                         tax = round(sum(s["vat"] for s in segments), 2)
                         total = round(sum(s["gross"] for s in segments), 2)
                 else:
-                    cat_code, cat_name = _ai_categorize_receipt(
+                    cat_code, cat_name = _exp_categorize_receipt(
                         db, result.get("merchant", ""), result.get("raw_text", ""),
                         total, exp_accounts,
                     )
@@ -17080,9 +17136,9 @@ body {{ background:#f7f6f3 !important; }}
                 for _si, _sp in enumerate(splits[1:], start=2):
                     seq += 1
                     s_text = _sp.get("text") or result.get("raw_text", "")
-                    s_total, s_net, s_tax, _zr = _exp_reconcile_amounts(
+                    s_total, s_net, s_tax, _zr = _exp_reconcile_amounts_from_text(
                         _sp.get("total"), _sp.get("net"), _sp.get("tax"),
-                        vat_rate)
+                        s_text, vat_rate)
                     s_merchant = _sp.get("merchant") or result.get("merchant", "")
                     s_date = (_sp.get("date") or purchased_on or today)
                     s_segments: list = []
@@ -17097,7 +17153,7 @@ body {{ background:#f7f6f3 !important; }}
                             s_code = _prim["account_code"]
                             s_name = _prim["account_name"]
                         else:
-                            s_code, s_name = _ai_categorize_receipt(
+                            s_code, s_name = _exp_categorize_receipt(
                                 db, s_merchant, s_text, s_total, exp_accounts)
                     except Exception:
                         pass
