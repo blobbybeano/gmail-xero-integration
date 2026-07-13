@@ -593,6 +593,7 @@ def _exp_reconcile_amounts_from_text(total, net, tax, raw_text, vat_rate):
     receipt dumps on that same path before applying receipt-specific zero-rated
     handling.
     """
+    original_tax = tax
     total, net, tax = em_pipe.reconcile_email_amounts_from_text(
         total,
         net,
@@ -600,6 +601,38 @@ def _exp_reconcile_amounts_from_text(total, net, tax, raw_text, vat_rate):
         raw_text or "",
         vat_rate=vat_rate,
     )
+    text = raw_text or ""
+    lowered = text.lower()
+    if any(t in lowered for t in ("customer receipt", "card payment", "approved")):
+        vals: list[float] = []
+        for match in re.findall(r"(?:£|gbp\s*)\s*(\d{1,5}(?:,\d{3})*\.\d{2})", text, re.I):
+            try:
+                vals.append(round(float(match.replace(",", "")), 2))
+            except ValueError:
+                pass
+        for match in re.findall(r"\b(\d{1,5}(?:,\d{3})*\.\d{2})\s*(?:gbp|visa|mastercard|card)\b", text, re.I):
+            try:
+                vals.append(round(float(match.replace(",", "")), 2))
+            except ValueError:
+                pass
+        if vals:
+            paid_total = max(vals)
+            try:
+                current = None if total is None else round(float(total), 2)
+            except (TypeError, ValueError):
+                current = None
+            if current is None or paid_total > current + 0.01:
+                total = paid_total
+                try:
+                    supplied_tax = None if original_tax is None else round(float(original_tax), 2)
+                except (TypeError, ValueError):
+                    supplied_tax = None
+                if supplied_tax is not None and 0 <= supplied_tax <= paid_total:
+                    tax = supplied_tax
+                    net = round(paid_total - supplied_tax, 2)
+                else:
+                    net = None
+                    tax = None
     return _exp_reconcile_amounts(total, net, tax, vat_rate)
 
 
@@ -1959,6 +1992,14 @@ def _ai_receipt_hints_block(db_path: str) -> str:
         "- Cleaning-product suppliers such as ECA Cleaning are materials / job "
         "consumables for this exterior cleaning business, not the Cleaning "
         "expense account.\n"
+        "- Food, meals, drinks, groceries, cafes, restaurants, takeaways and "
+        "refreshments are Staff Amenities / food / subsistence when that account "
+        "exists. Do not code a food-dominant receipt to Materials just because "
+        "it came from a supermarket or shop.\n"
+        "- If one receipt clearly mixes unrelated spend such as road fuel plus "
+        "food, split it into separate lines/accounts under the same receipt. "
+        "Keep polar-opposite items separate; do not hide food inside fuel or "
+        "materials.\n"
         "- Only use a fuel account when the receipt clearly looks like a petrol "
         "station / forecourt fuel receipt, with evidence such as litres, pump, "
         "unleaded, petrol, diesel, fuel grade, or a known fuel-station merchant "
@@ -2519,6 +2560,30 @@ def _looks_like_materials(merchant: str = "", raw_text: str = "") -> bool:
     return any(t in text for t in terms)
 
 
+def _looks_like_food_expense(merchant: str = "", raw_text: str = "") -> bool:
+    text = _receipt_rule_text(merchant, raw_text)
+    if not text:
+        return False
+    food_terms = (
+        "food", "meal", "meals", "lunch", "breakfast", "dinner",
+        "sandwich", "sandwiches", "burger", "pizza", "chips", "crisps",
+        "coffee", "tea", "drink", "drinks", "water", "cafe", "caf\u00e9",
+        "restaurant", "takeaway", "take away", "mcdonald", "kfc",
+        "subway", "greggs", "pret", "costa", "starbucks", "nero",
+        "tesco express", "sainsbury", "sainsburys", "asda", "morrisons",
+        "waitrose", "aldi", "lidl", "co-op", "coop", "home bargains",
+        "groceries", "grocery", "snack", "snacks", "confectionery",
+        "milk", "bread", "pastry", "pastries", "chocolate", "biscuit",
+    )
+    non_food_terms = (
+        "adblue", "ad blue", "diesel", "unleaded", "petrol", "fuel",
+        "pump", "litre", "litres", "parking", "tyre", "mot", "brake",
+        "screenwash", "engine oil", "wiper", "screwfix", "toolstation",
+        "wickes", "b&q", "b q", "tradepoint",
+    )
+    return any(t in text for t in food_terms) and not any(t in text for t in non_food_terms)
+
+
 def _looks_like_parking(merchant: str = "", raw_text: str = "") -> bool:
     text = _receipt_rule_text(merchant, raw_text)
     terms = (
@@ -2616,6 +2681,24 @@ def _find_software_account(accounts: list) -> "tuple[str, str]":
         accounts,
         any_terms=("software", "computer", "it ", "subscription"),
         exclude_terms=("merchant", "bank charge", "vehicle", "fuel", "material", "clean"),
+    )
+
+
+def _find_food_account(accounts: list) -> "tuple[str, str]":
+    code, name = _find_account_by_terms(
+        accounts,
+        any_terms=(
+            "staff amenities", "amenities", "subsistence", "meals",
+            "meal", "food", "refreshment", "refreshments", "welfare",
+        ),
+        exclude_terms=("fuel", "vehicle", "motor", "material", "clean"),
+    )
+    if code:
+        return code, name
+    return _find_account_by_terms(
+        accounts,
+        any_terms=("entertainment",),
+        exclude_terms=("fuel", "vehicle", "motor", "material", "clean"),
     )
 
 
@@ -2768,6 +2851,19 @@ def _apply_receipt_account_guardrails(
             segments[0]["account_name"] = ""
         cat_code, cat_name = "", ""
 
+    if segments:
+        food_code, food_name = _find_food_account(accounts)
+        if food_code:
+            for seg in segments:
+                label = str(seg.get("label") or "")
+                if _looks_like_food_expense("", label):
+                    seg["account_code"] = food_code
+                    seg["account_name"] = food_name
+        if len(segments) > 1:
+            primary = max(segments, key=lambda s: s.get("gross") or 0)
+            cat_code = primary.get("account_code") or cat_code
+            cat_name = primary.get("account_name") or cat_name
+
     # Supplier invoices often contain generic policy wording about repair or
     # replacement. Known trade suppliers default to Materials unless the actual
     # receipt evidence says fuel, parking, vehicle parts, or garage/van work.
@@ -2797,6 +2893,16 @@ def _apply_receipt_account_guardrails(
             any_terms=("material", "materials", "tools", "consumable", "supplies"),
             exclude_terms=("fuel", "vehicle", "motor", "parking"),
         )
+        _set_single(code, name)
+        return segments, cat_code, cat_name
+
+    if (
+        _looks_like_food_expense(merchant, raw_text)
+        and not _looks_like_fuel_receipt(merchant, raw_text)
+        and not _looks_like_vehicle_maintenance(merchant, raw_text)
+        and not _looks_like_parking(merchant, raw_text)
+    ):
+        code, name = _find_food_account(accounts)
         _set_single(code, name)
         return segments, cat_code, cat_name
 
@@ -12424,6 +12530,75 @@ body {{ background:#f7f6f3 !important; }}
             or text.startswith("waiting for admin receipt xero submission")
         )
 
+    def _receipt_xero_line_items(rec: dict, *, default_account: str = "") -> list[dict]:
+        """Build Xero purchase-bill lines for one receipt.
+
+        A physical receipt remains one Xero bill/payment.  When OCR/AI has
+        split the receipt into materially different segments (for example food
+        plus fuel), each segment becomes its own line so the P&L account is
+        correct without creating duplicate payments.
+        """
+        merchant = (rec.get("merchant") or rec.get("ocr_merchant") or "Receipt").strip()
+        day = (rec.get("purchased_on") or "")[:10]
+        desc_base = f"{merchant} {day}".strip() if day else merchant
+        lines: list[dict] = []
+        segs = rec.get("segments") or []
+        try:
+            total = round(float(rec.get("amount_inc") or 0), 2)
+        except (TypeError, ValueError):
+            total = 0.0
+        if isinstance(segs, list) and len(segs) > 1:
+            seg_total = 0.0
+            prepared: list[dict] = []
+            for seg in segs:
+                if not isinstance(seg, dict):
+                    continue
+                try:
+                    gross = round(float(seg.get("gross") or 0), 2)
+                except (TypeError, ValueError):
+                    gross = 0.0
+                if gross <= 0:
+                    continue
+                seg_total += gross
+                label = (str(seg.get("label") or "").strip() or "Receipt line")[:80]
+                acct = (str(seg.get("account_code") or "").strip() or default_account)
+                line = {
+                    "Description": f"{desc_base} - {label}"[:4000],
+                    "Quantity": 1,
+                    "UnitAmount": gross,
+                }
+                if acct:
+                    line["AccountCode"] = acct
+                try:
+                    if float(seg.get("vat_rate") or 0) == 0:
+                        line["TaxType"] = "NONE"
+                except (TypeError, ValueError):
+                    pass
+                prepared.append(line)
+            if total > 0 and abs(round(seg_total, 2) - total) <= 0.05 and prepared:
+                return prepared
+
+        try:
+            unit = round(float(rec.get("amount_inc") or 0), 2)
+        except (TypeError, ValueError):
+            unit = 0.0
+        if unit <= 0:
+            return []
+        acct = (rec.get("category_account_code") or "").strip() or default_account
+        line = {
+            "Description": desc_base[:4000],
+            "Quantity": 1,
+            "UnitAmount": unit,
+        }
+        if acct:
+            line["AccountCode"] = acct
+        try:
+            if abs(float(rec.get("vat_amount") or 0)) <= 0.005:
+                line["TaxType"] = "NONE"
+        except (TypeError, ValueError):
+            pass
+        return [line]
+
     def _create_xero_bill_for_settlement(eng, settlement, receipts, *, force: bool = False):
         """Raise a Xero ACCPAY purchase bill for the receipts a subcontractor
         payment has just settled, then record the payment against it so the bill
@@ -12462,24 +12637,7 @@ body {{ background:#f7f6f3 !important; }}
         default_acct = (eng.get("expense_account_code") or "").strip()
         line_items = []
         for r in billable:
-            try:
-                unit = round(float(r.get("amount_inc") or 0), 2)
-            except (TypeError, ValueError):
-                unit = 0.0
-            if unit <= 0:
-                continue
-            merchant = (r.get("merchant") or r.get("ocr_merchant") or "Receipt").strip()
-            day = (r.get("purchased_on") or "")[:10]
-            desc = f"{merchant} {day}".strip() if day else merchant
-            acct = (r.get("category_account_code") or "").strip() or default_acct
-            line = {
-                "Description": desc[:4000],
-                "Quantity": 1,
-                "UnitAmount": unit,
-            }
-            if acct:
-                line["AccountCode"] = acct
-            line_items.append(line)
+            line_items.extend(_receipt_xero_line_items(r, default_account=default_acct))
 
         if not line_items:
             return ""
@@ -13505,32 +13663,47 @@ body {{ background:#f7f6f3 !important; }}
         # Auto-categorise: ask the AI to code the receipt against one of the
         # real Xero expense accounts so engineers usually just confirm it.
         # Falls back to the engineer's / global default account if AI can't decide.
+        ocr_had_breakdown = result.get("net") is not None or result.get("tax") is not None
+        segments: list = []
         cat_code, cat_name = "", ""
         try:
             _at, _tid, _ = _load_xero_at_tid(config)
             _exp_accounts, _ = _get_xero_expense_accounts(_at, _tid, config.admin_db_file)
-            cat_code, cat_name = _exp_categorize_receipt(
-                db,
-                result.get("merchant", ""),
-                result.get("raw_text", ""),
-                total,
-                _exp_accounts,
+            segments = _ai_analyze_receipt(
+                db, result.get("merchant", ""), result.get("raw_text", ""),
+                total, _exp_accounts, vat_rate,
             )
-            if not cat_code:
-                fallback = (
-                    (eng.get("expense_account_code") or "").strip()
-                    or (settings.get("default_expense_account") or "").strip()
+            if segments:
+                primary = max(segments, key=lambda s: s.get("gross") or 0)
+                cat_code = primary.get("account_code") or ""
+                cat_name = primary.get("account_name") or ""
+                if len(segments) > 1 and not ocr_had_breakdown:
+                    net = round(sum(s["net"] for s in segments), 2)
+                    tax = round(sum(s["vat"] for s in segments), 2)
+                    total = round(sum(s["gross"] for s in segments), 2)
+            else:
+                cat_code, cat_name = _exp_categorize_receipt(
+                    db,
+                    result.get("merchant", ""),
+                    result.get("raw_text", ""),
+                    total,
+                    _exp_accounts,
                 )
-                if fallback:
-                    cat_code, cat_name = _resolve_expense_account_choice(
-                        fallback, _exp_accounts
+                if not cat_code:
+                    fallback = (
+                        (eng.get("expense_account_code") or "").strip()
+                        or (settings.get("default_expense_account") or "").strip()
                     )
-            _, cat_code, cat_name = _apply_receipt_account_guardrails(
-                [], cat_code, cat_name, total, _exp_accounts,
+                    if fallback:
+                        cat_code, cat_name = _resolve_expense_account_choice(
+                            fallback, _exp_accounts
+                        )
+            segments, cat_code, cat_name = _apply_receipt_account_guardrails(
+                segments, cat_code, cat_name, total, _exp_accounts,
                 result.get("merchant", ""), result.get("raw_text", ""),
             )
         except Exception:
-            cat_code, cat_name = "", ""
+            segments, cat_code, cat_name = [], "", ""
 
         today = dt.datetime.now(dt.timezone.utc).date().isoformat()
         rec = exp_store.create_receipt(
@@ -13552,6 +13725,7 @@ body {{ background:#f7f6f3 !important; }}
             mime_type=content_type,
             category_account_code=cat_code,
             category_account_name=cat_name,
+            segments=segments,
             payment_source=payment_source,
             owner_paid_account_code=owner_paid_account_code,
             status="pending_review",
@@ -13644,6 +13818,33 @@ body {{ background:#f7f6f3 !important; }}
             "<p id='vat_mode_hint' class='text-xs text-gray-400 mt-1'></p>"
             "</div>"
         )
+        segments = rec.get("segments") or []
+        segment_html = ""
+        if isinstance(segments, list) and len(segments) > 1:
+            seg_rows = ""
+            for seg in segments:
+                if not isinstance(seg, dict):
+                    continue
+                try:
+                    gross_s = "£" + format(float(seg.get("gross") or 0), ",.2f")
+                except (TypeError, ValueError):
+                    gross_s = "£0.00"
+                seg_rows += (
+                    "<div class='flex items-start justify-between gap-3 py-1 border-t border-emerald-100 first:border-t-0'>"
+                    "<div><div class='font-medium text-emerald-900'>"
+                    + escape(str(seg.get("label") or "Receipt line"))
+                    + "</div><div class='text-[11px] text-emerald-700'>"
+                    + escape(str(seg.get("account_name") or seg.get("account_code") or "no account"))
+                    + "</div></div><div class='font-semibold text-emerald-900'>"
+                    + gross_s + "</div></div>"
+                )
+            if seg_rows:
+                segment_html = (
+                    "<div class='rounded-lg bg-emerald-50 border border-emerald-200 p-3 text-xs'>"
+                    "<div class='font-semibold text-emerald-900 mb-1'>Split receipt detected</div>"
+                    "<div class='text-emerald-700 mb-2'>This will stay as one receipt/payment, with separate Xero lines.</div>"
+                    + seg_rows + "</div>"
+                )
 
         ocr_note = ""
         if rec.get("ocr_error"):
@@ -13725,6 +13926,7 @@ body {{ background:#f7f6f3 !important; }}
                          class="w-full rounded-lg border border-gray-300 px-3 py-2 text-base">
                 </div>
                 {category_html}
+                {segment_html}
                 <div>
                   <label class="block text-xs font-medium text-gray-500 mb-1">Total paid (inc VAT)</label>
                   <input id="amount_inc" type="number" step="0.01" inputmode="decimal"
@@ -19986,6 +20188,7 @@ body {{ background:#f7f6f3 !important; }}
                 mime_type=it.get("mime_type", ""),
                 category_account_code=account_code,
                 category_account_name=account_name,
+                segments=it.get("segments") or [],
                 status=status,
             )
             return rec
@@ -22029,19 +22232,20 @@ document.addEventListener('submit', function(e) {{
 
             filename = (rec.get("filename") or "email-invoice").strip()
             reference = ("Email invoice " + filename)[:255]
-            desc_bits = [merchant]
-            if filename:
-                desc_bits.append(filename)
-            line = {
-                "Description": " - ".join(desc_bits)[:4000],
-                "Quantity": 1,
-                "UnitAmount": amount_inc,
-                "AccountCode": account_code,
-            }
+            line_items = _receipt_xero_line_items(rec, default_account=account_code)
+            if not line_items:
+                msg = "Cannot submit to Xero yet — no valid receipt lines."
+                exp_store.update_receipt(
+                    config.admin_db_file, rid,
+                    status="approved", xero_error=msg,
+                )
+                result["blocked"] += 1
+                result["errors"].append(f"{merchant or rid}: {msg}")
+                continue
             try:
                 bill = client.create_bill(
                     contact={"Name": merchant},
-                    line_items=[line],
+                    line_items=line_items,
                     reference=reference,
                     bill_date=purchased_on,
                     due_date=purchased_on,

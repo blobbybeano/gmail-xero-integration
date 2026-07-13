@@ -21,6 +21,7 @@ class ReceiptAccountResolutionTests(unittest.TestCase):
             {"Code": "402", "Name": "Van Fuel"},
             {"Code": "403", "Name": "Machinery Fuel"},
             {"Code": "404", "Name": "Vehicle Repairs and Maintenance"},
+            {"Code": "495", "Name": "Staff Amenities"},
             {"Code": "480", "Name": "Rates"},
         ]
 
@@ -58,7 +59,7 @@ class ReceiptAccountResolutionTests(unittest.TestCase):
     def test_non_fuel_receipt_cannot_stay_as_fuel(self):
         _segments, code, name = _apply_receipt_account_guardrails(
             [], "402", "Van Fuel", 18.00, self.accounts,
-            "Corner Shop", "milk bread cleaning cloths",
+            "Corner Shop", "cleaning cloths storage box",
         )
         self.assertEqual((code, name), ("", ""))
 
@@ -106,6 +107,44 @@ class ReceiptAccountResolutionTests(unittest.TestCase):
             "10L ADBLUE-SCR DIESEL VEHICLES total to pay 7.99",
         )
         self.assertEqual((code, name), ("404", "Vehicle Repairs and Maintenance"))
+
+    def test_food_receipt_overrides_materials_to_staff_amenities(self):
+        _segments, code, name = _apply_receipt_account_guardrails(
+            [], "310", "Materials", 12.40, self.accounts,
+            "Tesco Express",
+            "meal deal sandwich crisps drink total 12.40",
+        )
+        self.assertEqual((code, name), ("495", "Staff Amenities"))
+
+    def test_food_segment_recoded_without_splitting_payment(self):
+        segments = [
+            {
+                "label": "Diesel fuel",
+                "account_code": "402",
+                "account_name": "Van Fuel",
+                "gross": 55.00,
+                "net": 45.83,
+                "vat": 9.17,
+                "vat_rate": 20,
+            },
+            {
+                "label": "Food and drinks",
+                "account_code": "310",
+                "account_name": "Materials",
+                "gross": 8.50,
+                "net": 8.50,
+                "vat": 0,
+                "vat_rate": 0,
+            },
+        ]
+        new_segments, code, name = _apply_receipt_account_guardrails(
+            segments, "402", "Van Fuel", 63.50, self.accounts,
+            "Service Station",
+            "diesel pump sandwich drink total 63.50",
+        )
+        self.assertEqual(new_segments[1]["account_code"], "495")
+        self.assertEqual(new_segments[1]["account_name"], "Staff Amenities")
+        self.assertEqual((code, name), ("402", "Van Fuel"))
 
     def test_gsf_car_parts_overrides_fuel_to_repairs(self):
         _segments, code, name = _apply_receipt_account_guardrails(
@@ -220,6 +259,17 @@ class ReceiptAccountResolutionTests(unittest.TestCase):
             20.0,
         )
         self.assertEqual((total, net, tax, zero_rated), (15.49, 12.91, 2.58, 0.0))
+
+    def test_card_receipt_uses_paid_total_over_vat_summary_net(self):
+        total, net, tax, zero_rated = _exp_reconcile_amounts_from_text(
+            5.48,
+            5.48,
+            0.62,
+            "CUSTOMER RECEIPT\nTotal 6.10\nVAT rate Excl VAT Incl\n"
+            "Total 5.48 0.62 6.10\nCard payment APPROVED Amount 6.10 GBP",
+            20.0,
+        )
+        self.assertEqual((total, net, tax, zero_rated), (6.10, 5.48, 0.62, 0.0))
 
     def test_vat_mode_detects_no_standard_and_mixed(self):
         self.assertEqual(_exp_vat_mode(12.00, 12.00, 0.00, 20.0), "no_vat")

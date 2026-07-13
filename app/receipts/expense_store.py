@@ -11,6 +11,7 @@ is a single source of truth for runtime data.
 
 from __future__ import annotations
 
+import json
 import secrets
 import sqlite3
 import uuid
@@ -86,6 +87,7 @@ def _ensure_tables(db_path: str) -> None:
                 mime_type TEXT NOT NULL DEFAULT '',
                 category_account_code TEXT NOT NULL DEFAULT '',
                 category_account_name TEXT NOT NULL DEFAULT '',
+                segments_json TEXT NOT NULL DEFAULT '[]',
                 payment_source TEXT NOT NULL DEFAULT 'company_card',
                 owner_paid_account_code TEXT NOT NULL DEFAULT '',
                 xero_type TEXT NOT NULL DEFAULT '',
@@ -127,6 +129,11 @@ def _ensure_tables(db_path: str) -> None:
             conn.execute(
                 "ALTER TABLE expense_receipts "
                 "ADD COLUMN category_account_name TEXT NOT NULL DEFAULT ''"
+            )
+        if "segments_json" not in _cols:
+            conn.execute(
+                "ALTER TABLE expense_receipts "
+                "ADD COLUMN segments_json TEXT NOT NULL DEFAULT '[]'"
             )
         if "payment_source" not in _cols:
             conn.execute(
@@ -202,7 +209,14 @@ def _conn(db_path: str) -> sqlite3.Connection:
 
 
 def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
-    return dict(row) if row is not None else None
+    if row is None:
+        return None
+    data = dict(row)
+    try:
+        data["segments"] = json.loads(data.get("segments_json") or "[]")
+    except Exception:
+        data["segments"] = []
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +380,7 @@ def create_receipt(
     mime_type: str = "",
     category_account_code: str = "",
     category_account_name: str = "",
+    segments: list | None = None,
     payment_source: str = "company_card",
     owner_paid_account_code: str = "",
     status: str = "pending_review",
@@ -382,15 +397,17 @@ def create_receipt(
                  amount_ex, vat_amount, currency, ocr_merchant, ocr_amount,
                  ocr_date, ocr_raw, ocr_error, stored_file, filename,
                  mime_type, category_account_code, category_account_name,
-                 payment_source, owner_paid_account_code, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 segments_json, payment_source, owner_paid_account_code,
+                 created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 rid, engineer_id, status, merchant, purchased_on, amount_inc,
                 amount_ex, vat_amount, currency, ocr_merchant, ocr_amount,
                 ocr_date, ocr_raw, ocr_error, stored_file, filename,
                 mime_type, category_account_code, category_account_name,
-                payment_source, owner_paid_account_code.strip(),
+                json.dumps(segments or []), payment_source,
+                owner_paid_account_code.strip(),
                 now, now,
             ),
         )
@@ -403,9 +420,11 @@ def update_receipt(db_path: str, receipt_id: str, **fields) -> dict[str, Any] | 
         "status", "merchant", "purchased_on", "amount_inc", "amount_ex",
         "vat_amount", "currency", "xero_type", "xero_id", "xero_error",
         "settlement_id", "category_account_code", "category_account_name",
-        "payment_source", "owner_paid_account_code",
+        "segments", "payment_source", "owner_paid_account_code",
     }
     sets = {k: v for k, v in fields.items() if k in allowed}
+    if "segments" in sets:
+        sets["segments_json"] = json.dumps(sets.pop("segments") or [])
     if "payment_source" in sets and sets["payment_source"] not in PAYMENT_SOURCES:
         sets["payment_source"] = "company_card"
     if not sets:
@@ -441,7 +460,7 @@ def list_receipts_for_engineer(
             "ORDER BY created_at DESC LIMIT ?",
             (engineer_id, max(limit, 1)),
         ).fetchall()
-    return [dict(r) for r in rows]
+    return [_row_to_dict(r) for r in rows]
 
 
 def list_all_receipts(db_path: str, *, limit: int = 1000) -> list[dict[str, Any]]:
@@ -450,7 +469,7 @@ def list_all_receipts(db_path: str, *, limit: int = 1000) -> list[dict[str, Any]
             "SELECT * FROM expense_receipts ORDER BY created_at DESC LIMIT ?",
             (max(limit, 1),),
         ).fetchall()
-    return [dict(r) for r in rows]
+    return [_row_to_dict(r) for r in rows]
 
 
 def stored_file_in_use(db_path: str, stored_file: str) -> bool:
@@ -517,7 +536,7 @@ def list_receipts_with_images(db_path: str) -> list[dict[str, Any]]:
             "WHERE stored_file != '' "
             "ORDER BY created_at DESC"
         ).fetchall()
-    return [dict(r) for r in rows]
+    return [_row_to_dict(r) for r in rows]
 
 
 def amount_owed_to_engineer(db_path: str, engineer_id: int) -> float:

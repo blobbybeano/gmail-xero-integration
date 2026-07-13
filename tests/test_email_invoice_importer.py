@@ -36,6 +36,7 @@ ACCOUNTS = [
     {"Code": "460", "Name": "Machinery Fuel"},
     {"Code": "470", "Name": "Van Fuel"},
     {"Code": "480", "Name": "Rates"},
+    {"Code": "495", "Name": "Staff Amenities"},
 ]
 
 
@@ -369,6 +370,10 @@ class EmailInvoiceImporterTests(unittest.TestCase):
         self.assertEqual(
             rule_based_categorise("Screwfix", "gutter sealant screws fixings", ACCOUNTS),
             ("410", "Materials"),
+        )
+        self.assertEqual(
+            rule_based_categorise("Tesco Express", "sandwich coffee snacks", ACCOUNTS),
+            ("495", "Staff Amenities"),
         )
         self.assertEqual(
             rule_based_categorise("Google Ads", "Search advertising campaign", ACCOUNTS),

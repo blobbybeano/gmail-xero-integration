@@ -555,6 +555,27 @@ def rule_based_categorise(
         )
 
     if any(t in text for t in (
+        "food", "meal", "meals", "lunch", "breakfast", "dinner",
+        "sandwich", "burger", "pizza", "coffee", "cafe", "restaurant",
+        "takeaway", "take away", "mcdonald", "kfc", "subway", "greggs",
+        "pret", "costa", "starbucks", "groceries", "grocery", "snack",
+        "snacks", "milk", "bread",
+    )) and not any(t in text for t in (
+        "adblue", "ad blue", "diesel", "unleaded", "petrol", "fuel",
+        "pump", "litre", "litres", "parking", "tyre", "mot", "brake",
+        "screwfix", "toolstation", "wickes", "b&q", "b q", "tradepoint",
+    )):
+        return _find_account_by_terms(
+            exp_accounts,
+            any_terms=(
+                "staff amenities", "amenities", "subsistence", "meals",
+                "meal", "food", "refreshment", "refreshments", "welfare",
+                "entertainment",
+            ),
+            exclude_terms=("fuel", "vehicle", "motor", "material", "clean"),
+        )
+
+    if any(t in text for t in (
         "screwfix", "toolstation", "wickes", "b&q", "b q", "bandq",
         "tradepoint", "travis perkins", "jewson", "selco", "builder depot",
         "builders merchant", "builders merchants", "homebase",
@@ -1731,6 +1752,7 @@ def import_batch_items(
                 mime_type=it.get("attachment_mime", ""),
                 category_account_code=it.get("category_account_code", ""),
                 category_account_name=it.get("category_account_name", ""),
+                segments=it.get("segments") or [],
                 status=receipt_status,
             )
             if rec:
