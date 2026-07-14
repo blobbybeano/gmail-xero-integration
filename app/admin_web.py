@@ -13246,7 +13246,9 @@ body {{ background:#f7f6f3 !important; }}
             )
 
         paid_with_html = ""
+        upload_payment_source_default = "company_card"
         if _expense_owner_paid_enabled(eng):
+            upload_payment_source_default = "company_card"
             paid_with_html = """
                 <div class="rounded-xl border border-gray-200 bg-white p-2 grid grid-cols-2 gap-2">
                   <label class="cursor-pointer">
@@ -13272,8 +13274,10 @@ body {{ background:#f7f6f3 !important; }}
                 </div>
             """
         elif eng.get("kind") == "company_card":
+            upload_payment_source_default = "company_card"
             paid_with_html = '<input type="hidden" name="payment_source" value="company_card">'
         else:
+            upload_payment_source_default = "owner_paid"
             paid_with_html = '<input type="hidden" name="payment_source" value="owner_paid">'
 
         # Subcontractor: recognise any payment in the feed, then show the
@@ -13424,6 +13428,23 @@ body {{ background:#f7f6f3 !important; }}
                 <span class="text-[11px] opacity-70 mt-0.5">Card terminal photo</span>
               </a>
               </div>
+              <form id="exp-upload-form" method="post"
+                    action="/expenses/{escape(token)}/upload"
+                    enctype="multipart/form-data">
+                <input id="exp-upload-payment-source" type="hidden"
+                       name="payment_source" value="{escape(upload_payment_source_default)}">
+                <label for="exp-upload-file"
+                       class="flex items-center justify-center gap-2 w-full rounded-xl
+                              border border-dashed border-gray-300 bg-white px-4 py-2.5
+                              text-sm font-semibold text-gray-600 active:bg-gray-50">
+                  <span class="text-base">&#8682;</span>
+                  <span>Upload</span>
+                  <span class="text-xs font-normal text-gray-400">photos or files</span>
+                </label>
+                <input id="exp-upload-file" type="file" name="receipt_file"
+                       accept="image/*,application/pdf" multiple
+                       style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none">
+              </form>
               {card_feed_html}
               <div>
                 <h2 class="text-sm font-semibold text-gray-500 uppercase tracking-wide
@@ -13442,6 +13463,26 @@ body {{ background:#f7f6f3 !important; }}
               </svg>
               <div class="mt-3 text-sm font-medium text-gray-700">Reading your receipt&hellip;</div>
             </div>
+            <script>
+            (function() {{
+              var uploadFile = document.getElementById('exp-upload-file');
+              var uploadForm = document.getElementById('exp-upload-form');
+              var uploadSource = document.getElementById('exp-upload-payment-source');
+              function currentSource() {{
+                var picked = document.querySelector('#exp-form input[name="payment_source"]:checked');
+                if (picked) return picked.value;
+                var hidden = document.querySelector('#exp-form input[type="hidden"][name="payment_source"]');
+                return hidden ? hidden.value : '{escape(upload_payment_source_default)}';
+              }}
+              if (uploadFile && uploadForm) {{
+                uploadFile.addEventListener('change', function() {{
+                  if (!uploadFile.files || !uploadFile.files.length) return;
+                  if (uploadSource) uploadSource.value = currentSource();
+                  uploadForm.submit();
+                }});
+              }}
+            }})();
+            </script>
             """
         )
 
@@ -13689,125 +13730,209 @@ body {{ background:#f7f6f3 !important; }}
         if session.get("engineer_id") != eng["id"]:
             return redirect(url_for("portal_login"))
 
-        file = request.files.get("receipt_file")
-        if not file or not file.filename:
+        files = [
+            f for f in request.files.getlist("receipt_file")
+            if f and (f.filename or "").strip()
+        ]
+        if not files:
             return redirect(f"/expenses/{token}")
         payment_source, owner_paid_account_code = _expense_normalise_payment_source(
             eng, request.form.get("payment_source")
         )
 
-        file_bytes = file.read() or b""
-        filename = file.filename or "receipt.jpg"
-        # Trust the file's magic bytes, never the client-supplied Content-Type.
-        content_type = _exp_sniff_mime(file_bytes[:16])
-        if content_type is None:
-            return _exp_error_page(
-                "Please upload a photo (JPG, PNG, GIF, WebP) or a PDF receipt.",
-                400,
-            )
-
-        svc = ReceiptService(config)
-        # Shrink big phone photos before OCR — same speed-up as the dump tool.
-        file_bytes, filename, content_type = _exp_resize_for_ocr(
-            file_bytes, filename, content_type
-        )
-        try:
-            result = svc.analyze_upload(
-                file_bytes=file_bytes, filename=filename, mime_type=content_type
-            )
-        except Exception as exc:  # OCR/save failure shouldn't lose the claim
-            result = {
-                "stored_file": "",
-                "merchant": "",
-                "total": None,
-                "net": None,
-                "tax": None,
-                "date": "",
-                "currency": "GBP",
-                "raw_text": "",
-                "ocr_error": str(exc).splitlines()[0][:200],
-            }
-
-        settings = get_expense_settings(db)
-        vat_rate = settings["vat_rate"]
-        total = result.get("total")
-        net = result.get("net")
-        tax = result.get("tax")
-        total, net, tax, _zero_rated = _exp_reconcile_amounts_from_text(
-            total, net, tax, result.get("raw_text", ""), vat_rate
-        )
-
-        # Auto-categorise: ask the AI to code the receipt against one of the
-        # real Xero expense accounts so engineers usually just confirm it.
-        # Falls back to the engineer's / global default account if AI can't decide.
-        ocr_had_breakdown = result.get("net") is not None or result.get("tax") is not None
-        segments: list = []
-        cat_code, cat_name = "", ""
-        try:
-            _at, _tid, _ = _load_xero_at_tid(config)
-            _exp_accounts, _ = _get_xero_expense_accounts(_at, _tid, config.admin_db_file)
-            segments = _ai_analyze_receipt(
-                db, result.get("merchant", ""), result.get("raw_text", ""),
-                total, _exp_accounts, vat_rate,
-            )
-            if segments:
-                primary = max(segments, key=lambda s: s.get("gross") or 0)
-                cat_code = primary.get("account_code") or ""
-                cat_name = primary.get("account_name") or ""
-                if len(segments) > 1 and not ocr_had_breakdown:
-                    net = round(sum(s["net"] for s in segments), 2)
-                    tax = round(sum(s["vat"] for s in segments), 2)
-                    total = round(sum(s["gross"] for s in segments), 2)
-            else:
-                cat_code, cat_name = _exp_categorize_receipt(
-                    db,
-                    result.get("merchant", ""),
-                    result.get("raw_text", ""),
-                    total,
-                    _exp_accounts,
+        def _create_receipt_from_file(file):
+            file_bytes = file.read() or b""
+            filename = file.filename or "receipt.jpg"
+            # Trust the file's magic bytes, never the client-supplied Content-Type.
+            content_type = _exp_sniff_mime(file_bytes[:16])
+            if content_type is None:
+                raise ValueError(
+                    "Please upload a photo (JPG, PNG, GIF, WebP) or a PDF receipt."
                 )
-                if not cat_code:
-                    fallback = (
-                        (eng.get("expense_account_code") or "").strip()
-                        or (settings.get("default_expense_account") or "").strip()
-                    )
-                    if fallback:
-                        cat_code, cat_name = _resolve_expense_account_choice(
-                            fallback, _exp_accounts
-                        )
-            segments, cat_code, cat_name = _apply_receipt_account_guardrails(
-                segments, cat_code, cat_name, total, _exp_accounts,
-                result.get("merchant", ""), result.get("raw_text", ""),
-            )
-        except Exception:
-            segments, cat_code, cat_name = [], "", ""
 
-        today = dt.datetime.now(dt.timezone.utc).date().isoformat()
-        rec = exp_store.create_receipt(
-            db,
-            engineer_id=eng["id"],
-            merchant=result.get("merchant", ""),
-            purchased_on=(result.get("date") or today),
-            amount_inc=total,
-            amount_ex=net,
-            vat_amount=tax,
-            currency=result.get("currency", "GBP"),
-            ocr_merchant=result.get("merchant", ""),
-            ocr_amount=total,
-            ocr_date=result.get("date", ""),
-            ocr_raw=(result.get("raw_text", "") or "")[:5000],
-            ocr_error=result.get("ocr_error", ""),
-            stored_file=result.get("stored_file", ""),
-            filename=filename,
-            mime_type=content_type,
-            category_account_code=cat_code,
-            category_account_name=cat_name,
-            segments=segments,
-            payment_source=payment_source,
-            owner_paid_account_code=owner_paid_account_code,
-            status="pending_review",
-        )
-        return redirect(f"/expenses/{token}/review/{rec['id']}")
+            svc = ReceiptService(config)
+            # Shrink big phone photos before OCR — same speed-up as the dump tool.
+            file_bytes, filename, content_type = _exp_resize_for_ocr(
+                file_bytes, filename, content_type
+            )
+            try:
+                result = svc.analyze_upload(
+                    file_bytes=file_bytes, filename=filename, mime_type=content_type
+                )
+            except Exception as exc:  # OCR/save failure shouldn't lose the claim
+                result = {
+                    "stored_file": "",
+                    "merchant": "",
+                    "total": None,
+                    "net": None,
+                    "tax": None,
+                    "date": "",
+                    "currency": "GBP",
+                    "raw_text": "",
+                    "ocr_error": str(exc).splitlines()[0][:200],
+                }
+
+            settings = get_expense_settings(db)
+            vat_rate = settings["vat_rate"]
+            total = result.get("total")
+            net = result.get("net")
+            tax = result.get("tax")
+            total, net, tax, _zero_rated = _exp_reconcile_amounts_from_text(
+                total, net, tax, result.get("raw_text", ""), vat_rate
+            )
+
+            # Auto-categorise: ask the AI to code the receipt against one of the
+            # real Xero expense accounts so engineers usually just confirm it.
+            # Falls back to the engineer's / global default account if AI can't decide.
+            ocr_had_breakdown = result.get("net") is not None or result.get("tax") is not None
+            segments: list = []
+            cat_code, cat_name = "", ""
+            try:
+                _at, _tid, _ = _load_xero_at_tid(config)
+                _exp_accounts, _ = _get_xero_expense_accounts(_at, _tid, config.admin_db_file)
+                segments = _ai_analyze_receipt(
+                    db, result.get("merchant", ""), result.get("raw_text", ""),
+                    total, _exp_accounts, vat_rate,
+                )
+                if segments:
+                    primary = max(segments, key=lambda s: s.get("gross") or 0)
+                    cat_code = primary.get("account_code") or ""
+                    cat_name = primary.get("account_name") or ""
+                    if len(segments) > 1 and not ocr_had_breakdown:
+                        net = round(sum(s["net"] for s in segments), 2)
+                        tax = round(sum(s["vat"] for s in segments), 2)
+                        total = round(sum(s["gross"] for s in segments), 2)
+                else:
+                    cat_code, cat_name = _exp_categorize_receipt(
+                        db,
+                        result.get("merchant", ""),
+                        result.get("raw_text", ""),
+                        total,
+                        _exp_accounts,
+                    )
+                    if not cat_code:
+                        fallback = (
+                            (eng.get("expense_account_code") or "").strip()
+                            or (settings.get("default_expense_account") or "").strip()
+                        )
+                        if fallback:
+                            cat_code, cat_name = _resolve_expense_account_choice(
+                                fallback, _exp_accounts
+                            )
+                segments, cat_code, cat_name = _apply_receipt_account_guardrails(
+                    segments, cat_code, cat_name, total, _exp_accounts,
+                    result.get("merchant", ""), result.get("raw_text", ""),
+                )
+            except Exception:
+                segments, cat_code, cat_name = [], "", ""
+
+            today = dt.datetime.now(dt.timezone.utc).date().isoformat()
+            return exp_store.create_receipt(
+                db,
+                engineer_id=eng["id"],
+                merchant=result.get("merchant", ""),
+                purchased_on=(result.get("date") or today),
+                amount_inc=total,
+                amount_ex=net,
+                vat_amount=tax,
+                currency=result.get("currency", "GBP"),
+                ocr_merchant=result.get("merchant", ""),
+                ocr_amount=total,
+                ocr_date=result.get("date", ""),
+                ocr_raw=(result.get("raw_text", "") or "")[:5000],
+                ocr_error=result.get("ocr_error", ""),
+                stored_file=result.get("stored_file", ""),
+                filename=filename,
+                mime_type=content_type,
+                category_account_code=cat_code,
+                category_account_name=cat_name,
+                segments=segments,
+                payment_source=payment_source,
+                owner_paid_account_code=owner_paid_account_code,
+                status="pending_review",
+            )
+
+        created = []
+        for file in files:
+            try:
+                created.append(_create_receipt_from_file(file))
+            except ValueError as exc:
+                return _exp_error_page(str(exc), 400)
+        if not created:
+            return redirect(f"/expenses/{token}")
+        if len(created) == 1:
+            return redirect(f"/expenses/{token}/review/{created[0]['id']}")
+        ids = ",".join(str(r["id"]) for r in created if r and r.get("id"))
+        return redirect(f"/expenses/{token}/review-upload?ids={urllib.parse.quote(ids)}")
+
+    @app.get("/expenses/<token>/review-upload")
+    def expense_engineer_review_upload_batch(token: str):
+        db = config.admin_db_file
+        eng = exp_store.get_engineer_by_token(db, token)
+        if not eng or not eng.get("active"):
+            return _exp_error_page("This expenses link is not active.")
+        if session.get("engineer_id") != eng["id"]:
+            return redirect(url_for("portal_login"))
+        raw_ids = (request.args.get("ids") or "").strip()
+        ids = [x.strip() for x in raw_ids.split(",") if x.strip()]
+        receipts = []
+        for rid in ids:
+            rec = exp_store.get_receipt(db, rid)
+            if rec and rec.get("engineer_id") == eng["id"]:
+                receipts.append(rec)
+        if not receipts:
+            return redirect(f"/expenses/{token}")
+        return_to = f"/expenses/{token}/review-upload?ids={urllib.parse.quote(','.join(ids))}"
+        rows = []
+        approved = 0
+        for rec in receipts:
+            status = rec.get("status") or ""
+            if status != "pending_review":
+                approved += 1
+            merchant = rec.get("merchant") or rec.get("ocr_merchant") or rec.get("filename") or "Receipt"
+            amount = _exp_money(rec.get("amount_inc"), rec.get("currency") or "GBP")
+            date = _exp_uk_date(rec.get("purchased_on") or "")
+            cat = rec.get("category_account_name") or rec.get("category_account_code") or "check account"
+            badge = _exp_status_badge(status)
+            rows.append(
+                "<a class='block rounded-xl border border-gray-200 bg-white p-4 active:bg-gray-50' "
+                f"href='/expenses/{escape(token)}/review/{escape(rec['id'])}?return_to={urllib.parse.quote(return_to)}'>"
+                "<div class='flex items-start justify-between gap-3'>"
+                "<div class='min-w-0'>"
+                f"<div class='font-semibold text-gray-900 truncate'>{escape(merchant)}</div>"
+                f"<div class='text-xs text-gray-500 mt-0.5'>{escape(date)} &middot; {escape(cat)}</div>"
+                f"<div class='mt-2'>{badge}</div>"
+                "</div>"
+                f"<div class='text-right font-bold text-gray-900 shrink-0'>{amount}</div>"
+                "</div></a>"
+            )
+        all_done = approved == len(receipts)
+        done_html = ""
+        if all_done:
+            done_html = (
+                "<div class='rounded-xl border border-emerald-200 bg-emerald-50 "
+                "p-3 text-sm text-emerald-800 text-center'>All uploaded receipts "
+                "are approved.</div>"
+            )
+        return _page(f"""
+        <main data-receipt-page class="max-w-xl mx-auto p-4 space-y-4">
+          <div class="pt-2 flex items-center justify-between">
+            <a href="/expenses/{escape(token)}" class="text-sm text-indigo-600">&larr; Home</a>
+            <span class="text-xs text-gray-500">Upload review</span>
+          </div>
+          <div>
+            <h1 class="text-xl font-bold text-gray-900">Check uploaded receipts</h1>
+            <p class="text-sm text-gray-500 mt-1">Open each receipt, check the AI reading, then approve it.</p>
+          </div>
+          <div class="rounded-xl border border-gray-200 bg-white p-3 flex items-center justify-between">
+            <span class="text-sm font-medium text-gray-700">{approved} of {len(receipts)} approved</span>
+            <a href="/expenses/{escape(token)}"
+               class="text-sm font-semibold text-indigo-600">Finish</a>
+          </div>
+          {done_html}
+          <div class="space-y-2">{''.join(rows)}</div>
+        </main>
+        """)
 
     @app.get("/expenses/<token>/review/<rid>")
     def expense_engineer_review(token: str, rid: str):
@@ -13820,6 +13945,10 @@ body {{ background:#f7f6f3 !important; }}
         rec = exp_store.get_receipt(db, rid)
         if not rec or rec.get("engineer_id") != eng["id"]:
             return _exp_error_page("Receipt not found.")
+        return_to = (request.args.get("return_to") or "").strip()
+        if not return_to.startswith(f"/expenses/{token}/review-upload"):
+            return_to = ""
+        back_href = return_to or f"/expenses/{token}"
 
         _settings = get_expense_settings(db)
         vat_rate = _settings["vat_rate"]
@@ -13981,7 +14110,7 @@ body {{ background:#f7f6f3 !important; }}
             f"""
             <main class="max-w-xl mx-auto p-4 space-y-4">
               <div class="flex items-center justify-between pt-2">
-                <a href="/expenses/{escape(token)}" class="text-sm text-indigo-600">&larr; Back</a>
+                <a href="{escape(back_href)}" class="text-sm text-indigo-600">&larr; Back</a>
                 <span class="text-xs text-gray-500">Check the details</span>
               </div>
               {photo_html}
@@ -13989,6 +14118,7 @@ body {{ background:#f7f6f3 !important; }}
               {status_note}
               <form method="post" action="/expenses/{escape(token)}/review/{escape(rid)}"
                     class="space-y-4 rounded-xl border border-gray-200 bg-white p-4">
+                <input type="hidden" name="return_to" value="{escape(return_to)}">
                 <div id="vat_meta" data-rate="{vat_rate}"></div>
                 {source_html}
                 <div>
@@ -14155,6 +14285,9 @@ body {{ background:#f7f6f3 !important; }}
             )
 
         exp_store.update_receipt(db, rid, **updates)
+        return_to = (request.form.get("return_to") or "").strip()
+        if return_to.startswith(f"/expenses/{token}/review-upload"):
+            return redirect(return_to)
         return redirect(f"/expenses/{token}?flash=approved")
 
     @app.get("/expenses/<token>/photo/<rid>")
