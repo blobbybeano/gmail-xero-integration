@@ -539,20 +539,100 @@ def list_receipts_with_images(db_path: str) -> list[dict[str, Any]]:
     return [_row_to_dict(r) for r in rows]
 
 
-def amount_owed_to_engineer(db_path: str, engineer_id: int) -> float:
+def amount_owed_to_engineer(
+    db_path: str, engineer_id: int, *, payment_source: str | None = None
+) -> float:
     """Sum of approved/submitted, not-yet-settled receipts for a subcontractor."""
+    source_clause = ""
+    params: list[Any] = [engineer_id]
+    if payment_source:
+        source_clause = " AND payment_source = ?"
+        params.append(payment_source)
     with _conn(db_path) as conn:
         row = conn.execute(
-            """
+            f"""
             SELECT COALESCE(SUM(COALESCE(amount_inc, 0)), 0) AS total
             FROM expense_receipts
             WHERE engineer_id = ?
               AND status IN ('approved', 'submitted')
               AND settlement_id IS NULL
+              {source_clause}
             """,
-            (engineer_id,),
+            params,
         ).fetchone()
     return float(row["total"] or 0.0)
+
+
+def amount_unpaid_to_engineer(
+    db_path: str, engineer_id: int, *, payment_source: str | None = None
+) -> float:
+    """Sum receipts still unpaid from the subcontractor's point of view.
+
+    This includes ordinary unbatched receipts plus receipts already grouped into
+    a prepared office payout.  It excludes receipts marked settled/paid.
+    """
+    source_clause = ""
+    params: list[Any] = [engineer_id]
+    if payment_source:
+        source_clause = " AND r.payment_source = ?"
+        params.append(payment_source)
+    with _conn(db_path) as conn:
+        row = conn.execute(
+            f"""
+            SELECT COALESCE(SUM(COALESCE(r.amount_inc, 0)), 0) AS total
+            FROM expense_receipts r
+            LEFT JOIN expense_settlements s ON s.id = r.settlement_id
+            WHERE r.engineer_id = ?
+              AND r.status IN ('approved', 'submitted')
+              {source_clause}
+              AND (
+                r.settlement_id IS NULL
+                OR COALESCE(s.status, '') IN ('prepared', 'pending', 'review')
+              )
+            """,
+            params,
+        ).fetchone()
+    return float(row["total"] or 0.0)
+
+
+def list_unsettled_receipts_for_engineer(
+    db_path: str, engineer_id: int, *, payment_source: str | None = None
+) -> list[dict[str, Any]]:
+    """Approved/submitted receipts not yet allocated to any payout batch."""
+    source_clause = ""
+    params: list[Any] = [engineer_id]
+    if payment_source:
+        source_clause = " AND payment_source = ?"
+        params.append(payment_source)
+    with _conn(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM expense_receipts
+            WHERE engineer_id = ?
+              AND status IN ('approved', 'submitted')
+              AND settlement_id IS NULL
+              AND COALESCE(amount_inc, 0) > 0
+              {source_clause}
+            ORDER BY purchased_on ASC, created_at ASC
+            """,
+            params,
+        ).fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
+def list_receipts_for_settlement(
+    db_path: str, settlement_id: int
+) -> list[dict[str, Any]]:
+    with _conn(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM expense_receipts
+            WHERE settlement_id = ?
+            ORDER BY purchased_on ASC, created_at ASC
+            """,
+            (settlement_id,),
+        ).fetchall()
+    return [_row_to_dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +669,48 @@ def create_settlement(
     return _row_to_dict(row)
 
 
+def create_prepared_settlement_for_engineer(
+    db_path: str,
+    *,
+    engineer_id: int,
+    reference: str,
+    payment_source: str | None = None,
+    note: str = "",
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Create an office-prepared payout batch from all currently owed receipts.
+
+    The receipts are linked to the settlement but intentionally left as
+    approved/submitted until the payment is marked paid or recognised in the
+    bank feed.  That keeps the engineer-facing unpaid total honest while still
+    stopping the same receipts being prepared twice.
+    """
+    receipts = list_unsettled_receipts_for_engineer(
+        db_path, engineer_id, payment_source=payment_source
+    )
+    if not receipts:
+        return None, []
+    amount = round(sum(float(r.get("amount_inc") or 0) for r in receipts), 2)
+    if amount <= 0:
+        return None, []
+    settlement = create_settlement(
+        db_path,
+        engineer_id=engineer_id,
+        reference=reference,
+        amount=amount,
+        paid_on="",
+        status="prepared",
+        plaid_tx_id="",
+        note=note,
+    )
+    with _conn(db_path) as conn:
+        conn.executemany(
+            "UPDATE expense_receipts SET settlement_id = ?, updated_at = ? WHERE id = ?",
+            [(settlement["id"], _now_iso(), r["id"]) for r in receipts],
+        )
+        conn.commit()
+    return settlement, list_receipts_for_settlement(db_path, settlement["id"])
+
+
 def list_settlements_for_engineer(db_path: str, engineer_id: int) -> list[dict[str, Any]]:
     with _conn(db_path) as conn:
         rows = conn.execute(
@@ -599,8 +721,18 @@ def list_settlements_for_engineer(db_path: str, engineer_id: int) -> list[dict[s
     return [dict(r) for r in rows]
 
 
+def get_settlement(db_path: str, settlement_id: int) -> dict[str, Any] | None:
+    with _conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM expense_settlements WHERE id = ?", (settlement_id,)
+        ).fetchone()
+    return _row_to_dict(row)
+
+
 def update_settlement(db_path: str, settlement_id: int, **fields) -> dict[str, Any] | None:
-    allowed = {"status", "note", "xero_bill_id", "xero_error", "paid_on"}
+    allowed = {
+        "status", "note", "xero_bill_id", "xero_error", "paid_on", "plaid_tx_id",
+    }
     sets = {k: (v if v is not None else "") for k, v in fields.items() if k in allowed}
     if not sets:
         with _conn(db_path) as conn:

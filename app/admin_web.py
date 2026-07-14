@@ -3935,6 +3935,8 @@ def create_app() -> Flask:
     app = Flask(__name__)
     app.secret_key = config.web_secret_key
     app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500 MB — receipt dump bulk uploads
+    app.config["PERMANENT_SESSION_LIFETIME"] = dt.timedelta(days=90)
+    app.config["SESSION_REFRESH_EACH_REQUEST"] = True
 
     @app.errorhandler(413)
     def upload_too_large(e):
@@ -11905,6 +11907,7 @@ body {{ background:#f7f6f3 !important; }}
             and (eng.get("password_hash") or "")
             and check_password_hash(eng["password_hash"], password)
         ):
+            session.permanent = True
             session["engineer_id"] = eng["id"]
             return redirect(f"/expenses/{eng['token']}")
         return _portal_login_page(
@@ -12413,6 +12416,11 @@ body {{ background:#f7f6f3 !important; }}
         the payment automatically."""
         return f"PWSUB{eng.get('id')}"
 
+    def _subcontractor_batch_reference(eng):
+        first = re.sub(r"[^A-Za-z0-9]+", "", str(eng.get("name") or "PAY").split()[0])
+        first = (first or "PAY").upper()[:8]
+        return f"{first}-{secrets.randbelow(900) + 100}"
+
     def _exp_purge_old_photos():
         """Best-effort disk cleanup: clear local photos of submitted/settled
         receipts older than ~30 days, but only when the image is recoverable
@@ -12776,6 +12784,8 @@ body {{ background:#f7f6f3 !important; }}
         for settlement in exp_store.list_settlements_for_engineer(db, eng["id"]):
             if done >= max(int(limit or 5), 1):
                 break
+            if (settlement.get("status") or "").strip().lower() in {"prepared", "pending"}:
+                continue
             if (settlement.get("xero_bill_id") or "").strip():
                 continue
             if not force and not _is_waiting_expense_xero_error(settlement.get("xero_error") or ""):
@@ -12812,8 +12822,6 @@ body {{ background:#f7f6f3 !important; }}
         db = config.admin_db_file
         if not cardfeed.is_connected(db):
             return
-        if exp_store.amount_owed_to_engineer(db, eng["id"]) <= 0:
-            return
         eng_id = eng.get("id")
         if not eng_id:
             return
@@ -12824,19 +12832,81 @@ body {{ background:#f7f6f3 !important; }}
         if not ref:
             return
         ref_re = re.compile(re.escape(ref) + r"(?![0-9])")
+        def _norm_ref(value: str) -> str:
+            return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
         # Idempotency: never re-consume a Plaid transaction already settled.
         try:
+            settlements = exp_store.list_settlements_for_engineer(db, eng_id)
             used_tx = {
                 (s.get("plaid_tx_id") or "").strip()
-                for s in exp_store.list_settlements_for_engineer(db, eng_id)
-                if (s.get("plaid_tx_id") or "").strip()
+                for s in settlements if (s.get("plaid_tx_id") or "").strip()
             }
         except Exception:
+            settlements = []
             used_tx = set()
         try:
             txs = cardfeed.get_cached_transactions(db) or []
         except Exception:
             return
+
+        prepared = [
+            s for s in settlements
+            if (s.get("status") or "").strip().lower() in {"prepared", "pending", "review"}
+            and not (s.get("plaid_tx_id") or "").strip()
+            and not (s.get("xero_bill_id") or "").strip()
+            and (s.get("reference") or "").strip()
+        ]
+        for s in prepared:
+            sref = _norm_ref(s.get("reference") or "")
+            if not sref:
+                continue
+            try:
+                expected_p = int(round(float(s.get("amount") or 0) * 100))
+            except (TypeError, ValueError):
+                expected_p = 0
+            if expected_p <= 0:
+                continue
+            for t in txs:
+                tx_id = str(t.get("transaction_id") or "").strip()
+                if tx_id and tx_id in used_tx:
+                    continue
+                name = _norm_ref(t.get("name") or "")
+                if sref not in name:
+                    continue
+                try:
+                    paid_p = int(round(abs(float(t.get("amount") or 0)) * 100))
+                except (TypeError, ValueError):
+                    paid_p = 0
+                if abs(paid_p - expected_p) > 2:
+                    continue
+                paid_on = str(t.get("date") or "")[:10]
+                exp_store.update_settlement(
+                    db, int(s["id"]),
+                    status="paid",
+                    paid_on=paid_on,
+                    plaid_tx_id=tx_id,
+                    xero_error="",
+                )
+                chosen = exp_store.list_receipts_for_settlement(db, int(s["id"]))
+                for r in chosen:
+                    exp_store.update_receipt(db, r["id"], status="settled")
+                latest = exp_store.update_settlement(db, int(s["id"]))
+                print(f"[subcontractor-settle] prepared engineer={eng_id} "
+                      f"ref={s.get('reference')} tx={tx_id} amount={paid_p/100:.2f}",
+                      flush=True)
+                if allow_xero:
+                    _create_xero_bill_for_settlement(eng, latest or s, chosen)
+                else:
+                    exp_store.update_settlement(
+                        db, int(s["id"]),
+                        xero_error="Waiting for admin receipt Xero submission.",
+                    )
+                return
+
+        if exp_store.amount_owed_to_engineer(db, eng["id"]) <= 0:
+            return
+
         for t in txs:
             tx_id = str(t.get("transaction_id") or "").strip()
             if tx_id and tx_id in used_tx:
@@ -13204,7 +13274,7 @@ body {{ background:#f7f6f3 !important; }}
         owed_html = ""
         if eng.get("kind") == "subcontractor":
             _maybe_settle_subcontractor(eng, allow_xero=False)
-            owed = exp_store.amount_owed_to_engineer(db, eng["id"])
+            owed = exp_store.amount_unpaid_to_engineer(db, eng["id"])
             ref = _subcontractor_reference(eng)
             settlements = exp_store.list_settlements_for_engineer(db, eng["id"])
             paid_line = ""
@@ -14876,6 +14946,19 @@ body {{ background:#f7f6f3 !important; }}
                         f"Receipt Xero submissions checked: {flash_n} settlement(s) touched."
                         if flash_n else "Receipt Xero submissions checked."
                     ),
+                    "no_subcontractor_receipts": "No approved subcontractor receipts are ready to batch.",
+                    "payout_prepared": (
+                        "Subcontractor payout prepared"
+                        + (
+                            f": {request.args.get('ref')} for {request.args.get('amount')}."
+                            if request.args.get("ref") else "."
+                        )
+                    ),
+                    "payout_paid_xero": "Subcontractor payout marked paid and sent to Xero.",
+                    "payout_paid_waiting": (
+                        "Subcontractor payout marked paid. Xero did not complete; check the "
+                        "batch message below before retrying."
+                    ),
                 }
                 msg = _flash_labels.get(flash, "Done.")
             err_flashes = {"not_found", "username_taken"}
@@ -14980,6 +15063,144 @@ body {{ background:#f7f6f3 !important; }}
                 "font-bold align-middle ml-1'>!</span>"
             )
 
+        payout_cards = []
+        payout_people = []
+        for e in engineers:
+            kind = e.get("kind") or "company_card"
+            if kind == "subcontractor":
+                payout_people.append((e, None, "Subcontractor receipts"))
+            elif _expense_owner_paid_enabled(e):
+                payout_people.append((e, "owner_paid", "Personal reimbursements"))
+        for sub, pay_source, payout_label in payout_people:
+            if (sub.get("kind") or "") == "subcontractor":
+                _maybe_settle_subcontractor(sub, allow_xero=False)
+            unbatched = exp_store.amount_owed_to_engineer(
+                db, sub["id"], payment_source=pay_source
+            )
+            unpaid_total = exp_store.amount_unpaid_to_engineer(
+                db, sub["id"], payment_source=pay_source
+            )
+            settlements = exp_store.list_settlements_for_engineer(db, sub["id"])
+            open_settlements = [
+                s for s in settlements[:8]
+                if (s.get("status") or "").strip().lower() in {"prepared", "pending", "review", "paid", "overpaid"}
+                and not (s.get("xero_bill_id") or "").strip()
+            ]
+            if open_settlements:
+                settlement_rows = []
+                for s in open_settlements:
+                    sid = int(s["id"])
+                    status = (s.get("status") or "prepared").strip()
+                    ref = escape(s.get("reference") or _subcontractor_reference(sub))
+                    amount = _exp_money(s.get("amount") or 0)
+                    note = (s.get("note") or "").strip()
+                    err = (s.get("xero_error") or "").strip()
+                    mark_paid = ""
+                    if status in {"prepared", "pending", "review"}:
+                        mark_paid = (
+                            "<form method='post' "
+                            f"action='/receipts/expenses/settlement/{sid}/mark-paid' "
+                            "class='flex items-center gap-1.5 flex-wrap'>"
+                            "<input name='paid_on' type='date' "
+                            f"value='{dt.datetime.now(dt.timezone.utc).date().isoformat()}' "
+                            "class='rounded border border-gray-300 px-2 py-1 text-xs'>"
+                            "<button type='submit' class='rounded bg-emerald-600 px-2 py-1 "
+                            "text-xs font-semibold text-white'>Mark paid &amp; send to Xero</button>"
+                            "</form>"
+                        )
+                    elif status in {"paid", "overpaid"}:
+                        mark_paid = (
+                            "<form method='post' "
+                            f"action='/receipts/expenses/settlement/{sid}/send-xero' class='inline'>"
+                            "<button type='submit' class='rounded border border-blue-300 "
+                            "bg-blue-50 px-2 py-1 text-xs font-semibold text-blue-800'>"
+                            "Send to Xero now</button></form>"
+                        )
+                    detail = ""
+                    if note:
+                        detail += (
+                            "<div class='mt-1 rounded border border-amber-200 bg-amber-50 "
+                            f"px-2 py-1 text-xs text-amber-800'>{escape(note)}</div>"
+                        )
+                    if err:
+                        detail += (
+                            "<div class='mt-1 rounded border border-blue-200 bg-blue-50 "
+                            f"px-2 py-1 text-xs text-blue-800'>{escape(err)}</div>"
+                        )
+                    settlement_rows.append(
+                        "<div class='border-t border-gray-100 py-2 first:border-t-0'>"
+                        "<div class='flex items-start justify-between gap-3 flex-wrap'>"
+                        "<div>"
+                        f"<div class='font-mono text-xs font-semibold text-gray-900'>{ref}</div>"
+                        f"<div class='text-xs text-gray-500'>{escape(status.title())} &middot; {amount}</div>"
+                        "</div>"
+                        f"{mark_paid}"
+                        "</div>"
+                        f"{detail}"
+                        "</div>"
+                    )
+                settlement_html = (
+                    "<div class='mt-3 rounded-lg border border-gray-200 bg-white px-3'>"
+                    + "".join(settlement_rows)
+                    + "</div>"
+                )
+            else:
+                settlement_html = (
+                    "<div class='mt-3 rounded-lg border border-dashed border-gray-200 "
+                    "bg-white px-3 py-2 text-xs text-gray-500'>No prepared payout batches.</div>"
+                )
+            prepare_btn = (
+                "<button type='submit' class='rounded-lg bg-gray-900 px-3 py-2 "
+                "text-sm font-semibold text-white'>Prepare payment batch</button>"
+                if unbatched > 0 else
+                "<button type='button' disabled class='rounded-lg bg-gray-200 px-3 py-2 "
+                "text-sm font-semibold text-gray-500'>Nothing to batch</button>"
+            )
+            payout_cards.append(
+                "<div class='rounded-xl border border-gray-200 bg-gray-50 p-4'>"
+                "<div class='flex items-start justify-between gap-3 flex-wrap'>"
+                "<div>"
+                f"<h3 class='font-semibold text-gray-900'>{escape(sub.get('name') or 'Subcontractor')}</h3>"
+                f"<div class='text-xs text-gray-500'>{escape(payout_label)}"
+                + (
+                    f" &middot; base ref <span class='font-mono'>{escape(_subcontractor_reference(sub))}</span>"
+                    if (sub.get("kind") or "") == "subcontractor" else ""
+                )
+                + "</div>"
+                "</div>"
+                "<div class='text-right'>"
+                f"<div class='text-xs text-gray-500'>Still unpaid</div>"
+                f"<div class='text-lg font-bold text-gray-900'>{_exp_money(unpaid_total)}</div>"
+                f"<div class='text-xs text-gray-500'>{_exp_money(unbatched)} ready to batch</div>"
+                "</div></div>"
+                "<form method='post' "
+                f"action='/receipts/expenses/{sub['id']}/prepare-payment' "
+                "class='mt-3 flex items-center justify-between gap-2 flex-wrap'>"
+                + (
+                    "<input type='hidden' name='payment_source' value='owner_paid'>"
+                    if pay_source == "owner_paid" else ""
+                )
+                +
+                "<p class='text-xs text-gray-600 max-w-lg'>Creates one payment reference, "
+                "groups the currently approved receipts under it, and keeps them unpaid "
+                "until the batch is marked paid or found in the bank feed.</p>"
+                f"{prepare_btn}</form>"
+                f"{settlement_html}"
+                "</div>"
+            )
+        payout_html = ""
+        if payout_cards:
+            payout_html = (
+                "<section class='rounded-xl border border-indigo-200 bg-indigo-50 p-4 space-y-3'>"
+                "<div class='flex items-start justify-between gap-3 flex-wrap'>"
+                "<div><h2 class='font-semibold text-indigo-950'>Receipt payouts</h2>"
+                "<p class='text-xs text-indigo-800 mt-0.5'>Prepare one short payment reference for each subcontractor or personal reimbursement batch. "
+                "After you pay it, mark it paid so Xero gets one grouped bill with every receipt attached.</p></div>"
+                "</div>"
+                + "".join(payout_cards)
+                + "</section>"
+            )
+
         eng_cards = []
         auto_xero_bill_budget = 5
         portal_url = f"{base_url}/expenses/login"
@@ -15054,11 +15275,11 @@ body {{ background:#f7f6f3 !important; }}
                     auto_xero_bill_budget = max(
                         auto_xero_bill_budget - _processed_bills, 0
                     )
-                owed = exp_store.amount_owed_to_engineer(db, e["id"])
+                owed = exp_store.amount_unpaid_to_engineer(db, e["id"])
                 _setts = exp_store.list_settlements_for_engineer(db, e["id"])
                 _pay_line = (
-                    f"<span class='text-xs text-indigo-700 font-medium'>Pay "
-                    f"{_exp_money(owed)} to settle</span>"
+                    f"<span class='text-xs text-indigo-700 font-medium'>Unpaid "
+                    f"{_exp_money(owed)}</span>"
                     if owed > 0 else
                     "<span class='text-xs text-emerald-700 font-medium'>"
                     "Fully settled</span>"
@@ -15582,6 +15803,8 @@ body {{ background:#f7f6f3 !important; }}
 
               {connections_html}
 
+              {payout_html}
+
               <section class="space-y-3">
                 <h2 class="text-sm font-semibold text-gray-500 uppercase tracking-wide">Engineers</h2>
                 {engineers_html}
@@ -15677,6 +15900,107 @@ body {{ background:#f7f6f3 !important; }}
             </main>
             """
         )
+
+    @app.post("/receipts/expenses/<int:engineer_id>/prepare-payment")
+    @require_login
+    def expense_prepare_subcontractor_payment(engineer_id: int):
+        db = config.admin_db_file
+        eng = exp_store.get_engineer(db, engineer_id)
+        if not eng:
+            return redirect("/receipts/expenses?flash=not_found")
+        requested_source = (request.form.get("payment_source") or "").strip()
+        if (eng.get("kind") or "") == "subcontractor":
+            pay_source = None
+            note = "Office-prepared subcontractor payout. Pay using this exact reference, then mark paid."
+        elif requested_source == "owner_paid" and _expense_owner_paid_enabled(eng):
+            pay_source = "owner_paid"
+            note = "Office-prepared personal reimbursement. Pay using this exact reference, then mark paid."
+        else:
+            return redirect("/receipts/expenses?flash=not_found")
+        ref = _subcontractor_batch_reference(eng)
+        settlement, receipts = exp_store.create_prepared_settlement_for_engineer(
+            db,
+            engineer_id=engineer_id,
+            reference=ref,
+            payment_source=pay_source,
+            note=note,
+        )
+        if not settlement or not receipts:
+            return redirect("/receipts/expenses?flash=no_subcontractor_receipts")
+        _feed.push(
+            f"Prepared subcontractor payout {ref} for {eng.get('name')} "
+            f"({_exp_money(settlement.get('amount') or 0)}).",
+            "success",
+        )
+        return redirect(
+            "/receipts/expenses?flash=payout_prepared"
+            f"&ref={urllib.parse.quote(ref)}"
+            f"&amount={urllib.parse.quote(_exp_money(settlement.get('amount') or 0))}"
+        )
+
+    @app.post("/receipts/expenses/settlement/<int:settlement_id>/mark-paid")
+    @require_login
+    def expense_mark_subcontractor_payment_paid(settlement_id: int):
+        db = config.admin_db_file
+        settlement = exp_store.get_settlement(db, settlement_id)
+        if not settlement:
+            return redirect("/receipts/expenses?flash=not_found")
+        eng = exp_store.get_engineer(db, int(settlement.get("engineer_id") or 0))
+        receipts = exp_store.list_receipts_for_settlement(db, settlement_id)
+        if not eng:
+            return redirect("/receipts/expenses?flash=not_found")
+        if (eng.get("kind") or "") != "subcontractor":
+            if not _expense_owner_paid_enabled(eng) or any(
+                (r.get("payment_source") or "company_card") != "owner_paid"
+                for r in receipts
+            ):
+                return redirect("/receipts/expenses?flash=not_found")
+        paid_on = (request.form.get("paid_on") or "").strip()
+        if not paid_on:
+            paid_on = dt.datetime.now(dt.timezone.utc).date().isoformat()
+        exp_store.update_settlement(
+            db, settlement_id,
+            status="paid",
+            paid_on=paid_on,
+            xero_error="",
+        )
+        for rec in receipts:
+            exp_store.update_receipt(db, rec["id"], status="settled")
+        latest = exp_store.get_settlement(db, settlement_id) or settlement
+        bill_id = _create_xero_bill_for_settlement(
+            eng, latest, receipts, force=True
+        )
+        if bill_id:
+            _feed.push(
+                f"Subcontractor payout {latest.get('reference')} sent to Xero.",
+                "success",
+            )
+            return redirect("/receipts/expenses?flash=payout_paid_xero")
+        return redirect("/receipts/expenses?flash=payout_paid_waiting")
+
+    @app.post("/receipts/expenses/settlement/<int:settlement_id>/send-xero")
+    @require_login
+    def expense_send_subcontractor_settlement_xero(settlement_id: int):
+        db = config.admin_db_file
+        settlement = exp_store.get_settlement(db, settlement_id)
+        if not settlement:
+            return redirect("/receipts/expenses?flash=not_found")
+        eng = exp_store.get_engineer(db, int(settlement.get("engineer_id") or 0))
+        receipts = exp_store.list_receipts_for_settlement(db, settlement_id)
+        if not eng:
+            return redirect("/receipts/expenses?flash=not_found")
+        if (eng.get("kind") or "") != "subcontractor":
+            if not _expense_owner_paid_enabled(eng) or any(
+                (r.get("payment_source") or "company_card") != "owner_paid"
+                for r in receipts
+            ):
+                return redirect("/receipts/expenses?flash=not_found")
+        bill_id = _create_xero_bill_for_settlement(
+            eng, settlement, receipts, force=True
+        )
+        if bill_id:
+            return redirect("/receipts/expenses?flash=payout_paid_xero")
+        return redirect("/receipts/expenses?flash=payout_paid_waiting")
 
     @app.post("/receipts/expenses/create")
     @require_login
