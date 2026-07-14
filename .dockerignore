@@ -18,3 +18,13 @@ admin_auth.json
 # Local certs / IDE artifacts
 certs/
 .DS_Store
+
+# Large runtime data — lives on the Fly volume, not in the image
+receipt_uploads/
+attached_assets/
+
+# Replit/local tooling
+.pythonlibs/
+.cache/
+.local/
+.upm/

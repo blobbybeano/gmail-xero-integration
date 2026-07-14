@@ -13245,6 +13245,71 @@ body {{ background:#f7f6f3 !important; }}
                 "p-3 text-sm text-gray-700 text-center'>Receipt removed.</div>"
             )
 
+        # Dump-batch notification — show a pulsing banner when the office has
+        # uploaded invoices for this engineer that are still pending review/import.
+        # Amber when recent (<24 h), red once overdue (≥24 h).
+        dump_notify_html = ""
+        try:
+            import sqlite3 as _sl3
+            _dc = _sl3.connect(db)
+            _dc.row_factory = _sl3.Row
+            _dp_rows = _dc.execute(
+                """
+                SELECT b.created_at, COUNT(i.id) AS cnt
+                FROM expense_dump_items i
+                JOIN expense_dump_batches b ON b.id = i.batch_id
+                WHERE b.engineer_id = ?
+                  AND b.status = 'ready'
+                  AND COALESCE(b.is_test, 0) = 0
+                  AND i.status IN ('new','needs_account','possible_duplicate','suspicious')
+                GROUP BY b.id, b.created_at
+                ORDER BY b.created_at ASC
+                """,
+                (eng["id"],),
+            ).fetchall()
+            _dc.close()
+            _dp_total = sum(int(r["cnt"]) for r in _dp_rows)
+            if _dp_total > 0:
+                _oldest = str(_dp_rows[0]["created_at"] or "")
+                try:
+                    _oldest_dt = dt.datetime.fromisoformat(
+                        _oldest.replace("Z", "+00:00")
+                    )
+                    if _oldest_dt.tzinfo is None:
+                        _oldest_dt = _oldest_dt.replace(tzinfo=dt.timezone.utc)
+                    _age_h = (
+                        dt.datetime.now(dt.timezone.utc) - _oldest_dt
+                    ).total_seconds() / 3600
+                except Exception:
+                    _age_h = 0
+                _urgent = _age_h >= 24
+                if _urgent:
+                    _n_bg = "border-red-300 bg-red-50"
+                    _n_txt = "text-red-800"
+                    _n_icon = "&#128308;"
+                    _n_msg = (
+                        f"{_dp_total} invoice{'s' if _dp_total != 1 else ''} "
+                        "uploaded by the office \u2014 please action"
+                    )
+                else:
+                    _n_bg = "border-amber-300 bg-amber-50"
+                    _n_txt = "text-amber-800"
+                    _n_icon = "&#128196;"
+                    _n_msg = (
+                        f"{_dp_total} invoice{'s' if _dp_total != 1 else ''} "
+                        "uploaded by the office \u2014 pending review"
+                    )
+                dump_notify_html = (
+                    f"<div class='rounded-xl border {_n_bg} p-3 flex items-center "
+                    f"gap-2 animate-pulse'>"
+                    f"<span class='text-base flex-shrink-0'>{_n_icon}</span>"
+                    f"<p class='text-sm font-semibold {_n_txt}'>"
+                    f"{escape(_n_msg)}</p>"
+                    f"</div>"
+                )
+        except Exception:
+            dump_notify_html = ""
+
         paid_with_html = ""
         upload_payment_source_default = "company_card"
         if _expense_owner_paid_enabled(eng):
@@ -13399,6 +13464,7 @@ body {{ background:#f7f6f3 !important; }}
                    class="text-xs text-gray-400 hover:text-gray-600 px-2 py-1">Log out</a>
               </div>
               {flash_html}
+              {dump_notify_html}
               {owed_html}
               <div class="grid grid-cols-2 gap-3">
               <form id="exp-form" method="post"
