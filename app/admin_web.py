@@ -12711,7 +12711,14 @@ body {{ background:#f7f6f3 !important; }}
                     )
 
             # Record the payment against the new bill so it shows as paid.
-            pay_acct = (eng.get("payment_account_code") or "").strip()
+            owner_paid_batch = bool(billable) and all(
+                (r.get("payment_source") or "company_card") == "owner_paid"
+                for r in billable
+            )
+            if owner_paid_batch:
+                pay_acct = (eng.get("owner_paid_account_code") or "").strip()
+            else:
+                pay_acct = (eng.get("payment_account_code") or "").strip()
             if bill_id and amount_paid > 0:
                 try:
                     client.record_invoice_payment(
