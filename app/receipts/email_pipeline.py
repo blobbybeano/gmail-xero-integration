@@ -235,7 +235,22 @@ def reconcile_amounts(
             if supplied_tax is not None and (supplied_tax < 0 or supplied_tax > inc):
                 supplied_tax = None
             if supplied_net is not None and (supplied_net < 0 or supplied_net > inc):
-                supplied_net = None
+                # net > total is mathematically impossible (total = net + tax,
+                # tax ≥ 0).  Document AI frequently maps the "Total VAT @ 20%"
+                # line as total_amount because the word "Total" appears there,
+                # giving us e.g. total=113.90, net=569.50, tax=113.90.
+                # When we also have a non-negative tax whose sum with net
+                # exceeds the suspicious total, that total is the VAT figure,
+                # not the invoice total — rebuild from the more reliable pair.
+                if (
+                    supplied_tax is not None
+                    and supplied_net > 0
+                    and supplied_tax >= 0
+                    and round(supplied_net + supplied_tax, 2) > inc + 0.01
+                ):
+                    inc = round(supplied_net + supplied_tax, 2)
+                else:
+                    supplied_net = None
 
         if supplied_net is not None:
             ex = supplied_net
