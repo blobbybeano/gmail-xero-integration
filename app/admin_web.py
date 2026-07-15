@@ -13564,7 +13564,7 @@ body {{ background:#f7f6f3 !important; }}
                     enctype="multipart/form-data">
                 <input id="exp-upload-payment-source" type="hidden"
                        name="payment_source" value="{escape(upload_payment_source_default)}">
-                <label for="exp-upload-file"
+                <label id="exp-upload-label" for="exp-upload-file"
                        class="flex items-center justify-center gap-2 w-full rounded-xl
                               border border-dashed border-gray-300 bg-white px-4 py-2.5
                               text-sm font-semibold text-gray-600 active:bg-gray-50">
@@ -13572,6 +13572,23 @@ body {{ background:#f7f6f3 !important; }}
                   <span>Upload</span>
                   <span class="text-xs font-normal text-gray-400">photos or files</span>
                 </label>
+                <div id="exp-upload-progress"
+                     class="hidden rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-3">
+                  <div class="flex items-center justify-between gap-3">
+                    <div>
+                      <div id="exp-upload-progress-title"
+                           class="text-sm font-semibold text-indigo-900">Uploading&hellip;</div>
+                      <div id="exp-upload-progress-detail"
+                           class="text-xs text-indigo-700 mt-0.5">Preparing files</div>
+                    </div>
+                    <div id="exp-upload-progress-percent"
+                         class="text-sm font-bold text-indigo-900">0%</div>
+                  </div>
+                  <div class="mt-3 h-2 rounded-full bg-white overflow-hidden">
+                    <div id="exp-upload-progress-bar"
+                         class="h-full w-0 bg-indigo-600 transition-all duration-150"></div>
+                  </div>
+                </div>
                 <input id="exp-upload-file" type="file" name="receipt_file"
                        accept="image/*,application/pdf" multiple
                        style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none">
@@ -13599,17 +13616,81 @@ body {{ background:#f7f6f3 !important; }}
               var uploadFile = document.getElementById('exp-upload-file');
               var uploadForm = document.getElementById('exp-upload-form');
               var uploadSource = document.getElementById('exp-upload-payment-source');
+              var uploadLabel = document.getElementById('exp-upload-label');
+              var progressWrap = document.getElementById('exp-upload-progress');
+              var progressTitle = document.getElementById('exp-upload-progress-title');
+              var progressDetail = document.getElementById('exp-upload-progress-detail');
+              var progressPercent = document.getElementById('exp-upload-progress-percent');
+              var progressBar = document.getElementById('exp-upload-progress-bar');
+              var uploadBusy = false;
               function currentSource() {{
                 var picked = document.querySelector('#exp-form input[name="payment_source"]:checked');
                 if (picked) return picked.value;
                 var hidden = document.querySelector('#exp-form input[type="hidden"][name="payment_source"]');
                 return hidden ? hidden.value : '{escape(upload_payment_source_default)}';
               }}
+              function setProgress(pct, title, detail) {{
+                pct = Math.max(0, Math.min(100, pct || 0));
+                if (progressWrap) progressWrap.classList.remove('hidden');
+                if (uploadLabel) {{
+                  uploadLabel.classList.add('hidden');
+                  uploadLabel.setAttribute('aria-disabled', 'true');
+                }}
+                if (progressTitle && title) progressTitle.innerHTML = title;
+                if (progressDetail && detail) progressDetail.textContent = detail;
+                if (progressPercent) progressPercent.textContent = Math.round(pct) + '%';
+                if (progressBar) progressBar.style.width = pct + '%';
+              }}
+              function failProgress(message) {{
+                uploadBusy = false;
+                if (progressTitle) progressTitle.textContent = 'Upload failed';
+                if (progressDetail) progressDetail.textContent = message || 'Please try again.';
+                if (progressPercent) progressPercent.textContent = '';
+                if (progressBar) progressBar.style.width = '100%';
+                if (progressBar) progressBar.className = 'h-full w-full bg-rose-500 transition-all duration-150';
+                setTimeout(function() {{
+                  if (progressWrap) progressWrap.classList.add('hidden');
+                  if (uploadLabel) {{
+                    uploadLabel.classList.remove('hidden');
+                    uploadLabel.removeAttribute('aria-disabled');
+                  }}
+                  if (progressBar) progressBar.className = 'h-full w-0 bg-indigo-600 transition-all duration-150';
+                  if (progressBar) progressBar.style.width = '0%';
+                }}, 2500);
+              }}
               if (uploadFile && uploadForm) {{
                 uploadFile.addEventListener('change', function() {{
                   if (!uploadFile.files || !uploadFile.files.length) return;
+                  if (uploadBusy) return;
+                  uploadBusy = true;
                   if (uploadSource) uploadSource.value = currentSource();
-                  uploadForm.submit();
+                  var count = uploadFile.files.length;
+                  setProgress(1, 'Uploading&hellip;', count + ' file' + (count === 1 ? '' : 's') + ' selected');
+                  if (!window.XMLHttpRequest || !window.FormData) {{
+                    uploadForm.submit();
+                    return;
+                  }}
+                  var xhr = new XMLHttpRequest();
+                  xhr.open('POST', uploadForm.action, true);
+                  xhr.upload.addEventListener('progress', function(ev) {{
+                    if (!ev.lengthComputable) {{
+                      setProgress(35, 'Uploading&hellip;', 'Sending files to the app');
+                      return;
+                    }}
+                    var pct = Math.round((ev.loaded / ev.total) * 85);
+                    setProgress(pct, 'Uploading&hellip;', 'Sending files to the app');
+                  }});
+                  xhr.onreadystatechange = function() {{
+                    if (xhr.readyState !== 4) return;
+                    if (xhr.status >= 200 && xhr.status < 400) {{
+                      setProgress(100, 'Upload complete', 'Opening the receipt review');
+                      window.location.href = xhr.responseURL || '/expenses/{escape(token)}';
+                    }} else {{
+                      failProgress('The app could not upload those files.');
+                    }}
+                  }};
+                  xhr.onerror = function() {{ failProgress('Network error while uploading.'); }};
+                  xhr.send(new FormData(uploadForm));
                 }});
               }}
             }})();
