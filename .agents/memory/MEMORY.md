@@ -4,3 +4,4 @@
 - [Card-feed bank provider](card-feed-provider.md) — card feed is a manual CSV upload; every free automated route for a Lloyds account is dead (verified Jul 2026); invariants any feed source must satisfy.
 - [Silent try/except helpers](silent-except-helpers.md) — broad except in receipt image helpers once hid a missing import; smoke-test helpers directly, don't trust no-error.
 - [Deterministic business rules](deterministic-business-rules.md) — hard thresholds (fuel <£40 rule) must be code-enforced post-AI; prompt hints alone get ignored.
+- [Xero rate-limit dual signal](xero-rate-limit-lockout.md) — 429 cooldown lives in TWO places (in-memory + state file); pause/resume must max() both, and never blindly retry a part-done Xero batch.
