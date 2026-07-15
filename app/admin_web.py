@@ -16407,6 +16407,54 @@ body {{ background:#f7f6f3 !important; }}
             "<span class='font-semibold'>All quiet.</span> No urgent Field Expenses items right now.</div>"
         )
 
+        people_nav_bits = []
+        for e in engineers:
+            eid = int(e.get("id") or 0)
+            if not eid:
+                continue
+            name = escape(str(e.get("name") or "Person"))
+            kind_label = (
+                "Subcontractor"
+                if (e.get("kind") or "") == "subcontractor"
+                else ("Owner/director" if _expense_owner_no_payout(e) else "Company card")
+            )
+            chips = []
+            p_amt = (pending_by_person.get(eid) or {}).get("amount") or 0
+            a_amt = (approved_by_person.get(eid) or {}).get("amount") or 0
+            u_amt = (unpaid_by_person.get(eid) or {}).get("amount") or 0
+            if p_amt:
+                chips.append(
+                    f"<span class='rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-800'>Review {_exp_money(p_amt)}</span>"
+                )
+            if a_amt:
+                chips.append(
+                    f"<span class='rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-semibold text-emerald-800'>Approved {_exp_money(a_amt)}</span>"
+                )
+            if u_amt:
+                chips.append(
+                    f"<span class='rounded-full bg-rose-100 px-2 py-0.5 text-[11px] font-semibold text-rose-800'>Owed {_exp_money(u_amt)}</span>"
+                )
+            if not chips:
+                chips.append(
+                    "<span class='rounded-full bg-gray-100 px-2 py-0.5 text-[11px] font-semibold text-gray-500'>Clear</span>"
+                )
+            people_nav_bits.append(
+                f"<a href='#person-{eid}' class='flex items-center justify-between gap-2 rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 hover:bg-white hover:border-indigo-200 hover:shadow-sm transition'>"
+                "<span class='min-w-0'>"
+                f"<span class='block truncate text-sm font-semibold text-gray-900'>{name}</span>"
+                f"<span class='block text-[11px] text-gray-500'>{escape(kind_label)}</span>"
+                "</span>"
+                f"<span class='flex flex-wrap justify-end gap-1'>{''.join(chips)}</span>"
+                "</a>"
+            )
+        people_nav_html = (
+            "<div class='mt-4 grid grid-cols-1 gap-2'>"
+            + "".join(people_nav_bits)
+            + "</div>"
+            if people_nav_bits else
+            "<div class='mt-4 rounded-xl border border-dashed border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-500'>No people set up yet.</div>"
+        )
+
         return _page(
             f"""
             <header class="bg-white border-b border-gray-200">
@@ -16421,17 +16469,18 @@ body {{ background:#f7f6f3 !important; }}
               {acct_warning_html}
 
               <section class="rounded-3xl border border-gray-200 bg-white p-5 shadow-sm">
-                <div class="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-4">
-                  <div>
+                <div class="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(520px,0.95fr)] gap-5 items-start">
+                  <div class="min-w-0">
                     <div class="text-xs font-semibold uppercase tracking-wide text-gray-400">Admin workspace</div>
                     <h1 class="mt-1 text-2xl font-bold text-gray-950">Field Expenses</h1>
                     <p class="mt-1 text-sm text-gray-500 max-w-2xl">Review receipt dumps, manage people, prepare payout batches, and keep the receipt-to-Xero flow tidy.</p>
+                    {people_nav_html}
                   </div>
-                  <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 lg:min-w-[620px]">
-                    {_dashboard_stat("Pending review", str(status_counts.get("pending_review", 0)), _exp_money(pending_total), "amber" if status_counts.get("pending_review", 0) else "gray", href="#people-manager", detail_html=_person_summary(pending_by_person, empty="Nothing waiting"))}
-                    {_dashboard_stat("Approved", _exp_money(approved_total), "ready for admin action", "emerald" if approved_total else "gray", href="#people-manager", detail_html=_person_summary(approved_by_person, empty="Nothing approved"))}
+                  <div class="grid grid-cols-2 gap-3">
+                    {_dashboard_stat("Pending review", str(status_counts.get("pending_review", 0)), _exp_money(pending_total), "amber" if status_counts.get("pending_review", 0) else "gray", href="#people-manager")}
+                    {_dashboard_stat("Approved", _exp_money(approved_total), "ready for admin action", "emerald" if approved_total else "gray", href="#people-manager")}
                     {_dashboard_stat("Open batches", str(open_payout_count), f"{_exp_money(total_unbatched)} ready to batch", "indigo" if open_payout_count or total_unbatched else "gray", href="#payouts")}
-                    {_dashboard_stat("Unpaid", _exp_money(total_unpaid), "owed / not settled", "rose" if total_unpaid else "gray", href="#payouts", detail_html=_person_summary(unpaid_by_person, empty="Nothing owed"))}
+                    {_dashboard_stat("Unpaid", _exp_money(total_unpaid), "owed / not settled", "rose" if total_unpaid else "gray", href="#payouts")}
                   </div>
                 </div>
               </section>
