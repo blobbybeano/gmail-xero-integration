@@ -16233,49 +16233,171 @@ body {{ background:#f7f6f3 !important; }}
             + "</div></div>"
         )
 
+        all_receipts = exp_store.list_all_receipts(db, limit=1000)
+        status_counts: dict[str, int] = {}
+        receipt_total = 0.0
+        approved_total = 0.0
+        pending_total = 0.0
+        for r in all_receipts:
+            st = (r.get("status") or "unknown").strip().lower()
+            status_counts[st] = status_counts.get(st, 0) + 1
+            try:
+                amt = float(r.get("amount_inc") or 0)
+            except (TypeError, ValueError):
+                amt = 0.0
+            receipt_total += amt
+            if st == "approved":
+                approved_total += amt
+            elif st == "pending_review":
+                pending_total += amt
+
+        people_total = len(engineers)
+        active_people = sum(1 for e in engineers if e.get("active"))
+        total_unpaid = 0.0
+        open_payout_count = 0
+        overdue_payout_count = 0
+        now_utc = dt.datetime.now(dt.timezone.utc)
+        for e in engineers:
+            try:
+                total_unpaid += float(exp_store.amount_unpaid_to_engineer(db, e["id"]) or 0)
+            except Exception:
+                pass
+            try:
+                settlements = exp_store.list_settlements_for_engineer(db, e["id"])
+            except Exception:
+                settlements = []
+            for s in settlements:
+                if (s.get("status") or "").strip().lower() in {"prepared", "pending", "review", "paid", "overpaid"} and not (s.get("xero_bill_id") or "").strip():
+                    open_payout_count += 1
+                    try:
+                        created = dt.datetime.fromisoformat(
+                            str(s.get("created_at") or "").replace("Z", "+00:00")
+                        )
+                        if created.tzinfo is None:
+                            created = created.replace(tzinfo=dt.timezone.utc)
+                        if (now_utc - created).total_seconds() > 86400:
+                            overdue_payout_count += 1
+                    except Exception:
+                        pass
+
+        def _dashboard_stat(label: str, value: str, sub: str, tone: str) -> str:
+            tones = {
+                "amber": "border-amber-200 bg-amber-50 text-amber-900",
+                "emerald": "border-emerald-200 bg-emerald-50 text-emerald-900",
+                "indigo": "border-indigo-200 bg-indigo-50 text-indigo-900",
+                "gray": "border-gray-200 bg-white text-gray-900",
+                "rose": "border-rose-200 bg-rose-50 text-rose-900",
+            }
+            cls = tones.get(tone, tones["gray"])
+            return (
+                f"<div class='rounded-2xl border {cls} p-4'>"
+                f"<div class='text-xs font-semibold uppercase tracking-wide opacity-70'>{escape(label)}</div>"
+                f"<div class='mt-1 text-2xl font-bold'>{value}</div>"
+                f"<div class='mt-1 text-xs opacity-75'>{escape(sub)}</div>"
+                "</div>"
+            )
+
+        urgent_notes = []
+        if status_counts.get("pending_review", 0):
+            urgent_notes.append(
+                f"{status_counts.get('pending_review', 0)} receipt(s) waiting for review"
+            )
+        if approved_total > 0:
+            urgent_notes.append(f"{_exp_money(approved_total)} approved and ready for admin action")
+        if open_payout_count:
+            label = f"{open_payout_count} payout batch(es) open"
+            if overdue_payout_count:
+                label += f", {overdue_payout_count} delayed"
+            urgent_notes.append(label)
+        if not setup_all_ready:
+            urgent_notes.append("setup needs attention")
+        urgency_html = (
+            "<div class='rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900'>"
+            "<div class='font-semibold mb-1'>Needs attention</div>"
+            + "".join(f"<div class='text-xs'>&bull; {escape(n)}</div>" for n in urgent_notes)
+            + "</div>"
+            if urgent_notes else
+            "<div class='rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-800'>"
+            "<span class='font-semibold'>All quiet.</span> No urgent Field Expenses items right now.</div>"
+        )
+
         return _page(
             f"""
             <header class="bg-white border-b border-gray-200">
-              <div class="max-w-4xl mx-auto px-4 py-3 flex items-center gap-4">
+              <div class="max-w-6xl mx-auto px-4 py-3 flex items-center gap-4">
                 <a href="/" class="text-sm text-indigo-600">&larr; Dashboard</a>
                 <a href="/receipts" class="text-sm text-gray-600">Receipts</a>
                 <span class="text-sm font-semibold text-gray-900">Field Expenses</span>
               </div>
             </header>
-            <main class="max-w-4xl mx-auto p-4 space-y-6">
+            <main class="max-w-6xl mx-auto p-4 space-y-6">
               {flash_html}
               {acct_warning_html}
 
-              <div class="space-y-2">
-                <a href="/receipts/expenses/dump"
-                   class="flex items-center justify-center px-4 py-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold shadow-sm">
-                  Receipt dump
-                </a>
-                <a href="/cardfeed"
-                   class="flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-white border border-gray-200 hover:bg-gray-50 text-gray-700 text-sm font-semibold shadow-sm">
-                  <svg class="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
-                  Upload bank statement (CSV)
-                </a>
-                <div class="text-center">
-                  <a href="/receipts/expenses/test"
-                     class="inline-flex items-center gap-1.5 text-xs text-gray-500 hover:text-gray-700">
-                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"/></svg>
-                    Test receipt scanner
-                  </a>
+              <section class="rounded-3xl border border-gray-200 bg-white p-5 shadow-sm">
+                <div class="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-4">
+                  <div>
+                    <div class="text-xs font-semibold uppercase tracking-wide text-gray-400">Admin workspace</div>
+                    <h1 class="mt-1 text-2xl font-bold text-gray-950">Field Expenses</h1>
+                    <p class="mt-1 text-sm text-gray-500 max-w-2xl">Review receipt dumps, manage people, prepare payout batches, and keep the receipt-to-Xero flow tidy.</p>
+                  </div>
+                  <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 lg:min-w-[620px]">
+                    {_dashboard_stat("Pending review", str(status_counts.get("pending_review", 0)), _exp_money(pending_total), "amber" if status_counts.get("pending_review", 0) else "gray")}
+                    {_dashboard_stat("Approved", _exp_money(approved_total), "ready for admin action", "emerald" if approved_total else "gray")}
+                    {_dashboard_stat("People", f"{active_people}/{people_total}", "active users", "indigo")}
+                    {_dashboard_stat("Unpaid", _exp_money(total_unpaid), "owed / not settled", "rose" if total_unpaid else "gray")}
+                  </div>
                 </div>
+              </section>
+
+              <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                <section class="lg:col-span-1 rounded-2xl border border-gray-200 bg-white p-4 shadow-sm space-y-3">
+                  <div>
+                    <h2 class="font-semibold text-gray-950">Action centre</h2>
+                    <p class="text-xs text-gray-500 mt-0.5">The jobs admin normally needs to do first.</p>
+                  </div>
+                  {urgency_html}
+                  <div class="grid grid-cols-1 gap-2">
+                    <a href="/receipts/expenses/dump"
+                       class="flex items-center justify-center px-4 py-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold shadow-sm">
+                      Receipt dump
+                    </a>
+                    <a href="/cardfeed"
+                       class="flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-white border border-gray-200 hover:bg-gray-50 text-gray-700 text-sm font-semibold shadow-sm">
+                      <svg class="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
+                      Upload bank statement (CSV)
+                    </a>
+                    <a href="/receipts/expenses/test"
+                       class="flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-white border border-gray-200 hover:bg-gray-50 text-gray-700 text-sm font-semibold shadow-sm">
+                      Test receipt scanner
+                    </a>
+                  </div>
+                </section>
+
+                <section class="lg:col-span-2 rounded-2xl border border-gray-200 bg-white p-4 shadow-sm space-y-4">
+                  <div class="flex items-start justify-between gap-3">
+                    <div>
+                      <h2 class="font-semibold text-gray-950">Payouts &amp; batches</h2>
+                      <p class="text-xs text-gray-500 mt-0.5">Prepare grouped payments for subcontractors and owner-paid receipts.</p>
+                    </div>
+                  </div>
+                  {payout_html if payout_html else "<div class='rounded-xl border border-dashed border-gray-200 bg-gray-50 p-4 text-sm text-gray-500'>No payout batches need attention.</div>"}
+                </section>
               </div>
 
-              {connections_html}
-
-              {payout_html}
-
-              <section class="space-y-3">
-                <h2 class="text-sm font-semibold text-gray-500 uppercase tracking-wide">Engineers</h2>
+              <section class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm space-y-3">
+                <div class="flex items-start justify-between gap-3">
+                  <div>
+                    <h2 class="font-semibold text-gray-950">People manager</h2>
+                    <p class="text-xs text-gray-500 mt-0.5">Open a person to see their submitted receipts, setup gaps, login details and defaults.</p>
+                  </div>
+                </div>
                 {engineers_html}
               </section>
 
-              <section class="rounded-xl border border-gray-200 bg-white p-4">
-                <h2 class="font-semibold text-gray-900 mb-3">Add an engineer</h2>
+              <section class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
+                <h2 class="font-semibold text-gray-950 mb-1">Add a person</h2>
+                <p class="text-xs text-gray-500 mb-3">Create an engineer or subcontractor login and set their receipt defaults.</p>
                 <form method="post" action="/receipts/expenses/create"
                       class="grid grid-cols-1 sm:grid-cols-3 gap-3">
                   <div class="sm:col-span-2">
@@ -16303,11 +16425,21 @@ body {{ background:#f7f6f3 !important; }}
                 </form>
               </section>
 
-              {storage_html}
+              <section class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                <div class="space-y-4">
+                  {storage_html}
+                </div>
+                <div class="space-y-4">
+                  {connections_html}
+                </div>
+              </section>
 
-              <details class="rounded-xl border border-gray-200 bg-white overflow-hidden group">
+              <details class="rounded-2xl border border-gray-200 bg-white overflow-hidden group shadow-sm">
                 <summary class="flex items-center justify-between px-4 py-3 cursor-pointer list-none select-none hover:bg-gray-50">
-                  <h2 class="font-semibold text-gray-900">Settings</h2>
+                  <div>
+                    <h2 class="font-semibold text-gray-950">Settings</h2>
+                    <p class="text-xs text-gray-500 mt-0.5">Defaults and timing controls for the Field Expenses flow.</p>
+                  </div>
                   <svg class="w-4 h-4 text-gray-400 transition-transform duration-200 group-open:rotate-180 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
                 </summary>
                         <form method="post" action="/receipts/expenses/save-settings"
