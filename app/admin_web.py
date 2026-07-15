@@ -15533,6 +15533,8 @@ body {{ background:#f7f6f3 !important; }}
             )
 
         payout_cards = []
+        payout_card_by_engineer: dict[int, str] = {}
+        payout_summary_by_engineer: dict[int, dict] = {}
         payout_people = []
         for e in engineers:
             kind = e.get("kind") or "company_card"
@@ -15625,7 +15627,7 @@ body {{ background:#f7f6f3 !important; }}
                 "<button type='button' disabled class='rounded-lg bg-gray-200 px-3 py-2 "
                 "text-sm font-semibold text-gray-500'>Nothing to batch</button>"
             )
-            payout_cards.append(
+            payout_card_html = (
                 "<div class='rounded-xl border border-gray-200 bg-gray-50 p-4'>"
                 "<div class='flex items-start justify-between gap-3 flex-wrap'>"
                 "<div>"
@@ -15657,6 +15659,13 @@ body {{ background:#f7f6f3 !important; }}
                 f"{settlement_html}"
                 "</div>"
             )
+            payout_cards.append(payout_card_html)
+            payout_card_by_engineer[int(sub["id"])] = payout_card_html
+            payout_summary_by_engineer[int(sub["id"])] = {
+                "unbatched": unbatched,
+                "unpaid": unpaid_total,
+                "open_count": len(open_settlements),
+            }
         payout_html = ""
         if payout_cards:
             payout_html = (
@@ -16420,7 +16429,19 @@ body {{ background:#f7f6f3 !important; }}
             "<span class='font-semibold'>All quiet.</span> No urgent Field Expenses items right now.</div>"
         )
 
-        def _receipt_panel_rows(rows: list[dict]) -> str:
+        def _submitted_stamp(value: str) -> str:
+            raw = str(value or "").strip()
+            if not raw:
+                return "Submitted time unknown"
+            try:
+                parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                if parsed.tzinfo is not None:
+                    parsed = parsed.astimezone()
+                return "Submitted " + parsed.strftime("%d/%m/%Y %H:%M")
+            except Exception:
+                return "Submitted " + raw[:16]
+
+        def _receipt_panel_rows(rows: list[dict], eng: dict) -> str:
             if not rows:
                 return (
                     "<div class='rounded-xl border border-dashed border-gray-200 bg-gray-50 "
@@ -16444,14 +16465,23 @@ body {{ background:#f7f6f3 !important; }}
                     if acct else
                     "<span class='text-[11px] text-gray-400 italic'>not coded yet</span>"
                 )
+                rid = escape(str(r.get("id") or ""))
+                review_href = (
+                    f"/expenses/{escape(str(eng.get('token') or ''))}/review/{rid}"
+                    "?return_to=/receipts/expenses"
+                )
+                submitted = escape(_submitted_stamp(r.get("created_at") or r.get("updated_at") or ""))
                 out.append(
                     "<div class='flex items-center justify-between gap-3 py-2 border-b "
                     "border-gray-100 last:border-0'>"
                     "<div class='min-w-0'>"
                     f"<div class='text-sm font-semibold text-gray-900 truncate'>{merchant}</div>"
-                    f"<div class='mt-0.5 flex flex-wrap gap-2'>{acct_html}<span class='text-[11px] text-gray-400'>{day}</span></div>"
+                    f"<div class='mt-0.5 flex flex-wrap gap-2'>{acct_html}<span class='text-[11px] text-gray-400'>Receipt date {day}</span><span class='text-[11px] text-gray-500'>{submitted}</span></div>"
                     "</div>"
-                    f"<div class='shrink-0 text-sm font-bold text-gray-900'>{amount}</div>"
+                    "<div class='shrink-0 text-right'>"
+                    f"<div class='text-sm font-bold text-gray-900'>{amount}</div>"
+                    f"<a href='{review_href}' class='mt-1 inline-flex rounded-lg border border-gray-300 bg-white px-2.5 py-1 text-xs font-semibold text-gray-700 hover:bg-gray-50'>Review</a>"
+                    "</div>"
                     "</div>"
                 )
             if len(rows) > 20:
@@ -16486,11 +16516,36 @@ body {{ background:#f7f6f3 !important; }}
                     "<span class='rounded-full bg-gray-100 px-2 py-0.5 text-[11px] font-semibold text-gray-500'>Clear</span>"
                 )
             p_panel = _receipt_panel_rows(
-                (status_receipts_by_person.get(eid) or {}).get("pending_review") or []
+                (status_receipts_by_person.get(eid) or {}).get("pending_review") or [],
+                e,
             )
             a_panel = _receipt_panel_rows(
-                (status_receipts_by_person.get(eid) or {}).get("approved") or []
+                (status_receipts_by_person.get(eid) or {}).get("approved") or [],
+                e,
             )
+            payout_card = payout_card_by_engineer.get(eid, "")
+            payout_summary = payout_summary_by_engineer.get(eid) or {}
+            payout_btn = ""
+            payout_panel = ""
+            box_grid = "grid-cols-2"
+            if payout_card:
+                box_grid = "grid-cols-3"
+                payout_btn = (
+                    f"<button type='button' data-exp-panel='exp-panel-{eid}-payouts' "
+                    "class='text-left rounded-xl border border-indigo-200 bg-indigo-50 px-3 py-3 text-indigo-900 hover:bg-indigo-100 hover:shadow-sm transition'>"
+                    "<span class='block text-[11px] font-semibold uppercase tracking-wide opacity-70'>Receipt payouts</span>"
+                    f"<span class='mt-1 block text-2xl font-bold'>{_exp_money(payout_summary.get('unpaid') or 0)}</span>"
+                    f"<span class='mt-1 block text-xs opacity-75'>{_exp_money(payout_summary.get('unbatched') or 0)} ready</span>"
+                    "</button>"
+                )
+                payout_panel = (
+                    f"<div id='exp-panel-{eid}-payouts' class='exp-person-panel hidden mt-3 rounded-xl border border-indigo-200 bg-indigo-50/60 p-3'>"
+                    "<div class='mb-2 flex items-center justify-between gap-2'>"
+                    f"<h3 class='text-sm font-bold text-indigo-950'>{name} · Receipt payouts</h3>"
+                    "<button type='button' data-exp-close class='rounded-lg border border-indigo-300 bg-white px-3 py-1.5 text-sm font-bold text-indigo-800 hover:bg-indigo-50'>Close</button>"
+                    "</div>"
+                    f"{payout_card}</div>"
+                )
             people_nav_bits.append(
                 "<div class='rounded-2xl border border-gray-200 bg-white p-3 shadow-sm'>"
                 "<div class='grid grid-cols-1 md:grid-cols-[minmax(160px,0.75fr)_minmax(0,1.25fr)] gap-3 items-stretch'>"
@@ -16499,7 +16554,7 @@ body {{ background:#f7f6f3 !important; }}
                 f"<span class='block text-[11px] text-gray-500'>{escape(kind_label)}</span>"
                 f"<span class='mt-2 flex flex-wrap gap-1'>{''.join(chips)}</span>"
                 "</a>"
-                "<div class='grid grid-cols-2 gap-2'>"
+                f"<div class='grid {box_grid} gap-2'>"
                 f"<button type='button' data-exp-panel='exp-panel-{eid}-pending' "
                 "class='text-left rounded-xl border border-amber-200 bg-amber-50 px-3 py-3 text-amber-900 hover:bg-amber-100 hover:shadow-sm transition'>"
                 "<span class='block text-[11px] font-semibold uppercase tracking-wide opacity-70'>Pending review</span>"
@@ -16512,19 +16567,21 @@ body {{ background:#f7f6f3 !important; }}
                 f"<span class='mt-1 block text-2xl font-bold'>{a_count}</span>"
                 f"<span class='mt-1 block text-xs opacity-75'>{_exp_money(a_amt)}</span>"
                 "</button>"
+                f"{payout_btn}"
                 "</div></div>"
                 f"<div id='exp-panel-{eid}-pending' class='exp-person-panel hidden mt-3 rounded-xl border border-amber-200 bg-amber-50/60 p-3'>"
                 "<div class='mb-2 flex items-center justify-between gap-2'>"
                 f"<h3 class='text-sm font-bold text-amber-950'>{name} · Pending review</h3>"
-                "<button type='button' data-exp-close class='text-xs text-amber-800 hover:underline'>Close</button>"
+                "<button type='button' data-exp-close class='rounded-lg border border-amber-300 bg-white px-3 py-1.5 text-sm font-bold text-amber-800 hover:bg-amber-50'>Close</button>"
                 "</div>"
                 f"{p_panel}</div>"
                 f"<div id='exp-panel-{eid}-approved' class='exp-person-panel hidden mt-3 rounded-xl border border-emerald-200 bg-emerald-50/60 p-3'>"
                 "<div class='mb-2 flex items-center justify-between gap-2'>"
                 f"<h3 class='text-sm font-bold text-emerald-950'>{name} · Approved</h3>"
-                "<button type='button' data-exp-close class='text-xs text-emerald-800 hover:underline'>Close</button>"
+                "<button type='button' data-exp-close class='rounded-lg border border-emerald-300 bg-white px-3 py-1.5 text-sm font-bold text-emerald-800 hover:bg-emerald-50'>Close</button>"
                 "</div>"
                 f"{a_panel}</div>"
+                f"{payout_panel}"
                 "</div>"
             )
         people_nav_script = (
@@ -16568,8 +16625,8 @@ body {{ background:#f7f6f3 !important; }}
                 </div>
               </section>
 
-              <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
-                <section class="lg:col-span-1 rounded-2xl border border-gray-200 bg-white p-4 shadow-sm space-y-3">
+              <div class="grid grid-cols-1 gap-4">
+                <section class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm space-y-3">
                   <div>
                     <h2 class="font-semibold text-gray-950">Action centre</h2>
                     <p class="text-xs text-gray-500 mt-0.5">The jobs admin normally needs to do first.</p>
@@ -16590,16 +16647,6 @@ body {{ background:#f7f6f3 !important; }}
                       Test receipt scanner
                     </a>
                   </div>
-                </section>
-
-                <section id="payouts" class="lg:col-span-2 rounded-2xl border border-gray-200 bg-white p-4 shadow-sm space-y-4 scroll-mt-24">
-                  <div class="flex items-start justify-between gap-3">
-                    <div>
-                      <h2 class="font-semibold text-gray-950">Payouts &amp; batches</h2>
-                      <p class="text-xs text-gray-500 mt-0.5">Prepare grouped payments for subcontractors and owner-paid receipts.</p>
-                    </div>
-                  </div>
-                  {payout_html if payout_html else "<div class='rounded-xl border border-dashed border-gray-200 bg-gray-50 p-4 text-sm text-gray-500'>No payout batches need attention.</div>"}
                 </section>
               </div>
 
