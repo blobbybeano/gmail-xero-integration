@@ -603,6 +603,74 @@ def _exp_reconcile_amounts_from_text(total, net, tax, raw_text, vat_rate):
     )
     text = raw_text or ""
     lowered = text.lower()
+
+    def _money_values_near_total_labels() -> list[float]:
+        vals: list[float] = []
+        money = r"(?:£|gbp\s*)?\s*(\d{1,5}(?:,\d{3})*\.\d{2})"
+        labelled = [
+            r"\b(?:grand\s+total|total\s+(?:paid|payable|due)|amount\s+due|balance\s+due|invoice\s+total)\b[^\n£0-9]{0,25}" + money,
+            r"\btotal\b[^\n£0-9]{0,25}" + money,
+            money + r"[^\n]{0,18}\b(?:total|paid|visa|mastercard|card|sale)\b",
+        ]
+        for pat in labelled:
+            for m in re.findall(pat, text, re.I):
+                raw = m[-1] if isinstance(m, tuple) else m
+                try:
+                    vals.append(round(float(str(raw).replace(",", "")), 2))
+                except ValueError:
+                    pass
+        if "vat" in lowered and ("total" in lowered or "invoice" in lowered):
+            for m in re.findall(money, text, re.I):
+                raw = m[-1] if isinstance(m, tuple) else m
+                try:
+                    vals.append(round(float(str(raw).replace(",", "")), 2))
+                except ValueError:
+                    pass
+        return [v for v in vals if v > 0]
+
+    def _looks_like_vat_summary_total(current: float | None, candidate: float) -> bool:
+        if current is None or current <= 0 or candidate <= current + 0.01:
+            return False
+        # Avoid changing genuine small purchases because a receipt contains a
+        # larger unrelated number such as a VAT registration number. This guard
+        # only fires when the "better" labelled total is materially larger and
+        # the existing total looks like VAT on that larger amount.
+        if candidate < current * 1.5:
+            return False
+        expected_vat = round(candidate * ((vat_rate or 0) / (100 + (vat_rate or 0))), 2)
+        expected_net_vat = round((candidate - current) * ((vat_rate or 0) / 100), 2)
+        return (
+            abs(current - expected_vat) <= max(0.03, candidate * 0.005)
+            or abs(current - expected_net_vat) <= max(0.03, candidate * 0.005)
+        )
+
+    candidates = _money_values_near_total_labels()
+    if candidates:
+        best_total = max(candidates)
+        try:
+            current_total = None if total is None else round(float(total), 2)
+        except (TypeError, ValueError):
+            current_total = None
+        if _looks_like_vat_summary_total(current_total, best_total):
+            total = best_total
+            try:
+                supplied_tax = None if tax is None else round(float(tax), 2)
+            except (TypeError, ValueError):
+                supplied_tax = None
+            try:
+                supplied_net = None if net is None else round(float(net), 2)
+            except (TypeError, ValueError):
+                supplied_net = None
+            if (
+                supplied_net is not None
+                and supplied_tax is not None
+                and abs((supplied_net + supplied_tax) - best_total) <= 0.03
+            ):
+                net, tax = supplied_net, supplied_tax
+            else:
+                net = None
+                tax = None
+
     if any(t in lowered for t in ("customer receipt", "card payment", "approved")):
         vals: list[float] = []
         for match in re.findall(r"(?:£|gbp\s*)\s*(\d{1,5}(?:,\d{3})*\.\d{2})", text, re.I):
