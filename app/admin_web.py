@@ -16468,6 +16468,29 @@ body {{ background:#f7f6f3 !important; }}
             card_transactions = cardfeed.get_cached_transactions(db) or []
         except Exception:
             card_transactions = []
+        card_dates = [
+            d for d in (_parse_date(t.get("date")) for t in card_transactions)
+            if d is not None
+        ]
+        recon_start = min(card_dates) if card_dates else (today_local - dt.timedelta(days=365))
+        recon_start = max(recon_start, today_local - dt.timedelta(days=365))
+        xero_reconciled_lines = _engineer_reconciled_lines(recon_start, today_local)
+
+        def _xero_has_reconciled_spend(amount: float, day: dt.date) -> bool:
+            """Best-effort Xero filter so old reconciled expenses don't look outstanding."""
+            if not xero_reconciled_lines:
+                return False
+            for ln in xero_reconciled_lines:
+                try:
+                    x_amt = float(ln[0])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                x_day = _parse_date(ln[1]) if len(ln) > 1 else None
+                if abs(x_amt - amount) <= 1.0 and (
+                    x_day is None or abs((x_day - day).days) <= 10
+                ):
+                    return True
+            return False
 
         def _receipt_candidates_for_card(eng_id: int, amount: float, day: dt.date):
             candidates = []
@@ -16525,6 +16548,8 @@ body {{ background:#f7f6f3 !important; }}
             used_receipts: set[str] = set()
             outstanding = []
             for tx in txs:
+                if _xero_has_reconciled_spend(tx["amount"], tx["date"]):
+                    continue
                 matched = False
                 for rec in _receipt_candidates_for_card(int(eng["id"]), tx["amount"], tx["date"]):
                     rid = str(rec.get("id") or "")
@@ -16540,6 +16565,26 @@ body {{ background:#f7f6f3 !important; }}
             for tx in outstanding:
                 weeks.setdefault(_week_start(tx["date"]), []).append(tx)
             return outstanding, weeks
+
+        def _linked_account_name(account_id: str) -> str:
+            meta = (_acct_labels or {}).get(account_id) or {}
+            name = str(meta.get("xero_account_name") or "").strip()
+            if name:
+                return name
+            for a in (_csv_status.get("accounts") or []):
+                if str(a.get("account_id") or "") == account_id:
+                    return str(a.get("name") or "").strip()
+            return account_id
+
+        def _is_receipt_card_account(account_id: str) -> bool:
+            label = _linked_account_name(account_id).lower()
+            if not label:
+                return False
+            card_words = ("card", "charge", "credit")
+            non_card_words = ("cash account", "current account")
+            if any(w in label for w in non_card_words):
+                return False
+            return any(w in label for w in card_words)
 
         def _submitted_stamp(value: str) -> str:
             raw = str(value or "").strip()
@@ -16641,6 +16686,7 @@ body {{ background:#f7f6f3 !important; }}
             payout_panel = ""
             card_btn = ""
             card_panel = ""
+            account_notice = ""
             box_grid = "grid-cols-2"
             if payout_card:
                 box_grid = "grid-cols-3"
@@ -16661,7 +16707,18 @@ body {{ background:#f7f6f3 !important; }}
                     f"{payout_card}</div>"
                 )
             elif str(e.get("plaid_account_id") or "").strip():
-                outstanding, weekly_outstanding = _card_outstanding_for_engineer(e)
+                linked_account_id = str(e.get("plaid_account_id") or "").strip()
+                linked_account_name = _linked_account_name(linked_account_id)
+                if not _is_receipt_card_account(linked_account_id):
+                    account_notice = (
+                        "<span class='rounded-full bg-gray-100 px-2 py-0.5 text-[11px] "
+                        "font-semibold text-gray-600' "
+                        f"title='Linked to {escape(linked_account_name)}. This is not treated as an engineer card receipt feed.'>"
+                        "Bank feed linked</span>"
+                    )
+                    outstanding, weekly_outstanding = [], {}
+                else:
+                    outstanding, weekly_outstanding = _card_outstanding_for_engineer(e)
                 week_items = []
                 for start, rows in sorted(weekly_outstanding.items(), reverse=True)[:5]:
                     total = sum(float(r.get("amount") or 0) for r in rows)
@@ -16689,37 +16746,38 @@ body {{ background:#f7f6f3 !important; }}
                 tx_rows_html = "".join(tx_rows) or (
                     "<div class='rounded-xl border border-dashed border-sky-200 bg-white/70 px-3 py-3 text-sm text-sky-700'>Nothing outstanding for this card.</div>"
                 )
-                box_grid = "grid-cols-3"
-                card_btn = (
-                    f"<button type='button' data-exp-panel='exp-panel-{eid}-card' "
-                    "class='text-left rounded-xl border border-sky-200 bg-sky-50 px-3 py-3 text-sky-900 hover:bg-sky-100 hover:shadow-sm transition'>"
-                    "<span class='block text-[11px] font-semibold uppercase tracking-wide opacity-70'>Card receipts</span>"
-                    f"<span class='mt-1 block text-2xl font-bold'>{len(outstanding)}</span>"
-                    f"<span class='mt-1 block text-xs opacity-75'>{_exp_money(sum(float(r.get('amount') or 0) for r in outstanding))} outstanding</span>"
-                    "</button>"
-                )
-                card_panel = (
-                    f"<div id='exp-panel-{eid}-card' class='exp-person-panel hidden mt-3 rounded-xl border border-sky-200 bg-sky-50/60 p-3'>"
-                    "<div class='mb-2 flex items-center justify-between gap-2'>"
-                    f"<h3 class='text-sm font-bold text-sky-950'>{name} · Outstanding card receipts</h3>"
-                    "<button type='button' data-exp-close class='rounded-lg border border-sky-300 bg-white px-3 py-1.5 text-sm font-bold text-sky-800 hover:bg-sky-50'>Close</button>"
-                    "</div>"
-                    "<div class='grid grid-cols-1 sm:grid-cols-[220px_minmax(0,1fr)] gap-3'>"
-                    "<div class='space-y-1'>"
-                    + "".join(week_items)
-                    + "</div>"
-                    f"<div class='rounded-xl border border-sky-100 bg-white px-3'>{tx_rows_html}</div>"
-                    "</div>"
-                    "<p class='mt-2 text-[11px] text-sky-700'>This compares uploaded bank-statement card payments with submitted receipts for this engineer. It does not call Xero.</p>"
-                    "</div>"
-                )
+                if _is_receipt_card_account(linked_account_id):
+                    box_grid = "grid-cols-3"
+                    card_btn = (
+                        f"<button type='button' data-exp-panel='exp-panel-{eid}-card' "
+                        "class='text-left rounded-xl border border-sky-200 bg-sky-50 px-3 py-3 text-sky-900 hover:bg-sky-100 hover:shadow-sm transition'>"
+                        "<span class='block text-[11px] font-semibold uppercase tracking-wide opacity-70'>Card receipts</span>"
+                        f"<span class='mt-1 block text-2xl font-bold'>{len(outstanding)}</span>"
+                        f"<span class='mt-1 block text-xs opacity-75'>{_exp_money(sum(float(r.get('amount') or 0) for r in outstanding))} outstanding</span>"
+                        "</button>"
+                    )
+                    card_panel = (
+                        f"<div id='exp-panel-{eid}-card' class='exp-person-panel hidden mt-3 rounded-xl border border-sky-200 bg-sky-50/60 p-3'>"
+                        "<div class='mb-2 flex items-center justify-between gap-2'>"
+                        f"<h3 class='text-sm font-bold text-sky-950'>{name} · Outstanding card receipts</h3>"
+                        "<button type='button' data-exp-close class='rounded-lg border border-sky-300 bg-white px-3 py-1.5 text-sm font-bold text-sky-800 hover:bg-sky-50'>Close</button>"
+                        "</div>"
+                        "<div class='grid grid-cols-1 sm:grid-cols-[220px_minmax(0,1fr)] gap-3'>"
+                        "<div class='space-y-1'>"
+                        + "".join(week_items)
+                        + "</div>"
+                        f"<div class='rounded-xl border border-sky-100 bg-white px-3'>{tx_rows_html}</div>"
+                        "</div>"
+                        "<p class='mt-2 text-[11px] text-sky-700'>This compares uploaded bank-statement card payments with submitted receipts for this engineer, and excludes matching spend already reconciled in Xero when the cached Xero check is available.</p>"
+                        "</div>"
+                    )
             people_nav_bits.append(
                 "<div class='rounded-2xl border border-gray-200 bg-white p-3 shadow-sm'>"
                 "<div class='grid grid-cols-1 md:grid-cols-[minmax(160px,0.75fr)_minmax(0,1.25fr)] gap-3 items-stretch'>"
                 f"<a href='#person-{eid}' class='flex flex-col justify-center rounded-xl bg-gray-50 px-3 py-3 hover:bg-indigo-50 transition'>"
                 f"<span class='block truncate text-sm font-bold text-gray-950'>{name}</span>"
                 f"<span class='block text-[11px] text-gray-500'>{escape(kind_label)}</span>"
-                f"<span class='mt-2 flex flex-wrap gap-1'>{''.join(chips)}</span>"
+                f"<span class='mt-2 flex flex-wrap gap-1'>{''.join(chips)}{account_notice}</span>"
                 "</a>"
                 f"<div class='grid {box_grid} gap-2'>"
                 f"<button type='button' data-exp-panel='exp-panel-{eid}-pending' "
