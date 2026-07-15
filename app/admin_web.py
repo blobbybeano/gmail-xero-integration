@@ -16253,6 +16253,7 @@ body {{ background:#f7f6f3 !important; }}
         engineer_by_id = {int(e["id"]): e for e in engineers if e.get("id") is not None}
         pending_by_person: dict[int, dict] = {}
         approved_by_person: dict[int, dict] = {}
+        status_receipts_by_person: dict[int, dict[str, list[dict]]] = {}
 
         def _add_person_total(bucket: dict[int, dict], engineer_id, amount: float) -> None:
             try:
@@ -16277,9 +16278,21 @@ body {{ background:#f7f6f3 !important; }}
             if st == "approved":
                 approved_total += amt
                 _add_person_total(approved_by_person, r.get("engineer_id"), amt)
+                try:
+                    status_receipts_by_person.setdefault(
+                        int(r.get("engineer_id")), {}
+                    ).setdefault("approved", []).append(r)
+                except (TypeError, ValueError):
+                    pass
             elif st == "pending_review":
                 pending_total += amt
                 _add_person_total(pending_by_person, r.get("engineer_id"), amt)
+                try:
+                    status_receipts_by_person.setdefault(
+                        int(r.get("engineer_id")), {}
+                    ).setdefault("pending_review", []).append(r)
+                except (TypeError, ValueError):
+                    pass
 
         total_unpaid = 0.0
         total_unbatched = 0.0
@@ -16407,6 +16420,46 @@ body {{ background:#f7f6f3 !important; }}
             "<span class='font-semibold'>All quiet.</span> No urgent Field Expenses items right now.</div>"
         )
 
+        def _receipt_panel_rows(rows: list[dict]) -> str:
+            if not rows:
+                return (
+                    "<div class='rounded-xl border border-dashed border-gray-200 bg-gray-50 "
+                    "px-3 py-3 text-sm text-gray-500'>Nothing in this section.</div>"
+                )
+            out = []
+            for r in rows[:20]:
+                merchant = escape(r.get("merchant") or r.get("ocr_merchant") or "Receipt")
+                day = escape((r.get("purchased_on") or r.get("created_at") or "")[:10])
+                amount = _exp_money(r.get("amount_inc"), r.get("currency") or "GBP")
+                acct = escape(
+                    " ".join(
+                        x for x in [
+                            str(r.get("category_account_code") or "").strip(),
+                            str(r.get("category_account_name") or "").strip(),
+                        ] if x
+                    )
+                )
+                acct_html = (
+                    f"<span class='text-[11px] text-gray-500'>{acct}</span>"
+                    if acct else
+                    "<span class='text-[11px] text-gray-400 italic'>not coded yet</span>"
+                )
+                out.append(
+                    "<div class='flex items-center justify-between gap-3 py-2 border-b "
+                    "border-gray-100 last:border-0'>"
+                    "<div class='min-w-0'>"
+                    f"<div class='text-sm font-semibold text-gray-900 truncate'>{merchant}</div>"
+                    f"<div class='mt-0.5 flex flex-wrap gap-2'>{acct_html}<span class='text-[11px] text-gray-400'>{day}</span></div>"
+                    "</div>"
+                    f"<div class='shrink-0 text-sm font-bold text-gray-900'>{amount}</div>"
+                    "</div>"
+                )
+            if len(rows) > 20:
+                out.append(
+                    f"<div class='pt-2 text-xs text-gray-400'>Showing latest 20 of {len(rows)}.</div>"
+                )
+            return "".join(out)
+
         people_nav_bits = []
         for e in engineers:
             eid = int(e.get("id") or 0)
@@ -16422,14 +16475,8 @@ body {{ background:#f7f6f3 !important; }}
             p_amt = (pending_by_person.get(eid) or {}).get("amount") or 0
             a_amt = (approved_by_person.get(eid) or {}).get("amount") or 0
             u_amt = (unpaid_by_person.get(eid) or {}).get("amount") or 0
-            if p_amt:
-                chips.append(
-                    f"<span class='rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-800'>Review {_exp_money(p_amt)}</span>"
-                )
-            if a_amt:
-                chips.append(
-                    f"<span class='rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-semibold text-emerald-800'>Approved {_exp_money(a_amt)}</span>"
-                )
+            p_count = int((pending_by_person.get(eid) or {}).get("count") or 0)
+            a_count = int((approved_by_person.get(eid) or {}).get("count") or 0)
             if u_amt:
                 chips.append(
                     f"<span class='rounded-full bg-rose-100 px-2 py-0.5 text-[11px] font-semibold text-rose-800'>Owed {_exp_money(u_amt)}</span>"
@@ -16438,18 +16485,62 @@ body {{ background:#f7f6f3 !important; }}
                 chips.append(
                     "<span class='rounded-full bg-gray-100 px-2 py-0.5 text-[11px] font-semibold text-gray-500'>Clear</span>"
                 )
-            people_nav_bits.append(
-                f"<a href='#person-{eid}' class='flex items-center justify-between gap-2 rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 hover:bg-white hover:border-indigo-200 hover:shadow-sm transition'>"
-                "<span class='min-w-0'>"
-                f"<span class='block truncate text-sm font-semibold text-gray-900'>{name}</span>"
-                f"<span class='block text-[11px] text-gray-500'>{escape(kind_label)}</span>"
-                "</span>"
-                f"<span class='flex flex-wrap justify-end gap-1'>{''.join(chips)}</span>"
-                "</a>"
+            p_panel = _receipt_panel_rows(
+                (status_receipts_by_person.get(eid) or {}).get("pending_review") or []
             )
+            a_panel = _receipt_panel_rows(
+                (status_receipts_by_person.get(eid) or {}).get("approved") or []
+            )
+            people_nav_bits.append(
+                "<div class='rounded-2xl border border-gray-200 bg-white p-3 shadow-sm'>"
+                "<div class='grid grid-cols-1 md:grid-cols-[minmax(160px,0.75fr)_minmax(0,1.25fr)] gap-3 items-stretch'>"
+                f"<a href='#person-{eid}' class='flex flex-col justify-center rounded-xl bg-gray-50 px-3 py-3 hover:bg-indigo-50 transition'>"
+                f"<span class='block truncate text-sm font-bold text-gray-950'>{name}</span>"
+                f"<span class='block text-[11px] text-gray-500'>{escape(kind_label)}</span>"
+                f"<span class='mt-2 flex flex-wrap gap-1'>{''.join(chips)}</span>"
+                "</a>"
+                "<div class='grid grid-cols-2 gap-2'>"
+                f"<button type='button' data-exp-panel='exp-panel-{eid}-pending' "
+                "class='text-left rounded-xl border border-amber-200 bg-amber-50 px-3 py-3 text-amber-900 hover:bg-amber-100 hover:shadow-sm transition'>"
+                "<span class='block text-[11px] font-semibold uppercase tracking-wide opacity-70'>Pending review</span>"
+                f"<span class='mt-1 block text-2xl font-bold'>{p_count}</span>"
+                f"<span class='mt-1 block text-xs opacity-75'>{_exp_money(p_amt)}</span>"
+                "</button>"
+                f"<button type='button' data-exp-panel='exp-panel-{eid}-approved' "
+                "class='text-left rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-3 text-emerald-900 hover:bg-emerald-100 hover:shadow-sm transition'>"
+                "<span class='block text-[11px] font-semibold uppercase tracking-wide opacity-70'>Approved</span>"
+                f"<span class='mt-1 block text-2xl font-bold'>{a_count}</span>"
+                f"<span class='mt-1 block text-xs opacity-75'>{_exp_money(a_amt)}</span>"
+                "</button>"
+                "</div></div>"
+                f"<div id='exp-panel-{eid}-pending' class='exp-person-panel hidden mt-3 rounded-xl border border-amber-200 bg-amber-50/60 p-3'>"
+                "<div class='mb-2 flex items-center justify-between gap-2'>"
+                f"<h3 class='text-sm font-bold text-amber-950'>{name} · Pending review</h3>"
+                "<button type='button' data-exp-close class='text-xs text-amber-800 hover:underline'>Close</button>"
+                "</div>"
+                f"{p_panel}</div>"
+                f"<div id='exp-panel-{eid}-approved' class='exp-person-panel hidden mt-3 rounded-xl border border-emerald-200 bg-emerald-50/60 p-3'>"
+                "<div class='mb-2 flex items-center justify-between gap-2'>"
+                f"<h3 class='text-sm font-bold text-emerald-950'>{name} · Approved</h3>"
+                "<button type='button' data-exp-close class='text-xs text-emerald-800 hover:underline'>Close</button>"
+                "</div>"
+                f"{a_panel}</div>"
+                "</div>"
+            )
+        people_nav_script = (
+            "<script>(function(){"
+            "function closePanels(root){(root||document).querySelectorAll('.exp-person-panel').forEach(function(p){p.classList.add('hidden');});}"
+            "document.addEventListener('click',function(e){"
+            "var btn=e.target.closest('[data-exp-panel]');"
+            "if(btn){var id=btn.getAttribute('data-exp-panel');var panel=document.getElementById(id);if(panel){var card=btn.closest('.rounded-2xl');closePanels(card);panel.classList.remove('hidden');panel.scrollIntoView({block:'nearest',behavior:'smooth'});}return;}"
+            "if(e.target.closest('[data-exp-close]')){var p=e.target.closest('.exp-person-panel');if(p)p.classList.add('hidden');}"
+            "});"
+            "})();</script>"
+        )
         people_nav_html = (
-            "<div class='mt-4 grid grid-cols-1 gap-2'>"
+            "<div class='mt-4 grid grid-cols-1 gap-3'>"
             + "".join(people_nav_bits)
+            + people_nav_script
             + "</div>"
             if people_nav_bits else
             "<div class='mt-4 rounded-xl border border-dashed border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-500'>No people set up yet.</div>"
@@ -16469,19 +16560,11 @@ body {{ background:#f7f6f3 !important; }}
               {acct_warning_html}
 
               <section class="rounded-3xl border border-gray-200 bg-white p-5 shadow-sm">
-                <div class="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(520px,0.95fr)] gap-5 items-start">
-                  <div class="min-w-0">
-                    <div class="text-xs font-semibold uppercase tracking-wide text-gray-400">Admin workspace</div>
-                    <h1 class="mt-1 text-2xl font-bold text-gray-950">Field Expenses</h1>
-                    <p class="mt-1 text-sm text-gray-500 max-w-2xl">Review receipt dumps, manage people, prepare payout batches, and keep the receipt-to-Xero flow tidy.</p>
-                    {people_nav_html}
-                  </div>
-                  <div class="grid grid-cols-2 gap-3">
-                    {_dashboard_stat("Pending review", str(status_counts.get("pending_review", 0)), _exp_money(pending_total), "amber" if status_counts.get("pending_review", 0) else "gray", href="#people-manager")}
-                    {_dashboard_stat("Approved", _exp_money(approved_total), "ready for admin action", "emerald" if approved_total else "gray", href="#people-manager")}
-                    {_dashboard_stat("Open batches", str(open_payout_count), f"{_exp_money(total_unbatched)} ready to batch", "indigo" if open_payout_count or total_unbatched else "gray", href="#payouts")}
-                    {_dashboard_stat("Unpaid", _exp_money(total_unpaid), "owed / not settled", "rose" if total_unpaid else "gray", href="#payouts")}
-                  </div>
+                <div class="min-w-0">
+                  <div class="text-xs font-semibold uppercase tracking-wide text-gray-400">Admin workspace</div>
+                  <h1 class="mt-1 text-2xl font-bold text-gray-950">Field Expenses</h1>
+                  <p class="mt-1 text-sm text-gray-500 max-w-2xl">Review receipt dumps, manage people, prepare payout batches, and keep the receipt-to-Xero flow tidy.</p>
+                  {people_nav_html}
                 </div>
               </section>
 
