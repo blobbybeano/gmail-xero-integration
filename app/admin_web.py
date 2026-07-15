@@ -13245,6 +13245,31 @@ body {{ background:#f7f6f3 !important; }}
                 "p-3 text-sm text-gray-700 text-center'>Receipt removed.</div>"
             )
 
+        def _engineer_can_delete_receipt(r: dict) -> bool:
+            status = (r.get("status") or "").strip().lower()
+            return (
+                status in {"pending_review", "approved"}
+                and not (r.get("xero_id") or "").strip()
+                and not r.get("settlement_id")
+            )
+
+        def _engineer_delete_receipt_form(r: dict, *, compact: bool = False) -> str:
+            if not _engineer_can_delete_receipt(r):
+                return ""
+            label = "Delete" if compact else "Delete receipt"
+            classes = (
+                "text-[11px] font-semibold text-rose-600 px-2 py-1"
+                if compact
+                else "text-xs font-semibold text-rose-600 px-3 py-2"
+            )
+            return (
+                f"<form method='post' action='/expenses/{escape(token)}/receipt/"
+                f"{escape(str(r.get('id') or ''))}/delete' "
+                "onsubmit=\"return confirm('Delete this receipt before it is submitted?')\">"
+                f"<button type='submit' class='{classes}'>{escape(label)}</button>"
+                "</form>"
+            )
+
         # Dump-batch notification — show a pulsing banner when the office has
         # uploaded invoices for this engineer that are still pending review/import.
         # Amber when recent (<24 h), red once overdue (≥24 h).
@@ -13400,17 +13425,20 @@ body {{ background:#f7f6f3 !important; }}
                     if (r.get("payment_source") or "company_card") == "owner_paid"
                     else ""
                 )
+                delete_form = _engineer_delete_receipt_form(r, compact=True)
                 rows.append(
-                    f"<a href='/expenses/{escape(token)}/review/{escape(r['id'])}' "
-                    "class='flex items-center justify-between gap-3 px-4 py-3 "
+                    "<div class='flex items-center justify-between gap-3 px-4 py-3 "
                     "hover:bg-gray-50 border-b border-gray-100 last:border-0'>"
-                    "<div class='min-w-0'>"
+                    f"<a href='/expenses/{escape(token)}/review/{escape(r['id'])}' "
+                    "class='min-w-0 flex-1 block'>"
                     f"<div class='font-medium text-gray-900 truncate'>{escape(merchant)}</div>"
-                    f"<div class='mt-0.5 flex items-center gap-2'>"
+                    f"<div class='mt-0.5 flex items-center gap-2 flex-wrap'>"
                     f"{_exp_status_badge(r.get('status'))}{cat_html}{source_html}</div>"
-                    "</div>"
-                    f"<div class='text-right font-semibold text-gray-900 "
-                    f"whitespace-nowrap'>{amount}</div></a>"
+                    "</a>"
+                    "<div class='text-right shrink-0'>"
+                    f"<div class='font-semibold text-gray-900 whitespace-nowrap'>{amount}</div>"
+                    f"{delete_form}"
+                    "</div></div>"
                 )
             today_total = sum(float(r.get("amount_inc") or 0) for r in today_list)
             today_html = (
@@ -13435,12 +13463,49 @@ body {{ background:#f7f6f3 !important; }}
             if day == today:
                 continue
             total = sum(float(x.get("amount_inc") or 0) for x in rows_)
+            day_rows = []
+            for r in rows_:
+                merchant = r.get("merchant") or r.get("ocr_merchant") or "Receipt"
+                amount = _exp_money(r.get("amount_inc"), r.get("currency") or "GBP")
+                cat_name = (r.get("category_account_name") or "").strip()
+                cat_html = (
+                    f"<span class='inline-block text-xs px-2 py-0.5 rounded-full "
+                    f"bg-indigo-50 text-indigo-700 mt-0.5'>{escape(cat_name)}</span>"
+                    if cat_name else ""
+                )
+                source_html = (
+                    "<span class='inline-block text-xs px-2 py-0.5 rounded-full "
+                    "bg-emerald-50 text-emerald-700 mt-0.5'>Personal card</span>"
+                    if (r.get("payment_source") or "company_card") == "owner_paid"
+                    else ""
+                )
+                delete_form = _engineer_delete_receipt_form(r, compact=True)
+                day_rows.append(
+                    "<div class='flex items-center justify-between gap-3 px-4 py-3 "
+                    "border-t border-gray-100 first:border-t-0'>"
+                    f"<a href='/expenses/{escape(token)}/review/{escape(r['id'])}' "
+                    "class='min-w-0 flex-1 block'>"
+                    f"<div class='font-medium text-gray-900 truncate'>{escape(merchant)}</div>"
+                    f"<div class='mt-0.5 flex items-center gap-2 flex-wrap'>"
+                    f"{_exp_status_badge(r.get('status'))}{cat_html}{source_html}</div>"
+                    "</a>"
+                    "<div class='text-right shrink-0'>"
+                    f"<div class='font-semibold text-gray-900 whitespace-nowrap'>{amount}</div>"
+                    f"{delete_form}"
+                    "</div></div>"
+                )
             prev_lines.append(
-                "<div class='flex items-center justify-between px-4 py-3 "
-                "border-b border-gray-100 last:border-0'>"
+                "<details class='border-b border-gray-100 last:border-0'>"
+                "<summary class='list-none cursor-pointer flex items-center justify-between px-4 py-3'>"
                 f"<div><div class='font-medium text-gray-900'>{escape(_exp_day_label(day))}</div>"
-                f"<div class='text-xs text-gray-500'>{len(rows_)} receipt(s)</div></div>"
-                f"<div class='font-semibold text-gray-900'>{_exp_money(total)}</div></div>"
+                f"<div class='text-xs text-gray-500'>{len(rows_)} receipt(s) &middot; tap to view</div></div>"
+                "<div class='text-right'>"
+                f"<div class='font-semibold text-gray-900'>{_exp_money(total)}</div>"
+                "<div class='text-[11px] text-gray-400'>Open</div>"
+                "</div></summary>"
+                "<div class='bg-gray-50/60'>"
+                + "".join(day_rows)
+                + "</div></details>"
             )
         prev_html = ""
         if prev_lines:
@@ -14144,6 +14209,22 @@ body {{ background:#f7f6f3 !important; }}
                 f"text-xs text-blue-800'>This receipt is already "
                 f"{escape(rec.get('status'))}. You can still correct the details.</div>"
             )
+        can_delete = (
+            (rec.get("status") or "").strip().lower() in {"pending_review", "approved"}
+            and not (rec.get("xero_id") or "").strip()
+            and not rec.get("settlement_id")
+        )
+        delete_html = ""
+        if can_delete:
+            delete_html = (
+                f"<form method='post' action='/expenses/{escape(token)}/receipt/"
+                f"{escape(rid)}/delete' "
+                "onsubmit=\"return confirm('Delete this receipt before it is submitted?')\">"
+                "<button type='submit' class='w-full py-3 rounded-xl border "
+                "border-rose-200 bg-white text-rose-700 font-semibold text-sm "
+                "active:bg-rose-50'>Delete receipt</button>"
+                "</form>"
+            )
 
         source = rec.get("payment_source") or "company_card"
         source_html = ""
@@ -14228,6 +14309,7 @@ body {{ background:#f7f6f3 !important; }}
                   Approve &amp; Save &#10003;
                 </button>
               </form>
+              {delete_html}
             </main>
             <script>
             (function() {{
@@ -14355,6 +14437,33 @@ body {{ background:#f7f6f3 !important; }}
         if return_to.startswith(f"/expenses/{token}/review-upload"):
             return redirect(return_to)
         return redirect(f"/expenses/{token}?flash=approved")
+
+    @app.post("/expenses/<token>/receipt/<rid>/delete")
+    def expense_engineer_delete_receipt(token: str, rid: str):
+        db = config.admin_db_file
+        eng = exp_store.get_engineer_by_token(db, token)
+        if not eng or not eng.get("active"):
+            return _exp_error_page("This expenses link is not active.")
+        if session.get("engineer_id") != eng["id"]:
+            return redirect(url_for("portal_login"))
+        rec = exp_store.get_receipt(db, rid)
+        if not rec or rec.get("engineer_id") != eng["id"]:
+            return _exp_error_page("Receipt not found.")
+        status = (rec.get("status") or "").strip().lower()
+        if (
+            status not in {"pending_review", "approved"}
+            or (rec.get("xero_id") or "").strip()
+            or rec.get("settlement_id")
+        ):
+            return _exp_error_page(
+                "This receipt has already been submitted or linked to a payment, "
+                "so it cannot be deleted from the engineer screen.",
+                400,
+            )
+        stored_file = rec.get("stored_file") or ""
+        exp_store.delete_receipt(db, rid)
+        _exp_safe_remove_file(db, stored_file)
+        return redirect(f"/expenses/{token}?flash=deleted")
 
     @app.get("/expenses/<token>/photo/<rid>")
     def expense_engineer_photo(token: str, rid: str):
