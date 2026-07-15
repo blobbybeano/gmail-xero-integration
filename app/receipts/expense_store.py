@@ -60,6 +60,7 @@ def _ensure_tables(db_path: str) -> None:
                 customer_calendar_id TEXT NOT NULL DEFAULT '',
                 allow_owner_paid INTEGER NOT NULL DEFAULT 0,
                 owner_paid_account_code TEXT NOT NULL DEFAULT '',
+                owner_no_payout INTEGER NOT NULL DEFAULT 0,
                 active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL
             )
@@ -164,6 +165,8 @@ def _ensure_tables(db_path: str) -> None:
              "ALTER TABLE expense_engineers ADD COLUMN allow_owner_paid INTEGER NOT NULL DEFAULT 0"),
             ("owner_paid_account_code",
              "ALTER TABLE expense_engineers ADD COLUMN owner_paid_account_code TEXT NOT NULL DEFAULT ''"),
+            ("owner_no_payout",
+             "ALTER TABLE expense_engineers ADD COLUMN owner_no_payout INTEGER NOT NULL DEFAULT 0"),
         ):
             if _col not in _eng_cols:
                 conn.execute(_ddl)
@@ -235,6 +238,7 @@ def create_engineer(
     customer_calendar_id: str = "",
     allow_owner_paid: bool | int = False,
     owner_paid_account_code: str = "",
+    owner_no_payout: bool | int = False,
 ) -> dict[str, Any]:
     name = (name or "").strip()
     if not name:
@@ -254,14 +258,15 @@ def create_engineer(
                 (token, name, kind, xero_contact_id, xero_contact_name,
                  expense_account_code, payment_account_code, customer_calendar_id,
                  allow_owner_paid,
-                 owner_paid_account_code, active, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                 owner_paid_account_code, owner_no_payout, active, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
             """,
             (
                 token, name, kind, xero_contact_id.strip(),
                 xero_contact_name.strip(), expense_account_code.strip(),
                 payment_account_code.strip(), customer_calendar_id.strip(),
                 1 if allow_owner_paid else 0, owner_paid_account_code.strip(),
+                1 if owner_no_payout else 0,
                 _now_iso(),
             ),
         )
@@ -278,7 +283,7 @@ def update_engineer(db_path: str, engineer_id: int, **fields) -> dict[str, Any] 
         "expense_account_code", "payment_account_code", "customer_calendar_id",
         "active",
         "username", "password_hash", "plaid_account_id",
-        "allow_owner_paid", "owner_paid_account_code",
+        "allow_owner_paid", "owner_paid_account_code", "owner_no_payout",
     }
     sets = {k: v for k, v in fields.items() if k in allowed}
     if not sets:
@@ -289,6 +294,8 @@ def update_engineer(db_path: str, engineer_id: int, **fields) -> dict[str, Any] 
         sets["active"] = 1 if sets["active"] else 0
     if "allow_owner_paid" in sets:
         sets["allow_owner_paid"] = 1 if sets["allow_owner_paid"] else 0
+    if "owner_no_payout" in sets:
+        sets["owner_no_payout"] = 1 if sets["owner_no_payout"] else 0
     cols = ", ".join(f"{k} = ?" for k in sets)
     with _conn(db_path) as conn:
         conn.execute(

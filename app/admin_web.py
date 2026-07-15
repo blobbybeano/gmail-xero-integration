@@ -1934,6 +1934,11 @@ def _expense_owner_paid_enabled(eng: dict | None) -> bool:
     )
 
 
+def _expense_owner_no_payout(eng: dict | None) -> bool:
+    """True when personal receipts are owner/director spending, not money owed."""
+    return bool((eng or {}).get("owner_no_payout"))
+
+
 def _expense_normalise_payment_source(
     eng: dict | None,
     requested: str | None,
@@ -15533,7 +15538,7 @@ body {{ background:#f7f6f3 !important; }}
             kind = e.get("kind") or "company_card"
             if kind == "subcontractor":
                 payout_people.append((e, None, "Subcontractor receipts"))
-            elif _expense_owner_paid_enabled(e):
+            elif _expense_owner_paid_enabled(e) and not _expense_owner_no_payout(e):
                 payout_people.append((e, "owner_paid", "Personal reimbursements"))
         for sub, pay_source, payout_label in payout_people:
             if (sub.get("kind") or "") == "subcontractor":
@@ -15825,6 +15830,7 @@ body {{ background:#f7f6f3 !important; }}
                     f"class='{_sel_cls}' placeholder='blank = default'>"
                 )
             owner_checked = "checked" if e.get("allow_owner_paid") else ""
+            owner_no_payout_checked = "checked" if _expense_owner_no_payout(e) else ""
             owner_account_code = e.get("owner_paid_account_code") or ""
             if owner_paid_accounts:
                 owner_account_field = (
@@ -15903,7 +15909,7 @@ body {{ background:#f7f6f3 !important; }}
                     "<a href='/cardfeed' class='text-indigo-600'>Card feed</a> page to link a card.</p>"
                 )
             eng_cards.append(
-                "<details class='rounded-xl border border-gray-200 bg-white overflow-hidden group'>"
+                f"<details id='person-{int(e['id'])}' class='rounded-xl border border-gray-200 bg-white overflow-hidden group scroll-mt-24'>"
                 "<summary class='flex items-center justify-between gap-2 p-4 cursor-pointer "
                 "list-none select-none hover:bg-gray-50'>"
                 f"<div class='font-semibold text-gray-900 flex items-center gap-2'>{escape(e['name'])} "
@@ -15974,6 +15980,9 @@ body {{ background:#f7f6f3 !important; }}
                 f"<input type='checkbox' name='allow_owner_paid' value='1' {owner_checked} class='mt-1'> "
                 "<span>Allow personal / owner-paid receipt option</span></label>"
                 "<p class='text-xs text-emerald-700 mt-1'>Only enabled engineers will see a personal-card choice on the photo screen.</p>"
+                "<label class='flex items-start gap-2 text-sm text-emerald-950 rounded-md border border-emerald-200 bg-white/70 p-2'>"
+                f"<input type='checkbox' name='owner_no_payout' value='1' {owner_no_payout_checked} class='mt-1'> "
+                "<span><span class='font-semibold'>Business owner / director:</span> do not show these personal receipts as money owed or create payment batches.</span></label>"
                 "<div class='rounded-md border border-emerald-200 bg-white/80 p-2'>"
                 "<label class='block text-xs font-semibold text-emerald-900 mb-1'>"
                 f"Xero account to post these personal receipts to{_owner_mark}</label>"
@@ -16223,6 +16232,9 @@ body {{ background:#f7f6f3 !important; }}
             "<input type='checkbox' name='allow_owner_paid' value='1' class='mt-1'>"
             "<span>Allow personal / owner-paid receipt option</span></label>"
             "<p class='text-xs text-emerald-700 mt-1'>Use this only for people who should be able to submit receipts paid from a non-company card.</p>"
+            "<label class='flex items-start gap-2 text-sm text-emerald-950 rounded-md border border-emerald-200 bg-white/70 p-2'>"
+            "<input type='checkbox' name='owner_no_payout' value='1' class='mt-1'>"
+            "<span><span class='font-semibold'>Business owner / director:</span> do not show these personal receipts as money owed or create payment batches.</span></label>"
             "<div class='rounded-md border border-emerald-200 bg-white/80 p-2'>"
             "<label class='block text-xs font-semibold text-emerald-900 mb-1'>"
             "Xero account to post these personal receipts to"
@@ -16238,6 +16250,22 @@ body {{ background:#f7f6f3 !important; }}
         receipt_total = 0.0
         approved_total = 0.0
         pending_total = 0.0
+        engineer_by_id = {int(e["id"]): e for e in engineers if e.get("id") is not None}
+        pending_by_person: dict[int, dict] = {}
+        approved_by_person: dict[int, dict] = {}
+
+        def _add_person_total(bucket: dict[int, dict], engineer_id, amount: float) -> None:
+            try:
+                eid = int(engineer_id)
+            except (TypeError, ValueError):
+                return
+            eng = engineer_by_id.get(eid)
+            if not eng:
+                return
+            row = bucket.setdefault(eid, {"engineer": eng, "count": 0, "amount": 0.0})
+            row["count"] += 1
+            row["amount"] += amount
+
         for r in all_receipts:
             st = (r.get("status") or "unknown").strip().lower()
             status_counts[st] = status_counts.get(st, 0) + 1
@@ -16248,20 +16276,42 @@ body {{ background:#f7f6f3 !important; }}
             receipt_total += amt
             if st == "approved":
                 approved_total += amt
+                _add_person_total(approved_by_person, r.get("engineer_id"), amt)
             elif st == "pending_review":
                 pending_total += amt
+                _add_person_total(pending_by_person, r.get("engineer_id"), amt)
 
-        people_total = len(engineers)
-        active_people = sum(1 for e in engineers if e.get("active"))
         total_unpaid = 0.0
+        total_unbatched = 0.0
+        unpaid_by_person: dict[int, dict] = {}
         open_payout_count = 0
         overdue_payout_count = 0
         now_utc = dt.datetime.now(dt.timezone.utc)
-        for e in engineers:
+        for e, pay_source, _payout_label in payout_people:
             try:
-                total_unpaid += float(exp_store.amount_unpaid_to_engineer(db, e["id"]) or 0)
+                unpaid_amt = float(
+                    exp_store.amount_unpaid_to_engineer(
+                        db, e["id"], payment_source=pay_source
+                    ) or 0
+                )
             except Exception:
-                pass
+                unpaid_amt = 0.0
+            try:
+                unbatched_amt = float(
+                    exp_store.amount_owed_to_engineer(
+                        db, e["id"], payment_source=pay_source
+                    ) or 0
+                )
+            except Exception:
+                unbatched_amt = 0.0
+            total_unpaid += unpaid_amt
+            total_unbatched += unbatched_amt
+            if unpaid_amt > 0:
+                row = unpaid_by_person.setdefault(
+                    int(e["id"]), {"engineer": e, "count": 0, "amount": 0.0}
+                )
+                row["count"] += 1
+                row["amount"] += unpaid_amt
             try:
                 settlements = exp_store.list_settlements_for_engineer(db, e["id"])
             except Exception:
@@ -16280,7 +16330,39 @@ body {{ background:#f7f6f3 !important; }}
                     except Exception:
                         pass
 
-        def _dashboard_stat(label: str, value: str, sub: str, tone: str) -> str:
+        def _person_summary(bucket: dict[int, dict], *, empty: str) -> str:
+            rows = sorted(
+                bucket.values(),
+                key=lambda x: float(x.get("amount") or 0),
+                reverse=True,
+            )[:3]
+            if not rows:
+                return f"<span class='text-xs opacity-75'>{escape(empty)}</span>"
+            bits = []
+            for row in rows:
+                eng = row.get("engineer") or {}
+                name = escape(str(eng.get("name") or "Person"))
+                amount = _exp_money(row.get("amount") or 0)
+                eid = int(eng.get("id") or 0)
+                bits.append(
+                    f"<a href='#person-{eid}' class='block text-xs underline decoration-transparent "
+                    f"hover:decoration-current'>{name} · {amount}</a>"
+                )
+            if len(bucket) > len(rows):
+                bits.append(
+                    f"<span class='block text-[11px] opacity-65'>+{len(bucket) - len(rows)} more</span>"
+                )
+            return "".join(bits)
+
+        def _dashboard_stat(
+            label: str,
+            value: str,
+            sub: str,
+            tone: str,
+            *,
+            href: str = "",
+            detail_html: str = "",
+        ) -> str:
             tones = {
                 "amber": "border-amber-200 bg-amber-50 text-amber-900",
                 "emerald": "border-emerald-200 bg-emerald-50 text-emerald-900",
@@ -16289,12 +16371,16 @@ body {{ background:#f7f6f3 !important; }}
                 "rose": "border-rose-200 bg-rose-50 text-rose-900",
             }
             cls = tones.get(tone, tones["gray"])
+            tag = "a" if href else "div"
+            href_attr = f" href='{escape(href)}'" if href else ""
+            hover = " hover:shadow-sm hover:-translate-y-0.5 transition" if href else ""
             return (
-                f"<div class='rounded-2xl border {cls} p-4'>"
+                f"<{tag}{href_attr} class='block rounded-2xl border {cls} p-4{hover}'>"
                 f"<div class='text-xs font-semibold uppercase tracking-wide opacity-70'>{escape(label)}</div>"
                 f"<div class='mt-1 text-2xl font-bold'>{value}</div>"
                 f"<div class='mt-1 text-xs opacity-75'>{escape(sub)}</div>"
-                "</div>"
+                + (f"<div class='mt-2 space-y-0.5'>{detail_html}</div>" if detail_html else "")
+                + f"</{tag}>"
             )
 
         urgent_notes = []
@@ -16342,10 +16428,10 @@ body {{ background:#f7f6f3 !important; }}
                     <p class="mt-1 text-sm text-gray-500 max-w-2xl">Review receipt dumps, manage people, prepare payout batches, and keep the receipt-to-Xero flow tidy.</p>
                   </div>
                   <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 lg:min-w-[620px]">
-                    {_dashboard_stat("Pending review", str(status_counts.get("pending_review", 0)), _exp_money(pending_total), "amber" if status_counts.get("pending_review", 0) else "gray")}
-                    {_dashboard_stat("Approved", _exp_money(approved_total), "ready for admin action", "emerald" if approved_total else "gray")}
-                    {_dashboard_stat("People", f"{active_people}/{people_total}", "active users", "indigo")}
-                    {_dashboard_stat("Unpaid", _exp_money(total_unpaid), "owed / not settled", "rose" if total_unpaid else "gray")}
+                    {_dashboard_stat("Pending review", str(status_counts.get("pending_review", 0)), _exp_money(pending_total), "amber" if status_counts.get("pending_review", 0) else "gray", href="#people-manager", detail_html=_person_summary(pending_by_person, empty="Nothing waiting"))}
+                    {_dashboard_stat("Approved", _exp_money(approved_total), "ready for admin action", "emerald" if approved_total else "gray", href="#people-manager", detail_html=_person_summary(approved_by_person, empty="Nothing approved"))}
+                    {_dashboard_stat("Open batches", str(open_payout_count), f"{_exp_money(total_unbatched)} ready to batch", "indigo" if open_payout_count or total_unbatched else "gray", href="#payouts")}
+                    {_dashboard_stat("Unpaid", _exp_money(total_unpaid), "owed / not settled", "rose" if total_unpaid else "gray", href="#payouts", detail_html=_person_summary(unpaid_by_person, empty="Nothing owed"))}
                   </div>
                 </div>
               </section>
@@ -16374,7 +16460,7 @@ body {{ background:#f7f6f3 !important; }}
                   </div>
                 </section>
 
-                <section class="lg:col-span-2 rounded-2xl border border-gray-200 bg-white p-4 shadow-sm space-y-4">
+                <section id="payouts" class="lg:col-span-2 rounded-2xl border border-gray-200 bg-white p-4 shadow-sm space-y-4 scroll-mt-24">
                   <div class="flex items-start justify-between gap-3">
                     <div>
                       <h2 class="font-semibold text-gray-950">Payouts &amp; batches</h2>
@@ -16385,7 +16471,7 @@ body {{ background:#f7f6f3 !important; }}
                 </section>
               </div>
 
-              <section class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm space-y-3">
+              <section id="people-manager" class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm space-y-3 scroll-mt-24">
                 <div class="flex items-start justify-between gap-3">
                   <div>
                     <h2 class="font-semibold text-gray-950">People manager</h2>
@@ -16617,6 +16703,7 @@ body {{ background:#f7f6f3 !important; }}
             owner_paid_account_code=(
                 request.form.get("owner_paid_account_code") or ""
             ).strip(),
+            owner_no_payout=1 if request.form.get("owner_no_payout") else 0,
         )
         plaid_account_id = (request.form.get("plaid_account_id") or "").strip()
         if plaid_account_id and kind == "company_card":
@@ -16649,6 +16736,7 @@ body {{ background:#f7f6f3 !important; }}
             owner_paid_account_code=(
                 request.form.get("owner_paid_account_code") or ""
             ).strip(),
+            owner_no_payout=1 if request.form.get("owner_no_payout") else 0,
             username=username,
             active=1 if request.form.get("active") else 0,
         )
