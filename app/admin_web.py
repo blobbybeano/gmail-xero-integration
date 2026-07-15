@@ -16429,6 +16429,118 @@ body {{ background:#f7f6f3 !important; }}
             "<span class='font-semibold'>All quiet.</span> No urgent Field Expenses items right now.</div>"
         )
 
+        def _parse_date(v):
+            try:
+                return dt.date.fromisoformat(str(v or "")[:10])
+            except (TypeError, ValueError):
+                return None
+
+        today_local = dt.datetime.now().date()
+        this_monday = today_local - dt.timedelta(days=today_local.weekday())
+        try:
+            _csv_status = cardfeed.csv_status(db) or {}
+        except Exception:
+            _csv_status = {}
+        last_bank_upload = str(_csv_status.get("last_upload_at") or "").strip()
+        last_bank_upload_date = _parse_date(last_bank_upload)
+        bank_upload_stale = not last_bank_upload_date or last_bank_upload_date < this_monday
+        upload_cls = (
+            "border-amber-300 bg-amber-50 text-amber-950 animate-pulse"
+            if bank_upload_stale else
+            "border-emerald-200 bg-emerald-50 text-emerald-950"
+        )
+        upload_status_text = (
+            "Statement upload due: update the bank CSV for this week."
+            if bank_upload_stale else
+            f"Bank statement updated {last_bank_upload[:16]}."
+        )
+        bank_upload_html = (
+            f"<a href='/cardfeed' class='mt-4 flex items-center justify-between gap-3 rounded-2xl border {upload_cls} px-4 py-3 hover:shadow-sm transition'>"
+            "<span>"
+            "<span class='block text-sm font-bold'>Upload bank statement</span>"
+            f"<span class='block text-xs opacity-75'>{escape(upload_status_text)}</span>"
+            "</span>"
+            "<span class='rounded-lg bg-white/80 px-3 py-1.5 text-xs font-bold'>Open upload</span>"
+            "</a>"
+        )
+
+        try:
+            card_transactions = cardfeed.get_cached_transactions(db) or []
+        except Exception:
+            card_transactions = []
+
+        def _receipt_candidates_for_card(eng_id: int, amount: float, day: dt.date):
+            candidates = []
+            for r in all_receipts:
+                if int(r.get("engineer_id") or 0) != eng_id:
+                    continue
+                if (r.get("payment_source") or "company_card") != "company_card":
+                    continue
+                try:
+                    ra = float(r.get("amount_inc") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if abs(ra - amount) > 1.0:
+                    continue
+                rd = _parse_date(r.get("purchased_on") or r.get("created_at"))
+                if rd is None or abs((rd - day).days) <= 31:
+                    candidates.append((abs((rd - day).days) if rd else 999, r))
+            candidates.sort(key=lambda x: x[0])
+            return [r for _, r in candidates]
+
+        def _week_start(day: dt.date) -> dt.date:
+            return day - dt.timedelta(days=day.weekday())
+
+        def _week_label(start: dt.date) -> str:
+            if start == this_monday:
+                return "This week"
+            if start == this_monday - dt.timedelta(days=7):
+                return "Last week"
+            return f"Week of {start.strftime('%d %b')}"
+
+        def _card_outstanding_for_engineer(eng: dict) -> tuple[list[dict], dict[dt.date, list[dict]]]:
+            acct = str(eng.get("plaid_account_id") or "").strip()
+            if not acct:
+                return [], {}
+            txs = []
+            for idx, t in enumerate(card_transactions):
+                if str(t.get("account_id") or "").strip() != acct:
+                    continue
+                try:
+                    amount = float(t.get("amount") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if amount <= 0:
+                    continue
+                day = _parse_date(t.get("date"))
+                if not day:
+                    continue
+                txs.append({
+                    "key": str(t.get("transaction_id") or f"{day.isoformat()}:{amount:.2f}:{idx}"),
+                    "date": day,
+                    "amount": amount,
+                    "name": str(t.get("name") or "Card payment"),
+                })
+            txs.sort(key=lambda x: x["date"])
+            used_receipts: set[str] = set()
+            outstanding = []
+            for tx in txs:
+                matched = False
+                for rec in _receipt_candidates_for_card(int(eng["id"]), tx["amount"], tx["date"]):
+                    rid = str(rec.get("id") or "")
+                    if rid and rid in used_receipts:
+                        continue
+                    if rid:
+                        used_receipts.add(rid)
+                    matched = True
+                    break
+                if not matched:
+                    outstanding.append(tx)
+            weeks: dict[dt.date, list[dict]] = {}
+            for tx in outstanding:
+                weeks.setdefault(_week_start(tx["date"]), []).append(tx)
+            return outstanding, weeks
+
         def _submitted_stamp(value: str) -> str:
             raw = str(value or "").strip()
             if not raw:
@@ -16527,6 +16639,8 @@ body {{ background:#f7f6f3 !important; }}
             payout_summary = payout_summary_by_engineer.get(eid) or {}
             payout_btn = ""
             payout_panel = ""
+            card_btn = ""
+            card_panel = ""
             box_grid = "grid-cols-2"
             if payout_card:
                 box_grid = "grid-cols-3"
@@ -16545,6 +16659,59 @@ body {{ background:#f7f6f3 !important; }}
                     "<button type='button' data-exp-close class='rounded-lg border border-indigo-300 bg-white px-3 py-1.5 text-sm font-bold text-indigo-800 hover:bg-indigo-50'>Close</button>"
                     "</div>"
                     f"{payout_card}</div>"
+                )
+            elif str(e.get("plaid_account_id") or "").strip():
+                outstanding, weekly_outstanding = _card_outstanding_for_engineer(e)
+                week_items = []
+                for start, rows in sorted(weekly_outstanding.items(), reverse=True)[:5]:
+                    total = sum(float(r.get("amount") or 0) for r in rows)
+                    week_items.append(
+                        "<div class='flex items-center justify-between gap-2 rounded-lg border border-sky-100 bg-white/80 px-2 py-1'>"
+                        f"<span class='text-xs font-semibold text-sky-950'>{escape(_week_label(start))}</span>"
+                        f"<span class='text-xs text-sky-700'>{len(rows)} · {_exp_money(total)}</span>"
+                        "</div>"
+                    )
+                if not week_items:
+                    week_items.append(
+                        "<div class='rounded-lg border border-sky-100 bg-white/80 px-2 py-2 text-xs text-sky-700'>No outstanding card receipts.</div>"
+                    )
+                tx_rows = []
+                for tx in sorted(outstanding, key=lambda x: x["date"], reverse=True)[:40]:
+                    tx_rows.append(
+                        "<div class='flex items-center justify-between gap-3 py-2 border-b border-sky-100 last:border-0'>"
+                        "<div class='min-w-0'>"
+                        f"<div class='text-sm font-semibold text-gray-900 truncate'>{escape(tx.get('name') or 'Card payment')}</div>"
+                        f"<div class='text-[11px] text-gray-500'>{escape(tx['date'].strftime('%d/%m/%Y'))}</div>"
+                        "</div>"
+                        f"<div class='text-sm font-bold text-gray-900'>{_exp_money(tx.get('amount') or 0)}</div>"
+                        "</div>"
+                    )
+                tx_rows_html = "".join(tx_rows) or (
+                    "<div class='rounded-xl border border-dashed border-sky-200 bg-white/70 px-3 py-3 text-sm text-sky-700'>Nothing outstanding for this card.</div>"
+                )
+                box_grid = "grid-cols-3"
+                card_btn = (
+                    f"<button type='button' data-exp-panel='exp-panel-{eid}-card' "
+                    "class='text-left rounded-xl border border-sky-200 bg-sky-50 px-3 py-3 text-sky-900 hover:bg-sky-100 hover:shadow-sm transition'>"
+                    "<span class='block text-[11px] font-semibold uppercase tracking-wide opacity-70'>Card receipts</span>"
+                    f"<span class='mt-1 block text-2xl font-bold'>{len(outstanding)}</span>"
+                    f"<span class='mt-1 block text-xs opacity-75'>{_exp_money(sum(float(r.get('amount') or 0) for r in outstanding))} outstanding</span>"
+                    "</button>"
+                )
+                card_panel = (
+                    f"<div id='exp-panel-{eid}-card' class='exp-person-panel hidden mt-3 rounded-xl border border-sky-200 bg-sky-50/60 p-3'>"
+                    "<div class='mb-2 flex items-center justify-between gap-2'>"
+                    f"<h3 class='text-sm font-bold text-sky-950'>{name} · Outstanding card receipts</h3>"
+                    "<button type='button' data-exp-close class='rounded-lg border border-sky-300 bg-white px-3 py-1.5 text-sm font-bold text-sky-800 hover:bg-sky-50'>Close</button>"
+                    "</div>"
+                    "<div class='grid grid-cols-1 sm:grid-cols-[220px_minmax(0,1fr)] gap-3'>"
+                    "<div class='space-y-1'>"
+                    + "".join(week_items)
+                    + "</div>"
+                    f"<div class='rounded-xl border border-sky-100 bg-white px-3'>{tx_rows_html}</div>"
+                    "</div>"
+                    "<p class='mt-2 text-[11px] text-sky-700'>This compares uploaded bank-statement card payments with submitted receipts for this engineer. It does not call Xero.</p>"
+                    "</div>"
                 )
             people_nav_bits.append(
                 "<div class='rounded-2xl border border-gray-200 bg-white p-3 shadow-sm'>"
@@ -16568,6 +16735,7 @@ body {{ background:#f7f6f3 !important; }}
                 f"<span class='mt-1 block text-xs opacity-75'>{_exp_money(a_amt)}</span>"
                 "</button>"
                 f"{payout_btn}"
+                f"{card_btn}"
                 "</div></div>"
                 f"<div id='exp-panel-{eid}-pending' class='exp-person-panel hidden mt-3 rounded-xl border border-amber-200 bg-amber-50/60 p-3'>"
                 "<div class='mb-2 flex items-center justify-between gap-2'>"
@@ -16582,6 +16750,7 @@ body {{ background:#f7f6f3 !important; }}
                 "</div>"
                 f"{a_panel}</div>"
                 f"{payout_panel}"
+                f"{card_panel}"
                 "</div>"
             )
         people_nav_script = (
@@ -16621,6 +16790,7 @@ body {{ background:#f7f6f3 !important; }}
                   <div class="text-xs font-semibold uppercase tracking-wide text-gray-400">Admin workspace</div>
                   <h1 class="mt-1 text-2xl font-bold text-gray-950">Field Expenses</h1>
                   <p class="mt-1 text-sm text-gray-500 max-w-2xl">Review receipt dumps, manage people, prepare payout batches, and keep the receipt-to-Xero flow tidy.</p>
+                  {bank_upload_html}
                   {people_nav_html}
                 </div>
               </section>
@@ -16636,11 +16806,6 @@ body {{ background:#f7f6f3 !important; }}
                     <a href="/receipts/expenses/dump"
                        class="flex items-center justify-center px-4 py-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold shadow-sm">
                       Receipt dump
-                    </a>
-                    <a href="/cardfeed"
-                       class="flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-white border border-gray-200 hover:bg-gray-50 text-gray-700 text-sm font-semibold shadow-sm">
-                      <svg class="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
-                      Upload bank statement (CSV)
                     </a>
                     <a href="/receipts/expenses/test"
                        class="flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-white border border-gray-200 hover:bg-gray-50 text-gray-700 text-sm font-semibold shadow-sm">
