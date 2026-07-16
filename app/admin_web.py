@@ -3966,26 +3966,89 @@ def _save_admin_auth_file(config: AppConfig, username: str, password: str) -> No
     payload = {
         "username": username.strip(),
         "password": password,
+        "users": [
+            {
+                "username": username.strip(),
+                "password": password,
+                "role": "admin",
+            }
+        ],
         "updated_at": int(time.time()),
     }
     path.write_text(json.dumps(payload, indent=2))
 
 
-def _load_admin_auth(config: AppConfig) -> tuple[str, str]:
+def _load_admin_users(config: AppConfig) -> list[dict[str, str]]:
     """
-    Read admin auth from persistent file first, env fallback second.
+    Read admin users from persistent file first, env fallback second.
+
+    Older deployments stored a single ``username`` / ``password`` pair. Keep
+    accepting that while allowing a ``users`` list for multiple admin logins.
     """
     path = Path(config.admin_auth_file)
+    users: list[dict[str, str]] = []
     if path.exists():
         try:
             raw = json.loads(path.read_text())
+            for item in raw.get("users") or []:
+                if not isinstance(item, dict):
+                    continue
+                username = str(item.get("username", "")).strip()
+                password = str(item.get("password", ""))
+                if username and password:
+                    users.append(
+                        {
+                            "username": username,
+                            "password": password,
+                            "role": str(item.get("role") or "admin"),
+                        }
+                    )
             username = str(raw.get("username", "")).strip()
             password = str(raw.get("password", ""))
             if username and password:
-                return username, password
+                if not any(u["username"] == username for u in users):
+                    users.insert(
+                        0,
+                        {
+                            "username": username,
+                            "password": password,
+                            "role": "admin",
+                        },
+                    )
         except Exception:
             pass
+    if not users and config.admin_username and config.admin_password:
+        users.append(
+            {
+                "username": config.admin_username,
+                "password": config.admin_password,
+                "role": "admin",
+            }
+        )
+    return users
+
+
+def _load_admin_auth(config: AppConfig) -> tuple[str, str]:
+    users = _load_admin_users(config)
+    if users:
+        return users[0]["username"], users[0]["password"]
     return config.admin_username, config.admin_password
+
+
+def _check_admin_auth(config: AppConfig, username: str, password: str) -> bool:
+    username = (username or "").strip()
+    password = password or ""
+    for user in _load_admin_users(config):
+        expected_user = user.get("username", "")
+        expected_pass = user.get("password", "")
+        if (
+            expected_user
+            and expected_pass
+            and secrets.compare_digest(username, expected_user)
+            and secrets.compare_digest(password, expected_pass)
+        ):
+            return True
+    return False
 
 
 def _bootstrap_admin_auth(config: AppConfig) -> None:
@@ -4120,9 +4183,9 @@ def create_app() -> Flask:
     def login_post():
         username = (request.form.get("username") or "").strip()
         password = request.form.get("password") or ""
-        expected_user, expected_pass = _load_admin_auth(config)
-        if username == expected_user and password == expected_pass:
+        if _check_admin_auth(config, username, password):
             session["logged_in"] = True
+            session["admin_username"] = username
             return redirect(url_for("dashboard"))
         return _page(f"""
         <div class="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-50 to-blue-100 px-4">
