@@ -12946,6 +12946,69 @@ body {{ background:#f7f6f3 !important; }}
                 done += 1
         return done
 
+    def _submit_owner_no_payout_receipt_to_xero(eng, receipt_id: str) -> str:
+        """Immediately post owner-paid receipts that are not reimbursements.
+
+        Ben/director personal spend is different from subcontractor spend: there
+        is no later office payout to wait for. Once the owner has reviewed the
+        receipt, create one paid Xero bill via the configured owner-paid account
+        and link that Xero bill back to the receipt.
+        """
+        if not _expense_owner_no_payout(eng):
+            return ""
+        if not _expense_owner_paid_enabled(eng):
+            return ""
+        db = config.admin_db_file
+        rec = exp_store.get_receipt(db, receipt_id)
+        if not rec:
+            return ""
+        if (rec.get("payment_source") or "company_card") != "owner_paid":
+            return ""
+        if (rec.get("xero_id") or "").strip() or rec.get("settlement_id"):
+            return ""
+        try:
+            amount = round(float(rec.get("amount_inc") or 0), 2)
+        except (TypeError, ValueError):
+            amount = 0.0
+        if amount <= 0:
+            return ""
+        paid_on = (rec.get("purchased_on") or "")[:10]
+        if not paid_on:
+            paid_on = dt.datetime.now(dt.timezone.utc).date().isoformat()
+        ref = (
+            "OWNER-"
+            + re.sub(r"[^A-Za-z0-9]+", "", str(eng.get("name") or "OWNER").split()[0]).upper()[:8]
+            + "-"
+            + str(receipt_id)[-6:].upper()
+        )
+        settlement = exp_store.create_settlement(
+            db,
+            engineer_id=int(eng["id"]),
+            reference=ref,
+            amount=amount,
+            paid_on=paid_on,
+            status="paid",
+            plaid_tx_id="",
+            note="Owner/director paid receipt — no reimbursement due.",
+        )
+        exp_store.update_receipt(
+            db, receipt_id, settlement_id=settlement["id"], status="approved"
+        )
+        latest = exp_store.get_settlement(db, int(settlement["id"])) or settlement
+        latest_rec = exp_store.get_receipt(db, receipt_id) or rec
+        bill_id = _create_xero_bill_for_settlement(
+            eng, latest, [latest_rec], force=True
+        )
+        after = exp_store.get_settlement(db, int(settlement["id"])) or latest
+        err = (after.get("xero_error") or "").strip().lower()
+        if bill_id and not err.startswith("bill raised but payment failed"):
+            exp_store.update_receipt(db, receipt_id, status="settled")
+            _feed.push(
+                f"Owner-paid receipt sent to Xero for {eng.get('name')}.",
+                "success",
+            )
+        return bill_id
+
     def _maybe_settle_subcontractor(eng, *, allow_xero: bool = True):
         """Recognise the company's payment to a subcontractor in the Plaid feed
         by the app's payment reference (PWSUB<id>), then reconcile it against the
@@ -14650,6 +14713,11 @@ body {{ background:#f7f6f3 !important; }}
             )
 
         exp_store.update_receipt(db, rid, **updates)
+        if (
+            updates.get("payment_source") == "owner_paid"
+            and _expense_owner_no_payout(eng)
+        ):
+            _submit_owner_no_payout_receipt_to_xero(eng, rid)
         return_to = (request.form.get("return_to") or "").strip()
         if return_to.startswith(f"/expenses/{token}/review-upload"):
             return redirect(return_to)
