@@ -7,6 +7,7 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 import threading
 import time
 import uuid
@@ -1962,6 +1963,7 @@ def _expense_normalise_payment_source(
 
 _AI_HINTS_KEY = "ai_receipt_hints"
 _ACCOUNT_LEARNING_KEY = "account_category_learning"
+_RECEIPT_AI_CORRECTIONS_KEY = "receipt_ai_corrections"
 
 
 def get_ai_receipt_hints(db_path: str) -> str:
@@ -2007,6 +2009,82 @@ def _record_account_learning(db_path: str, merchant: str, code: str, name: str) 
             )
             learned = dict(rows[:500])
         set_json_setting(db_path, _ACCOUNT_LEARNING_KEY, learned)
+    except Exception:
+        pass
+
+
+def _safe_float2(value) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _record_receipt_ai_correction(
+    db_path: str,
+    *,
+    receipt: dict,
+    updates: dict,
+    actor: str,
+) -> None:
+    """Remember what the AI/app read versus what the user corrected.
+
+    This is intentionally small JSON in the admin DB, not another photo store.
+    It gives us an audit trail for tightening merchant/account/VAT prompts later
+    without retaining extra image copies.
+    """
+    rid = str((receipt or {}).get("id") or "").strip()
+    if not rid:
+        return
+
+    before = {
+        "merchant": str(receipt.get("merchant") or receipt.get("ocr_merchant") or "").strip(),
+        "ocr_merchant": str(receipt.get("ocr_merchant") or "").strip(),
+        "purchased_on": str(receipt.get("purchased_on") or "").strip(),
+        "amount_inc": _safe_float2(receipt.get("amount_inc")),
+        "amount_ex": _safe_float2(receipt.get("amount_ex")),
+        "vat_amount": _safe_float2(receipt.get("vat_amount")),
+        "category_account_code": str(receipt.get("category_account_code") or "").strip(),
+        "category_account_name": str(receipt.get("category_account_name") or "").strip(),
+    }
+    after = {
+        "merchant": str(updates.get("merchant") or "").strip(),
+        "purchased_on": str(updates.get("purchased_on") or "").strip(),
+        "amount_inc": _safe_float2(updates.get("amount_inc")),
+        "amount_ex": _safe_float2(updates.get("amount_ex")),
+        "vat_amount": _safe_float2(updates.get("vat_amount")),
+        "category_account_code": str(updates.get("category_account_code") or receipt.get("category_account_code") or "").strip(),
+        "category_account_name": str(updates.get("category_account_name") or receipt.get("category_account_name") or "").strip(),
+    }
+    changed = {
+        key: {"from": before.get(key), "to": after.get(key)}
+        for key in after
+        if before.get(key) != after.get(key)
+    }
+    if not changed:
+        return
+    try:
+        rows = get_json_setting(db_path, _RECEIPT_AI_CORRECTIONS_KEY, []) or []
+        if not isinstance(rows, list):
+            rows = []
+        rows.append({
+            "receipt_id": rid,
+            "engineer_id": receipt.get("engineer_id"),
+            "actor": actor,
+            "filename": str(receipt.get("filename") or "")[:160],
+            "stored_file": str(receipt.get("stored_file") or "")[:260],
+            "xero_type": str(receipt.get("xero_type") or ""),
+            "xero_id": str(receipt.get("xero_id") or ""),
+            "before": before,
+            "after": after,
+            "changed": changed,
+            "raw_text_sample": str(receipt.get("ocr_raw") or "")[:1200],
+            "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        })
+        rows = rows[-300:]
+        set_json_setting(db_path, _RECEIPT_AI_CORRECTIONS_KEY, rows)
     except Exception:
         pass
 
@@ -13257,6 +13335,112 @@ body {{ background:#f7f6f3 !important; }}
         exact.sort(key=lambda b: (0 if b.get("has_attachment") else 1))
         return exact[0]
 
+    def _receipt_duplicate_warning_html(
+        rec: dict, eng: dict, *, include_xero: bool = True
+    ) -> str:
+        """Visible duplicate warning for the engineer/admin review screen."""
+        if not rec or (rec.get("xero_id") or "").strip():
+            return ""
+        warnings: list[str] = []
+        rid = str(rec.get("id") or "")
+        db = config.admin_db_file
+        try:
+            amount = round(float(rec.get("amount_inc") or 0), 2)
+        except (TypeError, ValueError):
+            amount = 0.0
+        day = (rec.get("purchased_on") or "")[:10]
+        if day and amount > 0:
+            try:
+                with sqlite3.connect(db) as conn:
+                    conn.row_factory = sqlite3.Row
+                    rows = conn.execute(
+                        """
+                        SELECT id, engineer_id, status, merchant, ocr_merchant,
+                               purchased_on, amount_inc, xero_type, xero_id,
+                               created_at, stored_file
+                        FROM expense_receipts
+                        WHERE id <> ?
+                          AND purchased_on = ?
+                          AND round(coalesce(amount_inc, 0), 2) = ?
+                        ORDER BY created_at DESC
+                        LIMIT 5
+                        """,
+                        (rid, day, amount),
+                    ).fetchall()
+                for row in rows:
+                    candidate = dict(row)
+                    eng_name = ""
+                    try:
+                        cand_eng = exp_store.get_engineer(db, int(candidate.get("engineer_id") or 0))
+                        eng_name = cand_eng.get("name") or ""
+                    except Exception:
+                        eng_name = ""
+                    label = candidate.get("merchant") or candidate.get("ocr_merchant") or "Receipt"
+                    status = candidate.get("status") or "saved"
+                    xero_note = (
+                        " · already linked to Xero"
+                        if (candidate.get("xero_id") or "").strip() else ""
+                    )
+                    img_link = (
+                        f" · <a class='font-bold underline' target='_blank' "
+                        f"href='/receipts/expenses/receipt/{escape(str(candidate.get('id') or ''))}/image'>view saved receipt</a>"
+                        if candidate.get("stored_file") else ""
+                    )
+                    warnings.append(
+                        f"<li><b>App duplicate:</b> {escape(label)}"
+                        f" · {escape(eng_name or 'unknown user')} · "
+                        f"{escape(status)}{escape(xero_note)}{img_link}</li>"
+                    )
+            except Exception:
+                pass
+
+        source = (rec.get("payment_source") or "company_card").strip()
+        if include_xero and source == "company_card" and day and amount > 0:
+            payment_account = (
+                (eng.get("payment_account_code") or "").strip()
+                or (get_expense_settings(db).get("default_payment_account") or "").strip()
+            )
+            try:
+                spend = _dump_xero_existing_spend_match(
+                    amount_inc=amount,
+                    purchased_on=day,
+                    merchant=rec.get("merchant") or rec.get("ocr_merchant") or "",
+                    card_account=payment_account,
+                )
+                if spend:
+                    warnings.append(
+                        "<li><b>Xero duplicate:</b> matching card spend already exists "
+                        f"on {escape(spend.get('date') or day)} for £{float(spend.get('amount') or amount):,.2f}"
+                        f" · {escape(spend.get('contact') or 'unknown contact')}"
+                        f" · {'has receipt attached' if spend.get('has_attachment') else 'no receipt attached yet'}"
+                        f" · {'reconciled' if spend.get('reconciled') else 'not reconciled'}</li>"
+                    )
+            except Exception:
+                pass
+            try:
+                bill = _receipt_existing_xero_bill_match(rec)
+                if bill:
+                    warnings.append(
+                        "<li><b>Xero duplicate:</b> matching supplier bill already exists "
+                        f"on {escape(bill.get('date') or day)} for £{float(bill.get('amount') or amount):,.2f}"
+                        f" · {escape(bill.get('contact') or 'unknown contact')}"
+                        f" · {escape(bill.get('status') or '')}"
+                        f" · {'has receipt attached' if bill.get('has_attachment') else 'no receipt attached yet'}</li>"
+                    )
+            except Exception:
+                pass
+
+        if not warnings:
+            return ""
+        return (
+            "<div class='rounded-xl border-2 border-red-300 bg-red-50 p-4 text-sm text-red-900'>"
+            "<div class='text-base font-black tracking-wide text-red-800'>DUPLICATE CHECK</div>"
+            "<p class='mt-1 text-xs text-red-800'>This receipt looks like something already saved or already in Xero. Compare it before approving; approving will link/attach where possible instead of creating a duplicate.</p>"
+            "<ul class='mt-2 list-disc pl-5 space-y-1'>"
+            + "".join(warnings)
+            + "</ul></div>"
+        )
+
     def _maybe_settle_subcontractor(eng, *, allow_xero: bool = True):
         """Recognise the company's payment to a subcontractor in the Plaid feed
         by the app's payment reference (PWSUB<id>), then reconcile it against the
@@ -14737,6 +14921,7 @@ body {{ background:#f7f6f3 !important; }}
                 f"text-xs text-blue-800'>This receipt is already "
                 f"{escape(rec.get('status'))}. You can still correct the details.</div>"
             )
+        duplicate_warning_html = _receipt_duplicate_warning_html(rec, eng)
         can_delete = (
             (rec.get("status") or "").strip().lower() in {"pending_review", "approved"}
             and not (rec.get("xero_id") or "").strip()
@@ -14791,6 +14976,7 @@ body {{ background:#f7f6f3 !important; }}
               {photo_html}
               {ocr_note}
               {status_note}
+              {duplicate_warning_html}
               <form method="post" action="/expenses/{escape(token)}/review/{escape(rid)}"
                     class="space-y-4 rounded-xl border border-gray-200 bg-white p-4">
                 <input type="hidden" name="return_to" value="{escape(return_to)}">
@@ -14960,6 +15146,12 @@ body {{ background:#f7f6f3 !important; }}
                 category_name,
             )
 
+        _record_receipt_ai_correction(
+            db,
+            receipt=rec,
+            updates=updates,
+            actor=f"engineer:{eng.get('name') or eng.get('username') or eng.get('id')}",
+        )
         exp_store.update_receipt(db, rid, **updates)
         if (
             updates.get("payment_source") == "owner_paid"
@@ -17130,6 +17322,9 @@ body {{ background:#f7f6f3 !important; }}
                     "<div class='rounded-xl border border-dashed border-gray-200 bg-white px-3 py-8 "
                     "text-center text-sm text-gray-500'>No image stored for this receipt.</div>"
                 )
+                duplicate_warning = _receipt_duplicate_warning_html(
+                    r, eng, include_xero=False
+                )
                 review_panel = (
                     f"<div id='exp-review-{rid}' class='exp-person-panel exp-review-panel hidden mt-3 rounded-xl "
                     "border border-gray-300 bg-white p-3 shadow-sm'>"
@@ -17141,6 +17336,8 @@ body {{ background:#f7f6f3 !important; }}
                     "</div>"
                     "<div class='grid grid-cols-1 lg:grid-cols-[minmax(220px,0.85fr)_minmax(0,1.15fr)] gap-4'>"
                     f"{photo_html}"
+                    "<div class='space-y-3'>"
+                    f"{duplicate_warning}"
                     f"<form method='post' action='/receipts/expenses/receipt/{rid}/review' class='space-y-3'>"
                     "<input type='hidden' name='return_to' value='/receipts/expenses'>"
                     f"{source_html}"
@@ -17170,7 +17367,7 @@ body {{ background:#f7f6f3 !important; }}
                     "<button type='submit' name='status_action' value='save' class='rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm font-semibold text-gray-800 hover:bg-gray-50'>Save</button>"
                     "<button type='submit' name='status_action' value='approve' class='rounded-lg bg-emerald-600 px-3 py-2 text-sm font-semibold text-white hover:bg-emerald-700'>Approve &amp; save</button>"
                     "<button type='submit' name='status_action' value='pending' class='rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm font-semibold text-amber-800 hover:bg-amber-100'>Needs review</button>"
-                    "</div></form></div></div>"
+                    "</div></form></div></div></div>"
                 )
                 out.append(
                     "<div class='flex items-center justify-between gap-3 py-2 border-b "
@@ -17910,6 +18107,12 @@ body {{ background:#f7f6f3 !important; }}
                 400,
             )
 
+        _record_receipt_ai_correction(
+            db,
+            receipt=rec,
+            updates=updates,
+            actor=f"admin:{session.get('admin_username') or 'admin'}",
+        )
         exp_store.update_receipt(db, rid, **updates)
         return_to = request.form.get("return_to") or "/receipts/expenses"
         return redirect(return_to + ("&" if "?" in return_to else "?") + "flash=updated")
