@@ -16580,8 +16580,13 @@ body {{ background:#f7f6f3 !important; }}
             label = _linked_account_name(account_id).lower()
             if not label:
                 return False
-            card_words = ("card", "charge", "credit")
-            non_card_words = ("cash account", "current account")
+            # This is an engineer receipt feed, not a strict banking product
+            # classifier. "Ben - Personal Bank" should count, but the main
+            # "Pow Wash" current/business bank should not, otherwise the admin
+            # dashboard incorrectly treats all normal bank spend as one
+            # engineer's missing receipts.
+            card_words = ("card", "charge", "credit", "personal bank")
+            non_card_words = ("cash account", "current account", "pow wash")
             if any(w in label for w in non_card_words):
                 return False
             return any(w in label for w in card_words)
@@ -16623,11 +16628,116 @@ body {{ background:#f7f6f3 !important; }}
                     "<span class='text-[11px] text-gray-400 italic'>not coded yet</span>"
                 )
                 rid = escape(str(r.get("id") or ""))
-                review_href = (
-                    f"/expenses/{escape(str(eng.get('token') or ''))}/review/{rid}"
-                    "?return_to=/receipts/expenses"
-                )
                 submitted = escape(_submitted_stamp(r.get("created_at") or r.get("updated_at") or ""))
+                inc = r.get("amount_inc")
+                ex = r.get("amount_ex")
+                vat = r.get("vat_amount")
+                inc_v = "" if inc is None else f"{float(inc):.2f}"
+                ex_v = "" if ex is None else f"{float(ex):.2f}"
+                vat_v = "" if vat is None else f"{float(vat):.2f}"
+                selected_cat, _selected_name = _resolve_expense_account_choice(
+                    r.get("category_account_code") or "",
+                    exp_accounts,
+                )
+                if not selected_cat:
+                    selected_cat = str(r.get("category_account_code") or "").strip()
+                cat_field = (
+                    "<select name='category_account_code' class='w-full rounded-lg border "
+                    "border-gray-300 bg-white px-3 py-2 text-sm'>"
+                    + _exp_acct_options(
+                        exp_accounts,
+                        selected_cat,
+                        default_label="Choose account",
+                    )
+                    + "</select>"
+                    if exp_accounts else
+                    "<input name='category_account_code' "
+                    f"value='{escape(str(r.get('category_account_code') or ''))}' "
+                    "class='w-full rounded-lg border border-gray-300 px-3 py-2 text-sm' "
+                    "placeholder='Xero account code'>"
+                )
+                vat_mode = _exp_vat_mode(inc, ex, vat, settings["vat_rate"])
+                def _vat_opt(value: str, label: str) -> str:
+                    checked = "checked" if vat_mode == value else ""
+                    return (
+                        "<label class='inline-flex items-center gap-1 rounded-lg border "
+                        "border-gray-200 bg-white px-2 py-1 text-xs font-semibold text-gray-700'>"
+                        f"<input type='radio' name='vat_mode' value='{value}' {checked}>"
+                        f"{label}</label>"
+                    )
+                source = r.get("payment_source") or "company_card"
+                source_html = ""
+                if _expense_owner_paid_enabled(eng):
+                    company_checked = "checked" if source != "owner_paid" else ""
+                    owner_checked = "checked" if source == "owner_paid" else ""
+                    source_html = (
+                        "<div><label class='block text-xs font-semibold text-gray-500 mb-1'>Paid with</label>"
+                        "<div class='flex flex-wrap gap-2'>"
+                        "<label class='inline-flex items-center gap-1 rounded-lg border border-gray-200 "
+                        "bg-white px-2 py-1 text-xs font-semibold text-gray-700'>"
+                        f"<input type='radio' name='payment_source' value='company_card' {company_checked}>Company card</label>"
+                        "<label class='inline-flex items-center gap-1 rounded-lg border border-gray-200 "
+                        "bg-white px-2 py-1 text-xs font-semibold text-gray-700'>"
+                        f"<input type='radio' name='payment_source' value='owner_paid' {owner_checked}>Personal card</label>"
+                        "</div></div>"
+                    )
+                elif (eng.get("kind") or "") == "company_card":
+                    source_html = "<input type='hidden' name='payment_source' value='company_card'>"
+                else:
+                    source_html = "<input type='hidden' name='payment_source' value='owner_paid'>"
+                photo_html = (
+                    "<div class='rounded-xl border border-gray-200 bg-white p-2'>"
+                    f"<img src='/receipts/expenses/receipt/{rid}/image' alt='Receipt image' "
+                    "class='max-h-80 w-full rounded-lg object-contain bg-gray-50'>"
+                    f"<a href='/receipts/expenses/receipt/{rid}/image' target='_blank' "
+                    "class='mt-2 inline-flex text-xs font-semibold text-indigo-700'>Open full image</a>"
+                    "</div>"
+                    if r.get("stored_file") else
+                    "<div class='rounded-xl border border-dashed border-gray-200 bg-white px-3 py-8 "
+                    "text-center text-sm text-gray-500'>No image stored for this receipt.</div>"
+                )
+                review_panel = (
+                    f"<div id='exp-review-{rid}' class='exp-person-panel exp-review-panel hidden mt-3 rounded-xl "
+                    "border border-gray-300 bg-white p-3 shadow-sm'>"
+                    "<div class='mb-3 flex items-center justify-between gap-2'>"
+                    "<div><h4 class='text-sm font-bold text-gray-950'>Review receipt</h4>"
+                    "<p class='text-xs text-gray-500'>Admin review - no engineer login needed.</p></div>"
+                    "<button type='button' data-exp-close class='rounded-lg border border-gray-300 bg-white "
+                    "px-4 py-2 text-sm font-bold text-gray-800 hover:bg-gray-50'>Close</button>"
+                    "</div>"
+                    "<div class='grid grid-cols-1 lg:grid-cols-[minmax(220px,0.85fr)_minmax(0,1.15fr)] gap-4'>"
+                    f"{photo_html}"
+                    f"<form method='post' action='/receipts/expenses/receipt/{rid}/review' class='space-y-3'>"
+                    "<input type='hidden' name='return_to' value='/receipts/expenses'>"
+                    f"{source_html}"
+                    "<div><label class='block text-xs font-semibold text-gray-500 mb-1'>Shop / supplier</label>"
+                    f"<input name='merchant' value='{merchant}' class='w-full rounded-lg border border-gray-300 px-3 py-2 text-sm'></div>"
+                    "<div class='grid grid-cols-1 sm:grid-cols-2 gap-3'>"
+                    "<div><label class='block text-xs font-semibold text-gray-500 mb-1'>Receipt date</label>"
+                    f"<input type='date' name='purchased_on' value='{day}' class='w-full rounded-lg border border-gray-300 px-3 py-2 text-sm'></div>"
+                    "<div><label class='block text-xs font-semibold text-gray-500 mb-1'>Total paid inc VAT</label>"
+                    f"<input type='number' step='0.01' name='amount_inc' value='{inc_v}' class='w-full rounded-lg border border-gray-300 px-3 py-2 text-sm font-semibold'></div>"
+                    "</div>"
+                    "<div><label class='block text-xs font-semibold text-gray-500 mb-1'>Xero account</label>"
+                    f"{cat_field}</div>"
+                    "<div><label class='block text-xs font-semibold text-gray-500 mb-1'>VAT treatment</label>"
+                    "<div class='flex flex-wrap gap-2'>"
+                    + _vat_opt("standard", "VAT applied")
+                    + _vat_opt("no_vat", "No VAT")
+                    + _vat_opt("mixed", "Mixed VAT")
+                    + "</div></div>"
+                    "<div class='grid grid-cols-2 gap-3'>"
+                    "<div><label class='block text-xs font-semibold text-gray-500 mb-1'>Ex VAT</label>"
+                    f"<input type='number' step='0.01' name='amount_ex' value='{ex_v}' class='w-full rounded-lg border border-gray-300 px-3 py-2 text-sm'></div>"
+                    "<div><label class='block text-xs font-semibold text-gray-500 mb-1'>VAT</label>"
+                    f"<input type='number' step='0.01' name='vat_amount' value='{vat_v}' class='w-full rounded-lg border border-gray-300 px-3 py-2 text-sm'></div>"
+                    "</div>"
+                    "<div class='flex flex-wrap gap-2 pt-1'>"
+                    "<button type='submit' name='status_action' value='save' class='rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm font-semibold text-gray-800 hover:bg-gray-50'>Save</button>"
+                    "<button type='submit' name='status_action' value='approve' class='rounded-lg bg-emerald-600 px-3 py-2 text-sm font-semibold text-white hover:bg-emerald-700'>Approve &amp; save</button>"
+                    "<button type='submit' name='status_action' value='pending' class='rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm font-semibold text-amber-800 hover:bg-amber-100'>Needs review</button>"
+                    "</div></form></div></div>"
+                )
                 out.append(
                     "<div class='flex items-center justify-between gap-3 py-2 border-b "
                     "border-gray-100 last:border-0'>"
@@ -16637,9 +16747,10 @@ body {{ background:#f7f6f3 !important; }}
                     "</div>"
                     "<div class='shrink-0 text-right'>"
                     f"<div class='text-sm font-bold text-gray-900'>{amount}</div>"
-                    f"<a href='{review_href}' class='mt-1 inline-flex rounded-lg border border-gray-300 bg-white px-2.5 py-1 text-xs font-semibold text-gray-700 hover:bg-gray-50'>Review</a>"
+                    f"<button type='button' data-exp-panel='exp-review-{rid}' class='mt-1 inline-flex rounded-lg border border-indigo-200 bg-indigo-50 px-2.5 py-1 text-xs font-semibold text-indigo-800 hover:bg-indigo-100'>Open review</button>"
                     "</div>"
                     "</div>"
+                    f"{review_panel}"
                 )
             if len(rows) > 20:
                 out.append(
@@ -16709,16 +16820,31 @@ body {{ background:#f7f6f3 !important; }}
             elif str(e.get("plaid_account_id") or "").strip():
                 linked_account_id = str(e.get("plaid_account_id") or "").strip()
                 linked_account_name = _linked_account_name(linked_account_id)
-                if not _is_receipt_card_account(linked_account_id):
+                is_card_receipt_feed = _is_receipt_card_account(linked_account_id)
+                if not is_card_receipt_feed:
                     account_notice = (
-                        "<span class='rounded-full bg-gray-100 px-2 py-0.5 text-[11px] "
-                        "font-semibold text-gray-600' "
-                        f"title='Linked to {escape(linked_account_name)}. This is not treated as an engineer card receipt feed.'>"
-                        "Bank feed linked</span>"
+                        "<span class='rounded-full bg-sky-100 px-2 py-0.5 text-[11px] "
+                        "font-semibold text-sky-700' "
+                        f"title='Linked to {escape(linked_account_name)}. This is a bank-feed receipt follow-up list.'>"
+                        "Bank receipts linked</span>"
                     )
-                    outstanding, weekly_outstanding = [], {}
-                else:
-                    outstanding, weekly_outstanding = _card_outstanding_for_engineer(e)
+                outstanding, weekly_outstanding = _card_outstanding_for_engineer(e)
+                receipt_box_label = "Card receipts" if is_card_receipt_feed else "Bank receipts"
+                receipt_panel_title = (
+                    "Outstanding card receipts"
+                    if is_card_receipt_feed else
+                    "Outstanding bank-feed receipts"
+                )
+                receipt_empty_text = (
+                    "No outstanding card receipts."
+                    if is_card_receipt_feed else
+                    "No outstanding bank-feed receipts."
+                )
+                receipt_help_text = (
+                    "This compares uploaded card payments with submitted receipts for this engineer, and excludes matching spend already reconciled in Xero when the cached Xero check is available."
+                    if is_card_receipt_feed else
+                    "This compares the linked bank feed with submitted receipts for this person, and excludes matching spend already reconciled in Xero when the cached Xero check is available."
+                )
                 week_items = []
                 for start, rows in sorted(weekly_outstanding.items(), reverse=True)[:5]:
                     total = sum(float(r.get("amount") or 0) for r in rows)
@@ -16730,7 +16856,8 @@ body {{ background:#f7f6f3 !important; }}
                     )
                 if not week_items:
                     week_items.append(
-                        "<div class='rounded-lg border border-sky-100 bg-white/80 px-2 py-2 text-xs text-sky-700'>No outstanding card receipts.</div>"
+                        "<div class='rounded-lg border border-sky-100 bg-white/80 px-2 py-2 text-xs text-sky-700'>"
+                        f"{receipt_empty_text}</div>"
                     )
                 tx_rows = []
                 for tx in sorted(outstanding, key=lambda x: x["date"], reverse=True)[:40]:
@@ -16744,33 +16871,33 @@ body {{ background:#f7f6f3 !important; }}
                         "</div>"
                     )
                 tx_rows_html = "".join(tx_rows) or (
-                    "<div class='rounded-xl border border-dashed border-sky-200 bg-white/70 px-3 py-3 text-sm text-sky-700'>Nothing outstanding for this card.</div>"
+                    "<div class='rounded-xl border border-dashed border-sky-200 bg-white/70 px-3 py-3 text-sm text-sky-700'>"
+                    f"{receipt_empty_text}</div>"
                 )
-                if _is_receipt_card_account(linked_account_id):
-                    box_grid = "grid-cols-3"
-                    card_btn = (
-                        f"<button type='button' data-exp-panel='exp-panel-{eid}-card' "
-                        "class='text-left rounded-xl border border-sky-200 bg-sky-50 px-3 py-3 text-sky-900 hover:bg-sky-100 hover:shadow-sm transition'>"
-                        "<span class='block text-[11px] font-semibold uppercase tracking-wide opacity-70'>Card receipts</span>"
-                        f"<span class='mt-1 block text-2xl font-bold'>{len(outstanding)}</span>"
-                        f"<span class='mt-1 block text-xs opacity-75'>{_exp_money(sum(float(r.get('amount') or 0) for r in outstanding))} outstanding</span>"
-                        "</button>"
-                    )
-                    card_panel = (
-                        f"<div id='exp-panel-{eid}-card' class='exp-person-panel hidden mt-3 rounded-xl border border-sky-200 bg-sky-50/60 p-3'>"
-                        "<div class='mb-2 flex items-center justify-between gap-2'>"
-                        f"<h3 class='text-sm font-bold text-sky-950'>{name} · Outstanding card receipts</h3>"
-                        "<button type='button' data-exp-close class='rounded-lg border border-sky-300 bg-white px-3 py-1.5 text-sm font-bold text-sky-800 hover:bg-sky-50'>Close</button>"
-                        "</div>"
-                        "<div class='grid grid-cols-1 sm:grid-cols-[220px_minmax(0,1fr)] gap-3'>"
-                        "<div class='space-y-1'>"
-                        + "".join(week_items)
-                        + "</div>"
-                        f"<div class='rounded-xl border border-sky-100 bg-white px-3'>{tx_rows_html}</div>"
-                        "</div>"
-                        "<p class='mt-2 text-[11px] text-sky-700'>This compares uploaded bank-statement card payments with submitted receipts for this engineer, and excludes matching spend already reconciled in Xero when the cached Xero check is available.</p>"
-                        "</div>"
-                    )
+                box_grid = "grid-cols-3"
+                card_btn = (
+                    f"<button type='button' data-exp-panel='exp-panel-{eid}-card' "
+                    "class='text-left rounded-xl border border-sky-200 bg-sky-50 px-3 py-3 text-sky-900 hover:bg-sky-100 hover:shadow-sm transition'>"
+                    f"<span class='block text-[11px] font-semibold uppercase tracking-wide opacity-70'>{receipt_box_label}</span>"
+                    f"<span class='mt-1 block text-2xl font-bold'>{len(outstanding)}</span>"
+                    f"<span class='mt-1 block text-xs opacity-75'>{_exp_money(sum(float(r.get('amount') or 0) for r in outstanding))} outstanding</span>"
+                    "</button>"
+                )
+                card_panel = (
+                    f"<div id='exp-panel-{eid}-card' class='exp-person-panel hidden mt-3 rounded-xl border border-sky-200 bg-sky-50/60 p-3'>"
+                    "<div class='mb-2 flex items-center justify-between gap-2'>"
+                    f"<h3 class='text-sm font-bold text-sky-950'>{name} · {receipt_panel_title}</h3>"
+                    "<button type='button' data-exp-close class='rounded-lg border border-sky-300 bg-white px-3 py-1.5 text-sm font-bold text-sky-800 hover:bg-sky-50'>Close</button>"
+                    "</div>"
+                    "<div class='grid grid-cols-1 sm:grid-cols-[220px_minmax(0,1fr)] gap-3'>"
+                    "<div class='space-y-1'>"
+                    + "".join(week_items)
+                    + "</div>"
+                    f"<div class='rounded-xl border border-sky-100 bg-white px-3'>{tx_rows_html}</div>"
+                    "</div>"
+                    f"<p class='mt-2 text-[11px] text-sky-700'>{receipt_help_text}</p>"
+                    "</div>"
+                )
             people_nav_bits.append(
                 "<div class='rounded-2xl border border-gray-200 bg-white p-3 shadow-sm'>"
                 "<div class='grid grid-cols-1 md:grid-cols-[minmax(160px,0.75fr)_minmax(0,1.25fr)] gap-3 items-stretch'>"
@@ -16797,7 +16924,8 @@ body {{ background:#f7f6f3 !important; }}
                 "</div></div>"
                 f"<div id='exp-panel-{eid}-pending' class='exp-person-panel hidden mt-3 rounded-xl border border-amber-200 bg-amber-50/60 p-3'>"
                 "<div class='mb-2 flex items-center justify-between gap-2'>"
-                f"<h3 class='text-sm font-bold text-amber-950'>{name} · Pending review</h3>"
+                f"<div><h3 class='text-sm font-bold text-amber-950'>{name} · Pending review</h3>"
+                "<p class='text-xs text-amber-800'>Open a receipt below to compare the image against what the AI read and correct it here.</p></div>"
                 "<button type='button' data-exp-close class='rounded-lg border border-amber-300 bg-white px-3 py-1.5 text-sm font-bold text-amber-800 hover:bg-amber-50'>Close</button>"
                 "</div>"
                 f"{p_panel}</div>"
@@ -16814,9 +16942,10 @@ body {{ background:#f7f6f3 !important; }}
         people_nav_script = (
             "<script>(function(){"
             "function closePanels(root){(root||document).querySelectorAll('.exp-person-panel').forEach(function(p){p.classList.add('hidden');});}"
+            "function closeReviewPanels(root){(root||document).querySelectorAll('.exp-review-panel').forEach(function(p){p.classList.add('hidden');});}"
             "document.addEventListener('click',function(e){"
             "var btn=e.target.closest('[data-exp-panel]');"
-            "if(btn){var id=btn.getAttribute('data-exp-panel');var panel=document.getElementById(id);if(panel){var card=btn.closest('.rounded-2xl');closePanels(card);panel.classList.remove('hidden');panel.scrollIntoView({block:'nearest',behavior:'smooth'});}return;}"
+            "if(btn){var id=btn.getAttribute('data-exp-panel');var panel=document.getElementById(id);if(panel){var card=btn.closest('.rounded-2xl');if(id.indexOf('exp-review-')===0){closeReviewPanels(btn.closest('.exp-person-panel')||card);}else{closePanels(card);}panel.classList.remove('hidden');panel.scrollIntoView({block:'nearest',behavior:'smooth'});}return;}"
             "if(e.target.closest('[data-exp-close]')){var p=e.target.closest('.exp-person-panel');if(p)p.classList.add('hidden');}"
             "});"
             "})();</script>"
@@ -17222,6 +17351,131 @@ body {{ background:#f7f6f3 !important; }}
             return True
         except OSError:
             return False
+
+    @app.get("/receipts/expenses/receipt/<rid>/image")
+    @require_login
+    def expense_admin_receipt_image(rid: str):
+        """Admin receipt preview image/PDF without using an engineer portal login."""
+        db = config.admin_db_file
+        rec = exp_store.get_receipt(db, rid)
+        if not rec:
+            return _exp_error_page("Receipt not found.", 404)
+        path = os.path.abspath(rec.get("stored_file") or "")
+        if not path or not os.path.exists(path):
+            pulled = _exp_pull_receipt_image_from_xero(rec)
+            if pulled:
+                try:
+                    with open(pulled, "rb") as fh:
+                        data = fh.read()
+                finally:
+                    try:
+                        os.remove(pulled)
+                    except OSError:
+                        pass
+                mime = _exp_sniff_mime(data[:16]) or "application/octet-stream"
+                resp = Response(data, mimetype=mime)
+                resp.headers["X-Content-Type-Options"] = "nosniff"
+                return resp
+            return _exp_error_page("Receipt image not available.", 404)
+        with open(path, "rb") as fh:
+            head = fh.read(16)
+        safe_mime = _exp_sniff_mime(head)
+        if safe_mime and safe_mime.startswith("image/"):
+            resp = send_file(path, mimetype=safe_mime)
+        elif safe_mime == "application/pdf":
+            resp = send_file(path, mimetype="application/pdf")
+        else:
+            resp = send_file(
+                path,
+                mimetype="application/octet-stream",
+                as_attachment=True,
+                download_name="receipt",
+            )
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        return resp
+
+    @app.post("/receipts/expenses/receipt/<rid>/review")
+    @require_login
+    def expense_admin_receipt_review_save(rid: str):
+        """Save receipt review changes from the Field Expenses admin dashboard."""
+        db = config.admin_db_file
+        rec = exp_store.get_receipt(db, rid)
+        if not rec:
+            return redirect("/receipts/expenses?flash=not_found")
+        eng = exp_store.get_engineer(db, int(rec.get("engineer_id") or 0))
+        if not eng:
+            return redirect("/receipts/expenses?flash=not_found")
+
+        def _num(name):
+            raw = (request.form.get(name) or "").strip()
+            if not raw:
+                return None
+            try:
+                return round(float(raw), 2)
+            except ValueError:
+                return None
+
+        amount_inc, amount_ex, vat_amount = _exp_apply_vat_mode(
+            _num("amount_inc"),
+            _num("amount_ex"),
+            _num("vat_amount"),
+            request.form.get("vat_mode"),
+            get_expense_settings(db)["vat_rate"],
+        )
+        action = (request.form.get("status_action") or "save").strip().lower()
+        status = rec.get("status") or "pending_review"
+        if action == "approve":
+            status = "approved"
+        elif action == "pending":
+            status = "pending_review"
+
+        updates = {
+            "merchant": (request.form.get("merchant") or "").strip()[:120],
+            "purchased_on": (request.form.get("purchased_on") or "").strip(),
+            "amount_inc": amount_inc,
+            "amount_ex": amount_ex,
+            "vat_amount": vat_amount,
+            "status": status,
+        }
+        payment_source, owner_paid_account_code = _expense_normalise_payment_source(
+            eng,
+            request.form.get("payment_source")
+            or rec.get("payment_source")
+            or "company_card",
+        )
+        updates["payment_source"] = payment_source
+        updates["owner_paid_account_code"] = owner_paid_account_code
+
+        category_code = (request.form.get("category_account_code") or "").strip()
+        saved_exp_accounts = get_json_setting(db, _XERO_EXP_ACCT_SNAPSHOT_KEY, []) or []
+        resolved_code, category_name = _resolve_expense_account_choice(
+            category_code,
+            saved_exp_accounts,
+        )
+        if resolved_code:
+            category_code = resolved_code
+        elif not saved_exp_accounts and category_code:
+            category_name = ""
+        else:
+            category_code = ""
+        if category_code:
+            updates["category_account_code"] = category_code
+            updates["category_account_name"] = category_name
+            _record_account_learning(
+                db,
+                updates.get("merchant") or rec.get("merchant") or rec.get("ocr_merchant") or "",
+                category_code,
+                category_name,
+            )
+        elif action == "approve":
+            return _exp_error_page(
+                "Please choose what this receipt was for before approving it.",
+                400,
+            )
+
+        exp_store.update_receipt(db, rid, **updates)
+        return_to = request.form.get("return_to") or "/receipts/expenses"
+        return redirect(return_to + ("&" if "?" in return_to else "?") + "flash=updated")
 
     @app.post("/receipts/expenses/receipt/<rid>/delete-image")
     @require_login
