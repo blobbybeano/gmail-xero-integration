@@ -13009,6 +13009,254 @@ body {{ background:#f7f6f3 !important; }}
             )
         return bill_id
 
+    def _receipt_account_ref(value: str) -> dict[str, str]:
+        account_value = str(value or "").strip()
+        if account_value.lower().startswith("id:"):
+            return {"AccountID": account_value[3:].strip()}
+        if len(account_value) == 36 and account_value.count("-") == 4:
+            return {"AccountID": account_value}
+        return {"Code": account_value}
+
+    def _submit_company_card_receipt_to_xero(eng, receipt_id: str) -> str:
+        """Post an approved company-card receipt to Xero without duplicating it.
+
+        First try to find the matching Xero SPEND transaction by exact date and
+        amount. If it already exists, attach the receipt image and link the
+        local row to that Xero transaction. If not, create one Spend Money bank
+        transaction against the engineer's configured card account.
+        """
+        if (eng.get("kind") or "") != "company_card":
+            return ""
+        db = config.admin_db_file
+        rec = exp_store.get_receipt(db, receipt_id)
+        if not rec:
+            return ""
+        if (rec.get("payment_source") or "company_card") != "company_card":
+            return ""
+        if (rec.get("xero_id") or "").strip() or rec.get("settlement_id"):
+            return ""
+        payment_account = (
+            (eng.get("payment_account_code") or "").strip()
+            or (get_expense_settings(db).get("default_payment_account") or "").strip()
+        )
+        if not payment_account:
+            exp_store.update_receipt(
+                db, receipt_id,
+                xero_error="Cannot submit to Xero yet — no company-card payment account is configured.",
+            )
+            return ""
+
+        existing = _dump_xero_existing_spend_match(
+            amount_inc=rec.get("amount_inc"),
+            purchased_on=rec.get("purchased_on") or "",
+            merchant=rec.get("merchant") or rec.get("ocr_merchant") or "",
+            card_account=payment_account,
+        )
+        if existing:
+            if not existing.get("has_attachment"):
+                payload = _xero_attachment_bytes_for_receipt(rec)
+                if payload and not xero_is_disabled():
+                    filename, mime, data = payload
+                    try:
+                        client = build_xero_client(config)
+                        client.attach_file_to_bank_transaction(
+                            str(existing.get("id") or ""), filename, mime, data
+                        )
+                        existing["has_attachment"] = True
+                    except Exception as exc:
+                        exp_store.update_receipt(
+                            db, receipt_id,
+                            xero_error="Xero spend found, but attachment failed: "
+                            + str(exc).splitlines()[0][:180],
+                        )
+                        return ""
+            exp_store.update_receipt(
+                db, receipt_id,
+                status="submitted",
+                xero_type="BankTransactions",
+                xero_id=str(existing.get("id") or ""),
+                xero_error="",
+            )
+            _feed.push(
+                f"Receipt linked to existing Xero card spend for {eng.get('name')}.",
+                "success",
+            )
+            return str(existing.get("id") or "")
+
+        bill_match = _receipt_existing_xero_bill_match(rec)
+        if bill_match:
+            exp_store.update_receipt(
+                db, receipt_id,
+                status="submitted",
+                xero_type="ACCPAY",
+                xero_id=str(bill_match.get("id") or ""),
+                xero_error="",
+            )
+            _feed.push(
+                f"Receipt already existed in Xero as a supplier bill for {eng.get('name')}.",
+                "success",
+            )
+            return str(bill_match.get("id") or "")
+
+        merchant = (rec.get("merchant") or rec.get("ocr_merchant") or "Receipt").strip()
+        purchased_on = (rec.get("purchased_on") or "")[:10]
+        try:
+            amount_inc = round(float(rec.get("amount_inc") or 0), 2)
+        except (TypeError, ValueError):
+            amount_inc = 0.0
+        account_code = (rec.get("category_account_code") or "").strip()
+        missing = []
+        if not merchant:
+            missing.append("supplier")
+        if not purchased_on:
+            missing.append("date")
+        if amount_inc <= 0:
+            missing.append("total")
+        if not account_code:
+            missing.append("Xero expense account")
+        if missing:
+            exp_store.update_receipt(
+                db, receipt_id,
+                xero_error="Cannot submit to Xero yet — missing " + ", ".join(missing) + ".",
+            )
+            return ""
+        if xero_is_disabled():
+            exp_store.update_receipt(
+                db, receipt_id, xero_error="Xero is paused — receipt not submitted."
+            )
+            return ""
+        line_items = _receipt_xero_line_items(rec, default_account=account_code)
+        if not line_items:
+            exp_store.update_receipt(
+                db, receipt_id,
+                xero_error="Cannot submit to Xero yet — no valid receipt lines.",
+            )
+            return ""
+        payload = {
+            "BankTransactions": [
+                {
+                    "Type": "SPEND",
+                    "Contact": {"Name": merchant},
+                    "Date": purchased_on,
+                    "Reference": f"Receipt {rec.get('filename') or receipt_id}"[:255],
+                    "BankAccount": _receipt_account_ref(payment_account),
+                    "LineAmountTypes": "Inclusive",
+                    "LineItems": line_items,
+                }
+            ]
+        }
+        try:
+            client = build_xero_client(config)
+            if client is None:
+                raise RuntimeError("Xero not connected")
+            resp = client.create_bank_transaction_payload(payload)
+            if client.dry_run:
+                exp_store.update_receipt(
+                    db, receipt_id,
+                    xero_error="DRY_RUN — Xero spend simulated, not written.",
+                )
+                return ""
+            txs = (resp or {}).get("BankTransactions") or []
+            tx_id = str((txs[0] if txs else {}).get("BankTransactionID") or "").strip()
+            if not tx_id:
+                raise RuntimeError("Xero spend create returned no BankTransactionID")
+            att = _xero_attachment_bytes_for_receipt(rec)
+            if att:
+                filename, mime, data = att
+                client.attach_file_to_bank_transaction(tx_id, filename, mime, data)
+            exp_store.update_receipt(
+                db, receipt_id,
+                status="submitted",
+                xero_type="BankTransactions",
+                xero_id=tx_id,
+                xero_error="",
+            )
+            _feed.push(
+                f"Company-card receipt sent to Xero for {eng.get('name')}.",
+                "success",
+            )
+            return tx_id
+        except Exception as exc:
+            exp_store.update_receipt(
+                db, receipt_id,
+                xero_error="Xero submit failed: " + str(exc).splitlines()[0][:220],
+            )
+            return ""
+
+    _receipt_xero_bill_cache: dict[tuple[str, str], list[dict]] = {}
+
+    def _receipt_existing_xero_bill_match(rec: dict) -> dict | None:
+        """Find an existing Xero supplier bill by exact receipt date + amount."""
+        if xero_is_disabled():
+            return None
+        try:
+            amt = round(float(rec.get("amount_inc") or 0), 2)
+            day = dt.date.fromisoformat((rec.get("purchased_on") or "")[:10])
+        except (TypeError, ValueError):
+            return None
+        if amt <= 0:
+            return None
+        month_start = day.replace(day=1)
+        if month_start.month == 12:
+            next_month = dt.date(month_start.year + 1, 1, 1)
+        else:
+            next_month = dt.date(month_start.year, month_start.month + 1, 1)
+        start = month_start - dt.timedelta(days=5)
+        end = next_month + dt.timedelta(days=4)
+        cache_key = (start.isoformat(), end.isoformat())
+        if cache_key not in _receipt_xero_bill_cache:
+            bills: list[dict] = []
+            try:
+                client = build_xero_client(config)
+                if client is None:
+                    return None
+                where = (
+                    'Type=="ACCPAY"'
+                    f'&&Date>=DateTime({start.year},{start.month},{start.day})'
+                    f'&&Date<=DateTime({end.year},{end.month},{end.day})'
+                )
+                page = 1
+                while True:
+                    resp = client._request(
+                        "GET",
+                        f"{client.base_url}/Invoices",
+                        params={"where": where, "page": page},
+                    )
+                    if not resp.ok:
+                        break
+                    items = (resp.json() or {}).get("Invoices") or []
+                    for inv in items:
+                        try:
+                            total = round(float(inv.get("Total") or 0), 2)
+                        except (TypeError, ValueError):
+                            continue
+                        if total <= 0:
+                            continue
+                        bills.append({
+                            "date": _xero_date_to_iso(inv.get("Date")),
+                            "amount": total,
+                            "contact": (inv.get("Contact") or {}).get("Name") or "",
+                            "id": str(inv.get("InvoiceID") or ""),
+                            "status": str(inv.get("Status") or ""),
+                            "has_attachment": bool(inv.get("HasAttachments")),
+                        })
+                    if len(items) < 100:
+                        break
+                    page += 1
+            except Exception as exc:
+                print(f"[receipt-xero-dedupe] bill lookup failed: {exc}", flush=True)
+                bills = []
+            _receipt_xero_bill_cache[cache_key] = bills
+        exact = [
+            b for b in _receipt_xero_bill_cache.get(cache_key, [])
+            if b.get("date") == day.isoformat()
+            and abs(float(b.get("amount") or 0) - amt) <= 0.02
+        ]
+        if not exact:
+            return None
+        exact.sort(key=lambda b: (0 if b.get("has_attachment") else 1))
+        return exact[0]
+
     def _maybe_settle_subcontractor(eng, *, allow_xero: bool = True):
         """Recognise the company's payment to a subcontractor in the Plaid feed
         by the app's payment reference (PWSUB<id>), then reconcile it against the
@@ -14718,6 +14966,8 @@ body {{ background:#f7f6f3 !important; }}
             and _expense_owner_no_payout(eng)
         ):
             _submit_owner_no_payout_receipt_to_xero(eng, rid)
+        elif updates.get("payment_source") == "company_card":
+            _submit_company_card_receipt_to_xero(eng, rid)
         return_to = (request.form.get("return_to") or "").strip()
         if return_to.startswith(f"/expenses/{token}/review-upload"):
             return redirect(return_to)
