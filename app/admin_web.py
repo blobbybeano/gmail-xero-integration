@@ -16496,18 +16496,19 @@ body {{ background:#f7f6f3 !important; }}
             int(_e.get("id") or 0): str(_e.get("plaid_account_id") or "").strip()
             for _e in engineers
         }
+        receipts_by_feed: dict[str, list[dict]] = {}
+        for _r in all_receipts:
+            try:
+                _rid_eng = int(_r.get("engineer_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            _feed = engineer_feed_by_id.get(_rid_eng) or ""
+            if _feed and (_r.get("payment_source") or "company_card") == "company_card":
+                receipts_by_feed.setdefault(_feed, []).append(_r)
 
         def _receipt_candidates_for_feed(account_id: str, amount: float, day: dt.date):
             candidates = []
-            for r in all_receipts:
-                try:
-                    rid_eng = int(r.get("engineer_id") or 0)
-                except (TypeError, ValueError):
-                    continue
-                if engineer_feed_by_id.get(rid_eng) != account_id:
-                    continue
-                if (r.get("payment_source") or "company_card") != "company_card":
-                    continue
+            for r in receipts_by_feed.get(account_id, []):
                 try:
                     ra = float(r.get("amount_inc") or 0)
                 except (TypeError, ValueError):
@@ -16560,6 +16561,8 @@ body {{ background:#f7f6f3 !important; }}
                 return "Last week"
             return f"Week of {start.strftime('%d %b')}"
 
+        account_outstanding_cache: dict[tuple[str, bool], tuple[list[dict], dict[dt.date, list[dict]]]] = {}
+
         def _card_outstanding_for_engineer(
             eng: dict,
             *,
@@ -16568,6 +16571,9 @@ body {{ background:#f7f6f3 !important; }}
             acct = str(eng.get("plaid_account_id") or "").strip()
             if not acct:
                 return [], {}
+            cache_key = (acct, bool(bank_feed))
+            if cache_key in account_outstanding_cache:
+                return account_outstanding_cache[cache_key]
             txs = []
             for idx, t in enumerate(card_transactions):
                 if str(t.get("account_id") or "").strip() != acct:
@@ -16610,6 +16616,7 @@ body {{ background:#f7f6f3 !important; }}
             weeks: dict[dt.date, list[dict]] = {}
             for tx in outstanding:
                 weeks.setdefault(_week_start(tx["date"]), []).append(tx)
+            account_outstanding_cache[cache_key] = (outstanding, weeks)
             return outstanding, weeks
 
         def _linked_account_name(account_id: str) -> str:
