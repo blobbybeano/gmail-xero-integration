@@ -16492,10 +16492,19 @@ body {{ background:#f7f6f3 !important; }}
                     return True
             return False
 
-        def _receipt_candidates_for_card(eng_id: int, amount: float, day: dt.date):
+        engineer_feed_by_id = {
+            int(_e.get("id") or 0): str(_e.get("plaid_account_id") or "").strip()
+            for _e in engineers
+        }
+
+        def _receipt_candidates_for_feed(account_id: str, amount: float, day: dt.date):
             candidates = []
             for r in all_receipts:
-                if int(r.get("engineer_id") or 0) != eng_id:
+                try:
+                    rid_eng = int(r.get("engineer_id") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if engineer_feed_by_id.get(rid_eng) != account_id:
                     continue
                 if (r.get("payment_source") or "company_card") != "company_card":
                     continue
@@ -16511,6 +16520,36 @@ body {{ background:#f7f6f3 !important; }}
             candidates.sort(key=lambda x: x[0])
             return [r for _, r in candidates]
 
+        def _is_bank_receipt_candidate(name: str, amount: float) -> bool:
+            """True for receipt-like card purchases inside a normal bank feed.
+
+            Main bank feeds include wages, transfers, loans, bank charges and
+            ordinary supplier payments. Those should not inflate the Field
+            Expenses "missing receipts" total. For bank feeds, chase only clear
+            card-purchase lines, e.g. Lloyds card marker "CD 6083".
+            """
+            text = str(name or "")
+            upper = text.upper()
+            if amount <= 0:
+                return False
+            if any(
+                marker in upper
+                for marker in (
+                    "NON-GBP TRANS FEE",
+                    "SERVICE CHARGES",
+                    " LOAN ",
+                    "SALARY",
+                    " WAGE",
+                    " JUNE PAY",
+                    " PAY ",
+                    " RECEIPTS ",
+                    " EXPENSES ",
+                    "GARAGE RENT",
+                )
+            ):
+                return False
+            return bool(re.search(r"\bCD\s*\d{3,5}\b", text, re.I))
+
         def _week_start(day: dt.date) -> dt.date:
             return day - dt.timedelta(days=day.weekday())
 
@@ -16521,7 +16560,11 @@ body {{ background:#f7f6f3 !important; }}
                 return "Last week"
             return f"Week of {start.strftime('%d %b')}"
 
-        def _card_outstanding_for_engineer(eng: dict) -> tuple[list[dict], dict[dt.date, list[dict]]]:
+        def _card_outstanding_for_engineer(
+            eng: dict,
+            *,
+            bank_feed: bool = False,
+        ) -> tuple[list[dict], dict[dt.date, list[dict]]]:
             acct = str(eng.get("plaid_account_id") or "").strip()
             if not acct:
                 return [], {}
@@ -16538,11 +16581,14 @@ body {{ background:#f7f6f3 !important; }}
                 day = _parse_date(t.get("date"))
                 if not day:
                     continue
+                name = str(t.get("name") or "Card payment")
+                if bank_feed and not _is_bank_receipt_candidate(name, amount):
+                    continue
                 txs.append({
                     "key": str(t.get("transaction_id") or f"{day.isoformat()}:{amount:.2f}:{idx}"),
                     "date": day,
                     "amount": amount,
-                    "name": str(t.get("name") or "Card payment"),
+                    "name": name,
                 })
             txs.sort(key=lambda x: x["date"])
             used_receipts: set[str] = set()
@@ -16551,7 +16597,7 @@ body {{ background:#f7f6f3 !important; }}
                 if _xero_has_reconciled_spend(tx["amount"], tx["date"]):
                     continue
                 matched = False
-                for rec in _receipt_candidates_for_card(int(eng["id"]), tx["amount"], tx["date"]):
+                for rec in _receipt_candidates_for_feed(acct, tx["amount"], tx["date"]):
                     rid = str(rec.get("id") or "")
                     if rid and rid in used_receipts:
                         continue
@@ -16828,7 +16874,10 @@ body {{ background:#f7f6f3 !important; }}
                         f"title='Linked to {escape(linked_account_name)}. This is a bank-feed receipt follow-up list.'>"
                         "Bank receipts linked</span>"
                     )
-                outstanding, weekly_outstanding = _card_outstanding_for_engineer(e)
+                outstanding, weekly_outstanding = _card_outstanding_for_engineer(
+                    e,
+                    bank_feed=not is_card_receipt_feed,
+                )
                 receipt_box_label = "Card receipts" if is_card_receipt_feed else "Bank receipts"
                 receipt_panel_title = (
                     "Outstanding card receipts"
