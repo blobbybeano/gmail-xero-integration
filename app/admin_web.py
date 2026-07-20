@@ -7764,413 +7764,425 @@ function toggleReceiptsEnabled(requested) {{
             print("[webhook] Xero intent-to-receive verified successfully", flush=True)
             return "", 200
 
-        app_state = load_state(config.state_file)
-        inv_map = app_state.get("event_invoice_map", {})
-        inv_id_to_key = {v: k for k, v in inv_map.items()}
-        _now_webhook_ts = time.time()
-        _recent_paid_invoice_webhooks = {
-            str(k): dict(v or {})
-            for k, v in (app_state.get("recent_paid_xero_invoice_webhooks", {}) or {}).items()
-            if (_now_webhook_ts - float((v or {}).get("handled_at_ts") or 0.0)) <= 300
-        }
-        if _recent_paid_invoice_webhooks != (
-            app_state.get("recent_paid_xero_invoice_webhooks", {}) or {}
-        ):
-            app_state["recent_paid_xero_invoice_webhooks"] = _recent_paid_invoice_webhooks
-
-        if xero_is_disabled() or xero_lockout_is_active(config):
-            print(
-                "[webhook] Xero invoice webhook received while Xero is paused/locked; "
-                "skipping Xero token refresh and invoice fetch",
-                flush=True,
-            )
-            trigger_poll()
-            return "", 200
-        _busy = xero_busy_status(config.admin_db_file)
-        if _busy.get("active"):
-            print(
-                "[webhook] Xero invoice webhook received while Xero is busy "
-                f"({ _busy.get('reason') or _busy.get('owner') }); deferring invoice fetch",
-                flush=True,
-            )
-            trigger_poll()
-            return "", 200
-
-        creds = load_admin_credentials(config)
-        sheet_target = get_sheet_target(config.admin_db_file)
-        sales_sheet_target = get_sales_sheet_target(config.admin_db_file)
-        calendar_sales_sheets = get_calendar_sales_sheets(config.admin_db_file)
-        sales_stats_fields = get_sales_stats_fields(config.admin_db_file)
-        submitter_aliases = get_submitter_aliases(config.admin_db_file)
-        spreadsheet_id = (sheet_target.get("spreadsheet_id") or "").strip()
-        sheet_name = (sheet_target.get("sheet_name") or "Sheet1").strip() or "Sheet1"
-
-        xero_tok = load_xero_token(config.xero_token_file)
-        if token_is_expired(xero_tok) and xero_tok.get("refresh_token"):
+        def _process_invoice_events_async(events_snapshot: list[dict]) -> None:
             try:
-                _cid, _csec = _get_xero_creds(config)
-                if _cid and _csec:
-                    refreshed = refresh_xero_token(
-                        _cid,
-                        _csec,
-                        xero_tok["refresh_token"],
-                    )
-                    xero_tok = {**xero_tok, **refreshed}
-                    save_xero_token(config.xero_token_file, xero_tok)
-            except Exception as exc:
-                print(
-                    f"[webhook] Xero token refresh failed before invoice webhook handling: {exc}",
-                    flush=True,
-                )
-        xero_at = (xero_tok or {}).get("access_token", "")
-        xero_tenant = (xero_tok or {}).get("tenant_id", "")
-        _webhook_429 = False  # set True if a Xero 429 is hit mid-batch
-
-        def _fetch_invoice(invoice_id: str):
-            nonlocal xero_at, xero_tok, _webhook_429
-            if (
-                xero_is_disabled()
-                or xero_lockout_is_active(config)
-                or xero_busy_status(config.admin_db_file).get("active")
-            ):
-                return None
-            if not (xero_at and xero_tenant):
-                return None
-            url = f"https://api.xero.com/api.xro/2.0/Invoices/{invoice_id}"
-            headers = {
-                "Authorization": f"Bearer {xero_at}",
-                "Xero-tenant-id": xero_tenant,
-                "Accept": "application/json",
-            }
-            _throttle_xero_request()
-            resp = requests.get(url, headers=headers, timeout=10)
-            _log_xero_request(
-                "GET",
-                resp.url or url,
-                resp.status_code,
-                retry_after=str(resp.headers.get("Retry-After") or "").strip(),
-            )
-            if resp.status_code == 401 and xero_tok.get("refresh_token"):
-                try:
-                    _cid, _csec = _get_xero_creds(config)
-                    if _cid and _csec:
-                        refreshed = refresh_xero_token(_cid, _csec, xero_tok["refresh_token"])
-                        xero_tok = {**xero_tok, **refreshed}
-                        save_xero_token(config.xero_token_file, xero_tok)
-                        xero_at = (xero_tok or {}).get("access_token", "")
-                        headers["Authorization"] = f"Bearer {xero_at}"
-                        _throttle_xero_request()
-                        resp = requests.get(url, headers=headers, timeout=10)
-                        _log_xero_request(
-                            "GET",
-                            resp.url or url,
-                            resp.status_code,
-                            retry_after=str(resp.headers.get("Retry-After") or "").strip(),
-                        )
-                except Exception as exc:
-                    print(f"[webhook] Xero token refresh failed while fetching invoice: {exc}", flush=True)
-            if resp.status_code == 429:
-                retry_after_s = record_xero_rate_limit_from_response(resp)
-                if not retry_after_s:
-                    retry_after_s = 300
-                _lockout_until = time.time() + retry_after_s
-                _ls = load_state(config.state_file)
-                _ls["xero_lockout_until_ts"] = _lockout_until
-                _ls["xero_lockout_reason"] = "Xero API rate limit (429) during webhook batch"
-                _ls["xero_lockout_updated_at_ts"] = time.time()
-                save_state_merged(config.state_file, _ls)
-                print(
-                    f"[webhook] Xero 429 — persisted lockout for {retry_after_s}s, "
-                    "halting further webhook Xero calls this batch",
-                    flush=True,
-                )
-                _webhook_429 = True
-                return None
-            if not resp.ok:
-                return None
-            invoices = resp.json().get("Invoices", [])
-            return invoices[0] if invoices else None
-
-        def _is_invoice_paid(invoice_obj: dict | None) -> bool:
-            if not invoice_obj:
-                return False
-            status_raw = str(invoice_obj.get("Status") or "").upper()
-            try:
-                amount_due = float(invoice_obj.get("AmountDue") or 0.0)
-            except Exception:
-                amount_due = 0.0
-            # Treat fully settled invoices as paid even if status text lags.
-            return status_raw == "PAID" or amount_due <= 0.0001
-
-        _invoice_cache: dict = {}  # one Xero API call per unique invoice ID per batch
-        for ev in events:
-            if ev.get("eventCategory") != "INVOICE":
-                continue
-            invoice_id = ev.get("resourceId", "")
-            if not invoice_id:
-                continue
-            _recent_paid_row = _recent_paid_invoice_webhooks.get(invoice_id) or {}
-            if _recent_paid_row:
-                print(
-                    f"[webhook] Duplicate paid invoice webhook skipped for {invoice_id}",
-                    flush=True,
-                )
-                continue
-            print(f"[webhook] Xero invoice event: {ev.get('eventType')} {invoice_id}", flush=True)
-
-            try:
-                if invoice_id not in _invoice_cache:
-                    _invoice_cache[invoice_id] = _fetch_invoice(invoice_id)
-                if _webhook_429:
-                    print(
-                        "[webhook] Xero rate-limited mid-batch — stopping; "
-                        "remaining events will be picked up by the background poller",
-                        flush=True,
-                    )
-                    break
-                invoice = _invoice_cache[invoice_id]
-                status_raw = str((invoice or {}).get("Status") or "").upper()
-                is_paid_or_settled = _is_invoice_paid(invoice)
-                is_sent_or_authorised = status_raw in {"AUTHORISED", "PAID"}
-                inv_number = str((invoice or {}).get("InvoiceNumber") or "").strip()
-                event_key = inv_id_to_key.get(invoice_id, "")
-                if is_paid_or_settled:
-                    _recent_paid_invoice_webhooks[invoice_id] = {
-                        "handled_at_ts": time.time(),
-                        "event_key": event_key,
-                        "invoice_number": inv_number,
-                    }
+                app_state = load_state(config.state_file)
+                inv_map = app_state.get("event_invoice_map", {})
+                inv_id_to_key = {v: k for k, v in inv_map.items()}
+                _now_webhook_ts = time.time()
+                _recent_paid_invoice_webhooks = {
+                    str(k): dict(v or {})
+                    for k, v in (app_state.get("recent_paid_xero_invoice_webhooks", {}) or {}).items()
+                    if (_now_webhook_ts - float((v or {}).get("handled_at_ts") or 0.0)) <= 300
+                }
+                if _recent_paid_invoice_webhooks != (
+                    app_state.get("recent_paid_xero_invoice_webhooks", {}) or {}
+                ):
                     app_state["recent_paid_xero_invoice_webhooks"] = _recent_paid_invoice_webhooks
 
-                # Keep mapped diary entry in sync with Xero-side invoice edits and status.
-                if event_key and ":" in event_key and creds and invoice:
-                    cal_id, event_id = event_key.split(":", 1)
-                    queue_event_target(event_key)
+                if xero_is_disabled() or xero_lockout_is_active(config):
+                    print(
+                        "[webhook] Xero invoice webhook received while Xero is paused/locked; "
+                        "skipping Xero token refresh and invoice fetch",
+                        flush=True,
+                    )
+                    trigger_poll()
+                    return
+                _busy = xero_busy_status(config.admin_db_file)
+                if _busy.get("active"):
+                    print(
+                        "[webhook] Xero invoice webhook received while Xero is busy "
+                        f"({ _busy.get('reason') or _busy.get('owner') }); deferring invoice fetch",
+                        flush=True,
+                    )
+                    trigger_poll()
+                    return
+
+                creds = load_admin_credentials(config)
+                sheet_target = get_sheet_target(config.admin_db_file)
+                sales_sheet_target = get_sales_sheet_target(config.admin_db_file)
+                calendar_sales_sheets = get_calendar_sales_sheets(config.admin_db_file)
+                sales_stats_fields = get_sales_stats_fields(config.admin_db_file)
+                submitter_aliases = get_submitter_aliases(config.admin_db_file)
+                spreadsheet_id = (sheet_target.get("spreadsheet_id") or "").strip()
+                sheet_name = (sheet_target.get("sheet_name") or "Sheet1").strip() or "Sheet1"
+
+                xero_tok = load_xero_token(config.xero_token_file)
+                if token_is_expired(xero_tok) and xero_tok.get("refresh_token"):
                     try:
-                        gsvc = build_calendar_service_from_creds(creds)
-                        ge = gsvc.events().get(calendarId=cal_id, eventId=event_id).execute()
-                        cur_desc = ge.get("description") or ""
-                        synced_desc = sync_invoice_block_from_xero(
-                            cur_desc,
-                            (invoice.get("LineItems") or []),
-                        )
-                        cur_summary = ge.get("summary")
-                        desired_status = ""
-                        if is_paid_or_settled:
-                            desired_status = "green"
-                        elif is_sent_or_authorised:
-                            pay_mode = payment_choice(synced_desc or cur_desc)
-                            desired_status = "green" if pay_mode in {"card", "cash"} else "yellow"
-
-                        next_summary = cur_summary
-                        if desired_status:
-                            next_summary = set_title_status_emoji(next_summary, desired_status)
-                        next_summary = set_title_mail_emoji(
-                            next_summary,
-                            "invoice send failed" in (synced_desc or "").lower(),
-                        )
-
-                        if synced_desc != cur_desc or next_summary != cur_summary:
-                            update_event_description(
-                                config,
-                                event_id=event_id,
-                                description=synced_desc,
-                                summary=next_summary,
-                                calendar_id=cal_id,
+                        _cid, _csec = _get_xero_creds(config)
+                        if _cid and _csec:
+                            refreshed = refresh_xero_token(
+                                _cid,
+                                _csec,
+                                xero_tok["refresh_token"],
                             )
-                            print(
-                                f"[webhook] Calendar synced from Xero for {event_key} "
-                                f"(status={status_raw or 'UNKNOWN'})",
-                                flush=True,
-                            )
-
-                        if is_sent_or_authorised:
-                            app_state = mark_invoice_sent(app_state, event_key)
-                        if is_paid_or_settled:
-                            app_state = mark_invoice_paid(app_state, event_key)
-                        app_state = mark_recent_xero_webhook(app_state, event_key, invoice_id)
-                        app_state = save_state_merged(config.state_file, app_state)
+                            xero_tok = {**xero_tok, **refreshed}
+                            save_xero_token(config.xero_token_file, xero_tok)
                     except Exception as exc:
-                        print(f"[webhook] Calendar sync failed for {event_key}: {exc}", flush=True)
+                        print(
+                            f"[webhook] Xero token refresh failed before invoice webhook handling: {exc}",
+                            flush=True,
+                        )
+                xero_at = (xero_tok or {}).get("access_token", "")
+                xero_tenant = (xero_tok or {}).get("tenant_id", "")
+                _webhook_429 = False  # set True if a Xero 429 is hit mid-batch
 
-                if is_paid_or_settled:
-                    print(f"[webhook] Invoice {inv_number} is PAID — updating sheet + calendar", flush=True)
-                    _feed.push(f"Invoice {inv_number} paid — marking sheet row as Paid", "paid")
-                    if creds and spreadsheet_id and inv_number:
+                def _fetch_invoice(invoice_id: str):
+                    nonlocal xero_at, xero_tok, _webhook_429
+                    if (
+                        xero_is_disabled()
+                        or xero_lockout_is_active(config)
+                        or xero_busy_status(config.admin_db_file).get("active")
+                    ):
+                        return None
+                    if not (xero_at and xero_tenant):
+                        return None
+                    url = f"https://api.xero.com/api.xro/2.0/Invoices/{invoice_id}"
+                    headers = {
+                        "Authorization": f"Bearer {xero_at}",
+                        "Xero-tenant-id": xero_tenant,
+                        "Accept": "application/json",
+                    }
+                    _throttle_xero_request()
+                    resp = requests.get(url, headers=headers, timeout=10)
+                    _log_xero_request(
+                        "GET",
+                        resp.url or url,
+                        resp.status_code,
+                        retry_after=str(resp.headers.get("Retry-After") or "").strip(),
+                    )
+                    if resp.status_code == 401 and xero_tok.get("refresh_token"):
                         try:
-                            sheet_update_status = update_invoice_paid_in_sheet(
-                                creds,
-                                spreadsheet_id=spreadsheet_id,
-                                sheet_name=sheet_name,
-                                invoice_number=inv_number,
-                            )
-                            if sheet_update_status == "updated":
-                                print(f"[webhook] Sheet row updated for {inv_number}", flush=True)
-                                _feed.push(f"Sheet updated: {inv_number} marked as Paid", "paid")
-                            elif sheet_update_status == "already_paid":
-                                print(f"[webhook] Sheet row already up-to-date for {inv_number}", flush=True)
-                            else:
-                                print(
-                                    f"[webhook] Sheet row update skipped for {inv_number}: {sheet_update_status}",
-                                    flush=True,
+                            _cid, _csec = _get_xero_creds(config)
+                            if _cid and _csec:
+                                refreshed = refresh_xero_token(_cid, _csec, xero_tok["refresh_token"])
+                                xero_tok = {**xero_tok, **refreshed}
+                                save_xero_token(config.xero_token_file, xero_tok)
+                                xero_at = (xero_tok or {}).get("access_token", "")
+                                headers["Authorization"] = f"Bearer {xero_at}"
+                                _throttle_xero_request()
+                                resp = requests.get(url, headers=headers, timeout=10)
+                                _log_xero_request(
+                                    "GET",
+                                    resp.url or url,
+                                    resp.status_code,
+                                    retry_after=str(resp.headers.get("Retry-After") or "").strip(),
                                 )
                         except Exception as exc:
-                            print(f"[webhook] Sheet update failed: {exc}", flush=True)
+                            print(f"[webhook] Xero token refresh failed while fetching invoice: {exc}", flush=True)
+                    if resp.status_code == 429:
+                        retry_after_s = record_xero_rate_limit_from_response(resp)
+                        if not retry_after_s:
+                            retry_after_s = 300
+                        _lockout_until = time.time() + retry_after_s
+                        _ls = load_state(config.state_file)
+                        _ls["xero_lockout_until_ts"] = _lockout_until
+                        _ls["xero_lockout_reason"] = "Xero API rate limit (429) during webhook batch"
+                        _ls["xero_lockout_updated_at_ts"] = time.time()
+                        save_state_merged(config.state_file, _ls)
+                        print(
+                            f"[webhook] Xero 429 — persisted lockout for {retry_after_s}s, "
+                            "halting further webhook Xero calls this batch",
+                            flush=True,
+                        )
+                        _webhook_429 = True
+                        return None
+                    if not resp.ok:
+                        return None
+                    invoices = resp.json().get("Invoices", [])
+                    return invoices[0] if invoices else None
 
-                    if event_key and ":" in event_key:
-                        cal_id, event_id = event_key.split(":", 1)
-                        queue_event_target(event_key)
-                        try:
-                            gsvc = build_calendar_service_from_creds(creds) if creds else None
-                            if gsvc:
+                def _is_invoice_paid(invoice_obj: dict | None) -> bool:
+                    if not invoice_obj:
+                        return False
+                    status_raw = str(invoice_obj.get("Status") or "").upper()
+                    try:
+                        amount_due = float(invoice_obj.get("AmountDue") or 0.0)
+                    except Exception:
+                        amount_due = 0.0
+                    # Treat fully settled invoices as paid even if status text lags.
+                    return status_raw == "PAID" or amount_due <= 0.0001
+
+                _invoice_cache: dict = {}  # one Xero API call per unique invoice ID per batch
+                for ev in events_snapshot:
+                    if ev.get("eventCategory") != "INVOICE":
+                        continue
+                    invoice_id = ev.get("resourceId", "")
+                    if not invoice_id:
+                        continue
+                    _recent_paid_row = _recent_paid_invoice_webhooks.get(invoice_id) or {}
+                    if _recent_paid_row:
+                        print(
+                            f"[webhook] Duplicate paid invoice webhook skipped for {invoice_id}",
+                            flush=True,
+                        )
+                        continue
+                    print(f"[webhook] Xero invoice event: {ev.get('eventType')} {invoice_id}", flush=True)
+
+                    try:
+                        if invoice_id not in _invoice_cache:
+                            _invoice_cache[invoice_id] = _fetch_invoice(invoice_id)
+                        if _webhook_429:
+                            print(
+                                "[webhook] Xero rate-limited mid-batch — stopping; "
+                                "remaining events will be picked up by the background poller",
+                                flush=True,
+                            )
+                            break
+                        invoice = _invoice_cache[invoice_id]
+                        status_raw = str((invoice or {}).get("Status") or "").upper()
+                        is_paid_or_settled = _is_invoice_paid(invoice)
+                        is_sent_or_authorised = status_raw in {"AUTHORISED", "PAID"}
+                        inv_number = str((invoice or {}).get("InvoiceNumber") or "").strip()
+                        event_key = inv_id_to_key.get(invoice_id, "")
+                        if is_paid_or_settled:
+                            _recent_paid_invoice_webhooks[invoice_id] = {
+                                "handled_at_ts": time.time(),
+                                "event_key": event_key,
+                                "invoice_number": inv_number,
+                            }
+                            app_state["recent_paid_xero_invoice_webhooks"] = _recent_paid_invoice_webhooks
+
+                        # Keep mapped diary entry in sync with Xero-side invoice edits and status.
+                        if event_key and ":" in event_key and creds and invoice:
+                            cal_id, event_id = event_key.split(":", 1)
+                            queue_event_target(event_key)
+                            try:
+                                gsvc = build_calendar_service_from_creds(creds)
                                 ge = gsvc.events().get(calendarId=cal_id, eventId=event_id).execute()
-                                cur_summary = ge.get("summary")
-                                updated_summary = set_title_status_emoji(cur_summary, "green")
-                                updated_summary = set_title_mail_emoji(
-                                    updated_summary,
-                                    "invoice send failed" in (ge.get("description") or "").lower(),
+                                cur_desc = ge.get("description") or ""
+                                synced_desc = sync_invoice_block_from_xero(
+                                    cur_desc,
+                                    (invoice.get("LineItems") or []),
                                 )
-                                if updated_summary != cur_summary:
+                                cur_summary = ge.get("summary")
+                                desired_status = ""
+                                if is_paid_or_settled:
+                                    desired_status = "green"
+                                elif is_sent_or_authorised:
+                                    pay_mode = payment_choice(synced_desc or cur_desc)
+                                    desired_status = "green" if pay_mode in {"card", "cash"} else "yellow"
+
+                                next_summary = cur_summary
+                                if desired_status:
+                                    next_summary = set_title_status_emoji(next_summary, desired_status)
+                                next_summary = set_title_mail_emoji(
+                                    next_summary,
+                                    "invoice send failed" in (synced_desc or "").lower(),
+                                )
+
+                                if synced_desc != cur_desc or next_summary != cur_summary:
                                     update_event_description(
                                         config,
                                         event_id=event_id,
-                                        description=ge.get("description") or "",
-                                        summary=updated_summary,
+                                        description=synced_desc,
+                                        summary=next_summary,
                                         calendar_id=cal_id,
                                     )
-                                    print(f"[webhook] Calendar title set to green for {event_key}", flush=True)
-                                    _feed.push(f"Calendar updated to paid (green): {inv_number or event_id}", "paid")
+                                    print(
+                                        f"[webhook] Calendar synced from Xero for {event_key} "
+                                        f"(status={status_raw or 'UNKNOWN'})",
+                                        flush=True,
+                                    )
 
-                                # Invoice-mode sales logging happens only after payment is actually made.
-                                if payment_choice(ge.get("description")) == "invoice":
-                                    sales_lines = extract_sales_lines(ge.get("description"))
-                                    effective_sales_stats_fields = [
-                                        str(s) for s in (sales_stats_fields or DEFAULT_SALES_STATS_FIELDS)
-                                    ]
-                                    if sales_lines:
-                                        route = calendar_sales_sheets.get(cal_id) or {}
-                                        sales_spreadsheet_id = (
-                                            str(route.get("spreadsheet_id") or "").strip()
-                                            or str(sales_sheet_target.get("spreadsheet_id") or "").strip()
+                                if is_sent_or_authorised:
+                                    app_state = mark_invoice_sent(app_state, event_key)
+                                if is_paid_or_settled:
+                                    app_state = mark_invoice_paid(app_state, event_key)
+                                app_state = mark_recent_xero_webhook(app_state, event_key, invoice_id)
+                                app_state = save_state_merged(config.state_file, app_state)
+                            except Exception as exc:
+                                print(f"[webhook] Calendar sync failed for {event_key}: {exc}", flush=True)
+
+                        if is_paid_or_settled:
+                            print(f"[webhook] Invoice {inv_number} is PAID — updating sheet + calendar", flush=True)
+                            _feed.push(f"Invoice {inv_number} paid — marking sheet row as Paid", "paid")
+                            if creds and spreadsheet_id and inv_number:
+                                try:
+                                    sheet_update_status = update_invoice_paid_in_sheet(
+                                        creds,
+                                        spreadsheet_id=spreadsheet_id,
+                                        sheet_name=sheet_name,
+                                        invoice_number=inv_number,
+                                    )
+                                    if sheet_update_status == "updated":
+                                        print(f"[webhook] Sheet row updated for {inv_number}", flush=True)
+                                        _feed.push(f"Sheet updated: {inv_number} marked as Paid", "paid")
+                                    elif sheet_update_status == "already_paid":
+                                        print(f"[webhook] Sheet row already up-to-date for {inv_number}", flush=True)
+                                    else:
+                                        print(
+                                            f"[webhook] Sheet row update skipped for {inv_number}: {sheet_update_status}",
+                                            flush=True,
                                         )
-                                        sales_sheet_name = (
-                                            str(route.get("sheet_name") or "").strip()
-                                            or str(sales_sheet_target.get("sheet_name") or "Sales").strip()
-                                            or "Sales"
+                                except Exception as exc:
+                                    print(f"[webhook] Sheet update failed: {exc}", flush=True)
+
+                            if event_key and ":" in event_key:
+                                cal_id, event_id = event_key.split(":", 1)
+                                queue_event_target(event_key)
+                                try:
+                                    gsvc = build_calendar_service_from_creds(creds) if creds else None
+                                    if gsvc:
+                                        ge = gsvc.events().get(calendarId=cal_id, eventId=event_id).execute()
+                                        cur_summary = ge.get("summary")
+                                        updated_summary = set_title_status_emoji(cur_summary, "green")
+                                        updated_summary = set_title_mail_emoji(
+                                            updated_summary,
+                                            "invoice send failed" in (ge.get("description") or "").lower(),
                                         )
-                                        if sales_spreadsheet_id:
-                                            sales_total_ex = round(
-                                                sum(
-                                                    float(li.get("UnitAmount") or 0.0)
-                                                    * float(li.get("Quantity") or 1.0)
-                                                    for li in sales_lines
-                                                ),
-                                                2,
+                                        if updated_summary != cur_summary:
+                                            update_event_description(
+                                                config,
+                                                event_id=event_id,
+                                                description=ge.get("description") or "",
+                                                summary=updated_summary,
+                                                calendar_id=cal_id,
                                             )
-                                            sales_total_inc = round(
-                                                sum(
-                                                    (float(li.get("UnitAmount") or 0.0)
-                                                    * float(li.get("Quantity") or 1.0))
-                                                    * (
-                                                        1.2
-                                                        if (li.get("TaxType") or "").upper() == "OUTPUT2"
-                                                        else 1.0
-                                                    )
-                                                    for li in sales_lines
-                                                ),
-                                                2,
-                                            )
-                                            sales_marker = (
-                                                f"{invoice_id}:invoice:sales:{sales_spreadsheet_id}:"
-                                                f"{sales_sheet_name}:{len(sales_lines)}:"
-                                                f"{sales_total_ex:.2f}:{sales_total_inc:.2f}"
-                                            ).upper()
-                                            if get_sales_log_marker(app_state, event_key) != sales_marker:
-                                                from zoneinfo import ZoneInfo
+                                            print(f"[webhook] Calendar title set to green for {event_key}", flush=True)
+                                            _feed.push(f"Calendar updated to paid (green): {inv_number or event_id}", "paid")
 
-                                                london_tz = ZoneInfo("Europe/London")
-
-                                                def _fmt_london(iso_str: str) -> str:
-                                                    if not iso_str:
-                                                        return ""
-                                                    try:
-                                                        if "T" in iso_str:
-                                                            obj = dt.datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-                                                            if obj.tzinfo is None:
-                                                                obj = obj.replace(tzinfo=dt.timezone.utc)
-                                                            return obj.astimezone(london_tz).strftime("%d/%m/%Y %H:%M")
-                                                        obj = dt.date.fromisoformat(iso_str)
-                                                        return obj.strftime("%d/%m/%Y")
-                                                    except Exception:
-                                                        return iso_str
-
-                                                start = (ge.get("start", {}) or {}).get("dateTime") or (ge.get("start", {}) or {}).get("date") or ""
-                                                end = (ge.get("end", {}) or {}).get("dateTime") or (ge.get("end", {}) or {}).get("date") or ""
-                                                start_fmt = _fmt_london(start)
-                                                end_fmt = _fmt_london(end)
-                                                slot_text = f"{start_fmt} – {end_fmt}".strip(" –") if start_fmt != end_fmt else start_fmt
-                                                customer_fields = parse_customer_fields(ge.get("description"))
-                                                submitter_email = (
-                                                    ((ge.get("creator", {}) or {}).get("email"))
-                                                    or ((ge.get("organizer", {}) or {}).get("email"))
-                                                    or ""
-                                                ).strip().lower()
-                                                submitter_name = submitter_aliases.get(submitter_email, submitter_email)
-                                                event_id_raw = ge.get("id") or ""
-                                                date_part = start.split("T", 1)[0].replace("-", "") if start else ""
-                                                suffix = event_id_raw[-4:] if event_id_raw else "0000"
-                                                event_id_display = (
-                                                    f"GC-{date_part}-{suffix}" if date_part else (event_id_raw or event_key)
+                                        # Invoice-mode sales logging happens only after payment is actually made.
+                                        if payment_choice(ge.get("description")) == "invoice":
+                                            sales_lines = extract_sales_lines(ge.get("description"))
+                                            effective_sales_stats_fields = [
+                                                str(s) for s in (sales_stats_fields or DEFAULT_SALES_STATS_FIELDS)
+                                            ]
+                                            if sales_lines:
+                                                route = calendar_sales_sheets.get(cal_id) or {}
+                                                sales_spreadsheet_id = (
+                                                    str(route.get("spreadsheet_id") or "").strip()
+                                                    or str(sales_sheet_target.get("spreadsheet_id") or "").strip()
                                                 )
-                                                ensure_header(
-                                                    creds,
-                                                    spreadsheet_id=sales_spreadsheet_id,
-                                                    sheet_name=sales_sheet_name,
-                                                    stats_fields=effective_sales_stats_fields,
+                                                sales_sheet_name = (
+                                                    str(route.get("sheet_name") or "").strip()
+                                                    or str(sales_sheet_target.get("sheet_name") or "Sales").strip()
+                                                    or "Sales"
                                                 )
-                                                sales_lines_text: list[str] = []
-                                                for line in sales_lines:
-                                                    ex_vat = round(
-                                                        float(line.get("UnitAmount") or 0.0)
-                                                        * float(line.get("Quantity") or 1.0),
+                                                if sales_spreadsheet_id:
+                                                    sales_total_ex = round(
+                                                        sum(
+                                                            float(li.get("UnitAmount") or 0.0)
+                                                            * float(li.get("Quantity") or 1.0)
+                                                            for li in sales_lines
+                                                        ),
                                                         2,
                                                     )
-                                                    sales_lines_text.append(
-                                                        f"{line.get('Description') or ''} = £{ex_vat:.2f}"
+                                                    sales_total_inc = round(
+                                                        sum(
+                                                            (float(li.get("UnitAmount") or 0.0)
+                                                            * float(li.get("Quantity") or 1.0))
+                                                            * (
+                                                                1.2
+                                                                if (li.get("TaxType") or "").upper() == "OUTPUT2"
+                                                                else 1.0
+                                                            )
+                                                            for li in sales_lines
+                                                        ),
+                                                        2,
                                                     )
-                                                sales_row_event_id = f"{event_id_display}-S"
-                                                append_stats_row(
-                                                    creds,
-                                                    spreadsheet_id=sales_spreadsheet_id,
-                                                    sheet_name=sales_sheet_name,
-                                                    event_key=f"{event_key}:sales",
-                                                    stats_fields=effective_sales_stats_fields,
-                                                    payload={
-                                                        "submitter": submitter_name,
-                                                        "customer": customer_fields.get("name") or "",
-                                                        "invoice_number": inv_number,
-                                                        "slot_datetime": slot_text,
-                                                        "payment_method": "INVOICE",
-                                                        "sales_item_desc": "\n".join(sales_lines_text),
-                                                        "sales_total_ex_vat": f"{sales_total_ex:.2f}",
-                                                    },
-                                                    event_id_display=sales_row_event_id,
-                                                    dedupe_signature={"Event ID": sales_row_event_id},
-                                                    update_existing=True,
-                                                )
-                                                app_state = set_sales_log_marker(app_state, event_key, sales_marker)
-                                                app_state = save_state_merged(config.state_file, app_state)
-                                                print(f"[webhook] Sales rows upserted for paid invoice {inv_number}", flush=True)
-                                                _feed.push(
-                                                    f"Sales logged after payment: {inv_number or event_id}",
-                                                    "success",
-                                                )
-                        except Exception as exc:
-                            print(f"[webhook] Calendar status update failed for {event_key}: {exc}", flush=True)
-            except Exception as exc:
-                print(f"[webhook] Xero invoice fetch failed: {exc}", flush=True)
+                                                    sales_marker = (
+                                                        f"{invoice_id}:invoice:sales:{sales_spreadsheet_id}:"
+                                                        f"{sales_sheet_name}:{len(sales_lines)}:"
+                                                        f"{sales_total_ex:.2f}:{sales_total_inc:.2f}"
+                                                    ).upper()
+                                                    if get_sales_log_marker(app_state, event_key) != sales_marker:
+                                                        from zoneinfo import ZoneInfo
 
-        trigger_poll()
+                                                        london_tz = ZoneInfo("Europe/London")
+
+                                                        def _fmt_london(iso_str: str) -> str:
+                                                            if not iso_str:
+                                                                return ""
+                                                            try:
+                                                                if "T" in iso_str:
+                                                                    obj = dt.datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+                                                                    if obj.tzinfo is None:
+                                                                        obj = obj.replace(tzinfo=dt.timezone.utc)
+                                                                    return obj.astimezone(london_tz).strftime("%d/%m/%Y %H:%M")
+                                                                obj = dt.date.fromisoformat(iso_str)
+                                                                return obj.strftime("%d/%m/%Y")
+                                                            except Exception:
+                                                                return iso_str
+
+                                                        start = (ge.get("start", {}) or {}).get("dateTime") or (ge.get("start", {}) or {}).get("date") or ""
+                                                        end = (ge.get("end", {}) or {}).get("dateTime") or (ge.get("end", {}) or {}).get("date") or ""
+                                                        start_fmt = _fmt_london(start)
+                                                        end_fmt = _fmt_london(end)
+                                                        slot_text = f"{start_fmt} – {end_fmt}".strip(" –") if start_fmt != end_fmt else start_fmt
+                                                        customer_fields = parse_customer_fields(ge.get("description"))
+                                                        submitter_email = (
+                                                            ((ge.get("creator", {}) or {}).get("email"))
+                                                            or ((ge.get("organizer", {}) or {}).get("email"))
+                                                            or ""
+                                                        ).strip().lower()
+                                                        submitter_name = submitter_aliases.get(submitter_email, submitter_email)
+                                                        event_id_raw = ge.get("id") or ""
+                                                        date_part = start.split("T", 1)[0].replace("-", "") if start else ""
+                                                        suffix = event_id_raw[-4:] if event_id_raw else "0000"
+                                                        event_id_display = (
+                                                            f"GC-{date_part}-{suffix}" if date_part else (event_id_raw or event_key)
+                                                        )
+                                                        ensure_header(
+                                                            creds,
+                                                            spreadsheet_id=sales_spreadsheet_id,
+                                                            sheet_name=sales_sheet_name,
+                                                            stats_fields=effective_sales_stats_fields,
+                                                        )
+                                                        sales_lines_text: list[str] = []
+                                                        for line in sales_lines:
+                                                            ex_vat = round(
+                                                                float(line.get("UnitAmount") or 0.0)
+                                                                * float(line.get("Quantity") or 1.0),
+                                                                2,
+                                                            )
+                                                            sales_lines_text.append(
+                                                                f"{line.get('Description') or ''} = £{ex_vat:.2f}"
+                                                            )
+                                                        sales_row_event_id = f"{event_id_display}-S"
+                                                        append_stats_row(
+                                                            creds,
+                                                            spreadsheet_id=sales_spreadsheet_id,
+                                                            sheet_name=sales_sheet_name,
+                                                            event_key=f"{event_key}:sales",
+                                                            stats_fields=effective_sales_stats_fields,
+                                                            payload={
+                                                                "submitter": submitter_name,
+                                                                "customer": customer_fields.get("name") or "",
+                                                                "invoice_number": inv_number,
+                                                                "slot_datetime": slot_text,
+                                                                "payment_method": "INVOICE",
+                                                                "sales_item_desc": "\n".join(sales_lines_text),
+                                                                "sales_total_ex_vat": f"{sales_total_ex:.2f}",
+                                                            },
+                                                            event_id_display=sales_row_event_id,
+                                                            dedupe_signature={"Event ID": sales_row_event_id},
+                                                            update_existing=True,
+                                                        )
+                                                        app_state = set_sales_log_marker(app_state, event_key, sales_marker)
+                                                        app_state = save_state_merged(config.state_file, app_state)
+                                                        print(f"[webhook] Sales rows upserted for paid invoice {inv_number}", flush=True)
+                                                        _feed.push(
+                                                            f"Sales logged after payment: {inv_number or event_id}",
+                                                            "success",
+                                                        )
+                                except Exception as exc:
+                                    print(f"[webhook] Calendar status update failed for {event_key}: {exc}", flush=True)
+                    except Exception as exc:
+                        print(f"[webhook] Xero invoice fetch failed: {exc}", flush=True)
+
+                trigger_poll()
+            except Exception as exc:
+                print(f"[webhook] Xero async webhook worker failed: {exc}", flush=True)
+
+        threading.Thread(
+            target=_process_invoice_events_async,
+            args=(list(events),),
+            daemon=True,
+            name="xero-webhook-worker",
+        ).start()
+        print(f"[webhook] Queued {len(events)} Xero event(s) for async handling", flush=True)
         return "", 200
 
     @app.post("/admin/sync-today-invoices")
