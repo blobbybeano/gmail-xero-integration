@@ -13065,6 +13065,48 @@ body {{ background:#f7f6f3 !important; }}
         paid_on = (rec.get("purchased_on") or "")[:10]
         if not paid_on:
             paid_on = dt.datetime.now(dt.timezone.utc).date().isoformat()
+
+        owner_paid_account = (
+            (eng.get("owner_paid_account_code") or "").strip()
+            or (eng.get("payment_account_code") or "").strip()
+        )
+        existing = _dump_xero_existing_spend_match(
+            amount_inc=rec.get("amount_inc"),
+            purchased_on=paid_on,
+            merchant=rec.get("merchant") or rec.get("ocr_merchant") or "",
+            card_account=owner_paid_account,
+        )
+        if existing:
+            if not existing.get("has_attachment"):
+                ok, msg = _attach_receipt_to_existing_xero_object(
+                    rec,
+                    endpoint="BankTransactions",
+                    xero_id=str(existing.get("id") or ""),
+                )
+                if not ok:
+                    exp_store.update_receipt(
+                        db,
+                        receipt_id,
+                        xero_error=(
+                            "Existing Xero spend found, but the receipt image "
+                            "could not be attached yet. " + msg
+                        ),
+                    )
+                    return ""
+            exp_store.update_receipt(
+                db,
+                receipt_id,
+                status="settled",
+                xero_type="BankTransactions",
+                xero_id=str(existing.get("id") or ""),
+                xero_error="",
+            )
+            _feed.push(
+                f"Owner-paid receipt linked to existing Xero spend for {eng.get('name')}.",
+                "success",
+            )
+            return str(existing.get("id") or "")
+
         ref = (
             "OWNER-"
             + re.sub(r"[^A-Za-z0-9]+", "", str(eng.get("name") or "OWNER").split()[0]).upper()[:8]
@@ -13175,6 +13217,22 @@ body {{ background:#f7f6f3 !important; }}
 
         bill_match = _receipt_existing_xero_bill_match(rec)
         if bill_match:
+            if not bill_match.get("has_attachment"):
+                ok, msg = _attach_receipt_to_existing_xero_object(
+                    rec,
+                    endpoint="Invoices",
+                    xero_id=str(bill_match.get("id") or ""),
+                )
+                if not ok:
+                    exp_store.update_receipt(
+                        db,
+                        receipt_id,
+                        xero_error=(
+                            "Existing Xero supplier bill found, but the receipt "
+                            "image could not be attached yet. " + msg
+                        ),
+                    )
+                    return ""
             exp_store.update_receipt(
                 db, receipt_id,
                 status="submitted",
@@ -19336,6 +19394,41 @@ body {{ background:#f7f6f3 !important; }}
         if (mime or "").lower().startswith("image/"):
             data, filename, mime = _exp_resize_for_ocr(data, filename, mime)
         return filename, mime, data
+
+    def _attach_receipt_to_existing_xero_object(
+        rec: dict,
+        *,
+        endpoint: str,
+        xero_id: str,
+    ) -> tuple[bool, str]:
+        """Attach this receipt image to an existing Xero object if possible.
+
+        Used when the expense/bill already exists in Xero but has no receipt
+        image yet. This prevents duplicate spend while still giving accountants
+        the supporting document.
+        """
+        xid = str(xero_id or "").strip()
+        if not xid:
+            return False, "No Xero id to attach to."
+        if xero_is_disabled():
+            return False, "Xero is paused — receipt image not attached."
+        payload = _xero_attachment_bytes_for_receipt(rec)
+        if not payload:
+            return False, "Receipt image is not available locally."
+        filename, mime, data = payload
+        try:
+            client = build_xero_client(config)
+            if client is None:
+                return False, "Xero is not connected."
+            if endpoint == "BankTransactions":
+                client.attach_file_to_bank_transaction(xid, filename, mime, data)
+            elif endpoint == "Invoices":
+                client.attach_file_to_invoice(xid, filename, mime, data)
+            else:
+                return False, f"Unsupported Xero attachment endpoint: {endpoint}."
+            return True, "Receipt image attached to existing Xero item."
+        except Exception as exc:
+            return False, "Xero attachment failed: " + str(exc).splitlines()[0][:180]
 
     def _dump_process(batch, files, *, total_count: int | None = None):
         """Process an uploaded batch: OCR + AI-code + dedupe + classify each file,
