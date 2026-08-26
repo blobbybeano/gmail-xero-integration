@@ -97,6 +97,48 @@ class EmailInvoiceImporterTests(unittest.TestCase):
             "Screwfix",
         )
 
+    def test_payment_instructions_beat_person_sender_for_supplier(self):
+        raw = (
+            "Close Brothers Premium Finance Invoice Payment of this invoice is now due. "
+            "Please make your cheque payable to ‘Brown & Brown Insurance Brokers "
+            "(UK) Limited’ for the total amount and send to: Box 19. "
+            "Account Name : Brown & Brown Insurance Brokers (UK) Limited"
+        )
+        self.assertEqual(
+            derive_supplier_merchant(
+                "Charlie Hughes",
+                from_name="Charlie Hughes",
+                from_addr="charlie.hughes@bbrown.com",
+                subject="Outstanding Policy Fee",
+                raw_text=raw,
+                own_names=OWN_NAMES,
+            ),
+            "Brown & Brown Insurance Brokers (UK) Limited",
+        )
+
+    def test_bank_details_beat_own_company_addressed_invoice_supplier(self):
+        raw = (
+            "Pow Services Limited\n"
+            "Flat 24 Stretford Court\n"
+            "INVOICE\n"
+            "Invoice No : 144203\n"
+            "Invoice Date : 12.06.2026\n"
+            "Bank Details: INDIGO SERVICE SOLUTIONS LTD A/c No: 95520011 "
+            "Sort Code: 406384\n"
+            "Invoice Total 84.00"
+        )
+        self.assertEqual(
+            derive_supplier_merchant(
+                "Pow Services Limited",
+                from_name="",
+                from_addr="",
+                subject="",
+                raw_text=raw,
+                own_names=OWN_NAMES + ["Pow Services Limited"],
+            ),
+            "Indigo Group",
+        )
+
     def test_impossible_tax_does_not_make_positive_invoice_net_negative(self):
         self.assertEqual(
             reconcile_amounts(13.83, None, 55.32, vat_rate=20.0),
@@ -211,6 +253,75 @@ class EmailInvoiceImporterTests(unittest.TestCase):
         self.assertEqual(
             reconcile_email_amounts_from_text(13.83, None, 55.32, raw),
             (55.32, 55.32, 0.0),
+        )
+
+    def test_amazon_invoice_total_uses_final_positive_value_in_total_row(self):
+        raw = """
+        amazon.co.uk
+        Invoice date / Delivery date 11 May 2026
+        Total payable
+        £15.85
+        Unit price (excl. VAT) £13.21
+        VAT rate 20%
+        Unit price (incl. VAT) £15.85
+        Shipping Charges £0.00
+        Invoice total
+        £0.00
+        £0.00
+        £15.85
+        VAT rate
+        Item subtotal (excl. VAT)
+        VAT subtotal
+        Total
+        20%
+        £13.21
+        £2.64
+        £13.21
+        £2.64
+        """
+        self.assertEqual(explicit_total_from_text(raw), 15.85)
+        self.assertEqual(
+            reconcile_email_amounts_from_text(0.0, 13.21, 2.64, raw),
+            (15.85, 13.21, 2.64),
+        )
+
+    def test_amazon_invoice_total_uses_final_value_when_total_payable_has_date_noise(self):
+        raw = """
+        amazon.co.uk
+        Paid
+        Total payable
+        11.05.2026
+        GB64UB0DVAEUD
+        £36.58
+        Unit price
+        VAT rate
+        Unit price (incl. VAT)
+        Item subtotal (incl. VAT)
+        2
+        £15.24
+        20%
+        £18.29
+        £36.58
+        Shipping Charges
+        £0.00
+        Invoice total
+        £0.00
+        £0.00
+        £36.58
+        VAT rate
+        Item subtotal (excl. VAT)
+        VAT subtotal
+        Total
+        20%
+        £30.48
+        £6.10
+        £30.48
+        £6.10
+        """
+        self.assertEqual(explicit_total_from_text(raw), 36.58)
+        self.assertEqual(
+            reconcile_email_amounts_from_text(0.0, 30.48, 6.10, raw),
+            (36.58, 30.48, 6.10),
         )
 
     def test_import_rechecks_duplicates_before_creating_receipt(self):

@@ -115,6 +115,11 @@ def _ensure_tables(db_path: str) -> None:
                 "ALTER TABLE expense_dump_batches "
                 "ADD COLUMN card_account TEXT NOT NULL DEFAULT ''"
             )
+        if "supplier_profile" not in existing_cols:
+            conn.execute(
+                "ALTER TABLE expense_dump_batches "
+                "ADD COLUMN supplier_profile TEXT NOT NULL DEFAULT ''"
+            )
         item_cols = {
             r[1] for r in conn.execute("PRAGMA table_info(expense_dump_items)")
         }
@@ -146,6 +151,7 @@ def create_batch(
     engineer_id: int | None = None,
     subcontractor_account: str = "",
     card_account: str = "",
+    supplier_profile: str = "",
     is_test: bool = False,
 ) -> dict[str, Any]:
     bid = f"dump-{uuid.uuid4().hex[:12]}"
@@ -155,12 +161,12 @@ def create_batch(
             """
             INSERT INTO expense_dump_batches
                 (id, label, engineer_id, subcontractor_account, status,
-                 total_count, summary_json, is_test, card_account,
+                 total_count, summary_json, is_test, card_account, supplier_profile,
                  created_at, updated_at)
-            VALUES (?, ?, ?, ?, 'processing', 0, '{}', ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, 'processing', 0, '{}', ?, ?, ?, ?, ?)
             """,
             (bid, label, engineer_id, subcontractor_account,
-             1 if is_test else 0, card_account, now, now),
+             1 if is_test else 0, card_account, supplier_profile, now, now),
         )
         conn.commit()
     return get_batch(db_path, bid)
@@ -168,7 +174,7 @@ def create_batch(
 
 def update_batch(db_path: str, batch_id: str, **fields) -> dict[str, Any] | None:
     allowed = {"label", "engineer_id", "subcontractor_account", "card_account",
-               "status", "total_count"}
+               "supplier_profile", "status", "total_count"}
     sets = {k: v for k, v in fields.items() if k in allowed}
     if "summary" in fields:
         sets["summary_json"] = json.dumps(fields["summary"])

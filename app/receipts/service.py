@@ -55,6 +55,199 @@ def _parse_uk_date(text: str) -> str:
     return ""
 
 
+def _clean_receipt_merchant(merchant: str, raw_text: str = "") -> str:
+    """Clean common OCR supplier mistakes before account matching.
+
+    Document AI sometimes returns phone/browser UI text, copy labels, or a
+    repeated logo line as the supplier.  This helper only overrides the merchant
+    when the OCR value is clearly noise or the receipt text contains a strong,
+    recognisable supplier clue.
+    """
+    raw = raw_text or ""
+
+    def _space(value: str) -> str:
+        return re.sub(r"\s+", " ", (value or "").strip())
+
+    def _norm(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+
+    def _collapse_repeated(value: str) -> str:
+        parts = [_space(p) for p in re.split(r"[\r\n]+", value or "") if _space(p)]
+        if len(parts) >= 2 and len({_norm(p) for p in parts if _norm(p)}) == 1:
+            return parts[0]
+        compact = _space(value)
+        words = compact.split()
+        if len(words) >= 2 and len(words) % 2 == 0:
+            half = len(words) // 2
+            if [_norm(w) for w in words[:half]] == [_norm(w) for w in words[half:]]:
+                return " ".join(words[:half])
+        return compact
+
+    def _canonical_supplier(value: str) -> str:
+        norm = _norm(value).replace(" ", "")
+        if "indigoservicesolutions" in norm or "indigogroup" in norm:
+            return "Indigo Group"
+        if norm in {
+            "ringgo", "ringgoparking", "ringgoparkinglimited",
+            "ringo", "ringoparking",
+        }:
+            return "RingGo Parking"
+        return _space(value)
+
+    def _looks_like_amazon_invoice(value: str) -> bool:
+        norm = _norm(value)
+        compact = norm.replace(" ", "")
+        if not ("amazon" in compact or "amazoncouk" in compact):
+            return False
+        return any(
+            marker in norm
+            for marker in (
+                "total payable",
+                "invoice date",
+                "order number",
+                "order no",
+                "payment reference",
+                "amazon co uk",
+            )
+        )
+
+    def _amazon_supplier_label(ocr_merchant: str, value: str) -> str:
+        if not _looks_like_amazon_invoice(value) and not _looks_like_amazon_invoice(ocr_merchant):
+            return ""
+
+        def _clean_supplier(value: str) -> str:
+            supplier = _space(value)
+            supplier = re.sub(
+                r"\b(?:business\s+address|vat\s+(?:no|number)|invoice\s+number|order\s+number|order\s+#).*$",
+                "",
+                supplier,
+                flags=re.I,
+            )
+            supplier = supplier.strip(" .,:;|-")
+            supplier = re.sub(r"\s+", " ", supplier)
+            norm = _norm(supplier)
+            compact = norm.replace(" ", "")
+            buyer_noise = {
+                "benjaminoliver", "benoliver", "powwash", "powservices",
+                "powserviceslimited", "powservicesltd",
+            }
+            if (
+                not supplier
+                or compact in buyer_noise
+                or compact in {"amazon", "amazoncouk", "amazoneu", "amazoneusarl"}
+                or len(compact) < 4
+            ):
+                return ""
+            return supplier[:80]
+
+        raw = value or ""
+        patterns = (
+            r"\bsold\s+by\s+(.+?)(?=\n|business\s+address|vat\s+(?:no|number)|invoice\s+number|order\s+#|order\s+number|$)",
+            r"\bdispatched\s+from\s+and\s+sold\s+by\s+(.+?)(?=\n|business\s+address|vat\s+(?:no|number)|invoice\s+number|order\s+#|order\s+number|$)",
+        )
+        supplier = ""
+        for pat in patterns:
+            m = re.search(pat, raw, re.I | re.S)
+            if not m:
+                continue
+            supplier = _clean_supplier(m.group(1))
+            if supplier:
+                break
+        if not supplier:
+            supplier = _clean_supplier(ocr_merchant)
+        return f"Amazon (Supplier - {supplier})" if supplier else "Amazon"
+
+    def _supplier_from_payment_line(value: str) -> str:
+        text = re.sub(r"[ \t]+", " ", value or "")
+        patterns = (
+            r"\bbank\s+details\s*(?:\||:|-)?\s*(?:\||:|-)?\s+[‘'\"“”]?(.+?)(?=\s+(?:a/?c|account\s+no|account\s+number|sort\s+code)\b|[\n\r]|$)",
+            r"\baccount\s+name\s*(?:\||:|-)?\s*(?:\||:|-)?\s+[‘'\"“”]?(.+?)(?=\s+(?:sort\s+code|account\s+number|iban)\b|[\n\r]|$)",
+        )
+        for pat in patterns:
+            m = re.search(pat, text, re.I)
+            if not m:
+                continue
+            supplier = re.sub(r"\s+", " ", m.group(1)).strip(" ‘'’\"“”.,:;|-")
+            if supplier and len(_norm(supplier).replace(" ", "")) >= 5:
+                return _canonical_supplier(supplier)
+        return ""
+
+    cleaned = _canonical_supplier(_collapse_repeated(merchant))
+    raw_norm = _norm(raw).replace(" ", "")
+    if "ringgo" in raw_norm or "ringgoparking" in raw_norm:
+        return "RingGo Parking"
+    cleaned_norm = _norm(cleaned)
+    text_norm = _norm(raw)
+    compact_cleaned = cleaned_norm.replace(" ", "")
+    amazon_label = _amazon_supplier_label(cleaned, raw)
+    if amazon_label:
+        return amazon_label
+    own_company_norms = {
+        "powservices", "powservicesltd", "powserviceslimited",
+        "powerwash", "powerwashltd", "powwash", "powwashltd",
+    }
+    looks_like_own_company = any(
+        own in compact_cleaned or compact_cleaned in own
+        for own in own_company_norms
+        if compact_cleaned
+    )
+    payment_supplier = _supplier_from_payment_line(raw)
+    if payment_supplier and looks_like_own_company:
+        return payment_supplier
+
+    supplier_patterns = [
+        (r"\bindigo\s+service\s+solutions\b|\bindigo\s+group\b", "Indigo Group"),
+        (r"\bscrew\s*fix\b|\bscrewfix\b|\bscrevfix\b|\bscervfix\b", "Screwfix"),
+        (r"\btool\s*station\b|\btoolstation\b", "Toolstation"),
+        (r"\bb\s*&\s*q\b|\bbandq\b|\bb and q\b", "B&Q"),
+        (r"\bwickes\b", "Wickes"),
+        (r"\bthe range\b", "The Range"),
+        (r"\bhome bargains\b", "Home Bargains"),
+        (r"\basda\b", "ASDA"),
+        (r"\btesco\b", "Tesco"),
+        (r"\bsainsbury'?s?\b", "Sainsbury's"),
+        (r"\bmorrisons?\b", "Morrisons"),
+        (r"\bshell\b", "Shell"),
+        (r"\bbp\b", "BP"),
+        (r"\besso\b", "Esso"),
+        (r"\btexaco\b", "Texaco"),
+        (r"\bmurco\b", "Murco"),
+        (r"\brontec\b", "Rontec"),
+        (r"\bmotor fuel limited\b|\bmfg\b", "MFG"),
+        (r"\brup(?:e|x)yal\b", "Rupeyal Service Station"),
+        (r"\bmerton\b", "Merton Council"),
+        (r"\broyal borough(?: of kingston)?\b", "Royal Borough Kingston"),
+        (r"\brac\b", "RAC"),
+        (r"\btender\s*pos\b|\btenderpos\b", "Tender POS"),
+        (r"\bcheck\s*a\s*trade\b|\bcheckatrade\b", "Checkatrade"),
+        (r"\bamzn[a-z0-9]*\b|\bamazon(?:\s+eu)?\b|\bamazon\.co\.uk\b", "Amazon"),
+    ]
+
+    inferred = ""
+    for pat, name in supplier_patterns:
+        if re.search(pat, text_norm, re.I) or re.search(pat, cleaned_norm, re.I):
+            inferred = name
+            break
+
+    noise_values = {
+        "", "hello", "hi", "merchant copy", "customer copy", "copy",
+        "history bookmarks profiles", "nleaded", "unleaded", "approved",
+        "receipt", "invoice", "tax invoice",
+    }
+    looks_noisy = (
+        cleaned_norm in noise_values
+        or bool(re.fullmatch(r"\d{1,2}\s*\d{2}", cleaned_norm))
+        or bool(re.fullmatch(r"\d{1,2}[:.]\d{2}", cleaned.strip()))
+        or (len(cleaned_norm) <= 2 and cleaned_norm not in {"bp"})
+    )
+
+    if inferred and (looks_noisy or not cleaned_norm or inferred.lower().replace("&", "and") in cleaned_norm.replace("&", "and")):
+        return inferred
+    if looks_noisy:
+        return inferred or ""
+    return cleaned
+
+
 class ReceiptService:
     """
     Receipt processing scaffold service.
@@ -317,6 +510,7 @@ class ReceiptService:
             merchant = merchant or be.get("merchant", "")
             if total is None:
                 total = be.get("amount")
+        merchant = _clean_receipt_merchant(merchant, raw_text)
 
         return {
             "merchant": merchant,

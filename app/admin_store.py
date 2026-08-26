@@ -382,6 +382,7 @@ def get_expense_settings(db_path: str) -> dict[str, Any]:
             "vat_rate": 20.0,
             "xero_submission_mode": "scheduled",
             "xero_submission_time": "17:00",
+            "bank_feed_reminder_day": 0,
         },
     )
     if not isinstance(raw, dict):
@@ -396,12 +397,19 @@ def get_expense_settings(db_path: str) -> dict[str, Any]:
     if mode not in {"scheduled", "manual", "immediate"}:
         mode = "scheduled"
     submit_time = _clean_hhmm(raw.get("xero_submission_time"), "17:00")
+    try:
+        reminder_day = int(raw.get("bank_feed_reminder_day", 0))
+    except (TypeError, ValueError):
+        reminder_day = 0
+    if reminder_day < 0 or reminder_day > 6:
+        reminder_day = 0
     return {
         "default_expense_account": str(raw.get("default_expense_account", "")).strip(),
         "default_payment_account": str(raw.get("default_payment_account", "")).strip(),
         "vat_rate": vat_rate,
         "xero_submission_mode": mode,
         "xero_submission_time": submit_time,
+        "bank_feed_reminder_day": reminder_day,
     }
 
 
@@ -417,6 +425,13 @@ def set_expense_settings(db_path: str, settings: dict[str, Any]) -> None:
     current["xero_submission_time"] = _clean_hhmm(
         current.get("xero_submission_time"), "17:00"
     )
+    try:
+        reminder_day = int(current.get("bank_feed_reminder_day", 0))
+    except (TypeError, ValueError):
+        reminder_day = 0
+    if reminder_day < 0 or reminder_day > 6:
+        reminder_day = 0
+    current["bank_feed_reminder_day"] = reminder_day
     set_json_setting(db_path, "expense_settings", current)
 
 

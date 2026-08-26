@@ -50,13 +50,66 @@ def normalize_merchant(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (name or "").lower())
 
 
+def supplier_from_payment_instructions(raw_text: str) -> str:
+    """Return a supplier explicitly named in payment instructions.
+
+    Broker and finance documents often arrive from a named person, but the
+    payable supplier is printed lower down as "cheque payable to ..." or
+    "Account Name ...".  That named payee is stronger than the sender name.
+    """
+    text = re.sub(r"[ \t]+", " ", raw_text or "")
+    if not text.strip():
+        return ""
+
+    def _canonical_supplier(value: str) -> str:
+        norm = normalize_merchant(value)
+        if "indigoservicesolutions" in norm or "indigogroup" in norm:
+            return "Indigo Group"
+        return value
+
+    patterns = (
+        r"(?:cheque|check)\s+payable\s+to\s+[‘'\"“”]?(.+?)(?=\s+for\s+the\s+total|\s+and\s+send|\s+please\s+quote|[\n\r]|$)",
+        r"make\s+your\s+(?:cheque|check)\s+payable\s+to\s+[‘'\"“”]?(.+?)(?=\s+for\s+the\s+total|\s+and\s+send|\s+please\s+quote|[\n\r]|$)",
+        r"\baccount\s+name\s*(?:\||:|-)?\s*(?:\||:|-)?\s+[‘'\"“”]?(.+?)(?=\s+(?:sort\s+code|account\s+number|iban)\b|[\n\r]|$)",
+        r"\bbank\s+details\s*(?:\||:|-)?\s*(?:\||:|-)?\s+[‘'\"“”]?(.+?)(?=\s+(?:a/?c|account\s+no|account\s+number|sort\s+code)\b|[\n\r]|$)",
+    )
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if not m:
+            continue
+        supplier = m.group(1)
+        supplier = re.split(
+            r"\s+(?:sort\s+code|account\s+number|iban|for\s+the\s+total|and\s+send|please\s+quote)\b",
+            supplier,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+        supplier = supplier.strip(" ‘'’\"“”.,:;|-")
+        supplier = re.sub(r"\s+", " ", supplier)
+        if supplier and len(normalize_merchant(supplier)) >= 5:
+            return _canonical_supplier(supplier)
+    return ""
+
+
+def _looks_like_person_name(name: str) -> bool:
+    parts = re.findall(r"[A-Za-z][A-Za-z'’-]+", name or "")
+    if len(parts) < 2 or len(parts) > 3:
+        return False
+    corporate_terms = {
+        "limited", "ltd", "llp", "plc", "group", "services", "insurance",
+        "brokers", "finance", "company", "co", "uk",
+    }
+    return not any(p.lower().strip("'’-") in corporate_terms for p in parts)
+
+
 def derive_supplier_merchant(
     merchant: str,
     *,
     from_name: str,
     from_addr: str,
     subject: str,
-    own_names: list[str] | None,
+    raw_text: str = "",
+    own_names: list[str] | None = None,
 ) -> str:
     """Fix the classic supplier-invoice OCR mistake: invoices addressed TO us
     often get OUR OWN company name extracted as the 'merchant' (it is usually
@@ -93,6 +146,21 @@ def derive_supplier_merchant(
         if not t:
             return False
         return any(o in t or t in o for o in own_norms)
+
+    payee = supplier_from_payment_instructions(raw_text)
+    if payee:
+        payee_norm = normalize_merchant(payee)
+        merchant_norm = normalize_merchant(merchant)
+        if (
+            not merchant_norm
+            or _is_own(merchant)
+            or _looks_like_person_name(merchant)
+            or merchant_norm in normalize_merchant(from_name)
+            or "limited" in payee.lower()
+            or "ltd" in payee.lower()
+        ):
+            if not _is_own(payee) and payee_norm != merchant_norm:
+                return payee
 
     if not merchant or not _is_own(merchant):
         return merchant
@@ -278,6 +346,29 @@ def _to_money(value: str) -> float | None:
         return None
 
 
+def _money_values_from_label_chunk(chunk: str) -> list[float]:
+    """Money values near a strong total label, avoiding dates and percentages."""
+    values: list[float] = []
+    currency_re = r"(?:GBP|£)\s*" + _MONEY_RE
+    for raw in re.findall(currency_re, chunk or "", flags=re.IGNORECASE):
+        val = _to_money(raw)
+        if val is not None and val > 0:
+            values.append(val)
+    if values:
+        return values
+
+    # Fallback for suppliers that omit £/GBP. Require a decimal, and ignore
+    # values that are clearly percentages or date fragments.
+    for m in re.finditer(r"(?<![\d./-])(\d{1,6}(?:,\d{3})*\.\d{2})(?![\d./-])", chunk or ""):
+        after = (chunk or "")[m.end(): m.end() + 1]
+        if after == "%":
+            continue
+        val = _to_money(m.group(1))
+        if val is not None and val > 0:
+            values.append(val)
+    return values
+
+
 def explicit_total_from_text(raw_text: str) -> float | None:
     """Return an explicit document-level total from OCR text when present.
 
@@ -288,19 +379,26 @@ def explicit_total_from_text(raw_text: str) -> float | None:
     """
     text = raw_text or ""
     strong_patterns = [
-        r"total\s+including\s+all\s+applicable\s+taxes\s*(?:[:\-])?\s*(?:GBP|£)?\s*" + _MONEY_RE,
-        r"total\s+(?:including|incl\.?|inc\.?)\s+(?:vat|tax(?:es)?)\s*(?:[:\-])?\s*(?:GBP|£)?\s*" + _MONEY_RE,
-        r"(?:balance|amount)\s+due\s*(?:[:\-])?\s*(?:GBP|£)?\s*" + _MONEY_RE,
-        r"grand\s+total\s*(?:[:\-])?\s*(?:GBP|£)?\s*" + _MONEY_RE,
-        r"invoice\s+total\s*(?:[:\-])?\s*(?:GBP|£)?\s*" + _MONEY_RE,
-        r"total\s+(?:payable|paid)\s*(?:[:\-])?\s*(?:GBP|£)?\s*" + _MONEY_RE,
+        r"total\s+including\s+all\s+applicable\s+taxes",
+        r"total\s+(?:including|incl\.?|inc\.?)\s+(?:vat|tax(?:es)?)",
+        r"(?:balance|amount)\s+due",
+        r"grand\s+total",
+        r"invoice\s+total",
+        r"total\s+(?:payable|paid)",
     ]
     for pat in strong_patterns:
-        matches = re.findall(pat, text, flags=re.IGNORECASE)
-        vals = [_to_money(m) for m in matches]
-        vals = [v for v in vals if v is not None]
-        if vals:
-            return vals[-1]
+        matches = []
+        for m in re.finditer(pat, text, flags=re.IGNORECASE):
+            # Treat the labelled total row as a small chunk. Amazon-style
+            # invoices can OCR as "Invoice total £0.00 £0.00 £15.85"; the
+            # first zero is shipping/adjustment, while the final positive
+            # value is the real document total.
+            chunk = text[m.start(): m.start() + 140]
+            vals = _money_values_from_label_chunk(chunk)
+            if vals:
+                matches.append(vals[-1])
+        if matches:
+            return matches[-1]
 
     # Weaker fallback: if the word "Total" appears several times, the last
     # total-like amount is normally the document total, not an earlier row.
@@ -1281,12 +1379,12 @@ def scan_email_batch(
                             "ocr_error": str(exc)[:200],
                         }
 
+                raw_text    = result.get("raw_text") or result.get("ocr_raw") or ""
                 merchant    = (result.get("merchant") or "").strip()
                 merchant    = derive_supplier_merchant(
                     merchant, from_name=from_name, from_addr=from_addr,
-                    subject=subject, own_names=own_names,
+                    subject=subject, raw_text=raw_text, own_names=own_names,
                 )
-                raw_text    = result.get("raw_text") or result.get("ocr_raw") or ""
                 stored_file = result.get("stored_file", "")
                 ocr_error   = result.get("ocr_error", "")
 
@@ -1568,12 +1666,12 @@ def rescan_message(
                           "tax": None, "date": "", "stored_file": "",
                           "raw_text": "", "ocr_error": str(exc)[:200]}
 
+        raw_text    = result.get("raw_text") or result.get("ocr_raw") or ""
         merchant    = (result.get("merchant") or "").strip()
         merchant    = derive_supplier_merchant(
             merchant, from_name=from_name, from_addr=from_addr,
-            subject=target.get("subject", ""), own_names=own_names,
+            subject=target.get("subject", ""), raw_text=raw_text, own_names=own_names,
         )
-        raw_text    = result.get("raw_text") or result.get("ocr_raw") or ""
         stored_file = result.get("stored_file", "")
         ocr_error   = result.get("ocr_error", "")
 
@@ -1727,9 +1825,18 @@ def import_batch_items(
                 )
                 continue
 
+            merchant = derive_supplier_merchant(
+                it.get("merchant", ""),
+                from_name="",
+                from_addr="",
+                subject="",
+                raw_text=it.get("ocr_raw", ""),
+                own_names=[],
+            )
+
             fresh_status, fresh_reason, fresh_match_id = dedup_against_receipts(
                 "",
-                normalize_merchant(it.get("merchant", "")),
+                normalize_merchant(merchant),
                 (it.get("purchased_on") or "")[:10],
                 it.get("amount_inc"),
                 existing_receipts,
@@ -1751,13 +1858,13 @@ def import_batch_items(
             rec = create_receipt(
                 db_path,
                 engineer_id=default_engineer_id,
-                merchant=it.get("merchant", ""),
+                merchant=merchant,
                 purchased_on=it.get("purchased_on", ""),
                 amount_inc=it.get("amount_inc"),
                 amount_ex=it.get("amount_ex"),
                 vat_amount=it.get("vat_amount"),
                 currency=it.get("currency", "GBP"),
-                ocr_merchant=it.get("merchant", ""),
+                ocr_merchant=merchant,
                 ocr_amount=it.get("amount_inc"),
                 ocr_date=it.get("purchased_on", ""),
                 ocr_raw=it.get("ocr_raw", ""),

@@ -19,6 +19,9 @@ class FakeXeroClient:
         self.simple_invoices = []
         self.invoice_payments = {}
         self.payment_details = {}
+        self.bulk_payments = []
+        self.get_invoice_calls = []
+        self.get_payments_calls = []
         self.deleted_payments = []
         self.created_payments = []
 
@@ -52,7 +55,21 @@ class FakeXeroClient:
         }
 
     def get_invoice(self, invoice_id):
+        self.get_invoice_calls.append(invoice_id)
         return {"InvoiceID": invoice_id, "Payments": self.invoice_payments.get(invoice_id, [])}
+
+    def get_bank_transactions(self, start_date=None, end_date=None):
+        return {"BankTransactions": []}
+
+    def get_open_invoices(self):
+        return {"Invoices": []}
+
+    def get_paid_invoices(self, start_date=None, end_date=None):
+        return {"Invoices": []}
+
+    def get_payments(self, start_date=None, end_date=None):
+        self.get_payments_calls.append((start_date, end_date))
+        return {"Payments": self.bulk_payments}
 
     def _request(self, method, url, **kwargs):
         class _Resp:
@@ -832,15 +849,14 @@ class CashflowsCsvSubmitTests(unittest.TestCase):
         app = self._app_with_preview(preview, dry_run=False, production=True)
         fake = FakeXeroClient()
         fake.dry_run = False
-        fake.invoice_payments["inv-paid"] = [{"PaymentID": "pay-reconciled"}]
-        fake.payment_details["pay-reconciled"] = {
+        fake.bulk_payments = [{
             "PaymentID": "pay-reconciled",
-            "HasAccount": True,
             "Status": "AUTHORISED",
             "IsReconciled": True,
             "Amount": 114.0,
             "Account": {"Code": "090", "Name": "Pow Wash"},
-        }
+            "Invoice": {"InvoiceID": "inv-paid"},
+        }]
         with app.test_client() as client:
             with client.session_transaction() as session:
                 session["logged_in"] = True
@@ -869,6 +885,8 @@ class CashflowsCsvSubmitTests(unittest.TestCase):
         msg = resp.get_json()["error"]
         self.assertIn("INV-5669", msg)
         self.assertIn("already reconciled", msg)
+        self.assertEqual(len(fake.get_payments_calls), 1)
+        self.assertEqual(fake.get_invoice_calls, [])
 
     def test_invented_invoice_id_is_rejected(self):
         preview = {
@@ -1011,6 +1029,7 @@ class CashflowsCsvSubmitTests(unittest.TestCase):
                 )
         self.assertEqual(resp.status_code, 200)
         data = resp.get_json()
+        self.assertEqual(data["preview_id"], "preview-1")
         self.assertEqual(data["totals"]["payout_count"], 1)
         self.assertEqual(data["status_counts"]["no_bank_line"], 1)
         self.assertNotIn("_source_csv_text", data)

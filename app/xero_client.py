@@ -229,8 +229,12 @@ class XeroClient:
                 f"Xero rate-limited: 429 cooldown active (Retry-After={remaining}s)"
             )
 
+        extra_headers = kwargs.pop("headers", None) or {}
+        headers = self._headers()
+        headers.update(extra_headers)
+
         _throttle_xero_request()
-        response = requests.request(method, url, headers=self._headers(), timeout=30, **kwargs)
+        response = requests.request(method, url, headers=headers, timeout=30, **kwargs)
         _log_xero_request(
             method,
             response.url or url,
@@ -239,8 +243,10 @@ class XeroClient:
         )
         if response.status_code == 401 and self._refresh_access_token():
             _throttle_xero_request()
+            headers = self._headers()
+            headers.update(extra_headers)
             response = requests.request(
-                method, url, headers=self._headers(), timeout=30, **kwargs
+                method, url, headers=headers, timeout=30, **kwargs
             )
             _log_xero_request(
                 method,
@@ -592,6 +598,42 @@ class XeroClient:
                 break
             page += 1
         return {"Payments": all_items}
+
+    def get_purchase_bills(
+        self,
+        *,
+        start_date: "dt.date | None" = None,
+        end_date: "dt.date | None" = None,
+    ) -> Dict:
+        """Fetch supplier bills (ACCPAY) in a bounded date range."""
+        clauses = ['Type=="ACCPAY"']
+        if start_date is not None:
+            clauses.append(
+                f"Date>=DateTime({start_date.year},{start_date.month},{start_date.day})"
+            )
+        if end_date is not None:
+            clauses.append(
+                f"Date<=DateTime({end_date.year},{end_date.month},{end_date.day})"
+            )
+        where = "&&".join(clauses)
+        all_items: list[Dict] = []
+        page = 1
+        while True:
+            response = self._request(
+                "GET",
+                f"{self.base_url}/Invoices",
+                params={"where": where, "page": page},
+            )
+            if not response.ok:
+                raise RuntimeError(
+                    f"Xero purchase bills fetch failed: {response.status_code} {response.text}"
+                )
+            items = (response.json() or {}).get("Invoices") or []
+            all_items.extend(items)
+            if len(items) < 100:
+                break
+            page += 1
+        return {"Invoices": all_items}
 
     def get_attachments(self, endpoint: str, guid: str) -> list:
         """List attachments on a Xero object (e.g. endpoint='BankTransactions'
@@ -980,6 +1022,28 @@ class XeroClient:
         if not response.ok:
             raise RuntimeError(
                 f"Xero bank transaction post failed: {response.status_code} {response.text}"
+            )
+        return response.json()
+
+    def update_bank_transaction_payload(self, bank_transaction_id: str, payload: Dict) -> Dict:
+        if self.dry_run:
+            return {"dry_run": True, "payload": payload}
+        url = f"{self.base_url}/BankTransactions/{bank_transaction_id}"
+        response = self._request("POST", url, json=payload)
+        if not response.ok:
+            raise RuntimeError(
+                f"Xero bank transaction update failed: {response.status_code} {response.text}"
+            )
+        return response.json()
+
+    def update_invoice_payload(self, invoice_id: str, payload: Dict) -> Dict:
+        if self.dry_run:
+            return {"dry_run": True, "payload": payload}
+        url = f"{self.base_url}/Invoices/{invoice_id}"
+        response = self._request("POST", url, json=payload)
+        if not response.ok:
+            raise RuntimeError(
+                f"Xero invoice update failed: {response.status_code} {response.text}"
             )
         return response.json()
 

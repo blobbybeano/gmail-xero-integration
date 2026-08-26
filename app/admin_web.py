@@ -24,6 +24,10 @@ from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2.credentials import Credentials
 from googleapiclient.errors import HttpError
 
+LEGACY_CALENDAR_RECEIPTS_ENABLED = False
+CUSTOMER_RECEIPT_PORTAL_ENABLED = True
+CUSTOMER_RECEIPT_OVERDUE_MARKERS_ENABLED = False
+
 from .admin_store import (
     DEFAULT_SALES_STATS_FIELDS,
     DEFAULT_STATS_FIELDS,
@@ -141,7 +145,13 @@ from .receipts import expense_store as exp_store
 from .receipts import dump_store
 from .receipts import email_store as em_store
 from .receipts import email_pipeline as em_pipe
+from .receipts.service import (
+    _clean_receipt_merchant,
+    _parse_uk_date as _receipt_parse_uk_date,
+)
 from . import card_feed as cardfeed
+from . import vehicle_store
+from . import xero_statement_feed as xero_statement
 from . import plaid_match
 from . import gmail_client as _gmail_mod
 from .cashflows_reconciliation import (
@@ -150,6 +160,30 @@ from .cashflows_reconciliation import (
     parse_cashflows_settlements,
     _date,
 )
+
+
+_RINGGO_XERO_CONTACT_ID = "211f5735-c074-4528-b85a-d46caa67206d"
+
+
+def _xero_contact_ref_for_merchant(merchant: str) -> dict[str, str]:
+    """Use the one existing RingGo supplier contact for every Xero write."""
+    cleaned = _clean_receipt_merchant(merchant or "", merchant or "")
+    if cleaned == "RingGo Parking":
+        return {"ContactID": _RINGGO_XERO_CONTACT_ID}
+    return {"Name": cleaned or merchant}
+
+
+def _receipt_segment_xero_tax_type(vat_rate) -> str:
+    """Map an explicitly validated UK purchase VAT rate to Xero's tax code."""
+    try:
+        rate = float(vat_rate)
+    except (TypeError, ValueError):
+        return ""
+    if abs(rate) <= 0.01:
+        return "NONE"
+    if abs(rate - 20.0) <= 0.01:
+        return "INPUT2"
+    return ""
 from .cashflows_csv import (
     CsvParseError,
     build_csv_reconciliation_preview,
@@ -258,13 +292,14 @@ window.addEventListener('popstate', function() {{
 }});
 document.addEventListener('change', function(e) {{
   var inp = e.target;
-  if (!inp || (inp.id !== 'exp-file' && inp.id !== 'cust-receipt-file')) return;
+  if (!inp || (inp.id !== 'exp-file' && inp.id !== 'cust-receipt-file' && inp.id !== 'cust-receipt-upload-file')) return;
   if (!inp.files || !inp.files.length) return;
   var form = inp.closest('form');
-  var overlay = document.getElementById(inp.id === 'exp-file' ? 'exp-overlay' : 'cust-overlay');
+  var isExpenseUpload = inp.id === 'exp-file';
+  var overlay = document.getElementById(isExpenseUpload ? 'exp-overlay' : 'cust-overlay');
   if (!overlay) {{
     overlay = document.createElement('div');
-    overlay.id = inp.id === 'exp-file' ? 'exp-overlay' : 'cust-overlay';
+    overlay.id = isExpenseUpload ? 'exp-overlay' : 'cust-overlay';
     overlay.style.cssText = 'display:none;position:fixed;inset:0;background:rgba(255,255,255,.92);z-index:50;align-items:center;justify-content:center;flex-direction:column;';
     overlay.innerHTML = '<div style="width:32px;height:32px;border:4px solid #d1d5db;border-top-color:#4f46e5;border-radius:9999px;animation:receiptSpin 1s linear infinite"></div><div style="margin-top:12px;font:500 14px system-ui;color:#374151">Uploading receipt&hellip;</div>';
     document.body.appendChild(overlay);
@@ -370,6 +405,7 @@ _EXPENSE_STATUS_BADGES = {
     "submitted": ("Sent to Xero", "bg-blue-100 text-blue-800"),
     "failed": ("Failed", "bg-red-100 text-red-800"),
     "settled": ("Paid", "bg-gray-200 text-gray-700"),
+    "ignored": ("Ignored duplicate", "bg-gray-100 text-gray-500"),
 }
 
 
@@ -391,6 +427,99 @@ def _exp_status_badge(status: str) -> str:
         f'<span class="inline-block px-2 py-0.5 rounded-full text-xs '
         f'font-medium {classes}">{escape(label)}</span>'
     )
+
+
+_EXPENSE_IMAGE_CLEANUP_SAFE_STATUSES = {"submitted", "settled"}
+_EXPENSE_VAT_CLEANUP_HISTORY_KEY = "expense_vat_image_cleanup_runs"
+
+
+def _expense_image_cleanup_date(value: str | None) -> dt.date | None:
+    try:
+        return dt.date.fromisoformat(str(value or "")[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def _expense_image_cleanup_period(start_s: str, end_s: str) -> tuple[dt.date, dt.date]:
+    start = _expense_image_cleanup_date(start_s)
+    end = _expense_image_cleanup_date(end_s)
+    if not start or not end:
+        raise ValueError("Choose a valid start and end date.")
+    if end < start:
+        raise ValueError("The end date must be after the start date.")
+    return start, end
+
+
+def _expense_image_cleanup_safe_reason(rec: dict) -> str:
+    """Return an empty string when a local receipt image is safe to archive.
+
+    We only clear local files once Xero has a clean submitted/settled record.
+    Pending, failed, duplicate-review, and unpaid subcontractor receipts keep
+    their images so the normal review and correction flow still works.
+    """
+    status = (rec.get("status") or "").strip().lower()
+    if status not in _EXPENSE_IMAGE_CLEANUP_SAFE_STATUSES:
+        return "still being reviewed or not fully submitted"
+    if not (rec.get("xero_id") or "").strip():
+        return "no Xero record yet"
+    if (rec.get("xero_error") or "").strip():
+        return "has a Xero error recorded"
+    return ""
+
+
+def _expense_image_cleanup_plan(db_path: str, start_s: str, end_s: str) -> dict:
+    start, end = _expense_image_cleanup_period(start_s, end_s)
+    safe: list[dict] = []
+    retained: list[dict] = []
+    totals = {"safe_bytes": 0, "retained_bytes": 0}
+    for rec in exp_store.list_receipts_with_images(db_path):
+        purchased = _expense_image_cleanup_date(
+            rec.get("purchased_on") or rec.get("created_at")
+        )
+        if not purchased or purchased < start or purchased > end:
+            continue
+        path = str(rec.get("stored_file") or "")
+        try:
+            size = os.path.getsize(os.path.abspath(path)) if path else 0
+        except OSError:
+            size = 0
+        reason = _expense_image_cleanup_safe_reason(rec)
+        row = {
+            "receipt": rec,
+            "date": purchased.isoformat(),
+            "path": path,
+            "size": size,
+            "reason": reason,
+        }
+        if reason:
+            retained.append(row)
+            totals["retained_bytes"] += size
+        else:
+            safe.append(row)
+            totals["safe_bytes"] += size
+    return {
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "safe": safe,
+        "retained": retained,
+        "safe_count": len(safe),
+        "retained_count": len(retained),
+        **totals,
+    }
+
+
+def _expense_bytes_label(value: int | float) -> str:
+    try:
+        size = float(value or 0)
+    except (TypeError, ValueError):
+        size = 0.0
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
 
 
 def _exp_day_label(iso_date: str) -> str:
@@ -562,6 +691,22 @@ def _exp_reconcile_amounts(total, net, tax, vat_rate):
             return None
 
     total, net, tax = _f(total), _f(net), _f(tax)
+    if total is not None and net is not None and tax is not None:
+        composed_total = round(net + tax, 2)
+        if abs(composed_total - total) > 0.03:
+            # OCR sometimes puts the net/subtotal into the total field while
+            # also reading a real VAT line.  Only repair the total when the
+            # current total is clearly the same as the net amount.
+            if abs(total - net) <= 0.03 and 0 < tax <= max(net * 0.25, 0.05):
+                total = composed_total
+            # Less common: the VAT field is accidentally used as the total.
+            elif abs(total - tax) <= 0.03 and net > 0:
+                total = composed_total
+            # If the tax value is impossible for the total, drop it and let the
+            # normal rate calculation below rebuild a safer VAT split.
+            elif tax > total + 0.03:
+                tax = None
+
     if total is not None:
         if net is not None and tax is None:
             # Net is the standard-rated taxable base; VAT is rate x net.
@@ -594,6 +739,7 @@ def _exp_reconcile_amounts_from_text(total, net, tax, raw_text, vat_rate):
     receipt dumps on that same path before applying receipt-specific zero-rated
     handling.
     """
+    original_net = net
     original_tax = tax
     total, net, tax = em_pipe.reconcile_email_amounts_from_text(
         total,
@@ -604,6 +750,69 @@ def _exp_reconcile_amounts_from_text(total, net, tax, raw_text, vat_rate):
     )
     text = raw_text or ""
     lowered = text.lower()
+
+    def _looks_like_amazon_invoice() -> bool:
+        compact = re.sub(r"[^a-z0-9]+", "", lowered)
+        if "amazon" not in compact and "amzn" not in compact:
+            return False
+        return any(
+            marker in lowered
+            for marker in (
+                "total payable",
+                "amazon.co.uk",
+                "payment reference id",
+                "order #",
+                "invoice date",
+            )
+        )
+
+    def _amazon_total_payable() -> float | None:
+        if not _looks_like_amazon_invoice():
+            return None
+        money = r"(?:£|gbp\s*)?\s*(\d{1,5}(?:,\d{3})*\.\d{2})"
+        candidates: list[float] = []
+        for m in re.finditer(r"\btotal\s+payable\b", text, re.I):
+            chunk = text[m.end(): m.end() + 220]
+            # Stop before the line-item table when possible; otherwise the
+            # first values after "Total payable" can include VAT summary rows.
+            chunk = re.split(
+                r"\b(?:unit\s+price|vat\s+rate|invoice\s+total|item\s+subtotal|shipping\s+charges)\b",
+                chunk,
+                maxsplit=1,
+                flags=re.I,
+            )[0]
+            for match in re.finditer(money, chunk, re.I):
+                raw = match.group(1)
+                before = chunk[match.start(1) - 1] if match.start(1) > 0 else ""
+                after = chunk[match.end(1): match.end(1) + 1]
+                if before in "./-" or after in "./-%":
+                    continue
+                try:
+                    val = round(float(str(raw).replace(",", "")), 2)
+                except ValueError:
+                    continue
+                if val > 0:
+                    candidates.append(val)
+            if candidates:
+                return candidates[0]
+        return None
+
+    amazon_total = _amazon_total_payable()
+    if amazon_total is not None:
+        try:
+            supplied_net = None if net is None else round(float(net), 2)
+            supplied_tax = None if tax is None else round(float(tax), 2)
+        except (TypeError, ValueError):
+            supplied_net = supplied_tax = None
+        total = amazon_total
+        if (
+            supplied_net is not None
+            and supplied_tax is not None
+            and abs((supplied_net + supplied_tax) - amazon_total) <= 0.03
+        ):
+            net, tax = supplied_net, supplied_tax
+        else:
+            net, tax = None, None
 
     def _money_values_near_total_labels() -> list[float]:
         vals: list[float] = []
@@ -628,6 +837,32 @@ def _exp_reconcile_amounts_from_text(total, net, tax, raw_text, vat_rate):
                 except ValueError:
                     pass
         return [v for v in vals if v > 0]
+
+    def _strong_final_total_values() -> list[float]:
+        vals: list[float] = []
+        money = r"(?:£|gbp\s*)?\s*(\d{1,5}(?:,\d{3})*\.\d{2})"
+        labels = (
+            "total paid", "amount paid", "card payment", "balance due",
+            "grand total", "total to pay", "total due", "invoice total",
+            "amount due",
+        )
+        label_re = "|".join(re.escape(x) for x in labels)
+        patterns = [
+            rf"\b(?:{label_re})\b[^\n£0-9]{{0,30}}{money}",
+            rf"{money}[^\n]{{0,22}}\b(?:paid|visa|mastercard|card payment|sale approved)\b",
+        ]
+        for pat in patterns:
+            for m in re.findall(pat, text, re.I):
+                raw = m[-1] if isinstance(m, tuple) else m
+                try:
+                    vals.append(round(float(str(raw).replace(",", "")), 2))
+                except ValueError:
+                    pass
+        out: list[float] = []
+        for v in vals:
+            if v > 0 and v not in out:
+                out.append(v)
+        return out
 
     def _looks_like_vat_summary_total(current: float | None, candidate: float) -> bool:
         if current is None or current <= 0 or candidate <= current + 0.01:
@@ -672,7 +907,58 @@ def _exp_reconcile_amounts_from_text(total, net, tax, raw_text, vat_rate):
                 net = None
                 tax = None
 
-    if any(t in lowered for t in ("customer receipt", "card payment", "approved")):
+    strong_totals = _strong_final_total_values()
+    if strong_totals:
+        # Prefer the largest strong labelled amount; these labels are much more
+        # specific than a generic "total" table heading.
+        strong_total = max(strong_totals)
+        try:
+            current_total = None if total is None else round(float(total), 2)
+        except (TypeError, ValueError):
+            current_total = None
+        if current_total is None or abs(current_total - strong_total) > 0.03:
+            # If OCR gave us a net+VAT pair that exactly equals the labelled
+            # paid total, keep that pair. Otherwise clear it and recalculate a
+            # standard split from the trusted paid total below.
+            try:
+                supplied_net = None if net is None else round(float(net), 2)
+                supplied_tax = None if tax is None else round(float(tax), 2)
+            except (TypeError, ValueError):
+                supplied_net = supplied_tax = None
+            total = strong_total
+            if (
+                supplied_net is not None
+                and supplied_tax is not None
+                and abs((supplied_net + supplied_tax) - strong_total) <= 0.03
+            ):
+                net, tax = supplied_net, supplied_tax
+            else:
+                try:
+                    original_net_val = None if original_net is None else round(float(original_net), 2)
+                    original_tax_val = None if original_tax is None else round(float(original_tax), 2)
+                except (TypeError, ValueError):
+                    original_net_val = original_tax_val = None
+                if (
+                    original_net_val is not None
+                    and original_tax_val is not None
+                    and abs((original_net_val + original_tax_val) - strong_total) <= 0.03
+                ):
+                    net, tax = original_net_val, original_tax_val
+                else:
+                    net, tax = None, None
+
+    if any(
+        t in lowered
+        for t in (
+            "customer receipt",
+            "card payment",
+            "approved",
+            "mastercard",
+            "visa",
+            "debit card",
+            "credit card",
+        )
+    ):
         vals: list[float] = []
         for match in re.findall(r"(?:£|gbp\s*)\s*(\d{1,5}(?:,\d{3})*\.\d{2})", text, re.I):
             try:
@@ -690,7 +976,14 @@ def _exp_reconcile_amounts_from_text(total, net, tax, raw_text, vat_rate):
                 current = None if total is None else round(float(total), 2)
             except (TypeError, ValueError):
                 current = None
-            if current is None or paid_total > current + 0.01:
+            if (
+                current is None
+                or paid_total > current + 0.01
+                # Receipt OCR can read a stray transaction/POS fragment as the
+                # total, e.g. "Total 996 ... £7.13". If the card-paid amount is
+                # clearly the real receipt total, trust the paid/card value.
+                or (current > 0 and paid_total > 0 and current > paid_total * 10)
+            ):
                 total = paid_total
                 try:
                     supplied_tax = None if original_tax is None else round(float(original_tax), 2)
@@ -703,6 +996,94 @@ def _exp_reconcile_amounts_from_text(total, net, tax, raw_text, vat_rate):
                     net = None
                     tax = None
     return _exp_reconcile_amounts(total, net, tax, vat_rate)
+
+
+def _exp_repair_dump_item_values_from_raw(item: dict, vat_rate: float) -> dict:
+    """Repair stale receipt-dump values from the stored OCR text before import.
+
+    Old dump rows can pre-date parser fixes. Do not trust a saved total/date
+    blindly when the raw receipt text gives a stronger card-paid total or UK
+    printed date.
+    """
+    raw = item.get("ocr_raw") or ""
+    updates: dict = {}
+    total, net, tax, _ = _exp_reconcile_amounts_from_text(
+        item.get("amount_inc"),
+        item.get("amount_ex"),
+        item.get("vat_amount"),
+        raw,
+        vat_rate,
+    )
+    try:
+        old_total = None if item.get("amount_inc") is None else round(float(item.get("amount_inc")), 2)
+    except (TypeError, ValueError):
+        old_total = None
+    try:
+        new_total = None if total is None else round(float(total), 2)
+    except (TypeError, ValueError):
+        new_total = None
+    if new_total is not None and (
+        old_total is None
+        or abs(new_total - old_total) > 0.03
+        or (old_total > 0 and new_total > 0 and old_total > new_total * 10)
+    ):
+        updates["amount_inc"] = new_total
+        updates["amount_ex"] = net
+        updates["vat_amount"] = tax
+
+    parsed_date = _receipt_parse_uk_date(raw)
+    if not parsed_date and raw:
+        months = {
+            "jan": 1, "january": 1,
+            "feb": 2, "february": 2,
+            "mar": 3, "march": 3,
+            "apr": 4, "april": 4,
+            "may": 5,
+            "jun": 6, "june": 6,
+            "jul": 7, "july": 7,
+            "aug": 8, "august": 8,
+            "sep": 9, "sept": 9, "september": 9,
+            "oct": 10, "october": 10,
+            "nov": 11, "november": 11,
+            "dec": 12, "december": 12,
+        }
+        for m in re.finditer(
+            r"\b(\d{1,2})(?:st|nd|rd|th)?\s+"
+            r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
+            r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|"
+            r"oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{2,4})\b",
+            raw,
+            re.I,
+        ):
+            day = int(m.group(1))
+            month = months.get(m.group(2).lower())
+            year = int(m.group(3))
+            if year < 100:
+                year += 2000
+            try:
+                cand = dt.date(year, int(month or 0), day)
+            except ValueError:
+                continue
+            if cand <= dt.date.today():
+                parsed_date = cand.isoformat()
+                break
+    old_date = (item.get("purchased_on") or "")[:10]
+    if parsed_date and parsed_date != old_date:
+        # Only auto-repair clearly stale/default dates or obvious OCR year
+        # mistakes. Normal date disagreements should remain visible for review.
+        repair_date = False
+        if not old_date:
+            repair_date = True
+        else:
+            try:
+                old_d = dt.date.fromisoformat(old_date)
+                new_d = dt.date.fromisoformat(parsed_date)
+                repair_date = abs((old_d - new_d).days) > 365
+            except Exception:
+                repair_date = True
+        if repair_date:
+            updates["purchased_on"] = parsed_date
+    return updates
 
 
 def _exp_vat_mode(amount_inc, amount_ex, vat_amount, vat_rate: float) -> str:
@@ -857,7 +1238,7 @@ def _receipt_bg_worker(
 
         # 3 — Update Google Calendar description (best-effort)
         parts = event_key.split(":", 1)
-        if len(parts) == 2 and not parts[0].startswith("_"):
+        if LEGACY_CALENDAR_RECEIPTS_ENABLED and len(parts) == 2 and not parts[0].startswith("_"):
             cal_id, cal_event_id = parts[0], parts[1]
             try:
                 _set("processing", "Updating calendar…")
@@ -886,6 +1267,7 @@ _NAV_LINKS = [
     ("/cardfeed", "Bank Statement"),
     ("/receipts/emails", "Email Invoices"),
     ("/cashflows-sync", "Cashflows Sync"),
+    ("/vehicles", "Vehicles"),
     ("/assistant", "Assistant"),
     ("/settings", "Settings"),
 ]
@@ -895,6 +1277,174 @@ def _nav_is_active(path: str, href: str) -> bool:
     if href == "/":
         return path == "/"
     return path == href or path.startswith(href + "/")
+
+
+_WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+
+def _field_expenses_bank_upload_due() -> tuple[bool, str, str, int]:
+    """Whether the weekly bank CSV upload reminder should be shown."""
+    try:
+        cfg = load_config()
+        db = cfg.admin_db_file
+        settings = get_expense_settings(db)
+        reminder_day = int(settings.get("bank_feed_reminder_day", 0))
+        if reminder_day < 0 or reminder_day > 6:
+            reminder_day = 0
+        status = cardfeed.csv_status(db) or {}
+        last_upload = str(status.get("last_upload_at") or "").strip()
+    except Exception:
+        return False, "", "", 0
+
+    today = dt.datetime.now().date()
+    period_start = today - dt.timedelta(days=(today.weekday() - reminder_day) % 7)
+
+    def _parse_date(value: str):
+        try:
+            return dt.date.fromisoformat(str(value or "")[:10])
+        except (TypeError, ValueError):
+            return None
+
+    last_date = _parse_date(last_upload)
+    due = not last_date or last_date < period_start
+    day_name = _WEEKDAY_NAMES[reminder_day]
+    return due, day_name, last_upload, reminder_day
+
+
+def _cardfeed_csv_upload_summary(
+    file_count: int, added: int, existing: int, too_old: int = 0
+) -> str:
+    """Describe an upload in terms of genuinely new and existing app rows."""
+    file_word = "file" if file_count == 1 else "files"
+    added_word = "item" if added == 1 else "items"
+    existing_word = "item" if existing == 1 else "items"
+    summary = (
+        f"Processed {file_count} {file_word}: "
+        f"{added} new {added_word} added; "
+        f"{existing} {existing_word} already existed in the app"
+    )
+    if too_old:
+        old_word = "item" if too_old == 1 else "items"
+        summary += f"; {too_old} {old_word} outside the 12-month window"
+    return summary
+
+
+def _bank_upload_nav_reminder(href: str, due: bool) -> bool:
+    """The weekly CSV reminder belongs on Bank Statement, not Expenses."""
+    return bool(due and href == "/cardfeed")
+
+
+def _vehicle_nav_attention_count() -> int:
+    try:
+        cfg = load_config()
+        return vehicle_store.attention_count(cfg.admin_db_file)
+    except Exception:
+        return 0
+
+
+def _vehicle_calendar_event_body(vehicle: dict, deadline: dict) -> dict:
+    due = vehicle_store.parse_date(deadline.get("due_date"))
+    if not due:
+        return {}
+    reminder_day = vehicle_store.one_month_before(due)
+    registration = vehicle_store.display_registration(vehicle.get("registration") or "")
+    kind = str(deadline.get("kind") or "")
+    label = vehicle_store.DEADLINE_LABELS.get(kind, kind.title())
+    arranged = bool(deadline.get("appointment_booked"))
+    verb = "Renew" if kind in {"tax", "insurance", "rac"} else "Book"
+    prefix = "✅ Arranged" if arranged else f"⚠️ {verb}"
+    summary = f"{prefix}: {registration} {label}"
+    details = [
+        f"Vehicle: {registration}",
+        f"Make/model: {(vehicle.get('make') or '').strip()} {(vehicle.get('model') or '').strip()}".strip(),
+        f"{label} due: {due.strftime('%d %B %Y')}",
+        "Action has been marked as arranged in Powwash."
+        if arranged else f"Please {verb.lower()} this before the due date.",
+    ]
+    if deadline.get("provider"):
+        details.append(f"Provider: {deadline['provider']}")
+    if deadline.get("reference"):
+        details.append(f"Reference: {deadline['reference']}")
+    if deadline.get("appointment_date"):
+        details.append(f"Appointment / renewal date: {deadline['appointment_date']}")
+    if deadline.get("appointment_notes"):
+        details.append(f"Notes: {deadline['appointment_notes']}")
+    details.append(
+        f"Powwash vehicle record: {vehicle.get('id')} / {kind}"
+    )
+    return {
+        "summary": summary,
+        "description": "\n".join(line for line in details if line),
+        "start": {"date": reminder_day.isoformat()},
+        "end": {"date": (reminder_day + dt.timedelta(days=1)).isoformat()},
+        "transparency": "transparent",
+        "reminders": {"useDefault": True},
+        "extendedProperties": {
+            "private": {
+                "powwashVehicleId": str(vehicle.get("id") or ""),
+                "powwashVehicleDeadline": kind,
+            }
+        },
+    }
+
+
+def _sync_vehicle_calendar_reminder(
+    config: AppConfig,
+    vehicle: dict,
+    deadline: dict,
+    *,
+    service=None,
+) -> tuple[bool, str]:
+    """Create or update one stable all-day reminder for a vehicle deadline."""
+    kind = str(deadline.get("kind") or "")
+    vehicle_id = str(vehicle.get("id") or "")
+    calendar_id = (
+        str(deadline.get("calendar_id") or "").strip()
+        or str(config.google_calendar_id or "").strip()
+        or "primary"
+    )
+    event_id = str(deadline.get("calendar_event_id") or "").strip()
+    body = _vehicle_calendar_event_body(vehicle, deadline)
+    try:
+        svc = service or build_calendar_service(config)
+        if not body:
+            if event_id:
+                svc.events().delete(
+                    calendarId=calendar_id, eventId=event_id
+                ).execute()
+            vehicle_store.set_calendar_result(
+                config.admin_db_file, vehicle_id, kind,
+                calendar_id="", event_id="", error="",
+            )
+            return True, "Calendar reminder cleared."
+
+        saved = None
+        if event_id:
+            try:
+                saved = svc.events().patch(
+                    calendarId=calendar_id, eventId=event_id, body=body
+                ).execute()
+            except HttpError as exc:
+                if getattr(exc.resp, "status", None) != 404:
+                    raise
+                event_id = ""
+        if not event_id:
+            saved = svc.events().insert(
+                calendarId=calendar_id, body=body
+            ).execute()
+        saved_id = str((saved or {}).get("id") or event_id).strip()
+        vehicle_store.set_calendar_result(
+            config.admin_db_file, vehicle_id, kind,
+            calendar_id=calendar_id, event_id=saved_id, error="",
+        )
+        return True, "Calendar reminder synced."
+    except Exception as exc:
+        message = str(exc).splitlines()[0][:300]
+        vehicle_store.set_calendar_result(
+            config.admin_db_file, vehicle_id, kind,
+            calendar_id=calendar_id, event_id=event_id, error=message,
+        )
+        return False, "Calendar reminder could not be synced: " + message
 
 
 def _nav() -> str:
@@ -912,20 +1462,41 @@ def _nav() -> str:
     except Exception:
         return ""
 
+    bank_due, _bank_day, _last_upload, _reminder_day = _field_expenses_bank_upload_due()
+    vehicle_attention = _vehicle_nav_attention_count()
     desktop, mobile = [], []
     for href, label in _NAV_LINKS:
         active = _nav_is_active(path, href)
-        d_cls = ("bg-indigo-600 text-white" if active
-                 else "text-neutral-300 hover:text-white hover:bg-neutral-800")
+        show_bank_upload_reminder = _bank_upload_nav_reminder(href, bank_due)
+        show_vehicle_attention = bool(vehicle_attention and href == "/vehicles")
+        if show_bank_upload_reminder or show_vehicle_attention:
+            d_cls = (
+                "bg-amber-400 text-neutral-950 animate-pulse shadow-sm"
+                if not active else
+                "bg-amber-300 text-neutral-950 animate-pulse shadow-sm"
+            )
+        else:
+            d_cls = ("bg-indigo-600 text-white" if active
+                     else "text-neutral-300 hover:text-white hover:bg-neutral-800")
+        nav_label = (
+            f"{label} ({vehicle_attention})" if show_vehicle_attention else label
+        )
         desktop.append(
             f'<a href="{href}" class="px-3 py-1.5 text-xs font-medium rounded-lg '
-            f'transition-colors {d_cls}">{label}</a>'
+            f'transition-colors {d_cls}">{nav_label}</a>'
         )
-        m_cls = ("bg-indigo-600 text-white" if active
-                 else "text-neutral-200 hover:text-white hover:bg-neutral-800")
+        if show_bank_upload_reminder or show_vehicle_attention:
+            m_cls = (
+                "bg-amber-400 text-neutral-950 animate-pulse"
+                if not active else
+                "bg-amber-300 text-neutral-950 animate-pulse"
+            )
+        else:
+            m_cls = ("bg-indigo-600 text-white" if active
+                     else "text-neutral-200 hover:text-white hover:bg-neutral-800")
         mobile.append(
             f'<a href="{href}" class="block px-3 py-2 text-sm font-medium '
-            f'rounded-lg {m_cls}">{label}</a>'
+            f'rounded-lg {m_cls}">{nav_label}</a>'
         )
     desktop_html = "".join(desktop)
     mobile_html = "".join(mobile)
@@ -1961,6 +2532,38 @@ def _expense_normalise_payment_source(
     return "company_card", ""
 
 
+def _expense_receipt_payment_account(
+    rec: dict | None,
+    eng: dict | None,
+    *,
+    default_payment_account: str = "",
+) -> str:
+    """Payment/bank account used for one receipt's Xero spend/payment lookup."""
+    rec = rec or {}
+    eng = eng or {}
+    if (rec.get("payment_source") or "company_card") == "owner_paid":
+        return (
+            str(rec.get("owner_paid_account_code") or "").strip()
+            or str(eng.get("owner_paid_account_code") or "").strip()
+            or str(eng.get("payment_account_code") or "").strip()
+        )
+    return (
+        str(rec.get("payment_account_code_override") or "").strip()
+        or str(eng.get("payment_account_code") or "").strip()
+        or str(default_payment_account or "").strip()
+    )
+
+
+def _expense_receipt_feed_account_id(rec: dict | None, eng: dict | None) -> str:
+    """Card-feed account this receipt should appear against in the portal."""
+    rec = rec or {}
+    eng = eng or {}
+    return (
+        str(rec.get("feed_account_id_override") or "").strip()
+        or str(eng.get("plaid_account_id") or "").strip()
+    )
+
+
 _AI_HINTS_KEY = "ai_receipt_hints"
 _ACCOUNT_LEARNING_KEY = "account_category_learning"
 _RECEIPT_AI_CORRECTIONS_KEY = "receipt_ai_corrections"
@@ -2175,6 +2778,11 @@ def _ai_receipt_hints_block(db_path: str) -> str:
         "receipt clearly shows fuel, parking, vehicle parts or a garage/van "
         "repair. Guttering, brackets, outlets, angles, pipe, fixings, sealant "
         "and screws are materials, not repairs and maintenance.\n"
+        "- Amazon / Amazon Marketplace / amazon.co.uk invoices for physical "
+        "goods normally use Materials / tools / consumables. Do not use the "
+        "marketplace seller, customer name, or delivery name as the supplier; "
+        "treat the supplier as Amazon unless it is clearly AWS/software or "
+        "another non-Amazon charge.\n"
         "- Halfords, car-parts shops, tyre shops and mechanics/garages are "
         "vehicle repairs / maintenance or motor vehicle expenses, not "
         "materials.\n"
@@ -2555,7 +3163,38 @@ def _ai_split_multi_receipts(db_path, raw_text):
             "tax": vat,
             "text": str(r.get("text") or "").strip()[:5000],
         })
-    return out
+    # If the model sees a second supplier name in the background/bottom of a
+    # photo, it can mistake the main receipt's VAT figure for another receipt's
+    # paid total. That creates a fake task pointing at the same image. Keep the
+    # split only when the extra receipt has enough of its own text/payment block.
+    filtered = []
+    for candidate in out:
+        try:
+            cand_total = round(float(candidate.get("total") or 0), 2)
+        except (TypeError, ValueError):
+            cand_total = 0.0
+        cand_text = re.sub(r"\s+", " ", str(candidate.get("text") or "")).strip().lower()
+        cand_is_short = len(cand_text) < 220
+        matches_sibling_vat = any(
+            other is not candidate
+            and other.get("tax") is not None
+            and abs(cand_total - round(float(other.get("tax") or 0), 2)) <= 0.02
+            for other in out
+        )
+        has_own_payment_block = any(
+            marker in cand_text
+            for marker in (
+                "sale total", "balance due", "total paid", "card payment",
+                "debit mastercard", "mastercard sale", "visa sale",
+                "cash", "payment received",
+            )
+        )
+        if matches_sibling_vat and cand_is_short and not has_own_payment_block:
+            continue
+        filtered.append(candidate)
+    if len(filtered) < 2:
+        return []
+    return filtered
 
 
 def _looks_like_multi_receipt_text(raw_text: str) -> bool:
@@ -2584,6 +3223,497 @@ _FUEL_THRESHOLD_GBP = 40.0
 
 def _receipt_rule_text(merchant: str = "", raw_text: str = "") -> str:
     return re.sub(r"[^a-z0-9]+", " ", ((merchant or "") + " " + (raw_text or "")).lower()).strip()
+
+
+def _receipt_names_share_token(a: str = "", b: str = "") -> bool:
+    """Loose merchant overlap for card-feed/Xero payment matching."""
+    def _canonical(value: str) -> str:
+        value = (value or "").lower()
+        # Xero/supplier names often say "Amazon", while bank card feeds say
+        # "AMZNMktplace" or similar. Treat those as the same supplier family
+        # before token comparison.
+        value = re.sub(r"\bamzn[a-z0-9]*\b", "amazon", value)
+        return value
+
+    stop = {
+        "pay", "paid", "pump", "card", "visa", "debit", "credit", "gb",
+        "gbr", "ltd", "limited", "the", "and", "at", "to", "from",
+        "transaction", "payment", "receipt", "invoice", "hd",
+    }
+    def _tokens(value: str) -> set[str]:
+        return {
+            t for t in re.findall(r"[a-z0-9]{4,}", _canonical(value))
+            if t not in stop
+        }
+    ta = _tokens(a)
+    tb = _tokens(b)
+    if not ta or not tb:
+        return False
+    if ta & tb:
+        return True
+    # Bank descriptions often truncate the merchant while Xero has the clean
+    # supplier name, e.g. "Mailchi" vs "Mailchimp". Treat a 5+ character prefix
+    # as the same merchant.
+    for left in ta:
+        for right in tb:
+            if len(left) >= 5 and len(right) >= 5 and (
+                left.startswith(right[:5]) or right.startswith(left[:5])
+            ):
+                return True
+    return False
+
+
+def _receipt_feed_is_still_settling(
+    receipt_date: dt.date | None,
+    feed_to_date: dt.date | None,
+    *,
+    grace_business_days: int = 3,
+) -> bool:
+    """Keep recent card purchases pending while the bank export catches up.
+
+    A CSV can contain other transactions dated today without containing a card
+    purchase that is still pending at the bank.  Only call a missing payment a
+    mismatch once the uploaded feed has moved at least three business days past
+    the receipt date.  A later/stale receipt naturally remains pending too.
+    """
+    if receipt_date is None or feed_to_date is None:
+        return True
+    if receipt_date > feed_to_date:
+        return True
+    elapsed = 0
+    cursor = receipt_date + dt.timedelta(days=1)
+    while cursor <= feed_to_date:
+        if cursor.weekday() < 5:
+            elapsed += 1
+        cursor += dt.timedelta(days=1)
+    return elapsed < max(int(grace_business_days or 0), 0)
+
+
+def _grouped_receipts_for_card_payment(
+    amount: float,
+    payment_date: dt.date,
+    payment_name: str,
+    receipts: list[dict],
+    *,
+    date_window_days: int = 10,
+) -> list[dict]:
+    """Find several same-supplier receipts that form one card-feed charge.
+
+    Amazon commonly takes one card payment for several individual invoices.
+    The returned subset is penny-exact (within two pence for rounding), bounded
+    to 24 candidates, and requires at least two receipts so ordinary one-to-one
+    matching remains unchanged.
+    """
+    try:
+        target = int(round(float(amount or 0) * 100))
+    except (TypeError, ValueError):
+        return []
+    if target <= 0 or not _receipt_names_share_token(payment_name, "Amazon"):
+        return []
+
+    candidates: list[tuple[int, dict]] = []
+    for rec in receipts:
+        if str(rec.get("status") or "").strip().lower() == "ignored":
+            continue
+        merchant = str(rec.get("merchant") or rec.get("ocr_merchant") or "")
+        if not _receipt_names_share_token(payment_name, merchant):
+            continue
+        try:
+            cents = int(round(float(rec.get("amount_inc") or 0) * 100))
+            rec_date = dt.date.fromisoformat(
+                str(rec.get("purchased_on") or rec.get("created_at") or "")[:10]
+            )
+        except (TypeError, ValueError):
+            continue
+        if cents <= 0 or cents > target + 2:
+            continue
+        if abs((rec_date - payment_date).days) > date_window_days:
+            continue
+        candidates.append((cents, rec))
+
+    if len(candidates) < 2:
+        return []
+    candidates = candidates[:24]
+    subsets: dict[int, tuple[int, ...]] = {0: ()}
+    for idx, (cents, _rec) in enumerate(candidates):
+        for existing, chosen in list(subsets.items()):
+            new_sum = existing + cents
+            if new_sum > target + 2 or new_sum in subsets:
+                continue
+            new_chosen = chosen + (idx,)
+            subsets[new_sum] = new_chosen
+            if abs(new_sum - target) <= 2 and len(new_chosen) >= 2:
+                return [candidates[i][1] for i in new_chosen]
+    return []
+
+
+def _marketplace_receipt_matches_card_name(
+    receipt_name: str,
+    payment_name: str,
+) -> bool:
+    """Stop an Amazon invoice consuming an unrelated same-value card line."""
+    receipt_is_amazon = _receipt_names_share_token(receipt_name, "Amazon")
+    payment_is_amazon = _receipt_names_share_token(payment_name, "Amazon")
+    return receipt_is_amazon == payment_is_amazon
+
+
+def _receipt_supplier_date_compatible(
+    receipt_name: str,
+    payment_name: str,
+    receipt_date: dt.date | None,
+    payment_date: dt.date | None,
+) -> bool:
+    """Prevent distant same-value purchases from consuming another receipt.
+
+    Matching supplier names may legitimately post several days apart.  When
+    OCR/bank naming gives us no supplier overlap, retain the useful fallback
+    only for the same or adjacent day.
+    """
+    if _receipt_names_share_token(receipt_name, payment_name):
+        return True
+    if receipt_date is None or payment_date is None:
+        return False
+    return abs((receipt_date - payment_date).days) <= 1
+
+
+def _shared_company_card_receipts_for_account(
+    all_receipts: list[dict],
+    engineers: list[dict],
+    account_id: str,
+) -> list[dict]:
+    """Receipts which can resolve one shared company-card/bank feed.
+
+    Receipt ownership remains unchanged; this list is only a matching view for
+    people, such as Ben and Yasmin, who are linked to the same feed account.
+    """
+    account_id = str(account_id or "").strip()
+    if not account_id:
+        return []
+    owner_feeds = {
+        int(eng.get("id") or 0): str(eng.get("plaid_account_id") or "").strip()
+        for eng in engineers
+    }
+    shared = []
+    for rec in all_receipts:
+        if (rec.get("payment_source") or "company_card") != "company_card":
+            continue
+        try:
+            owner_id = int(rec.get("engineer_id") or 0)
+        except (TypeError, ValueError):
+            owner_id = 0
+        receipt_feed = (
+            str(rec.get("feed_account_id_override") or "").strip()
+            or owner_feeds.get(owner_id, "")
+        )
+        if receipt_feed == account_id:
+            shared.append(rec)
+    return shared
+
+
+def _receipt_xero_reference(
+    rec: dict,
+    eng: dict | None = None,
+    *,
+    prefix: str = "Receipt",
+) -> str:
+    """Human-readable Xero reference for receipt-created records.
+
+    Avoid using raw phone filenames as the primary reference.  The attachment
+    still carries the original file name, but the Xero reference should help an
+    admin search by person, date, supplier and amount.
+    """
+    eng_name = str((eng or {}).get("name") or "").strip()
+    first_name = re.sub(r"[^A-Za-z0-9]+", "", (eng_name.split() or [""])[0])[:12]
+    merchant = str(rec.get("merchant") or rec.get("ocr_merchant") or "").strip()
+    merchant = re.sub(r"\s+", " ", merchant)
+    merchant = re.sub(r"[^\w '&.+-]+", "", merchant)[:36].strip()
+    day = str(rec.get("purchased_on") or rec.get("ocr_date") or "")[:10]
+    try:
+        amount = float(rec.get("amount_inc") or rec.get("ocr_amount") or 0)
+        amount_bit = f"£{amount:,.2f}" if amount > 0 else ""
+    except (TypeError, ValueError):
+        amount_bit = ""
+    fallback = str(rec.get("id") or rec.get("filename") or "").strip()[-8:]
+    bits = [prefix, first_name, day, merchant, amount_bit]
+    ref = " ".join(b for b in bits if b).strip()
+    if not ref or ref == prefix:
+        ref = f"{prefix} {fallback}".strip()
+    return ref[:255]
+
+
+def _receipt_xero_bill_near_duplicate(
+    rec: dict,
+    bill: dict,
+    *,
+    date_window_days: int = 14,
+    amount_tolerance: float | None = None,
+) -> bool:
+    """True when a Xero bill is close enough to warn before creating another.
+
+    Exact duplicate linking is handled elsewhere.  This helper is deliberately
+    for warnings: same/near supplier plus close date and close amount.
+    """
+    try:
+        rec_amt = round(float(rec.get("amount_inc") or 0), 2)
+        bill_amt = round(float(bill.get("amount") or 0), 2)
+    except (TypeError, ValueError):
+        return False
+    if rec_amt <= 0 or bill_amt <= 0:
+        return False
+    if amount_tolerance is None:
+        # A loose £2 window caused Amazon invoices with visibly different totals
+        # to be flagged as duplicates. Duplicate warnings should be near-exact:
+        # allow small OCR/penny differences, but not genuinely different buys.
+        amount_tolerance = max(0.05, min(0.75, rec_amt * 0.015))
+    if abs(rec_amt - bill_amt) > amount_tolerance:
+        return False
+    try:
+        rec_day = dt.date.fromisoformat(str(rec.get("purchased_on") or "")[:10])
+        bill_day = dt.date.fromisoformat(str(bill.get("date") or "")[:10])
+    except (TypeError, ValueError):
+        return False
+    if abs((bill_day - rec_day).days) > date_window_days:
+        return False
+    rec_merchant = rec.get("merchant") or rec.get("ocr_merchant") or ""
+    return _receipt_names_share_token(rec_merchant, bill.get("contact") or "")
+
+
+def _field_expense_xero_resolved_reason(
+    amt: float,
+    d: dt.date,
+    merchant_name: str,
+    recon: list | None,
+    *,
+    xero_account_id: str = "",
+    xero_account_name: str = "",
+) -> str:
+    """Return a resolved reason when Xero already covers a bank-feed row.
+
+    Most rows are one card-feed line to one Xero spend/payment. Marketplace
+    suppliers, especially Amazon, can reconcile one bank/card line to several
+    Xero bills/payments. In that case the engineer portal should still show the
+    row green if same-supplier Xero rows in the date window add up exactly.
+    """
+    if not recon:
+        return ""
+
+    def _line_date(value) -> dt.date | None:
+        try:
+            return dt.date.fromisoformat(str(value or "")[:10])
+        except (TypeError, ValueError):
+            return None
+
+    parsed = []
+    for ln in recon:
+        line_account_id = str(ln[4] if len(ln) > 4 else "").strip()
+        line_account_name = str(ln[5] if len(ln) > 5 else "").strip()
+        target_account_id = str(xero_account_id or "").removeprefix("id:").strip()
+        if target_account_id and line_account_id:
+            if target_account_id.lower() != line_account_id.removeprefix("id:").lower():
+                continue
+        elif xero_account_name and line_account_name:
+            if not _receipt_names_share_token(xero_account_name, line_account_name):
+                continue
+        try:
+            ra = float(ln[0])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if ra <= 0:
+            continue
+        rd = _line_date(ln[1]) if len(ln) > 1 else None
+        if rd is not None and abs((rd - d).days) > 10:
+            continue
+        reason = str(ln[2] if len(ln) > 2 else "reconciled")
+        xero_name = str(ln[3] if len(ln) > 3 else "")
+
+        # Exact one-to-one match stays deliberately permissive, because this is
+        # a resolved Xero signal by amount/date.
+        if abs(ra - amt) <= 0.02:
+            date_gap = abs((rd - d).days) if rd is not None else 0
+            if rd is None or date_gap <= 1:
+                if (
+                    reason != "xero bill"
+                    or not merchant_name
+                    or not xero_name
+                    or _receipt_names_share_token(merchant_name, xero_name)
+                ):
+                    return reason
+            if (
+                reason in {"attached", "xero bill"}
+                and date_gap <= 10
+                and _receipt_names_share_token(merchant_name, xero_name)
+            ):
+                return reason
+
+        same_or_next_day = rd is None or abs((rd - d).days) <= 1
+        supplier_overlap = (
+            not xero_name
+            or not merchant_name
+            or _receipt_names_share_token(merchant_name, xero_name)
+        )
+        generic_adjustment = bool(
+            same_or_next_day
+            and re.search(
+                r"\b(reconciliation\s+adjustment|adjustment|rounding|vat)\b",
+                f"{reason} {xero_name}",
+                re.I,
+            )
+        )
+
+        # For non-exact and grouped matches, require supplier overlap where
+        # Xero provides a name. Generic same-day Xero adjustment rows are
+        # allowed into the group, but a final match still needs at least one
+        # supplier-overlap row in the chosen set.
+        if not supplier_overlap and not generic_adjustment:
+            continue
+        if ra <= amt + 0.02:
+            parsed.append((int(round(ra * 100)), reason, supplier_overlap))
+
+    if len(parsed) < 2:
+        return ""
+
+    target = int(round(float(amt or 0) * 100))
+    # Keep this bounded: we only need small supplier groupings, and the Xero
+    # cache is already date-windowed. DP avoids exponential subset scans.
+    parent: dict[int, bool] = {0: False}
+    max_sum = target + 2
+    for cents, _reason, has_supplier in parsed[:24]:
+        for existing, existing_has_supplier in list(parent.items()):
+            new_sum = existing + cents
+            if new_sum > max_sum or new_sum in parent:
+                continue
+            combined_has_supplier = existing_has_supplier or has_supplier
+            parent[new_sum] = combined_has_supplier
+            if abs(new_sum - target) <= 2 and combined_has_supplier:
+                return "reconciled"
+    return ""
+
+
+def _recon_cache_range_status(cache: dict, start_s: str, end_s: str) -> tuple[bool, bool]:
+    """Return (fully_covers, overlaps) for the engineer Xero resolved cache.
+
+    A partial cache is useful for keeping rows green inside its date range, but
+    it must not stop an admin-triggered wider refresh. That was the source of
+    old months such as Sep/Oct/Nov showing as unresolved after a newer Jan-Jul
+    cache had been warmed.
+    """
+    cache_lines = cache.get("lines") if isinstance(cache.get("lines"), list) else None
+    cached_start = str(cache.get("start") or "")
+    cached_end = str(cache.get("end") or "")
+    overlaps = bool(
+        cache_lines is not None
+        and cached_start
+        and cached_end
+        and cached_start <= end_s
+        and cached_end >= start_s
+    )
+    fully_covers = bool(overlaps and cached_start <= start_s and cached_end >= end_s)
+    return fully_covers, overlaps
+
+
+_ENGINEER_RECON_CACHE_TTL_SECONDS = 15 * 60
+
+
+def _engineer_recon_cache_is_fresh(cache: dict, now: float) -> bool:
+    """Use a short freshness window, including legacy six-hour cache rows."""
+    try:
+        refreshed_at = float(cache.get("refreshed_at") or 0)
+    except (TypeError, ValueError):
+        refreshed_at = 0
+    if not refreshed_at:
+        try:
+            # Older cache records only stored a six-hour expiry timestamp.
+            refreshed_at = float(cache.get("until") or 0) - 21600
+        except (TypeError, ValueError):
+            refreshed_at = 0
+    return bool(
+        refreshed_at
+        and refreshed_at + _ENGINEER_RECON_CACHE_TTL_SECONDS > float(now)
+    )
+
+
+def _field_expense_account_is_bank_feed(account_id: str = "", label: str = "") -> bool:
+    """True when a linked feed is a normal bank account, not a card statement.
+
+    Normal bank CSVs contain customer receipts, wages, transfers and other
+    non-expense movements. Engineer portals must not chase all of those as
+    missing receipts. Credit-card CSVs can show all positive spend.
+    """
+    account_id = re.sub(r"\D", "", account_id or "")
+    label_l = (label or "").strip().lower()
+    if "charge card" in label_l or "credit card" in label_l:
+        return False
+    if len(account_id) > 4:
+        return True
+    return any(
+        token in label_l
+        for token in ("bank", "pow wash", "cash account", "current account")
+    )
+
+
+def _field_expense_bank_feed_candidate(name: str = "", amount: float = 0.0) -> bool:
+    """True for receipt-like purchases inside a normal bank feed.
+
+    The Pow Wash/main-bank CSV contains income lines such as customer receipts.
+    Those must not appear as missing engineer receipts. Keep this conservative:
+    chase clear card-purchase markers from the bank export, plus known supplier
+    spend names where Lloyds does not include the card marker.
+    """
+    text = str(name or "")
+    upper = text.upper()
+    try:
+        amount_f = float(amount or 0)
+    except (TypeError, ValueError):
+        amount_f = 0.0
+    if amount_f <= 0:
+        return False
+    if any(
+        marker in upper
+        for marker in (
+            "NON-GBP TRANS FEE",
+            "SERVICE CHARGES",
+            " LOAN ",
+            "SALARY",
+            " WAGE",
+            " PAY ",
+            " RECEIPTS ",
+            " STRIPE ",
+            "CFE SETT",
+            "GO CARDLESS",
+            "TRANSFER",
+        )
+    ):
+        return False
+    if re.search(r"\bCD\s*\d{3,5}\b", text, re.I):
+        return True
+    supplier_markers = (
+        "AMAZON",
+        "AMZN",
+        "CHECKATRADE",
+        "BROWN&BROWN",
+        "BROWN & BROWN",
+        "XERO UK",
+        "XERO LTD",
+        "WIX",
+        "PAJ UG",
+        "MAILCHIMP",
+        "TENDER POS",
+        "TFL CONGEST",
+        "TFL ROAD CHG",
+        "TFL TRAVEL",
+        "RAC BUSINESS",
+        "RAC ",
+        "INDIGO SERVICE",
+        "SCREWFIX",
+        "B&Q",
+        "B AND Q",
+        "WICKES",
+        "HALFORDS",
+        "EURO CAR PARTS",
+        "GSF CAR PARTS",
+        "EQUIP2CLEAN",
+    )
+    return any(marker in upper for marker in supplier_markers)
 
 
 def _account_has_fuel_name(code: str = "", name: str = "") -> bool:
@@ -2709,6 +3839,28 @@ def _looks_like_materials(merchant: str = "", raw_text: str = "") -> bool:
         "guttering", "downpipe", "pipe",
     )
     return any(t in text for t in terms)
+
+
+def _looks_like_amazon_marketplace_invoice(merchant: str = "", raw_text: str = "") -> bool:
+    text = _receipt_rule_text(merchant, raw_text)
+    compact = re.sub(r"[^a-z0-9]+", "", text)
+    if "amazonwebservices" in compact or "aws" in text:
+        return False
+    if "amazon" not in compact and "amzn" not in compact:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "amazon co uk",
+            "amazoncouk",
+            "total payable",
+            "payment reference id",
+            "order number",
+            "order no",
+            "order #",
+            "invoice date",
+        )
+    )
 
 
 def _looks_like_food_expense(merchant: str = "", raw_text: str = "") -> bool:
@@ -3048,6 +4200,22 @@ def _apply_receipt_account_guardrails(
         return segments, cat_code, cat_name
 
     if (
+        _looks_like_amazon_marketplace_invoice(merchant, raw_text)
+        and not _looks_like_software_supplier(merchant, raw_text)
+        and not _looks_like_vehicle_maintenance(merchant, raw_text)
+        and not _looks_like_fuel_receipt(merchant, raw_text)
+        and not _looks_like_parking(merchant, raw_text)
+        and not _looks_like_food_expense(merchant, raw_text)
+    ):
+        code, name = _find_account_by_terms(
+            accounts,
+            any_terms=("material", "materials", "tools", "consumable", "supplies"),
+            exclude_terms=("fuel", "vehicle", "motor", "parking"),
+        )
+        _set_single(code, name)
+        return segments, cat_code, cat_name
+
+    if (
         _looks_like_food_expense(merchant, raw_text)
         and not _looks_like_fuel_receipt(merchant, raw_text)
         and not _looks_like_vehicle_maintenance(merchant, raw_text)
@@ -3117,6 +4285,173 @@ def _apply_receipt_account_guardrails(
 
 
 # ── Receipt Dump helpers (bulk past-receipt upload & reconciliation) ─────────
+
+_DUMP_SUPPLIER_PROFILES = {"", "ringgo"}
+
+
+def _dump_supplier_profile(value: str) -> str:
+    value = (value or "").strip().lower()
+    return value if value in _DUMP_SUPPLIER_PROFILES else ""
+
+
+def _parse_ringgo_dump_receipt(raw_text: str, accounts: list) -> dict:
+    """Parse and penny-check the fixed RingGo VAT receipt layout.
+
+    This intentionally does not ask an LLM to infer the money. RingGo receipts
+    mix VAT-exempt operator parking with standard-rated RingGo fees, and Xero
+    must receive each standard-rated fee separately to preserve penny rounding.
+    Any missing or inconsistent field fails closed for manual review.
+    """
+    text = (raw_text or "").replace("\u00a0", " ").strip()
+
+    def _fail(message: str) -> dict:
+        return {"ok": False, "error": message}
+
+    compact = re.sub(r"\s+", " ", text).lower()
+    required = ("vat receipt", "receipt number", "ringgo charges", "ringgo ltd")
+    if not text or not all(marker in compact for marker in required):
+        return _fail("This file does not match the RingGo VAT receipt layout.")
+
+    receipt_match = re.search(
+        r"(?im)^\s*Receipt\s+number\s*:\s*([A-Z0-9-]{8,})\s*$", text
+    )
+    if not receipt_match:
+        return _fail("RingGo receipt number could not be read.")
+    receipt_number = receipt_match.group(1).strip()
+
+    date_match = re.search(
+        r"(?im)^\s*Date\s+of\s+issue\s*:\s*"
+        r"(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})\s*$",
+        text,
+    )
+    months = {
+        "jan": 1, "january": 1, "feb": 2, "february": 2,
+        "mar": 3, "march": 3, "apr": 4, "april": 4, "may": 5,
+        "jun": 6, "june": 6, "jul": 7, "july": 7,
+        "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+        "oct": 10, "october": 10, "nov": 11, "november": 11,
+        "dec": 12, "december": 12,
+    }
+    if not date_match:
+        return _fail("RingGo issue date could not be read.")
+    try:
+        purchased_on = dt.date(
+            int(date_match.group(3)),
+            months[date_match.group(2).lower()],
+            int(date_match.group(1)),
+        ).isoformat()
+    except (KeyError, ValueError):
+        return _fail("RingGo issue date is invalid.")
+
+    money = r"£?\s*(\d+(?:,\d{3})*\.\d{2})"
+
+    def _summary(label: str) -> tuple[float, float, float] | None:
+        match = re.search(
+            rf"(?im)^\s*{label}\s+{money}\s+{money}\s+{money}\s*$",
+            text,
+        )
+        if not match:
+            return None
+        return tuple(round(float(v.replace(",", "")), 2) for v in match.groups())
+
+    operator = _summary(r"Total\s+Operator\s+Charges")
+    ringgo = _summary(r"Total\s+RingGo\s+Charges")
+    overall = _summary(r"Total")
+    if not operator or not ringgo or not overall:
+        return _fail("One or more RingGo total rows could not be read.")
+
+    def _adds(net: float, vat: float, gross: float) -> bool:
+        return abs(round(net + vat, 2) - gross) <= 0.005
+
+    if not _adds(*operator) or abs(operator[1]) > 0.005:
+        return _fail("The VAT-exempt parking totals do not reconcile.")
+    if not _adds(*ringgo) or not _adds(*overall):
+        return _fail("The RingGo VAT totals do not reconcile.")
+    if any(
+        abs(round(a + b, 2) - c) > 0.005
+        for a, b, c in zip(operator, ringgo, overall)
+    ):
+        return _fail("The operator and RingGo sections do not add to the final total.")
+
+    section = re.search(
+        r"(?is)\bRingGo\s+charges\b(.*?)\bTotal\s+RingGo\s+Charges\b",
+        text,
+    )
+    if not section:
+        return _fail("The RingGo fee lines could not be located.")
+    fee_pattern = re.compile(
+        rf"(?im)^\s*\d+\s+(.+?)\s+{money}\s+20(?:\.0+)?%\s+{money}\s+{money}\s*$"
+    )
+    fees: list[dict] = []
+    for match in fee_pattern.finditer(section.group(1)):
+        label = re.sub(r"\s+", " ", match.group(1)).strip()[:60]
+        net, vat, gross = (
+            round(float(match.group(i).replace(",", "")), 2) for i in (2, 3, 4)
+        )
+        if not _adds(net, vat, gross):
+            return _fail(f"RingGo fee line '{label}' does not reconcile.")
+        fees.append({"label": label, "gross": gross, "net": net, "vat": vat})
+    if not fees:
+        return _fail("No individual 20% RingGo fee lines could be read.")
+    if any(
+        abs(round(sum(line[key] for line in fees), 2) - ringgo[idx]) > 0.005
+        for idx, key in enumerate(("net", "vat", "gross"))
+    ):
+        return _fail("The individual RingGo fee lines do not add to their section total.")
+
+    # This Xero organisation has historically coded RingGo to account 449
+    # (currently named "Motor Vehicle Expenses"). Prefer that exact active
+    # account; retain a name-based fallback if the chart is redesigned later.
+    parking_code = parking_name = ""
+    for account in accounts or []:
+        if (
+            str(account.get("Code") or "").strip() == "449"
+            and str(account.get("Status") or "ACTIVE").upper() == "ACTIVE"
+        ):
+            parking_code = "449"
+            parking_name = str(account.get("Name") or "Motor Vehicle Expenses").strip()
+            break
+    if not parking_code:
+        parking_code, parking_name = _find_account_by_terms(
+            accounts,
+            any_terms=("parking", "car park"),
+            exclude_terms=("fine", "penalty"),
+        )
+    if not parking_code:
+        return _fail("A Xero Parking expense account could not be found.")
+
+    segments = [{
+        "label": "Parking session (0% VAT)",
+        "account_code": parking_code,
+        "account_name": parking_name,
+        "gross": operator[2],
+        "net": operator[0],
+        "vat": operator[1],
+        "vat_rate": 0.0,
+    }]
+    segments.extend({
+        "label": f"{line['label']} (20% VAT)",
+        "account_code": parking_code,
+        "account_name": parking_name,
+        "gross": line["gross"],
+        "net": line["net"],
+        "vat": line["vat"],
+        "vat_rate": 20.0,
+    } for line in fees)
+
+    return {
+        "ok": True,
+        "merchant": "RingGo Parking",
+        "date": purchased_on,
+        "total": overall[2],
+        "net": overall[0],
+        "tax": overall[1],
+        "currency": "GBP",
+        "receipt_number": receipt_number,
+        "segments": segments,
+        "account_code": parking_code,
+        "account_name": parking_name,
+    }
 
 def _dump_digests(file_bytes: bytes) -> "tuple[str, str]":
     """Return (full_sha256, digest16) for a file. digest16 matches the digest
@@ -8612,6 +9947,7 @@ function toggleReceiptsEnabled(requested) {{
                   <div class="min-w-0 flex-1">
                     <div id="csv-progress-title" class="text-sm font-semibold text-emerald-900">Reconciling with Xero…</div>
                     <div id="csv-progress-msg" class="text-xs text-emerald-800/90 mt-0.5 truncate"></div>
+                    <div id="csv-progress-elapsed" class="text-[11px] font-medium text-emerald-700/80 mt-1 tabular-nums"></div>
                   </div>
                   <div id="csv-progress-count" class="text-sm font-bold text-emerald-800 tabular-nums shrink-0">0 / 0</div>
                 </div>
@@ -8915,6 +10251,7 @@ function toggleReceiptsEnabled(requested) {{
         const csvPreviewMode = document.getElementById('csv-preview-mode');
         const csvProgressTitle = document.getElementById('csv-progress-title');
         const csvProgressMsg = document.getElementById('csv-progress-msg');
+        const csvProgressElapsed = document.getElementById('csv-progress-elapsed');
         const csvProgressCount = document.getElementById('csv-progress-count');
         const csvProgressBar = document.getElementById('csv-progress-bar');
         const csvProgressSpinner = document.getElementById('csv-progress-spinner');
@@ -8925,6 +10262,35 @@ function toggleReceiptsEnabled(requested) {{
         let _csvPreviewData = null;
         let _submitPollTimer = null;
         let _submitProgressStatus = '';
+        let _submitClockTimer = null;
+        let _submitClockStartedAt = null;
+
+        function _formatSubmitElapsed(elapsedSeconds) {{
+          const seconds = Math.max(0, Math.floor(elapsedSeconds || 0));
+          const minutes = Math.floor(seconds / 60);
+          const remainder = seconds % 60;
+          return minutes + ':' + String(remainder).padStart(2, '0') + ' elapsed';
+        }}
+
+        function _updateSubmitClock() {{
+          if (!csvProgressElapsed || !_submitClockStartedAt) return;
+          csvProgressElapsed.textContent = _formatSubmitElapsed((Date.now() - _submitClockStartedAt) / 1000);
+        }}
+
+        function _startSubmitClock(startedAt) {{
+          let parsed = startedAt ? Date.parse(startedAt) : NaN;
+          if (!Number.isFinite(parsed)) parsed = Date.now();
+          _submitClockStartedAt = parsed;
+          if (_submitClockTimer) clearInterval(_submitClockTimer);
+          _updateSubmitClock();
+          _submitClockTimer = setInterval(_updateSubmitClock, 1000);
+        }}
+
+        function _stopSubmitClock() {{
+          if (_submitClockTimer) clearInterval(_submitClockTimer);
+          _submitClockTimer = null;
+          _updateSubmitClock();
+        }}
 
         function renderSubmitProgress(p) {{
           if (!csvProgress) return;
@@ -8936,6 +10302,11 @@ function toggleReceiptsEnabled(requested) {{
           csvProgressCount.textContent = done + ' / ' + total;
           csvProgressBar.style.width = pct + '%';
           csvProgressMsg.textContent = p.message || '';
+          if (p.phase === 'preflight') {{
+            _startSubmitClock();
+          }} else if ((p.status === 'running' || p.status === 'paused') && (!_submitClockStartedAt || p.started_at)) {{
+            _startSubmitClock(p.started_at);
+          }}
           if (p.status === 'paused') {{
             csvProgressTitle.textContent = 'Paused — waiting for Xero';
             csvProgressBar.className = 'h-full bg-amber-500 transition-all duration-500 ease-out';
@@ -8944,6 +10315,7 @@ function toggleReceiptsEnabled(requested) {{
               csvProgressNote.className = 'mt-2 text-[11px] text-amber-700/90';
             }}
           }} else if (p.status === 'done') {{
+            _stopSubmitClock();
             csvProgressTitle.textContent = '✅ Reconciliation complete';
             csvProgressBar.className = 'h-full bg-emerald-600 transition-all duration-500 ease-out';
             if (csvProgressSpinner) csvProgressSpinner.classList.add('hidden');
@@ -8952,6 +10324,7 @@ function toggleReceiptsEnabled(requested) {{
               csvProgressNote.className = 'mt-2 text-[11px] text-emerald-700/80';
             }}
           }} else if (p.status === 'error') {{
+            _stopSubmitClock();
             csvProgressTitle.textContent = '⚠ Submission stopped';
             csvProgressBar.className = 'h-full bg-red-500 transition-all duration-500 ease-out';
             if (csvProgressSpinner) csvProgressSpinner.classList.add('hidden');
@@ -8960,11 +10333,14 @@ function toggleReceiptsEnabled(requested) {{
               csvProgressNote.className = 'mt-2 text-[11px] text-red-700/90';
             }}
           }} else {{
-            csvProgressTitle.textContent = 'Reconciling with Xero…';
+            const isPreflight = p.phase === 'preflight';
+            csvProgressTitle.textContent = isPreflight ? 'Checking Xero before submission…' : 'Reconciling with Xero…';
             csvProgressBar.className = 'h-full bg-emerald-600 transition-all duration-500 ease-out';
             if (csvProgressSpinner) csvProgressSpinner.classList.remove('hidden');
             if (csvProgressNote) {{
-              csvProgressNote.textContent = 'You can safely close this page — the submission keeps running on the server and will pick up where it left off when you come back.';
+              csvProgressNote.textContent = isPreflight
+                ? 'No Xero writes have started yet. Keep this page open while existing payments are checked to prevent duplicates.'
+                : 'You can safely close this page — the submission keeps running on the server and will pick up where it left off when you come back.';
               csvProgressNote.className = 'mt-2 text-[11px] text-emerald-700/80';
             }}
           }}
@@ -9182,7 +10558,7 @@ function toggleReceiptsEnabled(requested) {{
           csvSubmitStatus.textContent = checked.length
             ? checked.length + ' batch' + (checked.length === 1 ? '' : 'es') + ' selected. Submit will only process those selected rows.'
             : 'No batches selected yet.';
-          csvSubmitBtn.disabled = checked.length === 0;
+          csvSubmitBtn.disabled = checked.length === 0 || ['running', 'paused'].includes(_submitProgressStatus);
         }}
         function collectCsvSubmission() {{
           if (!_csvPreviewData || !_csvPreviewData.batches) return [];
@@ -10188,6 +11564,16 @@ function toggleReceiptsEnabled(requested) {{
           csvSubmitStatus.textContent = csvPreviewMode && csvPreviewMode.checked
             ? 'Preview mode: preparing payloads without Xero writes...'
             : 'Preparing Xero submission payloads...';
+          renderSubmitProgress({{
+            status: 'running',
+            phase: 'preflight',
+            total: batches.length,
+            completed: 0,
+            percent: 0,
+            message: csvPreviewMode && csvPreviewMode.checked
+              ? 'Building the Xero payload preview…'
+              : 'Checking selected batches before Xero writes…'
+          }});
           try {{
             const resp = await fetch('/cashflows-sync/submit-csv-batches', {{
               method: 'POST',
@@ -10210,9 +11596,23 @@ function toggleReceiptsEnabled(requested) {{
             }}
             // Test mode (no async) — show the payload summary as before.
             csvSubmitStatus.textContent = data.message || 'Submission prepared.';
+            renderSubmitProgress({{
+              status: 'done',
+              total: batches.length,
+              completed: batches.length,
+              percent: 100,
+              message: data.message || 'Payload preview prepared.'
+            }});
             renderCsvSubmitSummary(data);
           }} catch (err) {{
             csvSubmitStatus.textContent = '';
+            renderSubmitProgress({{
+              status: 'error',
+              total: batches.length,
+              completed: 0,
+              percent: 0,
+              message: err.message || String(err)
+            }});
             csvShowError(err.message || String(err));
           }} finally {{
             updateCsvSubmitPanel();
@@ -10489,6 +11889,11 @@ function toggleReceiptsEnabled(requested) {{
                     "xero_connected": False,
                     "xero_error": msg,
                 }), 503
+            # A focused refresh should update Xero/calendar evidence without
+            # changing the browser-side preview scope.  The UI stores confirmed
+            # ticks/manual picks under the preview_id, so replacing it here makes
+            # every checked batch look unticked after a refresh.
+            result["preview_id"] = str(preview.get("preview_id") or result.get("preview_id") or "")
             result["source_filename"] = str(preview.get("source_filename") or "").strip()
             cached_preview = {**result, "_source_csv_text": csv_text}
             set_json_setting(config.admin_db_file, "cashflows_csv_preview", cached_preview)
@@ -10695,6 +12100,79 @@ function toggleReceiptsEnabled(requested) {{
                     return cand
             return None
 
+        _bulk_payment_index: dict[str, list[dict]] | None = None
+
+        def _normalise_existing_payment(payment: dict) -> dict | None:
+            payment_id = str(payment.get("PaymentID") or "").strip()
+            account = payment.get("Account") or {}
+            if not payment_id or not account:
+                return None
+            return {
+                "payment_id": payment_id,
+                "amount": _money_value(payment.get("Amount")),
+                "status": payment.get("Status"),
+                "account_name": account.get("Name"),
+                "account_id": account.get("AccountID"),
+                "account_code": account.get("Code"),
+                "is_reconciled": payment.get("IsReconciled"),
+            }
+
+        def _load_bulk_payment_index() -> dict[str, list[dict]]:
+            """Fetch the relevant payment window once instead of per invoice."""
+            nonlocal _bulk_payment_index
+            if _bulk_payment_index is not None:
+                return _bulk_payment_index
+            _bulk_payment_index = {}
+            if (
+                not production_enabled
+                or not xero_client
+                or not hasattr(xero_client, "get_payments")
+            ):
+                return _bulk_payment_index
+
+            date_values: list[dt.date] = []
+            for raw_date in (preview.get("date_from"), preview.get("date_to")):
+                try:
+                    if raw_date:
+                        date_values.append(dt.date.fromisoformat(str(raw_date)[:10]))
+                except ValueError:
+                    pass
+            for preview_batch in preview.get("batches") or []:
+                if not isinstance(preview_batch, dict):
+                    continue
+                raw_dates = [
+                    (preview_batch.get("payout") or {}).get("date"),
+                    *((sale or {}).get("date") for sale in (preview_batch.get("sales") or [])),
+                ]
+                for raw_date in raw_dates:
+                    try:
+                        if raw_date:
+                            date_values.append(dt.date.fromisoformat(str(raw_date)[:10]))
+                    except ValueError:
+                        pass
+            if not date_values:
+                return _bulk_payment_index
+
+            # Cashflows payments are normally posted close to the sale/payout.
+            # The margin keeps the bulk call bounded; any invoice not found in
+            # it still uses the slower detail lookup below as a safety fallback.
+            start_date = min(date_values) - dt.timedelta(days=31)
+            end_date = max(date_values) + dt.timedelta(days=31)
+            try:
+                payload = xero_client.get_payments(
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+            except Exception:
+                return _bulk_payment_index
+            for payment in payload.get("Payments") or []:
+                invoice = payment.get("Invoice") or {}
+                invoice_id = str(invoice.get("InvoiceID") or "").strip()
+                normalised = _normalise_existing_payment(payment)
+                if invoice_id and normalised:
+                    _bulk_payment_index.setdefault(invoice_id, []).append(normalised)
+            return _bulk_payment_index
+
         def _existing_account_payments(invoice_id: str) -> list[dict]:
             """Return Xero payments already posted to an account for this invoice.
 
@@ -10705,6 +12183,9 @@ function toggleReceiptsEnabled(requested) {{
             """
             if not production_enabled or not xero_client or not invoice_id:
                 return []
+            bulk_matches = _load_bulk_payment_index().get(invoice_id) or []
+            if bulk_matches:
+                return [dict(payment) for payment in bulk_matches]
             try:
                 invoice = xero_client.get_invoice(invoice_id)
             except Exception:
@@ -10721,19 +12202,9 @@ function toggleReceiptsEnabled(requested) {{
                     payment_detail = ((resp.json() or {}).get("Payments") or [{}])[0]
                 except Exception:
                     continue
-                account = payment_detail.get("Account") or {}
-                if payment_detail.get("HasAccount") and account:
-                    found.append(
-                        {
-                            "payment_id": payment_id,
-                            "amount": _money_value(payment_detail.get("Amount")),
-                            "status": payment_detail.get("Status"),
-                            "account_name": account.get("Name"),
-                            "account_id": account.get("AccountID"),
-                            "account_code": account.get("Code"),
-                            "is_reconciled": payment_detail.get("IsReconciled"),
-                        }
-                    )
+                normalised = _normalise_existing_payment(payment_detail)
+                if normalised:
+                    found.append(normalised)
             return found
 
         batch_map = {str(b.get("id") or ""): b for b in (preview.get("batches") or []) if isinstance(b, dict)}
@@ -11199,7 +12670,9 @@ function toggleReceiptsEnabled(requested) {{
             )
 
         if blocking_errors:
-            return _flask.jsonify({"error": " ".join(blocking_errors[:4])}), 400
+            msg = " ".join(blocking_errors[:4])
+            print(f"[cashflows-csv-submit] blocked before Xero writes: {msg}", flush=True)
+            return _flask.jsonify({"error": msg}), 400
 
         if not production_enabled:
             message = (
@@ -11663,7 +13136,11 @@ function toggleReceiptsEnabled(requested) {{
         )
         enabled_checked = "checked" if settings.get("enabled") else ""
         sample_event_key = "primary:sample-event-id"
-        sample_link = svc.create_upload_url(sample_event_key, base_url=_current_base_url())
+        sample_link = (
+            svc.create_upload_url(sample_event_key, base_url=_current_base_url())
+            if LEGACY_CALENDAR_RECEIPTS_ENABLED
+            else "Legacy calendar receipt upload links are switched off. Use the Powwash Expenses portal."
+        )
         body = f"""
         <main class="max-w-5xl mx-auto p-6 space-y-6">
           <div class="flex items-center justify-between gap-4">
@@ -11718,7 +13195,7 @@ function toggleReceiptsEnabled(requested) {{
           </form>
           <div class="rounded-xl border border-gray-200 bg-white p-4 space-y-2">
             <h2 class="text-sm font-semibold text-gray-900">Signed Link Preview</h2>
-            <p class="text-xs text-gray-600">This is the secure signed upload URL format used in calendar entries.</p>
+            <p class="text-xs text-gray-600">Legacy calendar receipt links are no longer used for engineers.</p>
             <code class="block text-xs bg-gray-50 border border-gray-200 rounded p-2 break-all">{escape(sample_link)}</code>
           </div>
           <form method="post" action="/receipts/create" class="rounded-xl border border-gray-200 bg-white p-4 space-y-3">
@@ -11789,6 +13266,10 @@ function toggleReceiptsEnabled(requested) {{
     def receipt_short_link(code: str):
         """Expand a short receipt-upload code into the full /receipts/submit?token= URL."""
         import time as _time
+        if not LEGACY_CALENDAR_RECEIPTS_ENABLED:
+            return _page(
+                "<main class='max-w-xl mx-auto p-6'><div class='rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800'>Calendar receipt upload links have been switched off. Use the Powwash Expenses portal instead.</div></main>"
+            ), 410
         links = get_json_setting(config.admin_db_file, "receipt_short_links", {})
         entry = links.get((code or "").strip())
         if not entry or not isinstance(entry, dict):
@@ -11805,6 +13286,10 @@ function toggleReceiptsEnabled(requested) {{
     def receipts_submit_page():
         svc = ReceiptService(config)
         token = (request.args.get("token") or "").strip()
+        if not LEGACY_CALENDAR_RECEIPTS_ENABLED:
+            return _page(
+                "<main class='max-w-xl mx-auto p-6'><div class='rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800'>Calendar receipt upload links have been switched off. Use the Powwash Expenses portal instead.</div></main>"
+            ), 410
         if not svc.is_enabled:
             return _page(
                 "<main class='max-w-xl mx-auto p-6'><div class='rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-800'>Receipts flow is currently paused.</div></main>"
@@ -11934,6 +13419,10 @@ body {{ background:#f7f6f3 !important; }}
     def receipts_submit_upload():
         svc = ReceiptService(config)
         token = (request.args.get("token") or "").strip()
+        if not LEGACY_CALENDAR_RECEIPTS_ENABLED:
+            return _page(
+                "<main class='max-w-xl mx-auto p-6'><div class='rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800'>Calendar receipt upload links have been switched off. Use the Powwash Expenses portal instead.</div></main>"
+            ), 410
         if not svc.is_enabled:
             return _page(
                 "<main class='max-w-xl mx-auto p-6'><div class='rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-800'>Receipts flow is currently paused.</div></main>"
@@ -12149,8 +13638,13 @@ body {{ background:#f7f6f3 !important; }}
     _recon_refresh_lock = threading.Lock()
     _recon_refresh_running = False
 
-    def _engineer_reconciled_lines(start, end):
-        """Reconciled SPEND lines (amount, iso_date) from Xero in a date window.
+    def _engineer_reconciled_lines(start, end, *, allow_refresh: bool = False):
+        """Resolved SPEND lines (amount, iso_date, reason) from Xero in a date window.
+
+        For the engineer portal, "resolved" means the company no longer needs
+        to chase the engineer for a receipt. A Xero spend with an attachment is
+        therefore resolved even when Xero has not yet reconciled it to the bank
+        feed. A fully reconciled spend is also resolved.
 
         Returns ``None`` when Xero is paused/unavailable (status unknown), so
         the feed can keep lines visible rather than silently dropping them.
@@ -12167,47 +13661,146 @@ body {{ background:#f7f6f3 !important; }}
         """
         nonlocal _recon_refresh_running
 
-        if xero_is_disabled():
-            return None
         import time as _t
         now = _t.time()
         start_s = start.isoformat() if hasattr(start, "isoformat") else str(start or "")
         end_s = end.isoformat() if hasattr(end, "isoformat") else str(end or "")
-        cache = get_json_setting(config.admin_db_file, "engineer_recon_cache", {}) or {}
-        if cache.get("until", 0) > now and isinstance(cache.get("lines"), list):
-            cached_start = str(cache.get("start") or "")
-            cached_end = str(cache.get("end") or "")
-            if cached_start <= start_s and cached_end >= end_s:
-                return cache["lines"]
+        cache_key = "engineer_recon_cache_v4"
+        cache = get_json_setting(config.admin_db_file, cache_key, {}) or {}
+        cache_lines = cache.get("lines") if isinstance(cache.get("lines"), list) else None
+        cache_fully_covers, cache_overlaps = _recon_cache_range_status(cache, start_s, end_s)
+        if _engineer_recon_cache_is_fresh(cache, now) and cache_lines is not None:
+            if cache_fully_covers:
+                return cache_lines
+            if cache_overlaps and not allow_refresh:
+                # A phone portal may ask for a wider historical window than the
+                # current warm cache, especially when an old CSV month is still
+                # visible. Do not throw away the cache in that case: rows inside
+                # the cached range must still stay green, and widening the cache
+                # can happen separately without making the live portal look
+                # unresolved.
+                return cache_lines
+        if xero_is_disabled():
+            return cache_lines if cache_overlaps else None
 
-        def _bg_refresh(s, e, ss, es):
+        refresh_start = start
+        retained_cache_lines = []
+        if cache_fully_covers and cache_lines is not None:
+            try:
+                refresh_start = max(start, end - dt.timedelta(days=45))
+                for cached_line in cache_lines:
+                    try:
+                        cached_day = dt.date.fromisoformat(str(cached_line[1] or "")[:10])
+                    except (TypeError, ValueError, IndexError):
+                        continue
+                    if cached_day < refresh_start:
+                        retained_cache_lines.append(cached_line)
+            except (TypeError, ValueError):
+                refresh_start = start
+                retained_cache_lines = []
+
+        def _bg_refresh(s, e, ss, es, retained_lines):
             nonlocal _recon_refresh_running
             try:
                 client = build_xero_client(config)
                 payload = client.get_bank_transactions(start_date=s, end_date=e)
                 raw = (payload or {}).get("BankTransactions") or []
-                lines = []
+                # For an already complete cache, replace only the recent
+                # window.  This picks up new reconciliation work without
+                # rereading a full year on every engineer portal refresh.
+                lines = list(retained_lines or [])
                 for t in raw:
                     if str(t.get("Type") or "").upper() != "SPEND":
                         continue
-                    if not t.get("IsReconciled"):
+                    is_reconciled = bool(t.get("IsReconciled"))
+                    has_attachment = bool(t.get("HasAttachments"))
+                    if not is_reconciled and not has_attachment:
                         continue
                     try:
                         amt = float(t.get("Total") or 0)
                     except (TypeError, ValueError):
                         continue
-                    lines.append([amt, _xero_date_to_iso(t.get("Date"))])
+                    lines.append([
+                        amt,
+                        _xero_date_to_iso(t.get("Date")),
+                        "attached" if has_attachment else "reconciled",
+                        " ".join([
+                            str((t.get("Contact") or {}).get("Name") or ""),
+                            str(t.get("Reference") or ""),
+                        ]).strip(),
+                        str((t.get("BankAccount") or {}).get("AccountID") or ""),
+                        str((t.get("BankAccount") or {}).get("Name") or ""),
+                    ])
+                try:
+                    bills_payload = client.get_purchase_bills(start_date=s, end_date=e)
+                    bills = (bills_payload or {}).get("Invoices") or []
+                except Exception as exc:
+                    bills = []
+                    print(f"[engineer-recon-cache] purchase bill refresh failed: {exc}", flush=True)
+                for inv in bills:
+                    if not bool(inv.get("HasAttachments")):
+                        continue
+                    if str(inv.get("Status") or "").upper() not in {"AUTHORISED", "PAID"}:
+                        continue
+                    try:
+                        amt = float(inv.get("Total") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if amt <= 0:
+                        continue
+                    lines.append([
+                        amt,
+                        _xero_date_to_iso(inv.get("Date")),
+                        "xero bill",
+                        " ".join([
+                            str((inv.get("Contact") or {}).get("Name") or ""),
+                            str(inv.get("InvoiceNumber") or ""),
+                            str(inv.get("Reference") or ""),
+                        ]).strip(),
+                        "",
+                        "",
+                    ])
+                try:
+                    payments_payload = client.get_payments(start_date=s, end_date=e)
+                    payments = (payments_payload or {}).get("Payments") or []
+                except Exception as exc:
+                    payments = []
+                    print(f"[engineer-recon-cache] payment refresh failed: {exc}", flush=True)
+                for p in payments:
+                    inv = p.get("Invoice") or {}
+                    if str(inv.get("Type") or "").upper() != "ACCPAY":
+                        continue
+                    try:
+                        amt = float(p.get("Amount") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if amt <= 0:
+                        continue
+                    contact = (inv.get("Contact") or {}).get("Name") or ""
+                    lines.append([
+                        amt,
+                        _xero_date_to_iso(p.get("Date")),
+                        "payment",
+                        " ".join([
+                            str(contact or ""),
+                            str(inv.get("InvoiceNumber") or ""),
+                            str(p.get("Reference") or ""),
+                        ]).strip(),
+                        str((p.get("Account") or {}).get("AccountID") or ""),
+                        str((p.get("Account") or {}).get("Name") or ""),
+                    ])
                 set_json_setting(
-                    config.admin_db_file, "engineer_recon_cache",
+                    config.admin_db_file, cache_key,
                     {
-                        "until": _t.time() + 21600,
+                        "refreshed_at": _t.time(),
+                        "until": _t.time() + _ENGINEER_RECON_CACHE_TTL_SECONDS,
                         "start": ss,
                         "end": es,
                         "lines": lines,
                     },
                 )
                 print(
-                    f"[engineer-recon-cache] warmed: {len(lines)} reconciled lines "
+                    f"[engineer-recon-cache] warmed: {len(lines)} resolved lines "
                     f"({ss} -> {es})",
                     flush=True,
                 )
@@ -12217,18 +13810,25 @@ body {{ background:#f7f6f3 !important; }}
                 with _recon_refresh_lock:
                     _recon_refresh_running = False
 
-        with _recon_refresh_lock:
-            if not _recon_refresh_running:
-                _recon_refresh_running = True
-                threading.Thread(
-                    target=_bg_refresh,
-                    args=(start, end, start_s, end_s),
-                    daemon=True,
-                ).start()
+        if allow_refresh:
+            with _recon_refresh_lock:
+                if not _recon_refresh_running:
+                    _recon_refresh_running = True
+                    threading.Thread(
+                        target=_bg_refresh,
+                        args=(
+                            refresh_start,
+                            end,
+                            start_s,
+                            end_s,
+                            retained_cache_lines,
+                        ),
+                        daemon=True,
+                    ).start()
 
-        return None
+        return cache_lines if cache_overlaps else None
 
-    def _engineer_card_feed_html(eng, receipts):
+    def _engineer_card_feed_html(eng, receipts, *, matching_receipts=None):
         """Card-holder feed for a company-card engineer.
 
         Shows the engineer's own card transactions as weekly bars. Each week
@@ -12238,6 +13838,7 @@ body {{ background:#f7f6f3 !important; }}
         """
         if (eng.get("kind") or "") != "company_card":
             return ""
+        matching_receipts = receipts if matching_receipts is None else matching_receipts
         acct = (eng.get("plaid_account_id") or "").strip()
         if not acct:
             return ""
@@ -12253,23 +13854,180 @@ body {{ background:#f7f6f3 !important; }}
             feed_status = cardfeed.connection_status(db) or {}
         except Exception:
             feed_status = {}
+        try:
+            account_labels = cardfeed.get_account_labels(db) or {}
+        except Exception:
+            account_labels = {}
+        account_label = str(
+            (account_labels.get(acct) or {}).get("xero_account_name") or ""
+        )
+        account_is_bank_feed = _field_expense_account_is_bank_feed(acct, account_label)
         last_updated = (
             feed_status.get("last_sync_at")
             or ((feed_status.get("csv") or {}).get("last_upload_at") if isinstance(feed_status.get("csv"), dict) else "")
             or feed_status.get("connected_at")
             or ""
         )
+        try:
+            notice_stamp = str(
+                get_json_setting(db, "engineer_bank_feed_notice_stamp", "") or ""
+            ).strip()
+        except Exception:
+            notice_stamp = ""
+        notice_updated = notice_stamp or str(last_updated or "")
         last_updated_html = (
             f"<span>Bank feed updated {escape(str(last_updated))}</span>"
             if last_updated else
             "<span>Bank feed update time unavailable</span>"
         )
+        feed_to = ""
+        try:
+            csv_status = cardfeed.csv_status(db) or {}
+            for account in csv_status.get("accounts") or []:
+                if str(account.get("account_id") or "") == acct:
+                    feed_to = str(account.get("date_to") or "")
+                    break
+            if not feed_to:
+                feed_to = str(csv_status.get("date_to") or "")
+        except Exception:
+            feed_to = ""
+        bank_update_notice = ""
+        if notice_updated:
+            try:
+                updated_dt = dt.datetime.fromisoformat(str(notice_updated).replace("Z", "+00:00"))
+                if updated_dt.tzinfo is None:
+                    updated_dt = updated_dt.replace(tzinfo=dt.timezone.utc)
+                recently_updated = (
+                    dt.datetime.now(dt.timezone.utc) - updated_dt.astimezone(dt.timezone.utc)
+                ) <= dt.timedelta(days=7)
+            except Exception:
+                recently_updated = False
+            try:
+                dismissed = get_json_setting(db, "engineer_bank_feed_update_dismissals", {}) or {}
+            except Exception:
+                dismissed = {}
+            dismiss_key = str(eng.get("id") or "")
+            dismissed_stamp = str(dismissed.get(dismiss_key) or "")
+            if recently_updated and dismissed_stamp != str(notice_updated):
+                bank_update_notice = (
+                    "<form method='post' "
+                    f"action='/expenses/{escape(str(eng.get('token') or ''))}/bank-feed-updated-dismiss' "
+                    "class='animate-pulse'>"
+                    f"<input type='hidden' name='feed_stamp' value='{escape(str(notice_updated))}'>"
+                    "<button type='submit' class='w-full rounded-xl border border-emerald-300 "
+                    "bg-emerald-50 px-4 py-2.5 text-left shadow-sm active:bg-emerald-100'>"
+                    "<div class='flex items-center justify-between gap-3'>"
+                    "<div><div class='text-sm font-bold text-emerald-900'>Bank feed recently updated</div>"
+                    f"<div class='text-[11px] text-emerald-700'>{escape(str(notice_updated))} · tap to dismiss</div></div>"
+                    "<span class='text-xs font-bold text-emerald-800'>OK</span>"
+                    "</div></button></form>"
+                )
 
         def _d(v):
             try:
                 return dt.date.fromisoformat(str(v or "")[:10])
             except (ValueError, TypeError):
                 return None
+
+        settings = get_expense_settings(db)
+
+        def _feed_label(feed_id: str) -> str:
+            feed_id = str(feed_id or "").strip()
+            meta = account_labels.get(feed_id) or {}
+            label = (
+                str(meta.get("xero_account_name") or "").strip()
+                or str(meta.get("name") or "").strip()
+            )
+            if label:
+                return label
+            for account in feed_status.get("accounts") or []:
+                if str(account.get("account_id") or "") == feed_id:
+                    return (
+                        str(account.get("name") or "").strip()
+                        or str(account.get("official_name") or "").strip()
+                        or feed_id
+                    )
+            return feed_id
+
+        def _receipt_account_choice_options(rec: dict) -> str:
+            current_source = rec.get("payment_source") or "company_card"
+            current_feed = _expense_receipt_feed_account_id(rec, eng)
+            current_payment = _expense_receipt_payment_account(
+                rec,
+                eng,
+                default_payment_account=settings.get("default_payment_account") or "",
+            )
+            selected = {
+                "source": current_source,
+                "feed": current_feed if current_source == "company_card" else "",
+                "payment": current_payment,
+            }
+            seen: set[tuple[str, str, str]] = set()
+            out = ""
+
+            def _add(label: str, source: str, feed_id: str, payment_account: str) -> None:
+                nonlocal out
+                source = "owner_paid" if source == "owner_paid" else "company_card"
+                feed_id = str(feed_id or "").strip()
+                payment_account = str(payment_account or "").strip()
+                if source == "company_card" and not feed_id and not payment_account:
+                    return
+                if source == "owner_paid" and not payment_account:
+                    return
+                key = (source, feed_id, payment_account)
+                if key in seen:
+                    return
+                seen.add(key)
+                payload = json.dumps({
+                    "source": source,
+                    "feed": feed_id,
+                    "payment": payment_account,
+                }, separators=(",", ":"))
+                is_sel = (
+                    source == selected["source"]
+                    and feed_id == selected["feed"]
+                    and payment_account == selected["payment"]
+                )
+                out += (
+                    f"<option value='{escape(payload, quote=True)}'"
+                    f"{' selected' if is_sel else ''}>{escape(label)}</option>"
+                )
+
+            _add(
+                f"{eng.get('name') or 'This user'} - current card ({_feed_label(acct)})",
+                "company_card",
+                acct,
+                (eng.get("payment_account_code") or "").strip()
+                or (settings.get("default_payment_account") or "").strip(),
+            )
+            try:
+                all_engineers = exp_store.list_engineers(db, include_inactive=False)
+            except Exception:
+                all_engineers = [eng]
+            for other in all_engineers:
+                other_feed = str(other.get("plaid_account_id") or "").strip()
+                if other_feed:
+                    other_payment = (
+                        str(other.get("payment_account_code") or "").strip()
+                        or str(settings.get("default_payment_account") or "").strip()
+                    )
+                    _add(
+                        f"{other.get('name') or 'User'} - {_feed_label(other_feed)}",
+                        "company_card",
+                        other_feed,
+                        other_payment,
+                    )
+                if other.get("allow_owner_paid"):
+                    owner_payment = str(other.get("owner_paid_account_code") or "").strip()
+                    _add(
+                        f"{other.get('name') or 'User'} - personal / owner-paid",
+                        "owner_paid",
+                        "",
+                        owner_payment,
+                    )
+            if not out:
+                out = "<option value=''>No other accounts configured</option>"
+            return out
 
         try:
             all_tx = cardfeed.get_cached_transactions(db) or []
@@ -12287,6 +14045,10 @@ body {{ background:#f7f6f3 !important; }}
             except (TypeError, ValueError):
                 continue
             if amt <= 0:  # ignore refunds / incoming credits
+                continue
+            if account_is_bank_feed and not _field_expense_bank_feed_candidate(
+                str(t.get("name") or ""), amt
+            ):
                 continue
             d = _d(t.get("date"))
             if d is None:
@@ -12307,18 +14069,29 @@ body {{ background:#f7f6f3 !important; }}
         for idx, tx in enumerate(txs + older_txs):
             tx["key"] = tx["id"] or f"{tx['date'].isoformat()}:{tx['amount']:.2f}:{idx}"
 
-        def _receipt_candidates(amt, d):
+        def _receipt_candidates(amt, d, payment_name=""):
             candidates = []
-            for r in receipts:
+            for r in matching_receipts:
                 if (r.get("payment_source") or "company_card") != "company_card":
+                    continue
+                if _expense_receipt_feed_account_id(r, eng) != acct:
                     continue
                 try:
                     ra = float(r.get("amount_inc") or 0)
                 except (TypeError, ValueError):
                     continue
+                receipt_name = str(r.get("merchant") or r.get("ocr_merchant") or "")
+                if not _marketplace_receipt_matches_card_name(
+                    receipt_name, str(payment_name or "")
+                ):
+                    continue
                 if abs(ra - amt) > 1.0:
                     continue
                 rd = _d(r.get("purchased_on") or (r.get("created_at") or "")[:10])
+                if not _receipt_supplier_date_compatible(
+                    receipt_name, str(payment_name or ""), rd, d
+                ):
+                    continue
                 if rd is None or abs((rd - d).days) <= 31:
                     candidates.append((abs((rd - d).days) if rd else 999, r))
             candidates.sort(key=lambda x: x[0])
@@ -12327,7 +14100,9 @@ body {{ background:#f7f6f3 !important; }}
         matched_by_tx: dict[str, dict] = {}
         used_receipts: set[str] = set()
         for tx in sorted(txs + older_txs, key=lambda x: x["date"]):
-            for rec in _receipt_candidates(tx["amount"], tx["date"]):
+            for rec in _receipt_candidates(
+                tx["amount"], tx["date"], str(tx.get("name") or "")
+            ):
                 rid = str(rec.get("id") or "")
                 if rid and rid in used_receipts:
                     continue
@@ -12336,9 +14111,42 @@ body {{ background:#f7f6f3 !important; }}
                     used_receipts.add(rid)
                 break
 
+        # Amazon and similar marketplace card lines can represent several
+        # individual invoices.  Match those penny-exact groups after the normal
+        # one-to-one pass so their component receipts do not appear as false
+        # mismatches.
+        for tx in sorted(txs + older_txs, key=lambda x: x["date"]):
+            tx_key = str(tx.get("key") or "")
+            if tx_key in matched_by_tx:
+                continue
+            available = []
+            for rec in matching_receipts:
+                if (rec.get("payment_source") or "company_card") != "company_card":
+                    continue
+                if _expense_receipt_feed_account_id(rec, eng) != acct:
+                    continue
+                rid = str(rec.get("id") or "")
+                if rid and rid in used_receipts:
+                    continue
+                available.append(rec)
+            grouped = _grouped_receipts_for_card_payment(
+                tx["amount"], tx["date"], str(tx.get("name") or ""), available
+            )
+            if not grouped:
+                continue
+            matched_by_tx[tx_key] = grouped[0]
+            for rec in grouped:
+                rid = str(rec.get("id") or "")
+                if rid:
+                    used_receipts.add(rid)
+
         receipt_only_rows = []
         for r in receipts:
             if (r.get("payment_source") or "company_card") != "company_card":
+                continue
+            if _expense_receipt_feed_account_id(r, eng) != acct:
+                continue
+            if str(r.get("status") or "").strip().lower() == "ignored":
                 continue
             rid = str(r.get("id") or "")
             if rid and rid in used_receipts:
@@ -12362,6 +14170,86 @@ body {{ background:#f7f6f3 !important; }}
                 "receipt": r,
             })
 
+        feed_to_date = _d(feed_to)
+        mismatch_rows = []
+        duplicate_rows = []
+        auto_ignored_duplicate_keys: set[str] = set()
+
+        def _has_exact_card_feed_line(row: dict) -> bool:
+            """True when the uploaded card feed already contains this payment.
+
+            If a receipt-only row has an exact card line but did not get matched,
+            it usually means another receipt row already consumed that one bank
+            payment. That is a duplicate/check issue, not a missing-bank-feed
+            issue.
+            """
+            try:
+                amt = round(float(row.get("amount") or 0), 2)
+            except (TypeError, ValueError):
+                return False
+            d = row.get("date")
+            if not isinstance(d, dt.date):
+                return False
+            for tx in txs + older_txs:
+                tx_date = tx.get("date")
+                if not isinstance(tx_date, dt.date):
+                    continue
+                try:
+                    tx_amt = round(float(tx.get("amount") or 0), 2)
+                except (TypeError, ValueError):
+                    continue
+                if abs(tx_amt - amt) <= 0.02 and abs((tx_date - d).days) <= 1:
+                    return True
+            return False
+
+        if feed_to_date is not None:
+            for row in receipt_only_rows:
+                rec = row.get("receipt") or {}
+                status = str(rec.get("status") or "").strip().lower()
+                if status not in {"approved", "submitted", "settled", "failed"}:
+                    continue
+                if _receipt_feed_is_still_settling(row["date"], feed_to_date):
+                    continue
+                rec_has_clean_xero_link = bool((rec.get("xero_id") or "").strip()) and not (
+                    rec.get("xero_error") or ""
+                ).strip()
+                if rec_has_clean_xero_link:
+                    continue
+                if _has_exact_card_feed_line(row):
+                    if (
+                        status in {"pending_review", "approved"}
+                        and not (rec.get("xero_id") or "").strip()
+                        and not rec.get("settlement_id")
+                    ):
+                        rid = str(rec.get("id") or "")
+                        if rid:
+                            try:
+                                exp_store.update_receipt(
+                                    db,
+                                    rid,
+                                    status="ignored",
+                                    xero_error=(
+                                        "Auto-ignored duplicate: the uploaded "
+                                        "card feed already has this exact date "
+                                        "and amount covered by another receipt."
+                                    ),
+                                )
+                                auto_ignored_duplicate_keys.add(str(row.get("key") or ""))
+                            except Exception:
+                                duplicate_rows.append(row)
+                        continue
+                    duplicate_rows.append(row)
+                    continue
+                if status in {"approved", "submitted", "failed"}:
+                    mismatch_rows.append(row)
+        if auto_ignored_duplicate_keys:
+            receipt_only_rows = [
+                row for row in receipt_only_rows
+                if str(row.get("key") or "") not in auto_ignored_duplicate_keys
+            ]
+        mismatch_keys = {str(row.get("key") or "") for row in mismatch_rows}
+        duplicate_keys = {str(row.get("key") or "") for row in duplicate_rows}
+
         visible_dates = [tx["date"] for tx in txs + older_txs if tx.get("date")]
         receipt_dates = [r["date"] for r in receipt_only_rows if r.get("date")]
         recon_start = min(visible_dates + receipt_dates) if (visible_dates or receipt_dates) else cutoff
@@ -12371,20 +14259,34 @@ body {{ background:#f7f6f3 !important; }}
         # Clamp to a year so one phone page-load cannot become a full-history
         # Xero audit; the result is cached below.
         recon_start = max(recon_start, today - dt.timedelta(days=365))
-        recon = _engineer_reconciled_lines(recon_start, today)
+        recon = _engineer_reconciled_lines(
+            recon_start, today, allow_refresh=True
+        )
+        try:
+            xero_statement_rows = xero_statement.get_reconciled_rows(db)
+        except Exception:
+            xero_statement_rows = []
+        account_label_meta = account_labels.get(acct) or {}
 
-        def _reconciled(amt, d):
-            if not recon:
-                return False
-            for ln in recon:
-                try:
-                    ra = float(ln[0])
-                except (TypeError, ValueError, IndexError):
-                    continue
-                rd = _d(ln[1]) if len(ln) > 1 else None
-                if abs(ra - amt) <= 1.0 and (rd is None or abs((rd - d).days) <= 10):
-                    return True
-            return False
+        def _xero_resolved_reason(amt, d, merchant_name: str = ""):
+            statement_match = xero_statement.find_reconciled_match(
+                xero_statement_rows,
+                amount=amt,
+                date=d,
+                xero_account_id=str(account_label_meta.get("xero_account_id") or ""),
+                xero_account_name=account_label,
+                description=merchant_name,
+            )
+            if statement_match:
+                return "xero statement"
+            return _field_expense_xero_resolved_reason(
+                amt,
+                d,
+                merchant_name,
+                recon,
+                xero_account_id=str(account_label_meta.get("xero_account_id") or ""),
+                xero_account_name=account_label,
+            )
 
         def _matching_receipt(tx):
             if tx.get("kind") == "receipt_only":
@@ -12396,15 +14298,26 @@ body {{ background:#f7f6f3 !important; }}
 
         this_week = _week_start(today)
 
-        def _week_label(start: dt.date) -> str:
-            end = start + dt.timedelta(days=6)
+        def _ordinal_suffix(day: int) -> str:
+            if 10 <= day % 100 <= 20:
+                return "th"
+            return {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+
+        def _week_label_html(start: dt.date) -> str:
             if start == this_week:
                 return "This week"
             if start == this_week - dt.timedelta(days=7):
                 return "Last week"
+            suffix = _ordinal_suffix(start.day)
             if start.year == today.year:
-                return f"Week of {start.strftime('%d %b')}"
-            return f"Week of {start.strftime('%d %b %Y')}"
+                return (
+                    f"Week {escape(start.strftime('%b'))} {start.day}"
+                    f"<sup class='text-[10px] leading-none'>{suffix}</sup>"
+                )
+            return (
+                f"Week {escape(start.strftime('%b'))} {start.day}"
+                f"<sup class='text-[10px] leading-none'>{suffix}</sup> {start.year}"
+            )
 
         def _date_span(start: dt.date) -> str:
             end = start + dt.timedelta(days=6)
@@ -12426,20 +14339,50 @@ body {{ background:#f7f6f3 !important; }}
             short_name = escape(str(name or "Card payment"))
             rec = _matching_receipt(tx)
             receipt_only = tx.get("kind") == "receipt_only"
-            reconciled = False if receipt_only else _reconciled(amt, d)
+            xero_reason = _xero_resolved_reason(amt, d, str(tx.get("name") or ""))
+            rec_has_xero = bool((rec or {}).get("xero_id"))
+            receipt_bank_mismatch = receipt_only and str(tx.get("key") or "") in mismatch_keys
+            receipt_possible_duplicate = receipt_only and str(tx.get("key") or "") in duplicate_keys
+            reconciled = bool(xero_reason) or (receipt_only and rec_has_xero)
             matched = bool(rec)
             if matched:
+                if receipt_bank_mismatch:
+                    matched_label = "mismatch - check value"
+                    badge = (
+                        "<span class='inline-flex items-center rounded-full bg-rose-50 "
+                        "px-2 py-0.5 text-[11px] font-semibold text-rose-700'>"
+                        + matched_label
+                        + "</span>"
+                    )
+                elif receipt_possible_duplicate:
+                    badge = (
+                        "<span class='inline-flex items-center rounded-full bg-amber-50 "
+                        "px-2 py-0.5 text-[11px] font-semibold text-amber-700'>"
+                        "possible duplicate - check</span>"
+                    )
+                else:
+                    if receipt_only and rec_has_xero:
+                        matched_label = "receipt matched"
+                    elif receipt_only:
+                        matched_label = "submitted receipt · waiting for next bank CSV"
+                    else:
+                        matched_label = "receipt matched"
+                    badge = (
+                        "<span class='inline-flex items-center rounded-full bg-emerald-50 "
+                        "px-2 py-0.5 text-[11px] font-semibold text-emerald-700'>"
+                        + matched_label
+                        + "</span>"
+                    )
+            elif reconciled:
                 badge = (
                     "<span class='inline-flex items-center rounded-full bg-emerald-50 "
                     "px-2 py-0.5 text-[11px] font-semibold text-emerald-700'>"
-                    + ("waiting for bank feed" if receipt_only else "receipt matched")
+                    + (
+                        "receipt matched"
+                        if xero_reason in {"attached", "xero bill"} else
+                        "reconciled in Xero · no receipt submitted"
+                    )
                     + "</span>"
-                )
-            elif reconciled:
-                badge = (
-                    "<span class='inline-flex items-center rounded-full bg-gray-100 "
-                    "px-2 py-0.5 text-[11px] font-semibold text-gray-600'>"
-                    "reconciled in Xero</span>"
                 )
             else:
                 badge = (
@@ -12448,26 +14391,65 @@ body {{ background:#f7f6f3 !important; }}
                     "receipt needed</span>"
                 )
             row_cls = (
-                "bg-emerald-50/60 border-emerald-100"
-                if matched else
-                ("bg-gray-50/70 border-gray-100 opacity-75" if reconciled else "bg-white border-gray-100")
+                "bg-emerald-100 border-emerald-300 ring-1 ring-emerald-200"
+                if (matched or reconciled) and not receipt_bank_mismatch and not receipt_possible_duplicate else
+                "bg-amber-50/70 border-amber-100"
+                if receipt_possible_duplicate else
+                "bg-rose-50/70 border-rose-100"
+                if receipt_bank_mismatch else
+                "bg-white border-gray-100"
+            )
+            row_style = (
+                " style='background:#dcfce7;border-color:#86efac;"
+                "box-shadow:inset 4px 0 0 #10b981;'"
+                if (matched or reconciled) and not receipt_bank_mismatch and not receipt_possible_duplicate else
+                ""
             )
             rec_line = ""
             if rec:
                 merchant = escape(rec.get("merchant") or rec.get("ocr_merchant") or "Receipt")
                 status = escape(str(rec.get("status") or "saved"))
+                rec_tone = (
+                    "text-rose-700" if receipt_bank_mismatch else
+                    "text-amber-700" if receipt_possible_duplicate else
+                    "text-emerald-700"
+                )
                 rec_line = (
-                    f"<div class='text-[11px] text-emerald-700 mt-0.5'>"
+                    f"<div class='text-[11px] {rec_tone} mt-0.5'>"
                     + (
-                        f"Submitted receipt · {status} · CSV not updated yet"
+                        (
+                            f"Submitted receipt · {status} · check bank-feed match"
+                            if receipt_bank_mismatch else
+                            f"Submitted receipt · {status} · possible duplicate"
+                            if receipt_possible_duplicate else
+                            f"Submitted receipt · {status} · receipt matched"
+                            if rec_has_xero else
+                            f"Submitted receipt · {status} · check bank-feed match"
+                            if receipt_bank_mismatch else
+                            f"Submitted receipt · {status} · possible duplicate"
+                            if receipt_possible_duplicate else
+                            f"Submitted receipt · {status} · waiting for next bank CSV"
+                        )
                         if receipt_only else
                         f"Matched to {merchant} · {status}"
                     )
                     + "</div>"
                 )
+            vat_src = rec if rec else None
+            if vat_src and vat_src.get("vat_amount") is not None:
+                try:
+                    vat_line = _exp_money(float(vat_src.get("vat_amount") or 0))
+                except (TypeError, ValueError):
+                    vat_line = ""
+            else:
+                vat_line = _exp_money(round(float(amt or 0) / 6, 2)) if amt else ""
+            vat_html = (
+                f"<div class='text-[11px] text-gray-500'>VAT {vat_line}</div>"
+                if vat_line else ""
+            )
             return (
                 "<div class='px-4 py-3 border-b last:border-0 flex "
-                f"items-center justify-between gap-3 {row_cls}'>"
+                f"items-center justify-between gap-3 {row_cls}'{row_style}>"
                 "<div class='min-w-0'>"
                 "<details class='group/tx min-w-0'>"
                 "<summary class='list-none cursor-pointer font-medium text-gray-900 "
@@ -12482,6 +14464,7 @@ body {{ background:#f7f6f3 !important; }}
                 "</div>"
                 "<div class='text-right whitespace-nowrap'>"
                 f"<div class='font-semibold text-gray-900'>{_exp_money(amt)}</div>"
+                f"{vat_html}"
                 f"<div class='mt-0.5'>{badge}</div>"
                 "</div></div>"
             )
@@ -12504,15 +14487,212 @@ body {{ background:#f7f6f3 !important; }}
             unmatched = [
                 tx for tx in card_rows
                 if not _matching_receipt(tx)
-                and not _reconciled(tx["amount"], tx["date"])
+                and not _xero_resolved_reason(tx["amount"], tx["date"], str(tx.get("name") or ""))
             ]
-            matched_count = sum(1 for tx in rows if _matching_receipt(tx))
+            unmatched += [
+                tx for tx in rows
+                if tx.get("kind") == "receipt_only"
+                and str(tx.get("key") or "") in mismatch_keys
+            ]
+            matched_count = sum(
+                1 for tx in rows
+                if _matching_receipt(tx)
+                and str(tx.get("key") or "") not in mismatch_keys
+            )
             total_inc_vat = round(sum(float(tx["amount"] or 0) for tx in rows), 2)
-            leftover_vat = round(sum(float(tx["amount"] or 0) for tx in unmatched) / 6, 2) if unmatched else 0.0
-            return unmatched, matched_count, total_inc_vat, leftover_vat
+            unresolved_amount = round(sum(float(tx["amount"] or 0) for tx in unmatched), 2)
+            resolved_amount = round(max(total_inc_vat - unresolved_amount, 0), 2)
+            resolved_count = max(len(rows) - len(unmatched), 0)
+            vat_amount = round(resolved_amount / 6, 2) if resolved_amount else 0.0
+            return (
+                unmatched, matched_count, total_inc_vat, vat_amount,
+                unresolved_amount, len(unmatched), resolved_amount, resolved_count,
+            )
 
         out = [
             "<div class='space-y-2'>",
+            bank_update_notice,
+        ]
+        def _engineer_receipt_action_row(row: dict, *, tone: str) -> str:
+            token = str(eng.get("token") or "")
+            rec = row.get("receipt") or {}
+            rid = str(rec.get("id") or "")
+            merchant = escape(str(row.get("name") or "Submitted receipt"))
+            review_href = (
+                f"/expenses/{escape(token)}/review/{escape(rid)}"
+                if rid else
+                f"/expenses/{escape(token)}"
+            )
+            photo_href = (
+                f"/expenses/{escape(token)}/photo/{escape(rid)}?preview=1"
+                if rid else
+                ""
+            )
+            prev_photo_href = ""
+            prev_title = ""
+            if rid:
+                try:
+                    amt = round(float(row.get("amount") or 0), 2)
+                except (TypeError, ValueError):
+                    amt = 0.0
+                day = row.get("date")
+                previous_matches = []
+                for other in receipts:
+                    oid = str(other.get("id") or "")
+                    if not oid or oid == rid:
+                        continue
+                    try:
+                        if int(other.get("engineer_id") or 0) != int(eng.get("id") or 0):
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+                    if not other.get("stored_file") and not (other.get("xero_id") or "").strip():
+                        continue
+                    try:
+                        oamt = round(float(other.get("amount_inc") or 0), 2)
+                    except (TypeError, ValueError):
+                        continue
+                    oday = _d(other.get("purchased_on") or (other.get("created_at") or "")[:10])
+                    if (
+                        isinstance(day, dt.date)
+                        and isinstance(oday, dt.date)
+                        and abs(oamt - amt) <= 0.02
+                        and abs((oday - day).days) <= 1
+                    ):
+                        previous_matches.append(
+                            (
+                                0 if (other.get("xero_id") or "").strip() else 1,
+                                0 if str(other.get("status") or "").lower() in {"submitted", "settled"} else 1,
+                                str(other.get("created_at") or ""),
+                                oid,
+                                other,
+                            )
+                        )
+                if previous_matches:
+                    previous_matches.sort()
+                    _rank_xero, _rank_status, _created, oid, other = previous_matches[0]
+                    prev_photo_href = (
+                        f"/expenses/{escape(token)}/photo/{escape(oid)}?preview=1"
+                    )
+                    prev_title = escape(
+                        str(other.get("merchant") or other.get("ocr_merchant") or "Previous receipt")
+                    )
+            status = str(rec.get("status") or "").strip().lower()
+            can_change = bool(
+                rid
+                and status in {"pending_review", "approved", "failed", "submitted", "ignored"}
+                and not rec.get("settlement_id")
+            )
+            action_cls = "text-rose-700" if tone == "rose" else "text-amber-700"
+            border_cls = "border-rose-100" if tone == "rose" else "border-amber-100"
+            options_button = (
+                f"<button type='button' data-exp-receipt-options='1' "
+                f"data-title='{merchant}' "
+                f"data-amount='{escape(_exp_money(row['amount']), quote=True)}' "
+                f"data-date='{escape(_exp_day_label(row['date'].isoformat()), quote=True)}' "
+                f"data-photo='{escape(photo_href, quote=True)}' "
+                f"data-prev-photo='{escape(prev_photo_href, quote=True)}' "
+                f"data-prev-title='{prev_title}' "
+                f"data-has-compare='{'1' if prev_photo_href else '0'}' "
+                f"data-review='{escape(review_href, quote=True)}' "
+                f"data-delete='/expenses/{escape(token)}/receipt/{escape(rid)}/delete' "
+                f"data-duplicate='/expenses/{escape(token)}/receipt/{escape(rid)}/accept-duplicate' "
+                f"data-can-change='{'1' if can_change else '0'}' "
+                f"class='rounded-md border {border_cls} bg-white px-2 py-1 text-[11px] "
+                f"font-bold {action_cls}'>Options</button>"
+                if rid else
+                ""
+            )
+            direct_delete = (
+                f"<form method='post' action='/expenses/{escape(token)}/receipt/{escape(rid)}/delete' "
+                "onsubmit=\"return confirm('Delete this receipt from the app? This cannot be undone.');\">"
+                f"<button type='submit' class='rounded-md border border-rose-200 bg-rose-50 "
+                f"px-2 py-1 text-[11px] font-bold text-rose-700'>Delete</button>"
+                "</form>"
+                if can_change else
+                ""
+            )
+            account_select = ""
+            if tone == "rose" and rid and can_change:
+                account_select = (
+                    "<form method='post' "
+                    f"action='/expenses/{escape(token)}/receipt/{escape(rid)}/payment-account' "
+                    "class='mt-2 grid grid-cols-[1fr_auto] gap-1'>"
+                    "<select name='account_choice' "
+                    "class='min-w-0 rounded-md border border-rose-200 bg-white px-2 py-1 "
+                    "text-[11px] font-semibold text-gray-800'>"
+                    + _receipt_account_choice_options(rec)
+                    + "</select>"
+                    "<button type='submit' class='rounded-md bg-rose-700 px-2 py-1 "
+                    "text-[11px] font-bold text-white'>Use</button>"
+                    "</form>"
+                )
+            return (
+                f"<div class='rounded-lg "
+                f"bg-white/70 border {border_cls} px-3 py-2'>"
+                "<div class='flex items-center justify-between gap-3'>"
+                "<div class='min-w-0'>"
+                f"<a href='{review_href}' class='block text-sm font-bold text-gray-950 truncate'>"
+                f"{merchant}</a>"
+                f"<div class='text-[11px] {action_cls}'>"
+                f"{escape(_exp_day_label(row['date'].isoformat()))} · {_exp_money(row['amount'])}</div>"
+                "</div>"
+                "<div class='shrink-0 flex flex-wrap items-center justify-end gap-2'>"
+                f"{options_button}{direct_delete}"
+                "</div></div>"
+                f"{account_select}</div>"
+            )
+
+        if duplicate_rows:
+            preview_rows = [
+                _engineer_receipt_action_row(row, tone="amber")
+                for row in sorted(duplicate_rows, key=lambda x: x["date"], reverse=True)[:4]
+            ]
+            more = len(duplicate_rows) - len(preview_rows)
+            if more > 0:
+                preview_rows.append(
+                    f"<div class='px-3 text-[11px] font-semibold text-amber-700'>+ {more} more to check</div>"
+                )
+            out.append(
+                "<div class='rounded-xl border-2 border-amber-300 "
+                "bg-amber-50 p-3 shadow-sm'>"
+                "<div class='text-sm font-black text-amber-950'>Possible duplicate receipt</div>"
+                "<div class='mt-1 text-xs text-amber-800'>A matching card payment exists "
+                "in the uploaded bank feed, but another receipt has already used that "
+                "payment. Review the photo, mark it as duplicate, or delete it if it "
+                "was uploaded by mistake.</div>"
+                "<div class='mt-3 space-y-1.5'>"
+                + "".join(preview_rows)
+                + "</div></div>"
+            )
+
+        if mismatch_rows:
+            token = str(eng.get("token") or "")
+            preview_rows = []
+            for row in sorted(mismatch_rows, key=lambda x: x["date"], reverse=True)[:4]:
+                preview_rows.append(_engineer_receipt_action_row(row, tone="rose"))
+            more = len(mismatch_rows) - len(preview_rows)
+            if more > 0:
+                preview_rows.append(
+                    f"<div class='px-3 text-[11px] font-semibold text-rose-700'>+ {more} more to check</div>"
+                )
+            out.append(
+                "<details class='group/mismatch animate-pulse rounded-lg border "
+                "border-rose-300 bg-rose-50 shadow-sm'>"
+                "<summary class='list-none cursor-pointer px-3 py-2 flex items-center "
+                "justify-between gap-3 text-sm font-black text-rose-950'>"
+                "<span>Receipt missmatch - check values</span>"
+                "<span class='text-base transition-transform group-open/mismatch:rotate-180'>⌄</span>"
+                "</summary>"
+                "<div class='border-t border-rose-200 px-3 pb-3 pt-2'>"
+                "<div class='text-xs text-rose-800'>These receipts were submitted, "
+                "and the uploaded bank feed covers their dates, but the app cannot find "
+                "a matching card payment. Check the total, VAT, date, or card account.</div>"
+                "<div class='mt-3 space-y-1.5'>"
+                + "".join(preview_rows)
+                + "</div></div></details>"
+            )
+        out += [
             "<div class='flex items-end justify-between gap-2 px-1'>"
             "<h2 class='text-sm font-semibold text-gray-500 uppercase tracking-wide'>"
             "Your card by week</h2>"
@@ -12525,22 +14705,62 @@ body {{ background:#f7f6f3 !important; }}
                 "&mdash; lines stay here until the office turns Xero back on.</p>"
             )
         for idx, start in enumerate(sorted(weeks.keys(), reverse=True)):
-            rows = weeks[start]
-            _unmatched, matched_count, total_inc_vat, leftover_vat = _summary(rows)
+            rows = sorted(
+                weeks[start],
+                key=lambda tx: (tx.get("date") or dt.date.min, tx.get("kind") != "card"),
+                reverse=True,
+            )
+            (
+                _unmatched, matched_count, total_inc_vat, vat_amount,
+                unresolved_amount, unresolved_count, resolved_amount, resolved_count,
+            ) = _summary(rows)
             open_attr = " open" if idx == 0 and rows else ""
             tone = (
-                "border-emerald-200 bg-emerald-50"
+                "border-emerald-300 bg-emerald-50"
                 if not _unmatched else
-                "border-amber-200 bg-amber-50"
+                "border-amber-300 bg-amber-50"
             )
+            if unresolved_count == 0 and rows:
+                summary_html = (
+                    "<div class='shrink-0 flex items-center gap-3'>"
+                    "<div class='min-w-[118px] text-center'>"
+                    f"<div class='text-sm font-black text-emerald-700'>{_exp_money(resolved_amount)}</div>"
+                    "<div class='text-[10px] uppercase tracking-wide font-bold text-emerald-700'>resolved</div>"
+                    f"<div class='text-[10px] text-gray-500'>{resolved_count} item{'s' if resolved_count != 1 else ''} · VAT {_exp_money(vat_amount)}</div>"
+                    "</div>"
+                    "<span class='inline-flex h-8 w-8 items-center justify-center rounded-full "
+                    "border border-indigo-200 bg-white text-lg font-bold text-indigo-600 "
+                    "shadow-sm animate-pulse transition-transform group-open/card:rotate-180'>⌄</span>"
+                    "</div>"
+                )
+            else:
+                summary_html = (
+                    "<div class='shrink-0 flex items-center gap-3'>"
+                    "<div class='text-left min-w-[82px]'>"
+                    f"<div class='text-xs font-bold {'text-amber-700' if unresolved_count else 'text-gray-400'}'>{_exp_money(unresolved_amount)}</div>"
+                    f"<div class='text-[10px] uppercase tracking-wide {'text-amber-700' if unresolved_count else 'text-gray-400'}'>unresolved</div>"
+                    f"<div class='text-[10px] text-gray-500'>{unresolved_count} receipt{'s' if unresolved_count != 1 else ''}</div>"
+                    "</div>"
+                    "<div class='text-right min-w-[82px]'>"
+                    f"<div class='text-sm font-bold text-gray-900'>{_exp_money(resolved_amount)}</div>"
+                    f"<div class='text-[10px] uppercase tracking-wide text-emerald-700'>resolved</div>"
+                    f"<div class='text-[10px] text-gray-600'>{resolved_count} item{'s' if resolved_count != 1 else ''} · VAT {_exp_money(vat_amount)}</div>"
+                    "</div>"
+                    "<span class='inline-flex h-8 w-8 items-center justify-center rounded-full "
+                    "border border-indigo-200 bg-white text-lg font-bold text-indigo-600 "
+                    "shadow-sm animate-pulse transition-transform group-open/card:rotate-180'>⌄</span>"
+                    "</div>"
+                )
             out.append(
-                f"<details class='rounded-xl border {tone} overflow-hidden'{open_attr}>"
+                f"<details class='group/card rounded-xl border-2 {tone} overflow-hidden "
+                "shadow-sm transition-all open:bg-white open:shadow-md open:ring-2 "
+                f"open:ring-indigo-100'{open_attr}>"
                 "<summary class='list-none cursor-pointer px-4 py-3 flex items-center "
-                "justify-between gap-3'>"
-                "<div>"
-                f"<div class='font-semibold text-gray-900'>{escape(_week_label(start))}</div>"
-                f"<div class='text-[11px] text-gray-400'>{escape(_date_span(start))}</div>"
-                f"<div class='text-xs text-gray-500'>"
+                "justify-between gap-3 transition-colors group-open/card:bg-white'>"
+                "<div class='min-w-0'>"
+                f"<div class='font-semibold text-gray-900 transition-all group-open/card:text-lg group-open/card:font-black'>{_week_label_html(start)}</div>"
+                f"<div class='text-[11px] text-gray-400 transition-all group-open/card:text-xs'>{escape(_date_span(start))}</div>"
+                f"<div class='text-xs text-gray-500 transition-all group-open/card:text-sm'>"
                 + (
                     f"{len(rows)} card payment(s) · {matched_count} matched"
                     if rows else
@@ -12548,11 +14768,8 @@ body {{ background:#f7f6f3 !important; }}
                 )
                 + "</div>"
                 "</div>"
-                "<div class='text-right shrink-0'>"
-                f"<div class='text-sm font-bold text-gray-900'>{_exp_money(total_inc_vat)}</div>"
-                f"<div class='text-[11px] text-gray-600'>total inc VAT · left over VAT {_exp_money(leftover_vat)}</div>"
-                "</div></summary>"
-                "<div class='border-t border-white/70 bg-white'>"
+                f"{summary_html}</summary>"
+                "<div class='border-t-2 border-indigo-100 bg-white'>"
                 + "".join(_row(tx) for tx in rows)
                 + "</div></details>"
             )
@@ -12564,27 +14781,64 @@ body {{ background:#f7f6f3 !important; }}
                 "<div class='grid grid-cols-1 gap-2'>"
             )
             for month_key in sorted(months.keys(), reverse=True):
-                rows = months[month_key]
-                _unmatched, matched_count, total_inc_vat, leftover_vat = _summary(rows)
-                tone = (
-                    "border-emerald-200 bg-emerald-50"
-                    if not _unmatched else
-                    "border-gray-200 bg-white"
+                rows = sorted(
+                    months[month_key],
+                    key=lambda tx: (tx.get("date") or dt.date.min, tx.get("kind") != "card"),
+                    reverse=True,
                 )
+                (
+                    _unmatched, matched_count, total_inc_vat, vat_amount,
+                    unresolved_amount, unresolved_count, resolved_amount, resolved_count,
+                ) = _summary(rows)
+                tone = (
+                    "border-emerald-300 bg-emerald-50"
+                    if not _unmatched else
+                    "border-amber-300 bg-amber-50"
+                )
+                if unresolved_count == 0 and rows:
+                    summary_html = (
+                        "<div class='shrink-0 flex items-center gap-3'>"
+                        "<div class='min-w-[118px] text-center'>"
+                        f"<div class='text-sm font-black text-emerald-700'>{_exp_money(resolved_amount)}</div>"
+                        "<div class='text-[10px] uppercase tracking-wide font-bold text-emerald-700'>resolved</div>"
+                        f"<div class='text-[10px] text-gray-500'>{resolved_count} item{'s' if resolved_count != 1 else ''} · VAT {_exp_money(vat_amount)}</div>"
+                        "</div>"
+                        "<span class='inline-flex h-8 w-8 items-center justify-center rounded-full "
+                        "border border-indigo-200 bg-white text-lg font-bold text-indigo-600 "
+                        "shadow-sm animate-pulse transition-transform group-open/card:rotate-180'>⌄</span>"
+                        "</div>"
+                    )
+                else:
+                    summary_html = (
+                        "<div class='shrink-0 flex items-center gap-3'>"
+                        "<div class='text-left min-w-[82px]'>"
+                        f"<div class='text-xs font-bold {'text-amber-700' if unresolved_count else 'text-gray-400'}'>{_exp_money(unresolved_amount)}</div>"
+                        f"<div class='text-[10px] uppercase tracking-wide {'text-amber-700' if unresolved_count else 'text-gray-400'}'>unresolved</div>"
+                        f"<div class='text-[10px] text-gray-500'>{unresolved_count} receipt{'s' if unresolved_count != 1 else ''}</div>"
+                        "</div>"
+                        "<div class='text-right min-w-[82px]'>"
+                        f"<div class='text-sm font-bold text-gray-900'>{_exp_money(resolved_amount)}</div>"
+                        f"<div class='text-[10px] uppercase tracking-wide text-emerald-700'>resolved</div>"
+                        f"<div class='text-[10px] text-gray-600'>{resolved_count} item{'s' if resolved_count != 1 else ''} · VAT {_exp_money(vat_amount)}</div>"
+                        "</div>"
+                        "<span class='inline-flex h-8 w-8 items-center justify-center rounded-full "
+                        "border border-indigo-200 bg-white text-lg font-bold text-indigo-600 "
+                        "shadow-sm animate-pulse transition-transform group-open/card:rotate-180'>⌄</span>"
+                        "</div>"
+                    )
                 out.append(
-                    f"<details class='rounded-xl border {tone} overflow-hidden'>"
+                    f"<details class='group/card rounded-xl border-2 {tone} overflow-hidden "
+                    "shadow-sm transition-all open:bg-white open:shadow-md open:ring-2 "
+                    "open:ring-indigo-100'>"
                     "<summary class='list-none cursor-pointer px-4 py-3 flex items-center "
-                    "justify-between gap-3'>"
-                    "<div>"
-                    f"<div class='font-semibold text-gray-900'>{escape(_month_label(month_key))}</div>"
-                    f"<div class='text-xs text-gray-500'>{len(rows)} card payment(s) · "
+                    "justify-between gap-3 transition-colors group-open/card:bg-white'>"
+                    "<div class='min-w-0'>"
+                    f"<div class='font-semibold text-gray-900 transition-all group-open/card:text-lg group-open/card:font-black'>{escape(_month_label(month_key))}</div>"
+                    f"<div class='text-xs text-gray-500 transition-all group-open/card:text-sm'>{len(rows)} card payment(s) · "
                     f"{matched_count} matched</div>"
                     "</div>"
-                    "<div class='text-right shrink-0'>"
-                    f"<div class='text-sm font-bold text-gray-900'>{_exp_money(total_inc_vat)}</div>"
-                    f"<div class='text-[11px] text-gray-600'>total inc VAT · left over VAT {_exp_money(leftover_vat)}</div>"
-                    "</div></summary>"
-                    "<div class='border-t border-gray-100 bg-white'>"
+                    f"{summary_html}</summary>"
+                    "<div class='border-t-2 border-indigo-100 bg-white'>"
                     + "".join(_row(tx) for tx in rows)
                     + "</div></details>"
                 )
@@ -12605,16 +14859,25 @@ body {{ background:#f7f6f3 !important; }}
         but smaller/faded so engineers can always tell which screen they are on
         and switch without hunting for a back link.
         """
+        if not CUSTOMER_RECEIPT_PORTAL_ENABLED:
+            active = "expense"
         active = active if active in {"expense", "customer"} else "expense"
 
         def _card(mode: str, href: str, icon: str, title: str, sub: str, color: str) -> str:
             is_active = active == mode
             size = "h-36 scale-100 opacity-100 shadow-sm" if is_active else "h-28 scale-[.94] opacity-55 shadow-none"
-            bg = (
-                f"bg-{color}-600 text-white active:bg-{color}-700"
-                if is_active else
-                f"bg-{color}-50 text-{color}-800 border border-{color}-100"
-            )
+            if mode == "expense":
+                bg = (
+                    "bg-sky-100 text-sky-950 border-2 border-sky-300 shadow-md ring-2 ring-sky-100 active:bg-sky-200"
+                    if is_active else
+                    "bg-sky-50 text-sky-800 border border-sky-100"
+                )
+            else:
+                bg = (
+                    f"bg-{color}-600 text-white active:bg-{color}-700"
+                    if is_active else
+                    f"bg-{color}-50 text-{color}-800 border border-{color}-100"
+                )
             icon_cls = "text-4xl" if is_active else "text-3xl"
             title_cls = "text-base" if is_active else "text-sm"
             sub_cls = "text-xs opacity-80" if is_active else "text-[11px] opacity-70"
@@ -12629,12 +14892,15 @@ body {{ background:#f7f6f3 !important; }}
                 "</a>"
             )
 
-        return (
-            "<div class='grid grid-cols-2 gap-3'>"
-            + _card("expense", f"/expenses/{token}", "&#128247;", "Expense receipt", "Fuel, parts, tools", "indigo")
-            + _card("customer", f"/expenses/{token}/customer-receipts", "&#128179;", "Customer receipt", "Card terminal photo", "emerald")
-            + "</div>"
-        )
+        cards = [
+            _card("expense", f"/expenses/{token}", "&#128247;", "Expense receipt", "Fuel, parts, tools", "sky")
+        ]
+        if CUSTOMER_RECEIPT_PORTAL_ENABLED:
+            cards.append(
+                _card("customer", f"/expenses/{token}/customer-receipts", "&#128179;", "Customer receipt", "Card terminal photo", "emerald")
+            )
+        cols = "grid-cols-2" if len(cards) > 1 else "grid-cols-1"
+        return "<div class='grid " + cols + " gap-3'>" + "".join(cards) + "</div>"
 
     def _subcontractor_reference(eng):
         """Stable payment reference the office quotes when paying a
@@ -12648,42 +14914,13 @@ body {{ background:#f7f6f3 !important; }}
         return f"{first}-{secrets.randbelow(900) + 100}"
 
     def _exp_purge_old_photos():
-        """Best-effort disk cleanup: clear local photos of submitted/settled
-        receipts older than ~30 days, but only when the image is recoverable
-        from Xero (xero_id present). The figures are always kept. Throttled to
-        run at most once a day via a stored timestamp."""
-        db = config.admin_db_file
-        import time as _t
-        now = _t.time()
-        try:
-            if float(get_json_setting(db, "exp_photo_purge_next", 0) or 0) > now:
-                return
-        except (TypeError, ValueError):
-            pass
-        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)
-        done = {"submitted", "settled"}
-        try:
-            recs = exp_store.list_receipts_with_images(db)
-        except Exception:
-            recs = []
-        for rec in recs:
-            if (rec.get("status") or "") not in done:
-                continue
-            if not (rec.get("xero_id") or "").strip():
-                continue  # only purge when recoverable from Xero
-            stamp = str(rec.get("updated_at") or rec.get("created_at") or "")
-            try:
-                d = dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-            except (ValueError, TypeError):
-                continue
-            if d.tzinfo is None:
-                d = d.replace(tzinfo=dt.timezone.utc)
-            if d > cutoff:
-                continue
-            old = exp_store.clear_receipt_stored_file(db, rec["id"])
-            if old:
-                _exp_safe_remove_file(db, old)
-        set_json_setting(db, "exp_photo_purge_next", now + 86400)
+        """Legacy hook kept as a no-op.
+
+        Receipt images are no longer purged automatically on page load. The
+        admin must explicitly mark a VAT period as finished before local images
+        are archived, so active receipt review work cannot lose its previews.
+        """
+        return
 
     def _allocate_receipts_to_payment(receipts, amount):
         """Decide which of a subcontractor's owed receipts a single bank payment
@@ -12772,7 +15009,10 @@ body {{ background:#f7f6f3 !important; }}
         plus fuel), each segment becomes its own line so the P&L account is
         correct without creating duplicate payments.
         """
-        merchant = (rec.get("merchant") or rec.get("ocr_merchant") or "Receipt").strip()
+        merchant = _clean_receipt_merchant(
+            rec.get("merchant") or rec.get("ocr_merchant") or "Receipt",
+            rec.get("ocr_raw") or "",
+        )
         day = (rec.get("purchased_on") or "")[:10]
         desc_base = f"{merchant} {day}".strip() if day else merchant
         lines: list[dict] = []
@@ -12803,11 +15043,9 @@ body {{ background:#f7f6f3 !important; }}
                 }
                 if acct:
                     line["AccountCode"] = acct
-                try:
-                    if float(seg.get("vat_rate") or 0) == 0:
-                        line["TaxType"] = "NONE"
-                except (TypeError, ValueError):
-                    pass
+                tax_type = _receipt_segment_xero_tax_type(seg.get("vat_rate"))
+                if tax_type:
+                    line["TaxType"] = tax_type
                 prepared.append(line)
             if total > 0 and abs(round(seg_total, 2) - total) <= 0.05 and prepared:
                 return prepared
@@ -12832,6 +15070,148 @@ body {{ background:#f7f6f3 !important; }}
         except (TypeError, ValueError):
             pass
         return [line]
+
+    def _receipt_material_fields_changed(before: dict, after: dict) -> bool:
+        fields = (
+            "merchant", "purchased_on", "amount_inc", "amount_ex", "vat_amount",
+            "category_account_code", "category_account_name", "payment_source",
+            "owner_paid_account_code", "payment_account_code_override",
+            "feed_account_id_override",
+        )
+        for field in fields:
+            if field in {"amount_inc", "amount_ex", "vat_amount"}:
+                try:
+                    old = round(float(before.get(field) or 0), 2)
+                except (TypeError, ValueError):
+                    old = 0.0
+                try:
+                    new = round(float(after.get(field) or 0), 2)
+                except (TypeError, ValueError):
+                    new = 0.0
+                if old != new:
+                    return True
+            elif str(before.get(field) or "").strip() != str(after.get(field) or "").strip():
+                return True
+        return False
+
+    def _sync_receipt_correction_to_xero(eng: dict, before: dict, after: dict) -> None:
+        """Push an explicit receipt edit onto the already-linked Xero object.
+
+        This never scans Xero and never creates a new object. It is one targeted
+        write after a user/admin has opened a receipt and saved corrected
+        values. Xero may still reject reconciled/locked/paid objects; in that
+        case the local correction remains and xero_error tells the user/admin.
+        """
+        xid = str(after.get("xero_id") or "").strip()
+        xtype = str(after.get("xero_type") or "").strip().lower()
+        if not xid or not _receipt_material_fields_changed(before, after):
+            return
+        if after.get("settlement_id"):
+            exp_store.update_receipt(
+                config.admin_db_file,
+                after["id"],
+                xero_error=(
+                    "Local correction saved. Xero was not changed because this "
+                    "receipt belongs to a payout batch; adjust the batch/bill manually."
+                ),
+            )
+            return
+        if xero_is_disabled():
+            exp_store.update_receipt(
+                config.admin_db_file,
+                after["id"],
+                xero_error="Local correction saved. Xero is paused, so the linked Xero record was not changed.",
+            )
+            return
+
+        client = build_xero_client(config)
+        if client is None:
+            exp_store.update_receipt(
+                config.admin_db_file,
+                after["id"],
+                xero_error="Local correction saved. Xero is not connected, so the linked Xero record was not changed.",
+            )
+            return
+
+        merchant = _clean_receipt_merchant(
+            after.get("merchant") or after.get("ocr_merchant") or "Receipt",
+            after.get("ocr_raw") or "",
+        )
+        purchased_on = (after.get("purchased_on") or "")[:10]
+        account_code = (after.get("category_account_code") or "").strip()
+        line_items = _receipt_xero_line_items(after, default_account=account_code)
+        if not merchant or not purchased_on or not line_items:
+            exp_store.update_receipt(
+                config.admin_db_file,
+                after["id"],
+                xero_error="Local correction saved. Xero was not changed because supplier/date/lines are incomplete.",
+            )
+            return
+
+        try:
+            if xtype in {"banktransactions", "banktransaction", "spend", "spendmoney"}:
+                payment_account = (
+                    (after.get("owner_paid_account_code") or "").strip()
+                    if (after.get("payment_source") or "company_card") == "owner_paid"
+                    else ""
+                ) or _expense_receipt_payment_account(
+                    after,
+                    eng,
+                    default_payment_account=get_expense_settings(
+                        config.admin_db_file
+                    ).get("default_payment_account") or "",
+                )
+                if not payment_account:
+                    raise RuntimeError("No payment account configured for the corrected receipt.")
+                payload = {
+                    "BankTransactions": [{
+                        "BankTransactionID": xid,
+                        "Type": "SPEND",
+                        "Contact": _xero_contact_ref_for_merchant(merchant),
+                        "Date": purchased_on,
+                        "Reference": _receipt_xero_reference(after, eng),
+                        "BankAccount": _receipt_account_ref(payment_account),
+                        "LineAmountTypes": "Inclusive",
+                        "LineItems": line_items,
+                    }]
+                }
+                client.update_bank_transaction_payload(xid, payload)
+            elif xtype in {"accpay", "invoice", "invoices"}:
+                payload = {
+                    "Invoices": [{
+                        "InvoiceID": xid,
+                        "Type": "ACCPAY",
+                        "Contact": _xero_contact_ref_for_merchant(merchant),
+                        "Date": purchased_on,
+                        "DueDate": purchased_on,
+                        "Reference": _receipt_xero_reference(after, eng),
+                        "LineAmountTypes": "Inclusive",
+                        "LineItems": line_items,
+                    }]
+                }
+                client.update_invoice_payload(xid, payload)
+            else:
+                exp_store.update_receipt(
+                    config.admin_db_file,
+                    after["id"],
+                    xero_error="Local correction saved. Xero was not changed because the linked record type is unknown.",
+                )
+                return
+            exp_store.update_receipt(
+                config.admin_db_file,
+                after["id"],
+                xero_error="",
+            )
+            _feed.push("Corrected receipt details updated in Xero.", "success")
+        except Exception as exc:
+            exp_store.update_receipt(
+                config.admin_db_file,
+                after["id"],
+                xero_error=(
+                    "Local correction saved, but Xero did not accept the update: "
+                    + str(exc).splitlines()[0][:220]
+                ),
+            )
 
     def _create_xero_bill_for_settlement(eng, settlement, receipts, *, force: bool = False):
         """Raise a Xero ACCPAY purchase bill for the receipts a subcontractor
@@ -12875,6 +15255,28 @@ body {{ background:#f7f6f3 !important; }}
 
         if not line_items:
             return ""
+
+        try:
+            receipt_total = round(sum(float(li.get("UnitAmount") or 0) for li in line_items), 2)
+        except (TypeError, ValueError):
+            receipt_total = 0.0
+        try:
+            settlement_amount = round(float(settlement.get("amount") or 0), 2)
+        except (TypeError, ValueError):
+            settlement_amount = receipt_total
+        if settlement_amount > 0 and receipt_total > 0 and abs(settlement_amount - receipt_total) > 0.01:
+            line_items.append(
+                {
+                    "Description": (
+                        f"Agreed payout adjustment for {settlement.get('reference') or 'receipt batch'} "
+                        f"(receipt total £{receipt_total:.2f}, paid £{settlement_amount:.2f})"
+                    )[:4000],
+                    "Quantity": 1,
+                    "UnitAmount": round(settlement_amount - receipt_total, 2),
+                    "AccountCode": default_acct or "310",
+                    "TaxType": "NONE",
+                }
+            )
 
         ref = settlement.get("reference") or _subcontractor_reference(eng)
         paid_on = (settlement.get("paid_on") or "")[:10] or None
@@ -13056,6 +15458,14 @@ body {{ background:#f7f6f3 !important; }}
             return ""
         if (rec.get("xero_id") or "").strip() or rec.get("settlement_id"):
             return ""
+        dup = _receipt_unresolved_exact_duplicate(rec, eng)
+        if dup:
+            exp_store.update_receipt(
+                db,
+                receipt_id,
+                xero_error=_receipt_duplicate_block_message(rec, dup),
+            )
+            return ""
         try:
             amount = round(float(rec.get("amount_inc") or 0), 2)
         except (TypeError, ValueError):
@@ -13067,7 +15477,8 @@ body {{ background:#f7f6f3 !important; }}
             paid_on = dt.datetime.now(dt.timezone.utc).date().isoformat()
 
         owner_paid_account = (
-            (eng.get("owner_paid_account_code") or "").strip()
+            _expense_receipt_payment_account(rec, eng)
+            or (eng.get("owner_paid_account_code") or "").strip()
             or (eng.get("payment_account_code") or "").strip()
         )
         existing = _dump_xero_existing_spend_match(
@@ -13167,9 +15578,20 @@ body {{ background:#f7f6f3 !important; }}
             return ""
         if (rec.get("xero_id") or "").strip() or rec.get("settlement_id"):
             return ""
+        dup = _receipt_unresolved_exact_duplicate(rec, eng)
+        if dup:
+            exp_store.update_receipt(
+                db,
+                receipt_id,
+                xero_error=_receipt_duplicate_block_message(rec, dup),
+            )
+            return ""
         payment_account = (
-            (eng.get("payment_account_code") or "").strip()
-            or (get_expense_settings(db).get("default_payment_account") or "").strip()
+            _expense_receipt_payment_account(
+                rec,
+                eng,
+                default_payment_account=get_expense_settings(db).get("default_payment_account") or "",
+            )
         )
         if not payment_account:
             exp_store.update_receipt(
@@ -13246,7 +15668,10 @@ body {{ background:#f7f6f3 !important; }}
             )
             return str(bill_match.get("id") or "")
 
-        merchant = (rec.get("merchant") or rec.get("ocr_merchant") or "Receipt").strip()
+        merchant = _clean_receipt_merchant(
+            rec.get("merchant") or rec.get("ocr_merchant") or "Receipt",
+            rec.get("ocr_raw") or "",
+        )
         purchased_on = (rec.get("purchased_on") or "")[:10]
         try:
             amount_inc = round(float(rec.get("amount_inc") or 0), 2)
@@ -13284,9 +15709,9 @@ body {{ background:#f7f6f3 !important; }}
             "BankTransactions": [
                 {
                     "Type": "SPEND",
-                    "Contact": {"Name": merchant},
+                    "Contact": _xero_contact_ref_for_merchant(merchant),
                     "Date": purchased_on,
-                    "Reference": f"Receipt {rec.get('filename') or receipt_id}"[:255],
+                    "Reference": _receipt_xero_reference(rec, eng),
                     "BankAccount": _receipt_account_ref(payment_account),
                     "LineAmountTypes": "Inclusive",
                     "LineItems": line_items,
@@ -13331,19 +15756,159 @@ body {{ background:#f7f6f3 !important; }}
             )
             return ""
 
+    def _review_upload_ids_from_return_to(token: str, return_to: str) -> list[str]:
+        if not return_to.startswith(f"/expenses/{token}/review-upload"):
+            return []
+        try:
+            parsed = urllib.parse.urlparse(return_to)
+            raw = urllib.parse.parse_qs(parsed.query).get("ids", [""])[0]
+        except Exception:
+            return []
+        return [x.strip() for x in raw.split(",") if x.strip()]
+
+    def _submit_review_upload_receipts_to_xero(eng: dict, ids: list[str], *, xero_limit: int = 3) -> dict:
+        """Submit approved receipts from the review queue using normal Xero guards."""
+        sent = 0
+        blocked = 0
+        remaining = 0
+        db = config.admin_db_file
+        for rid in ids:
+            try:
+                cooldown_until = float(get_xero_rate_limit_until_ts() or 0.0)
+            except (TypeError, ValueError):
+                cooldown_until = 0.0
+            if cooldown_until and cooldown_until > time.time():
+                remaining += 1
+                continue
+            rec = exp_store.get_receipt(db, rid)
+            if not rec or rec.get("engineer_id") != eng["id"]:
+                continue
+            if (rec.get("status") or "") != "approved":
+                continue
+            if (rec.get("xero_id") or "").strip() or rec.get("settlement_id"):
+                continue
+            source = rec.get("payment_source") or "company_card"
+            can_submit = (
+                source == "company_card" and (eng.get("kind") or "") == "company_card"
+            ) or (
+                source == "owner_paid" and _expense_owner_no_payout(eng)
+            )
+            if not can_submit:
+                continue
+            if sent + blocked >= xero_limit:
+                remaining += 1
+                continue
+            before_error = (rec.get("xero_error") or "").strip()
+            if source == "owner_paid":
+                _submit_owner_no_payout_receipt_to_xero(eng, rid)
+            else:
+                _submit_company_card_receipt_to_xero(eng, rid)
+            after = exp_store.get_receipt(db, rid) or rec
+            if (after.get("xero_id") or "").strip():
+                sent += 1
+            else:
+                after_error = (after.get("xero_error") or "").strip()
+                if after_error and after_error != before_error:
+                    blocked += 1
+                else:
+                    blocked += 1
+        return {"sent": sent, "blocked": blocked, "remaining": remaining}
+
+    def _process_approved_direct_receipts_to_xero(
+        *, engineer_id: int | None = None, limit: int = 1
+    ) -> dict:
+        """Trickle approved non-subcontractor receipts into Xero.
+
+        Admin review should stay quick: pressing approve only saves the local
+        receipt. This worker picks up approved receipts afterwards, one at a
+        time, and respects the shared Xero cooldown so field-expense uploads do
+        not create a burst of Xero calls while someone is checking receipts.
+        """
+        db = config.admin_db_file
+        sent = 0
+        blocked = 0
+        waiting = 0
+        max_items = max(int(limit or 1), 1)
+
+        try:
+            cooldown_until = float(get_xero_rate_limit_until_ts() or 0.0)
+        except (TypeError, ValueError):
+            cooldown_until = 0.0
+        if cooldown_until and cooldown_until > time.time():
+            return {
+                "sent": 0,
+                "blocked": 0,
+                "waiting": 1,
+                "cooldown": round(cooldown_until - time.time()),
+            }
+
+        engineers = exp_store.list_engineers(db, include_inactive=False)
+        if engineer_id is not None:
+            engineers = [eng for eng in engineers if int(eng.get("id") or 0) == engineer_id]
+
+        for eng in engineers:
+            if sent + blocked >= max_items:
+                break
+            receipts = exp_store.list_receipts_for_engineer(db, eng["id"])
+            for rec in receipts:
+                if sent + blocked >= max_items:
+                    break
+                if (rec.get("status") or "") != "approved":
+                    continue
+                if (rec.get("xero_id") or "").strip() or rec.get("settlement_id"):
+                    continue
+                source = rec.get("payment_source") or "company_card"
+                can_submit = (
+                    source == "company_card"
+                    and (eng.get("kind") or "") == "company_card"
+                ) or (
+                    source == "owner_paid"
+                    and _expense_owner_no_payout(eng)
+                )
+                if not can_submit:
+                    waiting += 1
+                    continue
+
+                before_error = (rec.get("xero_error") or "").strip()
+                if source == "owner_paid":
+                    _submit_owner_no_payout_receipt_to_xero(eng, rec["id"])
+                else:
+                    _submit_company_card_receipt_to_xero(eng, rec["id"])
+                after = exp_store.get_receipt(db, rec["id"]) or rec
+                if (after.get("xero_id") or "").strip():
+                    sent += 1
+                else:
+                    after_error = (after.get("xero_error") or "").strip()
+                    if after_error and after_error != before_error:
+                        blocked += 1
+                    else:
+                        waiting += 1
+                try:
+                    cooldown_until = float(get_xero_rate_limit_until_ts() or 0.0)
+                except (TypeError, ValueError):
+                    cooldown_until = 0.0
+                if cooldown_until and cooldown_until > time.time():
+                    return {
+                        "sent": sent,
+                        "blocked": blocked,
+                        "waiting": waiting + 1,
+                        "cooldown": round(cooldown_until - time.time()),
+                    }
+        return {"sent": sent, "blocked": blocked, "waiting": waiting, "cooldown": 0}
+
     _receipt_xero_bill_cache: dict[tuple[str, str], list[dict]] = {}
 
-    def _receipt_existing_xero_bill_match(rec: dict) -> dict | None:
-        """Find an existing Xero supplier bill by exact receipt date + amount."""
+    def _receipt_xero_bill_candidates(rec: dict) -> list[dict]:
+        """Fetch nearby Xero supplier bills for duplicate checks."""
         if xero_is_disabled():
-            return None
+            return []
         try:
             amt = round(float(rec.get("amount_inc") or 0), 2)
             day = dt.date.fromisoformat((rec.get("purchased_on") or "")[:10])
         except (TypeError, ValueError):
-            return None
+            return []
         if amt <= 0:
-            return None
+            return []
         month_start = day.replace(day=1)
         if month_start.month == 12:
             next_month = dt.date(month_start.year + 1, 1, 1)
@@ -13357,7 +15922,7 @@ body {{ background:#f7f6f3 !important; }}
             try:
                 client = build_xero_client(config)
                 if client is None:
-                    return None
+                    return []
                 where = (
                     'Type=="ACCPAY"'
                     f'&&Date>=DateTime({start.year},{start.month},{start.day})'
@@ -13395,9 +15960,18 @@ body {{ background:#f7f6f3 !important; }}
                 print(f"[receipt-xero-dedupe] bill lookup failed: {exc}", flush=True)
                 bills = []
             _receipt_xero_bill_cache[cache_key] = bills
+        return list(_receipt_xero_bill_cache.get(cache_key, []))
+
+    def _receipt_existing_xero_bill_match(rec: dict) -> dict | None:
+        """Find an existing Xero supplier bill by exact receipt date + amount."""
+        day = (rec.get("purchased_on") or "")[:10]
+        try:
+            amt = round(float(rec.get("amount_inc") or 0), 2)
+        except (TypeError, ValueError):
+            return None
         exact = [
-            b for b in _receipt_xero_bill_cache.get(cache_key, [])
-            if b.get("date") == day.isoformat()
+            b for b in _receipt_xero_bill_candidates(rec)
+            if b.get("date") == day
             and abs(float(b.get("amount") or 0) - amt) <= 0.02
         ]
         if not exact:
@@ -13405,15 +15979,71 @@ body {{ background:#f7f6f3 !important; }}
         exact.sort(key=lambda b: (0 if b.get("has_attachment") else 1))
         return exact[0]
 
+    def _receipt_possible_xero_bill_match(rec: dict) -> dict | None:
+        """Find a nearby Xero supplier bill that deserves a manual duplicate check."""
+        exact = _receipt_existing_xero_bill_match(rec)
+        if exact:
+            return None
+        near = [
+            b for b in _receipt_xero_bill_candidates(rec)
+            if _receipt_xero_bill_near_duplicate(rec, b)
+        ]
+        if not near:
+            return None
+        near.sort(
+            key=lambda b: (
+                0 if b.get("has_attachment") else 1,
+                abs(float(b.get("amount") or 0) - float(rec.get("amount_inc") or 0)),
+                b.get("date") or "",
+            )
+        )
+        return near[0]
+
     def _receipt_duplicate_warning_html(
-        rec: dict, eng: dict, *, include_xero: bool = True
+        rec: dict, eng: dict, *, include_xero: bool = True,
+        image_url_for_receipt=None, accept_url: str = "",
+        accept_return_to: str = "",
+        xero_attachment_url_for_match=None,
     ) -> str:
         """Visible duplicate warning for the engineer/admin review screen."""
         if not rec or (rec.get("xero_id") or "").strip():
             return ""
         warnings: list[str] = []
+        can_accept_duplicate = False
+        loose_xero_duplicate = False
+        attach_only_xero_match = False
         rid = str(rec.get("id") or "")
         db = config.admin_db_file
+        current_img_url = (
+            image_url_for_receipt(rid)
+            if image_url_for_receipt and rid and rec.get("stored_file") else ""
+        )
+
+        def _xero_compare_link(endpoint: str, xid: str, label: str) -> str:
+            url = ""
+            if xero_attachment_url_for_match and xid:
+                try:
+                    url = xero_attachment_url_for_match(endpoint, xid) or ""
+                except Exception:
+                    url = ""
+            if not url:
+                return (
+                    " · Xero has an attachment, but this screen cannot open it for comparison"
+                )
+            if current_img_url:
+                return (
+                    " · <button type='button' "
+                    "class='font-bold underline text-red-800 hover:text-red-950' "
+                    "data-receipt-compare='1' "
+                    f"data-current-url='{escape(current_img_url)}' "
+                    f"data-current-title='{escape(rec.get('merchant') or rec.get('ocr_merchant') or 'This receipt')}' "
+                    f"data-duplicate-url='{escape(url)}' "
+                    f"data-duplicate-title='{escape(label)}'>compare with Xero document</button>"
+                )
+            return (
+                f" · <a class='font-bold underline' target='_blank' "
+                f"href='{escape(url)}'>view Xero document</a>"
+            )
         try:
             amount = round(float(rec.get("amount_inc") or 0), 2)
         except (TypeError, ValueError):
@@ -13451,11 +16081,38 @@ body {{ background:#f7f6f3 !important; }}
                         " · already linked to Xero"
                         if (candidate.get("xero_id") or "").strip() else ""
                     )
-                    img_link = (
-                        f" · <a class='font-bold underline' target='_blank' "
-                        f"href='/receipts/expenses/receipt/{escape(str(candidate.get('id') or ''))}/image'>view saved receipt</a>"
-                        if candidate.get("stored_file") else ""
+                    cand_id = str(candidate.get("id") or "")
+                    can_view_candidate = (
+                        not str(accept_url or "").startswith("/expenses/")
+                        or int(candidate.get("engineer_id") or 0) == int(eng.get("id") or 0)
                     )
+                    cand_img_url = (
+                        image_url_for_receipt(cand_id)
+                        if image_url_for_receipt and cand_id
+                        and (candidate.get("stored_file") or (candidate.get("xero_id") or "").strip())
+                        and can_view_candidate
+                        else ""
+                    )
+                    img_link = ""
+                    if cand_img_url:
+                        if current_img_url:
+                            can_accept_duplicate = True
+                            img_link = (
+                                " · <button type='button' "
+                                "class='font-bold underline text-red-800 hover:text-red-950' "
+                                "data-receipt-compare='1' "
+                                f"data-current-url='{escape(current_img_url)}' "
+                                f"data-current-title='{escape(rec.get('merchant') or rec.get('ocr_merchant') or 'Current receipt')}' "
+                                f"data-duplicate-url='{escape(cand_img_url)}' "
+                                f"data-duplicate-title='{escape(label)}'>compare both receipts</button>"
+                            )
+                        else:
+                            img_link = (
+                                f" · <a class='font-bold underline' target='_blank' "
+                                f"href='{escape(cand_img_url)}'>view saved receipt</a>"
+                            )
+                    else:
+                        can_accept_duplicate = True
                     warnings.append(
                         f"<li><b>App duplicate:</b> {escape(label)}"
                         f" · {escape(eng_name or 'unknown user')} · "
@@ -13478,25 +16135,68 @@ body {{ background:#f7f6f3 !important; }}
                     card_account=payment_account,
                 )
                 if spend:
+                    if not spend.get("has_attachment"):
+                        attach_only_xero_match = True
+                    else:
+                        can_accept_duplicate = True
+                    spend_id = str(spend.get("id") or "").strip()
+                    spend_compare = (
+                        _xero_compare_link("BankTransactions", spend_id, "Existing Xero card spend")
+                        if spend.get("has_attachment") and spend_id else ""
+                    )
                     warnings.append(
                         "<li><b>Xero duplicate:</b> matching card spend already exists "
                         f"on {escape(spend.get('date') or day)} for £{float(spend.get('amount') or amount):,.2f}"
                         f" · {escape(spend.get('contact') or 'unknown contact')}"
                         f" · {'has receipt attached' if spend.get('has_attachment') else 'no receipt attached yet'}"
-                        f" · {'reconciled' if spend.get('reconciled') else 'not reconciled'}</li>"
+                        f" · {'reconciled' if spend.get('reconciled') else 'not reconciled'}"
+                        f"{spend_compare}</li>"
                     )
             except Exception:
                 pass
             try:
                 bill = _receipt_existing_xero_bill_match(rec)
                 if bill:
+                    if not bill.get("has_attachment"):
+                        attach_only_xero_match = True
+                    else:
+                        can_accept_duplicate = True
+                    bill_id = str(bill.get("id") or "").strip()
+                    bill_compare = (
+                        _xero_compare_link("Invoices", bill_id, "Existing Xero supplier bill")
+                        if bill.get("has_attachment") and bill_id else ""
+                    )
                     warnings.append(
                         "<li><b>Xero duplicate:</b> matching supplier bill already exists "
                         f"on {escape(bill.get('date') or day)} for £{float(bill.get('amount') or amount):,.2f}"
                         f" · {escape(bill.get('contact') or 'unknown contact')}"
                         f" · {escape(bill.get('status') or '')}"
-                        f" · {'has receipt attached' if bill.get('has_attachment') else 'no receipt attached yet'}</li>"
+                        f" · {'has receipt attached' if bill.get('has_attachment') else 'no receipt attached yet'}"
+                        f"{bill_compare}</li>"
                     )
+                else:
+                    possible_bill = _receipt_possible_xero_bill_match(rec)
+                    if possible_bill:
+                        loose_xero_duplicate = True
+                        # If the app is asking a human to review a possible Xero
+                        # duplicate, the same screen must also let them resolve
+                        # it.  Loose matches are not auto-blocked, but the user
+                        # may still decide it is a duplicate after checking Xero.
+                        can_accept_duplicate = True
+                        possible_id = str(possible_bill.get("id") or "").strip()
+                        possible_compare = (
+                            _xero_compare_link("Invoices", possible_id, "Possible Xero supplier bill")
+                            if possible_bill.get("has_attachment") and possible_id else ""
+                        )
+                        warnings.append(
+                            "<li><b>Possible Xero duplicate:</b> similar supplier bill exists "
+                            f"on {escape(possible_bill.get('date') or day)} for £{float(possible_bill.get('amount') or amount):,.2f}"
+                            f" · {escape(possible_bill.get('contact') or 'unknown contact')}"
+                            f" · {escape(possible_bill.get('status') or '')}"
+                            f" · {'has receipt attached' if possible_bill.get('has_attachment') else 'no receipt attached yet'}"
+                            f"{possible_compare}"
+                            " · check before creating a new Xero item</li>"
+                        )
             except Exception:
                 pass
 
@@ -13505,10 +16205,463 @@ body {{ background:#f7f6f3 !important; }}
         return (
             "<div class='rounded-xl border-2 border-red-300 bg-red-50 p-4 text-sm text-red-900'>"
             "<div class='text-base font-black tracking-wide text-red-800'>DUPLICATE CHECK</div>"
-            "<p class='mt-1 text-xs text-red-800'>This receipt looks like something already saved or already in Xero. Compare it before approving; approving will link/attach where possible instead of creating a duplicate.</p>"
+            "<p class='mt-1 text-xs text-red-800'>This receipt looks like something already saved or already in Xero. If two receipt photos are shown, compare them before accepting it as a duplicate. If Xero already has the payment but no receipt, saving this receipt will attach it to that Xero payment instead of creating another one.</p>"
             "<ul class='mt-2 list-disc pl-5 space-y-1'>"
             + "".join(warnings)
-            + "</ul></div>"
+            + "</ul>"
+            + (
+                "<div class='mt-3 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-900'>"
+                "Xero already has the payment but no receipt image. Approve/save this receipt and the app will attach it to that Xero entry.</div>"
+                if attach_only_xero_match else ""
+            )
+            + (
+                "<div class='mt-3 rounded-lg bg-white/70 px-3 py-2 text-xs font-semibold text-red-800 ring-1 ring-red-200'>"
+                "If this is not a duplicate, use Approve &amp; next below. "
+                "If it is the same receipt, use Accept as duplicate."
+                "</div>"
+                if loose_xero_duplicate and not attach_only_xero_match else ""
+            )
+                + (
+                    "<form method='post' action='" + escape(accept_url) + "' "
+                    "class='mt-3' data-duplicate-action-form='1'>"
+                + (
+                    "<input type='hidden' name='return_to' value='"
+                    + escape(accept_return_to) + "'>"
+                    if accept_return_to else ""
+                )
+                    +
+                    "<button type='submit' class='rounded-lg bg-red-700 px-3 py-2 text-xs font-bold text-white hover:bg-red-800'>"
+                    "Accept as duplicate</button></form>"
+                    if accept_url and can_accept_duplicate else ""
+                )
+                + "</div>"
+            )
+
+    def _receipt_xero_duplicate_attachment_allowed(
+        rec: dict,
+        eng: dict,
+        endpoint: str,
+        xid: str,
+    ) -> bool:
+        endpoint = str(endpoint or "").strip()
+        xid = str(xid or "").strip()
+        if endpoint not in {"Invoices", "BankTransactions"} or not xid:
+            return False
+        try:
+            amount = round(float((rec or {}).get("amount_inc") or 0), 2)
+        except (TypeError, ValueError):
+            amount = 0.0
+        day = ((rec or {}).get("purchased_on") or "")[:10]
+        if amount <= 0 or not day:
+            return False
+        if endpoint == "Invoices":
+            matches = [
+                _receipt_existing_xero_bill_match(rec),
+                _receipt_possible_xero_bill_match(rec),
+            ]
+            return any(
+                m
+                and str(m.get("id") or "").strip() == xid
+                and bool(m.get("has_attachment"))
+                for m in matches
+            )
+        payment_account = (
+            (eng.get("payment_account_code") or "").strip()
+            or (get_expense_settings(config.admin_db_file).get("default_payment_account") or "").strip()
+        )
+        spend = _dump_xero_existing_spend_match(
+            amount_inc=amount,
+            purchased_on=day,
+            merchant=rec.get("merchant") or rec.get("ocr_merchant") or "",
+            card_account=payment_account,
+        )
+        return (
+            bool(spend)
+            and str(spend.get("id") or "").strip() == xid
+            and bool(spend.get("has_attachment"))
+        )
+
+    def _xero_duplicate_attachment_response(endpoint: str, xid: str):
+        endpoint = str(endpoint or "").strip()
+        xid = str(xid or "").strip()
+        if endpoint not in {"Invoices", "BankTransactions"} or not xid:
+            return _exp_error_page("Xero attachment not available.", 404)
+        if xero_is_disabled():
+            return _exp_error_page("Xero is paused, so the existing document cannot be opened.", 503)
+        try:
+            client = build_xero_client(config)
+            if client is None:
+                return _exp_error_page("Xero is not connected.", 503)
+            attachments = client.get_attachments(endpoint, xid)
+            chosen = None
+            for att in attachments or []:
+                if str(att.get("MimeType") or "").lower().startswith("image/"):
+                    chosen = att
+                    break
+            if not chosen and attachments:
+                chosen = attachments[0]
+            filename = str((chosen or {}).get("FileName") or "").strip()
+            if not filename:
+                return _exp_error_page("No Xero attachment was found.", 404)
+            data, mime = client.get_attachment_content(endpoint, xid, filename)
+            mime = mime or _exp_sniff_mime(data[:16]) or "application/octet-stream"
+            if (
+                request.args.get("preview") == "1"
+                and request.args.get("raw") != "1"
+                and mime.startswith("image/")
+            ):
+                raw_href = escape(request.path + "?raw=1", quote=True)
+                return Response(
+                    "<!doctype html><html><head><meta name='viewport' "
+                    "content='width=device-width,initial-scale=1'>"
+                    "<style>html,body{margin:0;width:100%;height:100%;"
+                    "background:#f8fafc;overflow:auto;}body{min-height:100vh;display:flex;"
+                    "align-items:center;justify-content:center;}"
+                    "img{display:block;max-width:100vw;max-height:100dvh;"
+                    "width:100vw;height:100dvh;object-fit:contain;touch-action:"
+                    "pinch-zoom;}</style></head><body>"
+                    f"<img src='{raw_href}' alt='Xero attachment preview'>"
+                    "</body></html>",
+                    mimetype="text/html",
+                )
+            resp = Response(data, mimetype=mime)
+            resp.headers["X-Content-Type-Options"] = "nosniff"
+            if mime == "application/pdf":
+                resp.headers["Content-Disposition"] = f'inline; filename="{filename}"'
+            return resp
+        except Exception as exc:
+            return _exp_error_page(
+                "Could not open the existing Xero document: "
+                + str(exc).splitlines()[0][:180],
+                502,
+            )
+
+    def _expense_receipt_viewer_modal_html() -> str:
+        """Shared fitted receipt/document viewer for engineer receipt screens."""
+        return """
+            <div id="exp-doc-viewer"
+                 class="fixed inset-0 z-50 hidden items-center justify-center bg-black/65 p-3">
+              <div class="flex h-[94vh] w-full max-w-5xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl">
+                <div class="flex items-center justify-between gap-3 border-b border-gray-100 px-3 py-2">
+                  <div class="min-w-0">
+                    <div id="exp-doc-viewer-title"
+                         class="truncate text-sm font-black text-gray-900">Receipt</div>
+                    <div id="exp-doc-viewer-sub"
+                         class="text-xs text-gray-500"></div>
+                  </div>
+                  <button type="button" id="exp-doc-viewer-close"
+                          class="rounded-lg px-3 py-2 text-2xl font-black text-gray-500 hover:bg-gray-100">
+                    &times;
+                  </button>
+                </div>
+
+                <div id="exp-doc-viewer-switch"
+                     class="hidden border-b border-gray-100 bg-gray-50 px-3 py-2">
+                  <div class="grid grid-cols-[2.5rem_1fr_1fr_2.5rem] gap-2">
+                    <button type="button" id="exp-doc-prev"
+                            class="rounded-lg border border-gray-200 bg-white text-lg font-black text-gray-700">
+                      &lsaquo;
+                    </button>
+                    <button type="button" id="exp-doc-tab-current"
+                            class="rounded-lg bg-indigo-600 px-3 py-2 text-xs font-bold text-white">
+                      This receipt
+                    </button>
+                    <button type="button" id="exp-doc-tab-original"
+                            class="rounded-lg border border-gray-200 bg-white px-3 py-2 text-xs font-bold text-gray-700">
+                      Original
+                    </button>
+                    <button type="button" id="exp-doc-next"
+                            class="rounded-lg border border-gray-200 bg-white text-lg font-black text-gray-700">
+                      &rsaquo;
+                    </button>
+                  </div>
+                  <div class="mt-1 text-center text-[11px] font-semibold text-gray-500">
+                    Swipe left/right to compare
+                  </div>
+                </div>
+
+                <div id="exp-doc-viewer-body"
+                     class="relative flex-1 overflow-hidden bg-gray-100">
+                  <div id="exp-doc-current-pane"
+                       class="absolute inset-0 flex items-center justify-center p-2 sm:p-4">
+                    <img id="exp-doc-current-img"
+                         class="max-h-full max-w-full object-contain rounded-lg bg-white shadow-sm"
+                         alt="This receipt">
+                    <iframe id="exp-doc-current-frame"
+                            class="hidden h-full w-full rounded-lg border-0 bg-white"></iframe>
+                  </div>
+                  <div id="exp-doc-original-pane"
+                       class="absolute inset-0 hidden items-center justify-center p-2 sm:p-4">
+                    <img id="exp-doc-original-img"
+                         class="max-h-full max-w-full object-contain rounded-lg bg-white shadow-sm"
+                         alt="Original receipt">
+                    <iframe id="exp-doc-original-frame"
+                            class="hidden h-full w-full rounded-lg border-0 bg-white"></iframe>
+                  </div>
+                </div>
+
+                <div class="flex flex-wrap items-center justify-between gap-2 border-t border-gray-100 bg-white px-3 py-2">
+                  <a id="exp-doc-open-link" href="#" target="_blank"
+                     class="rounded-lg border border-gray-200 bg-white px-3 py-2 text-xs font-bold text-gray-700">
+                    Open full document
+                  </a>
+                  <div class="flex flex-wrap items-center justify-end gap-2">
+                    <a id="exp-receipt-review-link" href="#"
+                       class="hidden rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs font-bold text-indigo-700">
+                      Re-evaluate
+                    </a>
+                    <form id="exp-receipt-duplicate-form" method="post" class="hidden">
+                      <button type="submit"
+                              class="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-bold text-amber-800">
+                        Accept as duplicate
+                      </button>
+                    </form>
+                    <form id="exp-receipt-delete-form" method="post" class="hidden"
+                          onsubmit="return confirm('Delete this receipt from the app? This cannot be undone.');">
+                      <button type="submit"
+                              class="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-bold text-rose-700">
+                        Delete
+                      </button>
+                    </form>
+                    <button type="button" id="exp-doc-viewer-close-2"
+                            class="rounded-lg border border-gray-200 bg-white px-3 py-2 text-xs font-bold text-gray-600">
+                      Close
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <script>
+            (function() {
+              var modal = document.getElementById('exp-doc-viewer');
+              if (!modal) return;
+              var title = document.getElementById('exp-doc-viewer-title');
+              var sub = document.getElementById('exp-doc-viewer-sub');
+              var switcher = document.getElementById('exp-doc-viewer-switch');
+              var body = document.getElementById('exp-doc-viewer-body');
+              var openLink = document.getElementById('exp-doc-open-link');
+              var reviewLink = document.getElementById('exp-receipt-review-link');
+              var duplicateForm = document.getElementById('exp-receipt-duplicate-form');
+              var deleteForm = document.getElementById('exp-receipt-delete-form');
+              var panes = {
+                current: {
+                  wrap: document.getElementById('exp-doc-current-pane'),
+                  img: document.getElementById('exp-doc-current-img'),
+                  frame: document.getElementById('exp-doc-current-frame')
+                },
+                original: {
+                  wrap: document.getElementById('exp-doc-original-pane'),
+                  img: document.getElementById('exp-doc-original-img'),
+                  frame: document.getElementById('exp-doc-original-frame')
+                }
+              };
+              var tabCurrent = document.getElementById('exp-doc-tab-current');
+              var tabOriginal = document.getElementById('exp-doc-tab-original');
+              var active = 'current';
+              var hasOriginal = false;
+
+              function withRaw(url) {
+                if (!url) return '';
+                return url + (url.indexOf('?') === -1 ? '?raw=1' : '&raw=1');
+              }
+              function setSlot(which, url) {
+                var p = panes[which];
+                if (!p) return;
+                if (p.img) {
+                  p.img.classList.remove('hidden');
+                  p.img.removeAttribute('src');
+                  p.img.onerror = function() {
+                    p.img.classList.add('hidden');
+                    if (p.frame && url) {
+                      p.frame.src = url;
+                      p.frame.classList.remove('hidden');
+                    }
+                  };
+                  if (url) p.img.src = withRaw(url);
+                }
+                if (p.frame) {
+                  p.frame.classList.add('hidden');
+                  p.frame.removeAttribute('src');
+                }
+              }
+              function show(which) {
+                active = (which === 'original' && hasOriginal) ? 'original' : 'current';
+                Object.keys(panes).forEach(function(k) {
+                  if (!panes[k].wrap) return;
+                  panes[k].wrap.classList.toggle('hidden', k !== active);
+                  panes[k].wrap.classList.toggle('flex', k === active);
+                });
+                if (tabCurrent) {
+                  tabCurrent.className = active === 'current'
+                    ? 'rounded-lg bg-indigo-600 px-3 py-2 text-xs font-bold text-white'
+                    : 'rounded-lg border border-gray-200 bg-white px-3 py-2 text-xs font-bold text-gray-700';
+                }
+                if (tabOriginal) {
+                  tabOriginal.className = active === 'original'
+                    ? 'rounded-lg bg-indigo-600 px-3 py-2 text-xs font-bold text-white'
+                    : 'rounded-lg border border-gray-200 bg-white px-3 py-2 text-xs font-bold text-gray-700';
+                }
+                if (openLink) {
+                  var href = active === 'original' ? (openLink.dataset.original || '') : (openLink.dataset.current || '');
+                  openLink.href = href || '#';
+                }
+              }
+              function close() {
+                modal.classList.add('hidden');
+                modal.classList.remove('flex');
+                ['current', 'original'].forEach(function(k) {
+                  if (panes[k].img) panes[k].img.removeAttribute('src');
+                  if (panes[k].frame) panes[k].frame.removeAttribute('src');
+                });
+              }
+              function open(data) {
+                var currentUrl = data.currentUrl || data.photo || '';
+                var originalUrl = data.originalUrl || data.prevPhoto || data.duplicateUrl || '';
+                hasOriginal = !!originalUrl;
+                if (title) title.textContent = data.title || data.currentTitle || 'Receipt';
+                if (sub) sub.textContent = data.sub || [data.date || '', data.amount || ''].filter(Boolean).join(' · ');
+                if (switcher) switcher.classList.toggle('hidden', !hasOriginal);
+                if (openLink) {
+                  openLink.dataset.current = currentUrl;
+                  openLink.dataset.original = originalUrl;
+                  openLink.href = currentUrl || '#';
+                  openLink.classList.toggle('hidden', data.hideOpen === '1');
+                }
+                setSlot('current', currentUrl);
+                setSlot('original', originalUrl);
+                if (reviewLink) {
+                  reviewLink.href = data.review || '#';
+                  reviewLink.classList.toggle('hidden', !data.review);
+                }
+                var canChange = data.canChange === '1';
+                if (duplicateForm) {
+                  duplicateForm.action = data.duplicate || '#';
+                  duplicateForm.classList.toggle('hidden', !canChange || !data.duplicate);
+                }
+                if (deleteForm) {
+                  deleteForm.action = data.delete || '#';
+                  deleteForm.classList.toggle('hidden', !canChange || !data.delete);
+                }
+                show('current');
+                modal.classList.remove('hidden');
+                modal.classList.add('flex');
+              }
+              document.addEventListener('click', function(e) {
+                var opt = e.target.closest && e.target.closest('[data-exp-receipt-options]');
+                if (opt) {
+                  e.preventDefault();
+                  open(opt.dataset);
+                  return;
+                }
+                var cmp = e.target.closest && e.target.closest('[data-receipt-compare]');
+                if (cmp) {
+                  e.preventDefault();
+                  open({
+                    title: 'Compare duplicate receipts',
+                    sub: 'Check both images before accepting a duplicate',
+                    currentUrl: cmp.dataset.currentUrl || '',
+                    originalUrl: cmp.dataset.duplicateUrl || '',
+                    currentTitle: cmp.dataset.currentTitle || 'This receipt'
+                  });
+                  return;
+                }
+                if (e.target === modal || (e.target.closest && e.target.closest('#exp-doc-viewer-close, #exp-doc-viewer-close-2'))) {
+                  close();
+                }
+              });
+              if (tabCurrent) tabCurrent.addEventListener('click', function() { show('current'); });
+              if (tabOriginal) tabOriginal.addEventListener('click', function() { show('original'); });
+              var prev = document.getElementById('exp-doc-prev');
+              var next = document.getElementById('exp-doc-next');
+              if (prev) prev.addEventListener('click', function() { show('current'); });
+              if (next) next.addEventListener('click', function() { show('original'); });
+              var startX = null;
+              if (body) {
+                body.addEventListener('touchstart', function(e) {
+                  startX = e.touches && e.touches.length ? e.touches[0].clientX : null;
+                }, {passive:true});
+                body.addEventListener('touchend', function(e) {
+                  if (startX === null || !hasOriginal || !e.changedTouches || !e.changedTouches.length) return;
+                  var dx = e.changedTouches[0].clientX - startX;
+                  startX = null;
+                  if (Math.abs(dx) < 45) return;
+                  show(dx < 0 ? 'original' : 'current');
+                }, {passive:true});
+              }
+              document.addEventListener('keydown', function(e) {
+                if (e.key === 'Escape') close();
+                if (!modal.classList.contains('hidden') && hasOriginal && e.key === 'ArrowRight') show('original');
+                if (!modal.classList.contains('hidden') && e.key === 'ArrowLeft') show('current');
+              });
+            })();
+            </script>
+            """
+
+    def _receipt_unresolved_exact_duplicate(rec: dict, eng: dict) -> dict | None:
+        """Return another active local receipt with the same person/date/amount.
+
+        This is deliberately stricter than the visual duplicate warning. If two
+        local rows represent the same card payment, neither should be allowed to
+        create a fresh Xero spend until the user/admin confirms which copy is
+        the duplicate. Rows already marked ignored/failed are not blockers.
+        """
+        if not rec or not eng:
+            return None
+        rid = str(rec.get("id") or "")
+        day = (rec.get("purchased_on") or "")[:10]
+        if not rid or not day:
+            return None
+        try:
+            amount = round(float(rec.get("amount_inc") or 0), 2)
+        except (TypeError, ValueError):
+            amount = 0.0
+        if amount <= 0:
+            return None
+        source = (rec.get("payment_source") or "company_card").strip()
+        with sqlite3.connect(config.admin_db_file) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT id, status, merchant, ocr_merchant, purchased_on,
+                       amount_inc, xero_type, xero_id, created_at, updated_at
+                FROM expense_receipts
+                WHERE id <> ?
+                  AND engineer_id = ?
+                  AND purchased_on = ?
+                  AND round(coalesce(amount_inc, 0), 2) = ?
+                  AND coalesce(payment_source, 'company_card') = ?
+                  AND coalesce(status, '') NOT IN ('ignored', 'failed')
+                ORDER BY
+                  CASE
+                    WHEN coalesce(xero_id, '') <> '' THEN 0
+                    WHEN status IN ('submitted', 'settled') THEN 1
+                    WHEN status = 'approved' THEN 2
+                    ELSE 3
+                  END,
+                  created_at ASC
+                LIMIT 1
+                """,
+                (rid, int(eng.get("id") or 0), day, amount, source),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def _receipt_duplicate_block_message(rec: dict, dup: dict) -> str:
+        merchant = (
+            dup.get("merchant")
+            or dup.get("ocr_merchant")
+            or rec.get("merchant")
+            or rec.get("ocr_merchant")
+            or "this receipt"
+        )
+        try:
+            amount = float(rec.get("amount_inc") or dup.get("amount_inc") or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        day = _exp_uk_date((rec.get("purchased_on") or dup.get("purchased_on") or "")[:10])
+        return (
+            f"Duplicate needs review: another receipt for {merchant} on {day} "
+            f"for £{amount:,.2f} is already saved. Compare both receipts and "
+            "use Accept as duplicate on the extra copy before submitting to Xero."
         )
 
     def _maybe_settle_subcontractor(eng, *, allow_xero: bool = True):
@@ -13752,6 +16905,8 @@ body {{ background:#f7f6f3 !important; }}
         return ""
 
     def _customer_receipt_calendar_ids_for_engineer(eng) -> list[str]:
+        if not CUSTOMER_RECEIPT_PORTAL_ENABLED:
+            return []
         selected = str((eng or {}).get("customer_calendar_id") or "").strip()
         if selected:
             return [selected]
@@ -13762,6 +16917,8 @@ body {{ background:#f7f6f3 !important; }}
     CUSTOMER_RECEIPT_OVERDUE_DAYS = 4
 
     def _customer_receipt_event_has_attachment(event_key: str, description: str = "") -> bool:
+        if not CUSTOMER_RECEIPT_PORTAL_ENABLED:
+            return False
         if re.search(r"Customer receipt attached\s*✓", description or "", re.I):
             return True
         try:
@@ -13771,6 +16928,8 @@ body {{ background:#f7f6f3 !important; }}
             return False
 
     def _customer_receipt_is_overdue(start_dt: dt.datetime, event_key: str, description: str) -> bool:
+        if not CUSTOMER_RECEIPT_PORTAL_ENABLED or not CUSTOMER_RECEIPT_OVERDUE_MARKERS_ENABLED:
+            return False
         if _customer_receipt_event_has_attachment(event_key, description):
             return False
         if payment_choice(description or "") != "card":
@@ -13779,6 +16938,8 @@ body {{ background:#f7f6f3 !important; }}
         return start_dt < (now - dt.timedelta(days=CUSTOMER_RECEIPT_OVERDUE_DAYS))
 
     def _mark_customer_receipt_overdue_if_needed(cal_id: str, ev: dict, start_dt: dt.datetime) -> None:
+        if not CUSTOMER_RECEIPT_PORTAL_ENABLED or not CUSTOMER_RECEIPT_OVERDUE_MARKERS_ENABLED:
+            return
         event_id = str(ev.get("id") or "")
         if not event_id:
             return
@@ -13800,7 +16961,82 @@ body {{ background:#f7f6f3 !important; }}
         except Exception as exc:
             print(f"[customer-receipts] overdue marker failed {event_key}: {exc}", flush=True)
 
-    def _customer_receipt_jobs_for_engineer(eng, *, days_back: int = 14, days_forward: int = 14) -> list[dict]:
+    def _customer_receipt_cache_key(eng, days_back: int, days_forward: int) -> str:
+        cal_part = ",".join(_customer_receipt_calendar_ids_for_engineer(eng))
+        return f"{eng.get('id')}:{days_back}:{days_forward}:{cal_part}"
+
+    def _customer_receipt_jobs_cache_get(key: str) -> list[dict] | None:
+        try:
+            cache = get_json_setting(config.admin_db_file, "customer_receipt_jobs_cache", {}) or {}
+            row = cache.get(key) or {}
+            if (time.time() - float(row.get("saved_at") or 0)) > 120:
+                return None
+            jobs = row.get("jobs") or []
+            if not isinstance(jobs, list):
+                return None
+            out = []
+            tz = dt.datetime.now().astimezone().tzinfo or dt.timezone.utc
+            for job in jobs:
+                if not isinstance(job, dict):
+                    continue
+                item = dict(job)
+                try:
+                    item["start"] = dt.datetime.fromisoformat(
+                        str(item.get("start") or "").replace("Z", "+00:00")
+                    ).astimezone(tz)
+                except Exception:
+                    item["start"] = dt.datetime.now(tz)
+                out.append(item)
+            return out
+        except Exception:
+            return None
+
+    def _customer_receipt_jobs_cache_set(key: str, jobs: list[dict]) -> None:
+        try:
+            cache = get_json_setting(config.admin_db_file, "customer_receipt_jobs_cache", {}) or {}
+            serialised = []
+            for job in jobs:
+                item = dict(job)
+                start = item.get("start")
+                if isinstance(start, dt.datetime):
+                    item["start"] = start.isoformat()
+                serialised.append(item)
+            cache[key] = {"saved_at": time.time(), "jobs": serialised[:80]}
+            if len(cache) > 50:
+                ordered = sorted(
+                    cache.items(),
+                    key=lambda kv: float((kv[1] or {}).get("saved_at") or 0),
+                    reverse=True,
+                )
+                cache = dict(ordered[:50])
+            set_json_setting(config.admin_db_file, "customer_receipt_jobs_cache", cache)
+        except Exception as exc:
+            print(f"[customer-receipts] cache save failed: {exc}", flush=True)
+
+    def _customer_receipt_jobs_cache_clear_for_engineer(eng) -> None:
+        try:
+            prefix = f"{eng.get('id')}:"
+            cache = get_json_setting(config.admin_db_file, "customer_receipt_jobs_cache", {}) or {}
+            changed = False
+            for key in list(cache.keys()):
+                if str(key).startswith(prefix):
+                    cache.pop(key, None)
+                    changed = True
+            if changed:
+                set_json_setting(config.admin_db_file, "customer_receipt_jobs_cache", cache)
+        except Exception:
+            pass
+
+    def _customer_receipt_jobs_for_engineer(
+        eng, *, days_back: int = 14, days_forward: int = 14, use_cache: bool = True
+    ) -> list[dict]:
+        if not CUSTOMER_RECEIPT_PORTAL_ENABLED:
+            return []
+        cache_key = _customer_receipt_cache_key(eng, days_back, days_forward)
+        if use_cache:
+            cached = _customer_receipt_jobs_cache_get(cache_key)
+            if cached is not None:
+                return cached
         creds = load_admin_credentials(config)
         if not creds:
             return []
@@ -13857,8 +17093,6 @@ body {{ background:#f7f6f3 !important; }}
                     invoice_id = get_invoice_for_event(state, event_key) or ""
                     has_receipt = _customer_receipt_event_has_attachment(event_key, desc)
                     overdue = _customer_receipt_is_overdue(start_dt, event_key, desc)
-                    if overdue:
-                        _mark_customer_receipt_overdue_if_needed(cal_id, ev, start_dt)
                     rows.append({
                         "calendar_id": cal_id,
                         "event_id": ev.get("id") or "",
@@ -13879,7 +17113,9 @@ body {{ background:#f7f6f3 !important; }}
             0 if r.get("overdue") else 1,
             abs((r.get("start") - now).total_seconds()) if r.get("start") else 999999999,
         ))
-        return rows[:80]
+        rows = rows[:80]
+        _customer_receipt_jobs_cache_set(cache_key, rows)
+        return rows
 
     def _save_customer_receipt_match(event_key: str, details: dict) -> None:
         if not event_key:
@@ -13916,13 +17152,42 @@ body {{ background:#f7f6f3 !important; }}
 
         _exp_purge_old_photos()
         receipts = exp_store.list_receipts_for_engineer(db, eng["id"])
-        card_feed_html = _engineer_card_feed_html(eng, receipts)
-        today = dt.datetime.now(dt.timezone.utc).date().isoformat()
+        matching_receipts = receipts
+        shared_account_id = str(eng.get("plaid_account_id") or "").strip()
+        if shared_account_id:
+            try:
+                matching_receipts = _shared_company_card_receipts_for_account(
+                    exp_store.list_all_receipts(db, limit=5000),
+                    exp_store.list_engineers(db, include_inactive=True),
+                    shared_account_id,
+                )
+            except Exception as exc:
+                print(f"[expenses] shared receipt view failed: {exc}", flush=True)
+                matching_receipts = receipts
+        card_feed_html = _engineer_card_feed_html(
+            eng,
+            receipts,
+            matching_receipts=matching_receipts,
+        )
+        local_tz = dt.datetime.now().astimezone().tzinfo or dt.timezone.utc
+        today = dt.datetime.now(local_tz).date().isoformat()
+
+        def _receipt_created_local_day(r: dict) -> str:
+            raw = str(r.get("created_at") or "")
+            if not raw:
+                return ""
+            try:
+                parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=dt.timezone.utc)
+                return parsed.astimezone(local_tz).date().isoformat()
+            except Exception:
+                return raw[:10]
 
         from collections import OrderedDict
         groups: "OrderedDict[str, list]" = OrderedDict()
         for r in receipts:
-            day = (r.get("created_at") or "")[:10]
+            day = _receipt_created_local_day(r)
             groups.setdefault(day, []).append(r)
 
         # Flash message after an action.
@@ -13945,16 +17210,30 @@ body {{ background:#f7f6f3 !important; }}
                 "<div class='rounded-xl border border-gray-200 bg-gray-50 "
                 "p-3 text-sm text-gray-700 text-center'>Receipt removed.</div>"
             )
+        elif flash == "duplicate":
+            flash_html = (
+                "<div class='rounded-xl border border-red-200 bg-red-50 "
+                "p-3 text-sm text-red-800 text-center'>Receipt marked as a "
+                "duplicate and will not be sent to Xero.</div>"
+            )
+        elif flash == "account_changed":
+            flash_html = (
+                "<div class='rounded-xl border border-indigo-200 bg-indigo-50 "
+                "p-3 text-sm text-indigo-800 text-center'>Receipt payment "
+                "account updated. If it belongs to another card/feed it will "
+                "stop showing as a mismatch here.</div>"
+            )
 
         def _engineer_can_delete_receipt(r: dict) -> bool:
             status = (r.get("status") or "").strip().lower()
             return (
-                status in {"pending_review", "approved"}
-                and not (r.get("xero_id") or "").strip()
+                status in {"pending_review", "approved", "failed", "submitted", "ignored"}
                 and not r.get("settlement_id")
             )
 
-        def _engineer_delete_receipt_form(r: dict, *, compact: bool = False) -> str:
+        def _engineer_delete_receipt_form(
+            r: dict, *, compact: bool = False, return_to: str = ""
+        ) -> str:
             if not _engineer_can_delete_receipt(r):
                 return ""
             label = "Delete" if compact else "Delete receipt"
@@ -13967,6 +17246,11 @@ body {{ background:#f7f6f3 !important; }}
                 f"<form method='post' action='/expenses/{escape(token)}/receipt/"
                 f"{escape(str(r.get('id') or ''))}/delete' "
                 "onsubmit=\"return confirm('Delete this receipt before it is submitted?')\">"
+                + (
+                    f"<input type='hidden' name='return_to' value='{escape(return_to)}'>"
+                    if return_to else ""
+                )
+                +
                 f"<button type='submit' class='{classes}'>{escape(label)}</button>"
                 "</form>"
             )
@@ -13984,14 +17268,14 @@ body {{ background:#f7f6f3 !important; }}
                 SELECT b.created_at, COUNT(i.id) AS cnt
                 FROM expense_dump_items i
                 JOIN expense_dump_batches b ON b.id = i.batch_id
-                WHERE b.engineer_id = ?
+                WHERE (b.engineer_id = ? OR i.assigned_engineer_id = ?)
                   AND b.status = 'ready'
                   AND COALESCE(b.is_test, 0) = 0
                   AND i.status IN ('new','needs_account','possible_duplicate','suspicious')
                 GROUP BY b.id, b.created_at
                 ORDER BY b.created_at ASC
                 """,
-                (eng["id"],),
+                (eng["id"], eng["id"]),
             ).fetchall()
             _dc.close()
             _dp_total = sum(int(r["cnt"]) for r in _dp_rows)
@@ -14014,7 +17298,7 @@ body {{ background:#f7f6f3 !important; }}
                     _n_txt = "text-red-800"
                     _n_icon = "&#128308;"
                     _n_msg = (
-                        f"{_dp_total} invoice{'s' if _dp_total != 1 else ''} "
+                        f"{_dp_total} receipt file{'s' if _dp_total != 1 else ''} "
                         "uploaded by the office \u2014 please action"
                     )
                 else:
@@ -14022,16 +17306,18 @@ body {{ background:#f7f6f3 !important; }}
                     _n_txt = "text-amber-800"
                     _n_icon = "&#128196;"
                     _n_msg = (
-                        f"{_dp_total} invoice{'s' if _dp_total != 1 else ''} "
+                        f"{_dp_total} receipt file{'s' if _dp_total != 1 else ''} "
                         "uploaded by the office \u2014 pending review"
                     )
                 dump_notify_html = (
-                    f"<div class='rounded-xl border {_n_bg} p-3 flex items-center "
-                    f"gap-2 animate-pulse'>"
+                    f"<a href='/expenses/{escape(token)}/office-uploads' "
+                    f"class='rounded-xl border {_n_bg} p-3 flex items-center "
+                    f"gap-2 animate-pulse active:scale-[0.99]'>"
                     f"<span class='text-base flex-shrink-0'>{_n_icon}</span>"
-                    f"<p class='text-sm font-semibold {_n_txt}'>"
-                    f"{escape(_n_msg)}</p>"
-                    f"</div>"
+                    f"<span class='text-sm font-semibold {_n_txt} flex-1'>"
+                    f"{escape(_n_msg)}</span>"
+                    f"<span class='text-xs font-bold {_n_txt}'>Open</span>"
+                    f"</a>"
                 )
         except Exception:
             dump_notify_html = ""
@@ -14107,7 +17393,145 @@ body {{ background:#f7f6f3 !important; }}
                 f"{escape(ref)}</span> so it&rsquo;s matched automatically.</div>"
             )
 
-        # Today's receipts (full list + total).
+        pending_review_ids = [
+            str(r.get("id") or "")
+            for r in receipts
+            if (r.get("status") or "").strip().lower() == "pending_review"
+        ]
+        pending_review_ids = [rid for rid in pending_review_ids if rid]
+        review_queue_html = ""
+        if pending_review_ids:
+            review_href = (
+                f"/expenses/{escape(token)}/review-upload?ids="
+                f"{urllib.parse.quote(','.join(pending_review_ids))}"
+            )
+            review_queue_html = (
+                "<a href='" + review_href + "' "
+                "class='rounded-xl border-2 border-amber-200 bg-amber-50 p-4 "
+                "flex items-center justify-between gap-3 active:scale-[0.99]'>"
+                "<span>"
+                "<span class='block text-sm font-bold text-amber-950'>Continue receipt review</span>"
+                f"<span class='block text-xs text-amber-800 mt-0.5'>{len(pending_review_ids)} receipt"
+                f"{'s' if len(pending_review_ids) != 1 else ''} still need checking</span>"
+                "</span>"
+                "<span class='rounded-lg bg-white/80 px-3 py-1.5 text-xs font-bold text-amber-900'>Open</span>"
+                "</a>"
+            )
+
+        approved_xero_ready_ids = [
+            str(r.get("id") or "")
+            for r in receipts
+            if (r.get("status") or "").strip().lower() == "approved"
+            and not (r.get("xero_id") or "").strip()
+            and not r.get("settlement_id")
+            and (
+                (
+                    (r.get("payment_source") or "company_card") == "company_card"
+                    and (eng.get("kind") or "") == "company_card"
+                )
+                or (
+                    (r.get("payment_source") or "company_card") == "owner_paid"
+                    and _expense_owner_no_payout(eng)
+                )
+            )
+        ]
+        approved_xero_ready_ids = [rid for rid in approved_xero_ready_ids if rid]
+        approved_submit_html = ""
+        if approved_xero_ready_ids:
+            submit_href = (
+                f"/expenses/{escape(token)}/review-upload?ids="
+                f"{urllib.parse.quote(','.join(approved_xero_ready_ids))}"
+            )
+            approved_submit_html = (
+                "<a href='" + submit_href + "' "
+                "class='rounded-xl border-2 border-indigo-200 bg-indigo-50 p-4 "
+                "flex items-center justify-between gap-3 active:scale-[0.99]'>"
+                "<span>"
+                "<span class='block text-sm font-bold text-indigo-950'>Approved receipts waiting for Xero</span>"
+                f"<span class='block text-xs text-indigo-800 mt-0.5'>{len(approved_xero_ready_ids)} receipt"
+                f"{'s' if len(approved_xero_ready_ids) != 1 else ''} checked and ready to send safely</span>"
+                "</span>"
+                "<span class='rounded-lg bg-white/80 px-3 py-1.5 text-xs font-bold text-indigo-900'>Open</span>"
+                "</a>"
+            )
+
+        recent_plans = get_json_setting(db, "expense_instalment_plans", {}) or {}
+        eng_plan_count = 0
+        try:
+            eng_plan_count = sum(
+                1 for p in recent_plans.values()
+                if int((p or {}).get("engineer_id") or 0) == int(eng["id"])
+            )
+        except Exception:
+            eng_plan_count = 0
+        plan_hint_html = (
+            f"<span class='ml-1 rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] "
+            f"font-bold text-amber-800'>{eng_plan_count}</span>"
+            if eng_plan_count else ""
+        )
+        plan_list_html = ""
+        try:
+            eng_plans = [
+                (pid, p) for pid, p in recent_plans.items()
+                if int((p or {}).get("engineer_id") or 0) == int(eng["id"])
+            ]
+            eng_plans.sort(
+                key=lambda item: str((item[1] or {}).get("updated_at") or (item[1] or {}).get("created_at") or ""),
+                reverse=True,
+            )
+            if eng_plans:
+                plan_rows = []
+                for pid, p in eng_plans[:5]:
+                    status = (p.get("status") or "preview").strip().lower()
+                    tone = {
+                        "prepared_in_xero": "bg-emerald-50 text-emerald-700 border-emerald-200",
+                        "approved": "bg-emerald-50 text-emerald-700 border-emerald-200",
+                        "dismissed": "bg-gray-50 text-gray-600 border-gray-200",
+                    }.get(status, "bg-amber-50 text-amber-800 border-amber-200")
+                    title = p.get("supplier") or p.get("filename") or "Saved plan"
+                    detail_bits = []
+                    if p.get("document_type"):
+                        detail_bits.append(str(p.get("document_type")))
+                    selected = p.get("selected_bank_match") or {}
+                    if selected.get("amount"):
+                        detail_bits.append(_exp_money(selected.get("amount")))
+                    detail = " · ".join(detail_bits) or str(p.get("filename") or "")
+                    plan_rows.append(
+                        f"<a href='/expenses/{escape(token)}/instalment-plan/{escape(str(pid))}' "
+                        "class='flex items-center justify-between gap-3 rounded-xl border border-gray-200 "
+                        "bg-white px-3 py-2 active:bg-gray-50'>"
+                        "<span class='min-w-0'>"
+                        f"<span class='block truncate text-sm font-bold text-gray-900'>{escape(str(title))}</span>"
+                        f"<span class='block truncate text-xs text-gray-500'>{escape(detail)}</span>"
+                        "</span>"
+                        f"<span class='shrink-0 rounded-full border px-2 py-0.5 text-[11px] font-bold {tone}'>"
+                        f"{escape(status.replace('_', ' '))}</span>"
+                        "</a>"
+                    )
+                plan_list_html = (
+                    "<details class='rounded-xl border border-gray-100 bg-gray-50 overflow-hidden'>"
+                    "<summary class='list-none cursor-pointer flex items-center justify-between gap-3 px-3 py-2'>"
+                    "<span>"
+                    "<span class='block text-sm font-bold text-gray-900'>View saved instalment plans</span>"
+                    f"<span class='block text-xs text-gray-500'>{len(eng_plans)} saved plan"
+                    f"{'s' if len(eng_plans) != 1 else ''}</span>"
+                    "</span>"
+                    "<span class='text-xs font-bold text-gray-500'>Open</span>"
+                    "</summary>"
+                    "<div class='border-t border-gray-100 p-2 space-y-2'>"
+                    + "".join(plan_rows)
+                    + "</div></details>"
+                )
+        except Exception:
+            plan_list_html = ""
+        if not plan_list_html:
+            plan_list_html = (
+                "<div class='rounded-xl border border-gray-100 bg-gray-50 px-3 py-2 "
+                "text-xs text-gray-500'>No saved instalment plans yet.</div>"
+            )
+
+        # Receipts uploaded today. The receipt spend date may be older, so keep
+        # this as a compact submission-log bar rather than a spend-period card.
         today_list = groups.get(today, [])
         if today_list:
             rows = []
@@ -14127,6 +17551,10 @@ body {{ background:#f7f6f3 !important; }}
                     else ""
                 )
                 delete_form = _engineer_delete_receipt_form(r, compact=True)
+                try:
+                    vat_line = "VAT " + _exp_money(float(r.get("vat_amount") or 0))
+                except (TypeError, ValueError):
+                    vat_line = "VAT not read"
                 rows.append(
                     "<div class='flex items-center justify-between gap-3 px-4 py-3 "
                     "hover:bg-gray-50 border-b border-gray-100 last:border-0'>"
@@ -14138,25 +17566,30 @@ body {{ background:#f7f6f3 !important; }}
                     "</a>"
                     "<div class='text-right shrink-0'>"
                     f"<div class='font-semibold text-gray-900 whitespace-nowrap'>{amount}</div>"
+                    f"<div class='text-[11px] text-gray-500 whitespace-nowrap'>{escape(vat_line)}</div>"
                     f"{delete_form}"
                     "</div></div>"
                 )
             today_total = sum(float(r.get("amount_inc") or 0) for r in today_list)
             today_html = (
-                "<div class='rounded-xl border border-gray-200 bg-white overflow-hidden'>"
+                "<details class='group/card rounded-xl border border-gray-200 bg-white overflow-hidden shadow-sm'>"
+                "<summary class='list-none cursor-pointer flex items-center justify-between gap-3 px-4 py-2.5'>"
+                "<div class='min-w-0'>"
+                "<div class='text-sm font-bold text-gray-900'>Today's submissions</div>"
+                f"<div class='text-[11px] text-gray-500'>{len(today_list)} receipt{'s' if len(today_list) != 1 else ''} uploaded today</div>"
+                "</div>"
+                "<div class='shrink-0 flex items-center gap-3'>"
+                f"<div class='text-sm font-bold text-gray-900'>{_exp_money(today_total)}</div>"
+                "<span class='inline-flex h-7 w-7 items-center justify-center rounded-full "
+                "border border-indigo-200 bg-white text-base font-bold text-indigo-600 "
+                "shadow-sm animate-pulse transition-transform group-open/card:rotate-180'>⌄</span>"
+                "</div></summary>"
+                "<div class='border-t border-gray-100'>"
                 + "".join(rows)
-                + "<div class='flex items-center justify-between px-4 py-3 "
-                "bg-gray-50 border-t border-gray-200'>"
-                "<span class='text-sm font-medium text-gray-600'>Today's total</span>"
-                f"<span class='font-bold text-gray-900'>{_exp_money(today_total)}</span>"
-                "</div></div>"
+                + "</div></details>"
             )
         else:
-            today_html = (
-                "<div class='rounded-xl border border-dashed border-gray-300 "
-                "bg-white p-6 text-center text-sm text-gray-500'>"
-                "No receipts yet today. Tap the button above to add one.</div>"
-            )
+            today_html = ""
 
         # Previous days (single-line totals).
         prev_lines = []
@@ -14218,6 +17651,254 @@ body {{ background:#f7f6f3 !important; }}
                 + "</div></div>"
             )
 
+        # A compact audit trail so engineers can revisit recent submissions and
+        # correct VAT / totals without asking the office to log in as them.
+        recent_cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=31)
+
+        def _recent_dt(r: dict) -> dt.datetime | None:
+            for raw in (r.get("created_at"), r.get("updated_at")):
+                if not raw:
+                    continue
+                try:
+                    parsed = dt.datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+                    return parsed.astimezone(dt.timezone.utc)
+                except Exception:
+                    continue
+            return None
+
+        recent_receipts = []
+        for r in receipts:
+            if (r.get("status") or "").strip().lower() == "ignored":
+                continue
+            seen_at = _recent_dt(r)
+            if seen_at and seen_at >= recent_cutoff:
+                recent_receipts.append((seen_at, r))
+        recent_receipts.sort(key=lambda item: item[0], reverse=True)
+
+        recent_review_html = ""
+        if recent_receipts:
+            recent_total = sum(float(r.get("amount_inc") or 0) for _, r in recent_receipts)
+            recent_vat = sum(float(r.get("vat_amount") or 0) for _, r in recent_receipts)
+            recent_rows = []
+            for seen_at, r in recent_receipts[:80]:
+                merchant = r.get("merchant") or r.get("ocr_merchant") or "Receipt"
+                bought = (r.get("purchased_on") or r.get("ocr_date") or "")[:10]
+                bought_label = _exp_day_label(bought) if bought else "No receipt date"
+                submitted_label = seen_at.astimezone().strftime("%d %b, %H:%M")
+                amount_html = _exp_money(r.get("amount_inc"), r.get("currency") or "GBP")
+                vat_raw = r.get("vat_amount")
+                try:
+                    vat_num = float(vat_raw or 0)
+                except (TypeError, ValueError):
+                    vat_num = 0.0
+                if vat_raw is None:
+                    vat_html = (
+                        "<span class='inline-block rounded-full bg-amber-50 px-2 py-0.5 "
+                        "text-[11px] font-semibold text-amber-800'>VAT not read</span>"
+                    )
+                elif abs(vat_num) < 0.005 and float(r.get("amount_inc") or 0) > 0:
+                    vat_html = (
+                        "<span class='inline-block rounded-full bg-amber-50 px-2 py-0.5 "
+                        "text-[11px] font-semibold text-amber-800'>VAT £0.00</span>"
+                    )
+                else:
+                    vat_html = (
+                        "<span class='inline-block rounded-full bg-emerald-50 px-2 py-0.5 "
+                        f"text-[11px] font-semibold text-emerald-800'>VAT {_exp_money(vat_num)}</span>"
+                    )
+                xero_note = ""
+                if (r.get("xero_id") or "").strip():
+                    xero_note = (
+                        "<span class='inline-block rounded-full bg-blue-50 px-2 py-0.5 "
+                        "text-[11px] font-semibold text-blue-700'>Linked to Xero</span>"
+                    )
+                if (r.get("xero_error") or "").strip():
+                    xero_note = (
+                        "<span class='inline-block rounded-full bg-red-50 px-2 py-0.5 "
+                        "text-[11px] font-semibold text-red-700'>Xero needs a check</span>"
+                    )
+                can_change = _engineer_can_delete_receipt(r)
+                rid = str(r.get("id") or "")
+                direct_delete = (
+                    f"<form method='post' action='/expenses/{escape(token)}/receipt/{escape(rid)}/delete' "
+                    "onsubmit=\"return confirm('Delete this receipt from the app? This cannot be undone.');\">"
+                    "<button type='submit' class='rounded-md border border-rose-200 bg-rose-50 "
+                    "px-2 py-1 text-[11px] font-bold text-rose-700'>Delete</button>"
+                    "</form>"
+                    if can_change else
+                    ""
+                )
+                recent_rows.append(
+                    "<div class='flex items-center justify-between gap-3 px-4 py-3 "
+                    "border-t border-gray-100 first:border-t-0 hover:bg-gray-50'>"
+                    "<div class='min-w-0 flex-1'>"
+                    f"<div class='font-medium text-gray-900 truncate'>{escape(merchant)}</div>"
+                    f"<div class='text-xs text-gray-500'>{escape(bought_label)} &middot; submitted {escape(submitted_label)}</div>"
+                    "<div class='mt-1 flex items-center gap-1.5 flex-wrap'>"
+                    f"{_exp_status_badge(r.get('status'))}{vat_html}{xero_note}</div>"
+                    "</div>"
+                    "<div class='shrink-0 text-right space-y-1'>"
+                    f"<div class='font-semibold text-gray-900'>{amount_html}</div>"
+                    "<button type='button' data-exp-receipt-options='1' "
+                    f"data-title='{escape(merchant, quote=True)}' "
+                    f"data-amount='{escape(amount_html, quote=True)}' "
+                    f"data-date='{escape(bought_label, quote=True)}' "
+                        f"data-photo='/expenses/{escape(token)}/photo/{escape(str(r.get('id') or ''))}?preview=1' "
+                        f"data-review='/expenses/{escape(token)}/review/{escape(str(r.get('id') or ''))}' "
+                        f"data-delete='/expenses/{escape(token)}/receipt/{escape(str(r.get('id') or ''))}/delete' "
+                        f"data-can-change='{'1' if can_change else '0'}' "
+                        "class='rounded-md border border-indigo-100 bg-indigo-50 px-2 py-1 "
+                        "text-[11px] font-bold text-indigo-700'>View</button>"
+                        f"{direct_delete}"
+                        "</div>"
+                        "</div>"
+                    )
+            more_note = ""
+            if len(recent_receipts) > 80:
+                more_note = (
+                    "<div class='px-4 py-2 text-xs text-gray-500 bg-gray-50 border-t "
+                    "border-gray-100'>Showing latest 80 receipts.</div>"
+                )
+            recent_review_html = (
+                "<details class='rounded-xl border-2 border-sky-200 bg-white overflow-hidden'>"
+                "<summary class='list-none cursor-pointer flex items-center justify-between gap-3 px-4 py-3'>"
+                "<div><div class='text-sm font-bold text-gray-900'>Last 30 days receipts</div>"
+                "<div class='text-xs text-gray-500'>Open this to check VAT, totals, and Xero sync status.</div></div>"
+                "<div class='text-right shrink-0'>"
+                f"<div class='text-sm font-bold text-gray-900'>{_exp_money(recent_total)}</div>"
+                f"<div class='text-[11px] font-semibold text-emerald-700'>VAT {_exp_money(recent_vat)}</div>"
+                "</div></summary>"
+                "<div class='bg-white'>"
+                + "".join(recent_rows)
+                + more_note
+                + "</div></details>"
+            )
+
+        duplicate_review_html = ""
+        duplicate_receipts = []
+        for r in receipts:
+            if (r.get("status") or "").strip().lower() != "ignored":
+                continue
+            if "duplicate" not in (r.get("xero_error") or "").lower():
+                continue
+            seen_at = _recent_dt(r)
+            if seen_at and seen_at >= recent_cutoff:
+                duplicate_receipts.append((seen_at, r))
+        duplicate_receipts.sort(key=lambda item: item[0], reverse=True)
+
+        def _matching_original_receipt_for_duplicate(rec: dict) -> dict | None:
+            rid = str(rec.get("id") or "")
+            day = (rec.get("purchased_on") or "")[:10]
+            try:
+                amount = round(float(rec.get("amount_inc") or 0), 2)
+            except (TypeError, ValueError):
+                amount = 0.0
+            if not rid or not day or amount <= 0:
+                return None
+            matches = []
+            for other in receipts:
+                oid = str(other.get("id") or "")
+                if not oid or oid == rid:
+                    continue
+                if (other.get("purchased_on") or "")[:10] != day:
+                    continue
+                try:
+                    other_amount = round(float(other.get("amount_inc") or 0), 2)
+                except (TypeError, ValueError):
+                    continue
+                if abs(other_amount - amount) > 0.02:
+                    continue
+                if not (other.get("stored_file") or (other.get("xero_id") or "").strip()):
+                    continue
+                status = (other.get("status") or "").strip().lower()
+                matches.append((
+                    0 if status != "ignored" else 1,
+                    0 if (other.get("xero_id") or "").strip() else 1,
+                    str(other.get("created_at") or ""),
+                    other,
+                ))
+            if not matches:
+                return None
+            matches.sort(key=lambda item: item[:3])
+            return matches[0][3]
+
+        if duplicate_receipts:
+            rows = []
+            for _seen_at, r in duplicate_receipts[:30]:
+                rid = str(r.get("id") or "")
+                merchant = r.get("merchant") or r.get("ocr_merchant") or "Receipt"
+                bought = (r.get("purchased_on") or r.get("ocr_date") or "")[:10]
+                bought_label = _exp_day_label(bought) if bought else "No receipt date"
+                amount_html = _exp_money(r.get("amount_inc"), r.get("currency") or "GBP")
+                original = _matching_original_receipt_for_duplicate(r)
+                original_id = str((original or {}).get("id") or "")
+                original_photo = (
+                    f"/expenses/{escape(token)}/photo/{escape(original_id)}?preview=1"
+                    if original_id else ""
+                )
+                original_title = escape(
+                    str((original or {}).get("merchant") or (original or {}).get("ocr_merchant") or "Original receipt"),
+                    quote=True,
+                )
+                reason = escape(str(r.get("xero_error") or "Duplicate ignored."))
+                rows.append(
+                    "<div class='flex items-center justify-between gap-3 px-4 py-3 "
+                    "border-t border-gray-100 first:border-t-0 hover:bg-gray-50'>"
+                    "<div class='min-w-0 flex-1'>"
+                    f"<div class='font-medium text-gray-900 truncate'>{escape(merchant)}</div>"
+                    f"<div class='text-xs text-gray-500'>{escape(bought_label)} &middot; {amount_html}</div>"
+                    f"<div class='mt-1 text-[11px] text-gray-500'>{reason}</div>"
+                    "</div>"
+                    "<div class='shrink-0 text-right space-y-1'>"
+                    "<button type='button' data-exp-receipt-options='1' "
+                    f"data-title='{escape(merchant, quote=True)}' "
+                    f"data-amount='{escape(amount_html, quote=True)}' "
+                    f"data-date='{escape(bought_label, quote=True)}' "
+                    f"data-photo='/expenses/{escape(token)}/photo/{escape(rid)}?preview=1' "
+                    f"data-prev-photo='{escape(original_photo, quote=True)}' "
+                    f"data-prev-title='{original_title}' "
+                    f"data-review='/expenses/{escape(token)}/review/{escape(rid)}' "
+                    f"data-delete='/expenses/{escape(token)}/receipt/{escape(rid)}/delete' "
+                    f"data-duplicate='/expenses/{escape(token)}/receipt/{escape(rid)}/accept-duplicate' "
+                    "data-can-change='1' "
+                    "class='rounded-md border border-amber-200 bg-amber-50 px-2 py-1 "
+                    "text-[11px] font-bold text-amber-800'>View / compare</button>"
+                    "</div>"
+                    "</div>"
+                )
+            duplicate_review_html = (
+                "<details class='rounded-xl border-2 border-amber-200 bg-white overflow-hidden'>"
+                "<summary class='list-none cursor-pointer flex items-center justify-between gap-3 px-4 py-3'>"
+                "<div><div class='text-sm font-bold text-gray-900'>Ignored duplicates</div>"
+                "<div class='text-xs text-gray-500'>Open this if you want to check duplicate receipts the app blocked.</div></div>"
+                "<div class='text-right shrink-0'>"
+                f"<div class='text-sm font-bold text-amber-800'>{len(duplicate_receipts)}</div>"
+                "<div class='text-[11px] text-gray-400'>Open</div>"
+                "</div></summary>"
+                "<div class='bg-white'>"
+                + "".join(rows)
+                + "</div></details>"
+            )
+
+        customer_receipt_home_tile = ""
+        home_mode_cols = "grid-cols-1"
+        if CUSTOMER_RECEIPT_PORTAL_ENABLED:
+            home_mode_cols = "grid-cols-2"
+            customer_receipt_home_tile = f"""
+              <a href="/expenses/{escape(token)}/customer-receipts"
+                 data-receipt-mode-link data-mode-target="customer"
+                 data-mode="customer" data-active="false"
+                 class="flex flex-col items-center justify-center w-full h-28 scale-[.94]
+                        rounded-2xl bg-emerald-50 text-emerald-800 border border-emerald-100
+                        opacity-55 cursor-pointer receipt-mode-card transition-all duration-200 ease-out">
+                <span class="text-3xl">&#128179;</span>
+                <span class="mt-2 text-sm font-semibold">Customer receipt</span>
+                <span class="text-[11px] opacity-70 mt-0.5">Card terminal photo</span>
+              </a>
+            """
+
         return _page(
             f"""
             <main data-receipt-page class="max-w-xl mx-auto p-4 space-y-4">
@@ -14232,7 +17913,9 @@ body {{ background:#f7f6f3 !important; }}
               {flash_html}
               {dump_notify_html}
               {owed_html}
-              <div class="grid grid-cols-2 gap-3">
+              {review_queue_html}
+              {approved_submit_html}
+              <div class="grid {home_mode_cols} gap-3">
               <form id="exp-form" method="post"
                     action="/expenses/{escape(token)}/upload"
                     enctype="multipart/form-data">
@@ -14240,8 +17923,8 @@ body {{ background:#f7f6f3 !important; }}
                 <label for="exp-file"
                        data-mode="expense" data-active="true"
                        class="flex flex-col items-center justify-center w-full h-36
-                              rounded-2xl bg-indigo-600 text-white cursor-pointer
-                              active:bg-indigo-700 shadow-sm receipt-mode-card transition-all duration-200 ease-out">
+                              rounded-2xl bg-sky-100 text-sky-950 border-2 border-sky-300 cursor-pointer
+                              active:bg-sky-200 shadow-md ring-2 ring-sky-100 receipt-mode-card transition-all duration-200 ease-out">
                   <span class="text-4xl">&#128247;</span>
                   <span class="mt-2 text-base font-semibold">Expense receipt</span>
                   <span class="text-xs opacity-80 mt-0.5">Fuel, parts, tools</span>
@@ -14250,56 +17933,80 @@ body {{ background:#f7f6f3 !important; }}
                        accept="image/*" capture="environment"
                        style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none">
               </form>
-              <a href="/expenses/{escape(token)}/customer-receipts"
-                 data-receipt-mode-link data-mode-target="customer" data-mode="customer" data-active="false"
-                 class="flex flex-col items-center justify-center w-full h-28 scale-[.94]
-                        rounded-2xl bg-emerald-50 text-emerald-800 border border-emerald-100
-                        cursor-pointer opacity-55 receipt-mode-card transition-all duration-200 ease-out">
-                <span class="text-3xl">&#128179;</span>
-                <span class="mt-2 text-sm font-semibold">Customer receipt</span>
-                <span class="text-[11px] opacity-70 mt-0.5">Card terminal photo</span>
-              </a>
+              {customer_receipt_home_tile}
               </div>
-              <form id="exp-upload-form" method="post"
-                    action="/expenses/{escape(token)}/upload"
-                    enctype="multipart/form-data">
-                <input id="exp-upload-payment-source" type="hidden"
-                       name="payment_source" value="{escape(upload_payment_source_default)}">
-                <label id="exp-upload-label" for="exp-upload-file"
-                       class="flex items-center justify-center gap-2 w-full rounded-xl
-                              border border-dashed border-gray-300 bg-white px-4 py-2.5
-                              text-sm font-semibold text-gray-600 active:bg-gray-50">
-                  <span class="text-base">&#8682;</span>
-                  <span>Upload</span>
-                  <span class="text-xs font-normal text-gray-400">photos or files</span>
-                </label>
-                <div id="exp-upload-progress"
-                     class="hidden rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-3">
-                  <div class="flex items-center justify-between gap-3">
-                    <div>
-                      <div id="exp-upload-progress-title"
-                           class="text-sm font-semibold text-indigo-900">Uploading&hellip;</div>
-                      <div id="exp-upload-progress-detail"
-                           class="text-xs text-indigo-700 mt-0.5">Preparing files</div>
-                    </div>
-                    <div id="exp-upload-progress-percent"
-                         class="text-sm font-bold text-indigo-900">0%</div>
+              <details class="rounded-xl border border-gray-200 bg-white overflow-hidden shadow-sm">
+                <summary class="list-none cursor-pointer px-4 py-3 flex items-center justify-between gap-3">
+                  <div>
+                    <div class="text-sm font-bold text-gray-900">Advanced options</div>
+                    <div class="text-xs text-gray-500">Bulk uploads and direct-debit plans</div>
                   </div>
-                  <div class="mt-3 h-2 rounded-full bg-white overflow-hidden">
-                    <div id="exp-upload-progress-bar"
-                         class="h-full w-0 bg-indigo-600 transition-all duration-150"></div>
+                  <span class="inline-flex h-7 w-7 items-center justify-center rounded-full
+                               border border-gray-200 bg-gray-50 text-base font-bold text-gray-500">⌄</span>
+                </summary>
+                <div class="border-t border-gray-100 p-3 space-y-3 bg-gray-50/50">
+                  <form id="exp-upload-form" method="post"
+                        action="/expenses/{escape(token)}/upload"
+                        enctype="multipart/form-data">
+                    <input id="exp-upload-payment-source" type="hidden"
+                           name="payment_source" value="{escape(upload_payment_source_default)}">
+                    <label id="exp-upload-label" for="exp-upload-file"
+                           class="flex items-center justify-center gap-2 w-full rounded-xl
+                                  border border-dashed border-gray-300 bg-white px-4 py-2.5
+                                  text-sm font-semibold text-gray-600 active:bg-gray-50">
+                      <span class="text-base">&#8682;</span>
+                      <span>Upload photos or files</span>
+                    </label>
+                    <div id="exp-upload-progress"
+                         class="hidden rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-3">
+                      <div class="flex items-center justify-between gap-3">
+                        <div>
+                          <div id="exp-upload-progress-title"
+                               class="text-sm font-semibold text-indigo-900">Uploading&hellip;</div>
+                          <div id="exp-upload-progress-detail"
+                               class="text-xs text-indigo-700 mt-0.5">Preparing files</div>
+                        </div>
+                        <div id="exp-upload-progress-percent"
+                             class="text-sm font-bold text-indigo-900">0%</div>
+                      </div>
+                      <div class="mt-3 h-2 rounded-full bg-white overflow-hidden">
+                        <div id="exp-upload-progress-bar"
+                             class="h-full w-0 bg-indigo-600 transition-all duration-150"></div>
+                      </div>
+                    </div>
+                    <input id="exp-upload-file" type="file" name="receipt_file"
+                           accept="image/*,application/pdf" multiple
+                           style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none">
+                  </form>
+                  <div class="rounded-xl border border-gray-200 bg-white p-3 space-y-3">
+                    <div class="flex items-start justify-between gap-3">
+                      <div>
+                        <div class="text-sm font-bold text-gray-900">Instalment plans{plan_hint_html}</div>
+                        <div class="text-xs text-gray-500 mt-0.5">Payment schedules, direct debits, annual bills.</div>
+                      </div>
+                    </div>
+                    <form id="exp-plan-form" method="post"
+                          action="/expenses/{escape(token)}/instalment-plan"
+                          enctype="multipart/form-data">
+                      <label for="exp-plan-file"
+                             class="flex items-center justify-between gap-3 w-full rounded-xl
+                                    border border-dashed border-gray-300 bg-white px-4 py-2.5
+                                    text-sm font-semibold text-gray-700 active:bg-gray-50">
+                        <span>Upload plan</span>
+                        <span class="text-xs font-bold text-gray-500">Choose file</span>
+                      </label>
+                      <input id="exp-plan-file" type="file" name="plan_file"
+                             accept="image/*,application/pdf"
+                             style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none">
+                    </form>
+                    {plan_list_html}
                   </div>
                 </div>
-                <input id="exp-upload-file" type="file" name="receipt_file"
-                       accept="image/*,application/pdf" multiple
-                       style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none">
-              </form>
+              </details>
+              {today_html}
               {card_feed_html}
-              <div>
-                <h2 class="text-sm font-semibold text-gray-500 uppercase tracking-wide
-                           mb-2 px-1">Today</h2>
-                {today_html}
-              </div>
+              {duplicate_review_html}
+              {recent_review_html}
               {prev_html}
             </main>
             <div id="exp-overlay"
@@ -14312,6 +18019,7 @@ body {{ background:#f7f6f3 !important; }}
               </svg>
               <div class="mt-3 text-sm font-medium text-gray-700">Reading your receipt&hellip;</div>
             </div>
+            {_expense_receipt_viewer_modal_html()}
             <script>
             (function() {{
               var uploadFile = document.getElementById('exp-upload-file');
@@ -14324,6 +18032,24 @@ body {{ background:#f7f6f3 !important; }}
               var progressPercent = document.getElementById('exp-upload-progress-percent');
               var progressBar = document.getElementById('exp-upload-progress-bar');
               var uploadBusy = false;
+              function resetUploadUi() {{
+                uploadBusy = false;
+                if (progressWrap) progressWrap.classList.add('hidden');
+                if (uploadLabel) {{
+                  uploadLabel.classList.remove('hidden');
+                  uploadLabel.removeAttribute('aria-disabled');
+                }}
+                if (progressTitle) progressTitle.innerHTML = 'Uploading&hellip;';
+                if (progressDetail) progressDetail.textContent = 'Preparing files';
+                if (progressPercent) progressPercent.textContent = '0%';
+                if (progressBar) {{
+                  progressBar.className = 'h-full w-0 bg-indigo-600 transition-all duration-150';
+                  progressBar.style.width = '0%';
+                }}
+              }}
+              window.addEventListener('pageshow', function() {{
+                resetUploadUi();
+              }});
               function currentSource() {{
                 var picked = document.querySelector('#exp-form input[name="payment_source"]:checked');
                 if (picked) return picked.value;
@@ -14371,27 +18097,65 @@ body {{ background:#f7f6f3 !important; }}
                     uploadForm.submit();
                     return;
                   }}
-                  var xhr = new XMLHttpRequest();
-                  xhr.open('POST', uploadForm.action, true);
-                  xhr.upload.addEventListener('progress', function(ev) {{
-                    if (!ev.lengthComputable) {{
-                      setProgress(35, 'Uploading&hellip;', 'Sending files to the app');
+                  var files = Array.prototype.slice.call(uploadFile.files || []);
+                  var ids = [];
+                  function sendOne(i) {{
+                    if (i >= files.length) {{
+                      setProgress(100, 'Upload complete', 'Opening the receipt review');
+                      var joined = encodeURIComponent(ids.join(','));
+                      window.location.href = ids.length === 1
+                        ? '/expenses/{escape(token)}/review/' + encodeURIComponent(ids[0])
+                        : '/expenses/{escape(token)}/review-upload?ids=' + joined;
                       return;
                     }}
-                    var pct = Math.round((ev.loaded / ev.total) * 85);
-                    setProgress(pct, 'Uploading&hellip;', 'Sending files to the app');
-                  }});
-                  xhr.onreadystatechange = function() {{
-                    if (xhr.readyState !== 4) return;
-                    if (xhr.status >= 200 && xhr.status < 400) {{
-                      setProgress(100, 'Upload complete', 'Opening the receipt review');
-                      window.location.href = xhr.responseURL || '/expenses/{escape(token)}';
-                    }} else {{
-                      failProgress('The app could not upload those files.');
-                    }}
-                  }};
-                  xhr.onerror = function() {{ failProgress('Network error while uploading.'); }};
-                  xhr.send(new FormData(uploadForm));
+                    var fd = new FormData();
+                    fd.append('receipt_file', files[i], files[i].name || ('receipt-' + (i + 1)));
+                    fd.append('payment_source', currentSource());
+                    fd.append('ajax_upload', '1');
+                    var xhr = new XMLHttpRequest();
+                    xhr.open('POST', uploadForm.action, true);
+                    xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+                    xhr.upload.addEventListener('progress', function(ev) {{
+                      var base = (i / files.length) * 100;
+                      var span = 85 / files.length;
+                      if (!ev.lengthComputable) {{
+                        setProgress(base + span * 0.35, 'Uploading&hellip;', 'Receipt ' + (i + 1) + ' of ' + files.length);
+                        return;
+                      }}
+                      var pct = base + ((ev.loaded / ev.total) * span);
+                      setProgress(pct, 'Uploading&hellip;', 'Receipt ' + (i + 1) + ' of ' + files.length);
+                    }});
+                    xhr.onreadystatechange = function() {{
+                      if (xhr.readyState !== 4) return;
+                      if (xhr.status >= 200 && xhr.status < 400) {{
+                        try {{
+                          var data = JSON.parse(xhr.responseText || '{{}}');
+                          (data.ids || []).forEach(function(id) {{ if (id) ids.push(id); }});
+                        }} catch(e) {{}}
+                        setProgress(((i + 1) / files.length) * 100, 'Reading receipt&hellip;', 'Finished ' + (i + 1) + ' of ' + files.length);
+                        sendOne(i + 1);
+                      }} else {{
+                        failProgress('The app could not upload receipt ' + (i + 1) + '.');
+                      }}
+                    }};
+                    xhr.onerror = function() {{ failProgress('Network error while uploading receipt ' + (i + 1) + '.'); }};
+                    xhr.send(fd);
+                  }}
+                  sendOne(0);
+                }});
+              }}
+              var planFile = document.getElementById('exp-plan-file');
+              var planForm = document.getElementById('exp-plan-form');
+              if (planFile && planForm) {{
+                planFile.addEventListener('change', function() {{
+                  if (!planFile.files || !planFile.files.length) return;
+                  if (uploadLabel) uploadLabel.classList.add('hidden');
+                  if (progressWrap) progressWrap.classList.remove('hidden');
+                  if (progressTitle) progressTitle.textContent = 'Reading plan...';
+                  if (progressDetail) progressDetail.textContent = 'Checking document against the bank feed';
+                  if (progressPercent) progressPercent.textContent = '';
+                  if (progressBar) progressBar.style.width = '35%';
+                  planForm.submit();
                 }});
               }}
             }})();
@@ -14399,8 +18163,949 @@ body {{ background:#f7f6f3 !important; }}
             """
         )
 
+    def _expense_plan_money_values(text: str) -> list[float]:
+        values: list[float] = []
+        for raw in re.findall(r"(?:£|\bGBP\b)?\s*(\d{1,6}(?:,\d{3})*(?:\.\d{2}))", text or "", re.I):
+            try:
+                val = round(float(raw.replace(",", "")), 2)
+            except ValueError:
+                continue
+            if 0 < val < 250000:
+                values.append(val)
+        return values
+
+    def _expense_plan_supplier(filename: str, text: str) -> str:
+        hay = f"{filename}\n{text}".lower()
+        known = (
+            ("zurich", "Zurich Insurance"),
+            ("brown & brown", "Brown & Brown Insurance"),
+            ("brown and brown", "Brown & Brown Insurance"),
+            ("bbrown", "Brown & Brown Insurance"),
+            ("rac", "RAC"),
+            ("checkatrade", "Checkatrade"),
+            ("replit", "Replit"),
+            ("openai", "OpenAI"),
+        )
+        for needle, label in known:
+            if needle in hay:
+                return label
+        lines = [
+            re.sub(r"\s+", " ", line).strip(" -:|")
+            for line in (text or "").splitlines()
+            if re.sub(r"\s+", " ", line).strip(" -:|")
+        ]
+        for line in lines[:12]:
+            if len(line) < 4:
+                continue
+            if re.search(r"\b(schedule|invoice|policy|statement|tax|date|page)\b", line, re.I):
+                continue
+            if re.search(r"[A-Za-z]{3,}", line):
+                return line[:80]
+        return Path(filename or "Uploaded plan").stem[:80] or "Uploaded plan"
+
+    def _expense_plan_document_type(text: str, supplier: str = "") -> str:
+        lowered = (text or "").lower()
+        if "insurance" in lowered and ("policy" in lowered or "schedule" in lowered):
+            return "Insurance policy schedule"
+        if "direct debit" in lowered and ("instalment" in lowered or "monthly" in lowered):
+            return "Direct debit instalment plan"
+        if "payment schedule" in lowered or "instalment schedule" in lowered:
+            return "Instalment payment schedule"
+        if "renewal" in lowered and ("quote" in lowered or "invitation" in lowered):
+            return "Renewal proposal - needs review"
+        if "statement" in lowered and "balance" in lowered:
+            return "Statement - do not import as a bill without review"
+        if "invoice" in lowered:
+            return "Invoice / bill"
+        if supplier:
+            return "Supplier document"
+        return "Uploaded document"
+
+    def _expense_plan_refs(filename: str, text: str) -> list[str]:
+        refs: list[str] = []
+        stop = {
+            "PROPOSER", "BROKER", "POLICY", "COMMENCES", "SUBJECT", "UNLESS",
+            "LIMITS", "NUMBER", "SCHEDULE", "REFERENCE", "IMPORTANT",
+            "INSURANCE", "DOCUMENT", "STATEMENT",
+        }
+
+        def _add(value: str) -> None:
+            clean = re.sub(r"[^A-Z0-9\-/]", "", (value or "").upper())[:40]
+            if not clean or clean in stop or len(clean) < 5:
+                return
+            if clean not in refs:
+                refs.append(clean)
+
+        lines = [
+            re.sub(r"\s+", " ", line).strip()
+            for line in (text or "").splitlines()
+            if re.sub(r"\s+", " ", line).strip()
+        ]
+        for i, line in enumerate(lines):
+            # Handles "Policy number PC499640" and two-column OCR where the
+            # label and value land on adjacent lines.
+            m = re.search(
+                r"\b(?:policy|schedule|invoice|reference|ref|mandate|agreement)\s*(?:no\.?|number|#)?\b\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-/]{5,})",
+                line,
+                re.I,
+            )
+            if m:
+                _add(m.group(1))
+                continue
+            if re.fullmatch(r"(?i)(policy number|schedule number|invoice number|reference|ref)", line):
+                for nxt in lines[i + 1:i + 4]:
+                    if re.search(r"\b[A-Z]{2,}\d{3,}|\d{6,}\b", nxt, re.I):
+                        _add(nxt.split()[0])
+                        break
+        for value in re.findall(r"\b([A-Z]{1,6}\d{5,}[A-Z0-9\-/]*)\b", text or "", re.I):
+            _add(value)
+        for value in re.findall(r"#?(\d{8,12})", filename or ""):
+            _add(value)
+        return refs[:8]
+
+    def _expense_plan_ref_matches_name(refs: list[str], name: str) -> bool:
+        compact_name = re.sub(r"[^A-Z0-9]+", "", (name or "").upper())
+        for ref in refs or []:
+            compact_ref = re.sub(r"[^A-Z0-9]+", "", str(ref or "").upper())
+            if len(compact_ref) >= 6 and compact_ref in compact_name:
+                return True
+            # Zurich bank lines can include a fuller suffix than the schedule.
+            if len(compact_ref) >= 6 and compact_name.startswith(compact_ref):
+                return True
+            if len(compact_ref) >= 6 and compact_ref[:6] in compact_name:
+                return True
+        return False
+
+    def _expense_plan_bank_matches(
+        eng: dict, supplier: str, text: str, money_values: list[float]
+    ) -> tuple[list[dict], dict]:
+        txs = cardfeed.get_cached_transactions(config.admin_db_file) or []
+        acct = str(eng.get("plaid_account_id") or "").strip()
+        refs = _expense_plan_refs("", text)
+        supplier_words = [
+            w for w in re.findall(r"[a-z0-9]{4,}", (supplier or "").lower())
+            if w not in {"insurance", "limited", "ltd", "group", "company"}
+        ]
+        value_set = {round(float(v), 2) for v in money_values if v}
+        candidates: list[dict] = []
+        for t in txs:
+            if acct and str(t.get("account_id") or "").strip() != acct:
+                continue
+            try:
+                amount = round(float(t.get("amount") or 0), 2)
+            except (TypeError, ValueError):
+                continue
+            if amount <= 0:
+                continue
+            name = str(t.get("name") or "")
+            lowered = name.lower()
+            score = 0
+            reasons: list[str] = []
+            if any(w and w in lowered for w in supplier_words):
+                score += 8
+                reasons.append("supplier shown in bank feed")
+            if refs and _expense_plan_ref_matches_name(refs, name):
+                score += 8
+                reasons.append("reference/policy number")
+            if amount in value_set:
+                score += 5
+                reasons.append("amount appears in document")
+            if "dd" in lowered or "direct debit" in lowered:
+                score += 2
+                reasons.append("direct debit")
+            # Do not match random bank lines just because the document says
+            # "insurance" or "policy". A plan needs supplier/ref evidence.
+            if score < 8:
+                continue
+            candidates.append({
+                "date": str(t.get("date") or ""),
+                "amount": amount,
+                "name": name,
+                "bank_label": name,
+                "account_id": str(t.get("account_id") or ""),
+                "score": score,
+                "reasons": reasons,
+            })
+        candidates.sort(key=lambda row: (row["score"], row["date"]), reverse=True)
+        by_amount: dict[float, list[dict]] = {}
+        for c in candidates:
+            by_amount.setdefault(round(float(c["amount"]), 2), []).append(c)
+        repeated = [
+            {"amount": amount, "count": len(rows), "rows": rows[:12]}
+            for amount, rows in sorted(by_amount.items(), key=lambda kv: (-len(kv[1]), -kv[0]))
+            if len(rows) >= 2
+        ]
+        meta = {
+            "repeated_amounts": repeated[:5],
+            "match_basis": "supplier/reference text in the bank feed, then repeated amounts",
+            "account_scoped": bool(acct),
+            "supplier_match_count": len(candidates),
+        }
+        return candidates[:20], meta
+
+    def _expense_plan_suggested_account(accounts: list, supplier: str, document_type: str) -> tuple[str, str]:
+        hay = f"{supplier} {document_type}".lower()
+        preferences: list[str] = []
+        if "zurich" in hay or "insurance" in hay:
+            preferences = ["motor vehicle expenses", "insurance"]
+        elif "checkatrade" in hay:
+            preferences = ["advertising", "marketing"]
+        elif "replit" in hay or "openai" in hay:
+            preferences = ["software", "it", "computer"]
+        for pref in preferences:
+            code, name = _resolve_expense_account_choice(pref, accounts)
+            if code:
+                return code, name
+        return "", ""
+
+    def _expense_plan_account_options_html(accounts: list, selected_code: str = "") -> str:
+        rows = ["<option value=''>Choose Xero account</option>"]
+        selected_code = str(selected_code or "").strip()
+        for account in accounts or []:
+            code = str(account.get("Code") or "").strip()
+            name = str(account.get("Name") or "").strip()
+            if not code:
+                continue
+            selected = " selected" if code == selected_code else ""
+            label = _exp_acct_label(account)
+            rows.append(
+                f"<option value='{escape(code)}'{selected}>{escape(label)}</option>"
+            )
+        return "".join(rows)
+
+    def _expense_plan_match_key(row: dict) -> str:
+        raw = "|".join([
+            str(row.get("date") or ""),
+            f"{float(row.get('amount') or 0):.2f}",
+            str(row.get("account_id") or ""),
+            str(row.get("bank_label") or row.get("name") or ""),
+        ])
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+    def _expense_plan_duplicate_info(plan_id: str, digest: str, supplier: str, refs: list[str]) -> dict:
+        plans = get_json_setting(config.admin_db_file, "expense_instalment_plans", {}) or {}
+        for pid, plan in plans.items():
+            if str(pid) == str(plan_id):
+                continue
+            if digest and digest == str((plan or {}).get("digest") or ""):
+                return {"duplicate": True, "reason": "same uploaded document", "plan_id": pid}
+            old_refs = set((plan or {}).get("refs") or [])
+            if refs and old_refs and old_refs.intersection(set(refs)):
+                return {"duplicate": True, "reason": "same reference number", "plan_id": pid}
+            if supplier and supplier.lower() == str((plan or {}).get("supplier") or "").lower():
+                try:
+                    old_created = str((plan or {}).get("created_at") or "")[:10]
+                    if old_created == dt.datetime.now(dt.timezone.utc).date().isoformat():
+                        return {"duplicate": True, "reason": "same supplier uploaded today", "plan_id": pid}
+                except Exception:
+                    pass
+        return {"duplicate": False}
+
+    def _expense_plan_row_html(row: dict) -> str:
+        reasons = ", ".join(row.get("reasons") or [])
+        return (
+            "<div class='grid grid-cols-[5.5rem_1fr_auto] gap-3 px-3 py-2 "
+            "border-b border-gray-100 last:border-0 text-sm'>"
+            f"<div class='text-gray-500'>{escape(_exp_day_label(str(row.get('date') or '')[:10]))}</div>"
+            f"<div><div class='font-medium text-gray-900'>{escape(row.get('bank_label') or row.get('name') or '')}</div>"
+            f"<div class='text-[11px] text-gray-500'>{escape(reasons)}</div></div>"
+            f"<div class='font-bold text-gray-900'>{_exp_money(row.get('amount'))}</div>"
+            "</div>"
+        )
+
+    def _expense_plan_choice_html(
+        rows: list[dict],
+        selected_keys: set[str] | None = None,
+        prepared_matches: dict | None = None,
+    ) -> str:
+        if not rows:
+            return (
+                "<div class='rounded-xl border border-dashed border-gray-300 bg-white p-4 "
+                "text-sm text-gray-500 text-center'>No specific bank-feed choices found yet.</div>"
+            )
+        selected_keys = selected_keys or set()
+        prepared_matches = prepared_matches or {}
+        out = []
+        for idx, row in enumerate(rows[:8]):
+            key = _expense_plan_match_key(row)
+            checked = " checked" if key in selected_keys else ""
+            prepared = prepared_matches.get(key) or {}
+            prepared_id = str((prepared or {}).get("xero_bank_transaction_id") or "").strip()
+            prepared_badge = (
+                "<span class='rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] "
+                "font-bold text-emerald-800'>prepared in Xero</span>"
+                if prepared_id else ""
+            )
+            reasons = ", ".join(row.get("reasons") or [])
+            out.append(
+                "<label class='block rounded-xl border border-gray-200 bg-white p-3 active:bg-gray-50'>"
+                "<div class='flex items-start gap-3'>"
+                f"<input type='checkbox' name='match_keys' value='{escape(key)}'{checked} class='mt-1'>"
+                "<div class='min-w-0 flex-1'>"
+                "<div class='flex items-start justify-between gap-2'>"
+                f"<div class='text-xs font-semibold text-gray-500'>{escape(_exp_day_label(str(row.get('date') or '')[:10]))}</div>"
+                f"{prepared_badge}</div>"
+                f"<div class='mt-0.5 font-bold text-gray-900'>{_exp_money(row.get('amount'))}</div>"
+                f"<div class='mt-0.5 text-xs text-gray-700 break-words'>{escape(row.get('bank_label') or row.get('name') or '')}</div>"
+                f"<div class='mt-1 text-[11px] text-emerald-700'>{escape(reasons)}</div>"
+                "</div></div></label>"
+            )
+        return "".join(out)
+
+    def _expense_plan_default_reference(plan_id: str, supplier: str, selected: dict | None) -> str:
+        date_part = str((selected or {}).get("date") or "")[:10].replace("-", "")
+        supplier_part = re.sub(r"[^A-Za-z0-9]+", "", supplier or "PLAN")[:18].upper()
+        bits = ["PLAN", supplier_part]
+        if date_part:
+            bits.append(date_part)
+        bits.append(str(plan_id or "")[-6:].upper())
+        return "-".join([b for b in bits if b])
+
+    def _expense_plan_selected_bank_account_ref(eng: dict, selected: dict | None) -> tuple[dict, str]:
+        account_id = str((selected or {}).get("account_id") or "").strip()
+        labels = cardfeed.get_account_labels(config.admin_db_file) or {}
+        label_meta = labels.get(account_id) or {}
+        xero_id = str(label_meta.get("xero_account_id") or "").strip()
+        xero_name = str(label_meta.get("xero_account_name") or "").strip()
+        if xero_id:
+            return {"AccountID": xero_id}, xero_name or account_id
+        fallback = (
+            str(eng.get("payment_account_code") or "").strip()
+            or str(get_expense_settings(config.admin_db_file).get("default_payment_account") or "").strip()
+        )
+        if fallback:
+            return _receipt_account_ref(fallback), fallback
+        return {}, ""
+
+    def _expense_plan_attachment_payload(plan: dict) -> tuple[str, str, bytes] | None:
+        path = os.path.abspath(str(plan.get("stored_file") or ""))
+        upload_root = os.path.abspath(config.receipts_upload_dir)
+        if not path.startswith(upload_root) or not os.path.exists(path):
+            return None
+        try:
+            data = Path(path).read_bytes()
+        except OSError:
+            return None
+        if not data:
+            return None
+        filename = Path(str(plan.get("filename") or "")).name or Path(path).name or "payment-plan.pdf"
+        mime = (
+            str(plan.get("mime_type") or "").strip()
+            or _dump_mime_for(path)
+            or _exp_sniff_mime(data[:16])
+            or "application/octet-stream"
+        )
+        if (mime or "").lower().startswith("image/"):
+            data, filename, mime = _exp_resize_for_ocr(data, filename, mime)
+        return filename, mime, data
+
+    def _expense_plan_prepare_xero(
+        eng: dict,
+        plan: dict,
+        *,
+        selected: dict,
+        match_key: str,
+        account_code: str,
+        account_name: str,
+        contact_name: str,
+        reference: str,
+        description: str,
+        tax_type: str,
+    ) -> tuple[bool, str]:
+        prepared_matches = plan.get("xero_prepared_matches")
+        if not isinstance(prepared_matches, dict):
+            prepared_matches = {}
+        existing_match = prepared_matches.get(match_key) or {}
+        existing_id = str(existing_match.get("xero_bank_transaction_id") or "").strip()
+        if not existing_id and str(plan.get("selected_match_key") or "") == match_key:
+            existing_id = str(plan.get("xero_bank_transaction_id") or "").strip()
+        if existing_id:
+            prepared_matches[match_key] = {
+                **existing_match,
+                "xero_bank_transaction_id": existing_id,
+                "selected_bank_match": selected,
+                "prepared_at": existing_match.get("prepared_at") or plan.get("xero_prepared_at") or "",
+            }
+            plan.update({
+                "status": "prepared_in_xero",
+                "xero_prepared_matches": prepared_matches,
+                "selected_match_key": match_key,
+                "selected_bank_match": selected,
+                "selected_account_code": account_code,
+                "selected_account_name": account_name,
+                "xero_error": "",
+                "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            })
+            return True, f"Already prepared in Xero ({existing_id})."
+        if xero_is_disabled():
+            return False, "Xero is paused, so the match pack was not created."
+        bank_account, bank_account_label = _expense_plan_selected_bank_account_ref(eng, selected)
+        if not bank_account:
+            return False, "No Xero bank account is mapped for the chosen bank-feed payment."
+        try:
+            amount = round(float(selected.get("amount") or 0), 2)
+        except (TypeError, ValueError):
+            amount = 0.0
+        paid_on = str(selected.get("date") or "")[:10]
+        if amount <= 0 or not paid_on:
+            return False, "The selected bank payment is missing a valid date or amount."
+        contact_name = (contact_name or "").strip()[:255] or str(plan.get("supplier") or "Supplier")[:255]
+        base_reference = (reference or "").strip() or _expense_plan_default_reference(
+            str(plan.get("id") or ""), contact_name, selected
+        )
+        unique_suffix = f"{paid_on.replace('-', '')}-{match_key[-4:].upper()}"
+        reference = base_reference[: max(1, 255 - len(unique_suffix) - 1)]
+        if unique_suffix not in reference:
+            reference = f"{reference}-{unique_suffix}"[:255]
+        description = (description or "").strip()[:4000] or (
+            f"{contact_name} instalment / direct debit payment"
+        )
+        line_item = {
+            "Description": description,
+            "Quantity": 1,
+            "UnitAmount": amount,
+            "AccountCode": account_code,
+        }
+        tax_type = (tax_type or "").strip()
+        if tax_type:
+            line_item["TaxType"] = tax_type
+        payload = {
+            "BankTransactions": [
+                {
+                    "Type": "SPEND",
+                    "Contact": {"Name": contact_name},
+                    "Date": paid_on,
+                    "Reference": reference,
+                    "BankAccount": bank_account,
+                    "LineAmountTypes": "Inclusive",
+                    "LineItems": [line_item],
+                }
+            ]
+        }
+        plan.update({
+            "selected_match_key": match_key,
+            "selected_bank_match": selected,
+            "selected_account_code": account_code,
+            "selected_account_name": account_name,
+            "xero_contact_name": contact_name,
+            "xero_reference": base_reference[:255],
+            "xero_description": description,
+            "xero_tax_type": tax_type,
+            "xero_bank_account_label": bank_account_label,
+            "xero_payload_preview": payload,
+            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        })
+        try:
+            client = build_xero_client(config)
+            if client is None:
+                raise RuntimeError("Xero is not connected")
+            resp = client.create_bank_transaction_payload(payload)
+            if client.dry_run:
+                plan.update({
+                    "status": "approved",
+                    "xero_error": "DRY_RUN - Xero match pack simulated, not written.",
+                    "approved_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                })
+                return False, "Xero is in dry-run mode, so nothing was written."
+            txs = (resp or {}).get("BankTransactions") or []
+            tx_id = str((txs[0] if txs else {}).get("BankTransactionID") or "").strip()
+            if not tx_id:
+                raise RuntimeError("Xero spend create returned no BankTransactionID")
+            att = _expense_plan_attachment_payload(plan)
+            if att:
+                filename, mime, data = att
+                client.attach_file_to_bank_transaction(tx_id, filename, mime, data)
+            prepared_matches[match_key] = {
+                "xero_bank_transaction_id": tx_id,
+                "selected_bank_match": selected,
+                "amount": amount,
+                "date": paid_on,
+                "reference": reference,
+                "prepared_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            }
+            plan.update({
+                "status": "prepared_in_xero",
+                "xero_prepared_matches": prepared_matches,
+                "xero_bank_transaction_id": tx_id,
+                "xero_error": "",
+                "approved_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "xero_prepared_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            })
+            _feed.push(
+                f"Payment plan match pack prepared in Xero for {contact_name}: {_exp_money(amount)}.",
+                "success",
+            )
+            return True, "Prepared in Xero."
+        except Exception as exc:
+            plan.update({
+                "status": "approved",
+                "xero_error": str(exc).splitlines()[0][:240],
+                "approved_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            })
+            return False, "Xero prepare failed: " + str(exc).splitlines()[0][:180]
+
+    @app.post("/expenses/<token>/instalment-plan")
+    def expense_engineer_instalment_plan_upload(token: str):
+        db = config.admin_db_file
+        eng = exp_store.get_engineer_by_token(db, token)
+        if not eng or not eng.get("active"):
+            return _exp_error_page("This expenses link is not active.")
+        if session.get("engineer_id") != eng["id"]:
+            return redirect(url_for("portal_login"))
+        file = request.files.get("plan_file")
+        if not file or not (file.filename or "").strip():
+            return redirect(f"/expenses/{token}")
+        file_bytes = file.read() or b""
+        filename = file.filename or "instalment-plan.pdf"
+        content_type = _exp_sniff_mime(file_bytes[:16])
+        if content_type is None:
+            return _exp_error_page("Please upload a PDF or photo of the payment plan.", 400)
+        if content_type.startswith("image/"):
+            file_bytes, filename, content_type = _exp_resize_for_ocr(
+                file_bytes, filename, content_type
+            )
+        digest = hashlib.sha256(file_bytes).hexdigest()
+        try:
+            parsed = ReceiptService(config).analyze_upload(
+                file_bytes=file_bytes, filename=filename, mime_type=content_type
+            )
+        except Exception as exc:
+            return _exp_error_page("The app could not read this document: " + str(exc).splitlines()[0][:180], 400)
+        raw_text = str(parsed.get("raw_text") or "")
+        supplier = _expense_plan_supplier(filename, raw_text)
+        document_type = _expense_plan_document_type(raw_text, supplier)
+        money_values = _expense_plan_money_values(raw_text)
+        refs = _expense_plan_refs(filename, raw_text)
+        bank_matches, match_meta = _expense_plan_bank_matches(eng, supplier, raw_text, money_values)
+        plan_id = uuid.uuid4().hex[:12]
+        duplicate = _expense_plan_duplicate_info(plan_id, digest, supplier, refs)
+        plan = {
+            "id": plan_id,
+            "engineer_id": eng["id"],
+            "engineer_name": eng.get("name") or "",
+            "supplier": supplier,
+            "document_type": document_type,
+            "filename": filename,
+            "mime_type": content_type,
+            "stored_file": parsed.get("stored_file") or "",
+            "digest": digest,
+            "refs": refs,
+            "money_values": sorted(set(money_values), reverse=True)[:20],
+            "raw_text_preview": raw_text[:4000],
+            "ocr_error": parsed.get("ocr_error") or "",
+            "bank_matches": bank_matches,
+            "match_meta": match_meta,
+            "duplicate": duplicate,
+            "status": "preview",
+            "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        plans = get_json_setting(db, "expense_instalment_plans", {}) or {}
+        plans[plan_id] = plan
+        # Keep this bounded. It is a review aid, not a permanent archive.
+        ordered = sorted(
+            plans.items(),
+            key=lambda kv: str((kv[1] or {}).get("created_at") or ""),
+            reverse=True,
+        )
+        set_json_setting(db, "expense_instalment_plans", dict(ordered[:100]))
+        return redirect(f"/expenses/{token}/instalment-plan/{plan_id}")
+
+    @app.get("/expenses/<token>/instalment-plan/<plan_id>")
+    def expense_engineer_instalment_plan_preview(token: str, plan_id: str):
+        db = config.admin_db_file
+        eng = exp_store.get_engineer_by_token(db, token)
+        if not eng or not eng.get("active"):
+            return _exp_error_page("This expenses link is not active.")
+        if session.get("engineer_id") != eng["id"]:
+            return redirect(url_for("portal_login"))
+        plans = get_json_setting(db, "expense_instalment_plans", {}) or {}
+        plan = plans.get(plan_id)
+        if not plan or int(plan.get("engineer_id") or 0) != int(eng["id"]):
+            return _exp_error_page("Payment plan not found.", 404)
+        raw_text = str(plan.get("raw_text_preview") or "")
+        supplier = _expense_plan_supplier(str(plan.get("filename") or ""), raw_text)
+        refs = _expense_plan_refs(str(plan.get("filename") or ""), raw_text)
+        money_values = _expense_plan_money_values(raw_text)
+        bank_matches, match_meta = _expense_plan_bank_matches(eng, supplier, raw_text, money_values)
+        plan["supplier"] = supplier
+        plan["document_type"] = _expense_plan_document_type(raw_text, supplier)
+        plan["refs"] = refs
+        plan["money_values"] = sorted(set(money_values), reverse=True)[:20]
+        plan["bank_matches"] = bank_matches
+        plan["match_meta"] = match_meta
+        plans[plan_id] = plan
+        try:
+            set_json_setting(db, "expense_instalment_plans", plans)
+        except Exception:
+            pass
+        repeated = ((plan.get("match_meta") or {}).get("repeated_amounts") or [])
+        prepared_matches = plan.get("xero_prepared_matches")
+        if not isinstance(prepared_matches, dict):
+            prepared_matches = {}
+        selected_keys = {
+            str(k) for k in (plan.get("selected_match_keys") or [])
+            if str(k or "").strip()
+        }
+        selected_match_key = str(plan.get("selected_match_key") or "")
+        if selected_match_key:
+            selected_keys.add(selected_match_key)
+        selected_account_code = str(plan.get("selected_account_code") or "")
+        exp_accounts = get_json_setting(db, _XERO_EXP_ACCT_SNAPSHOT_KEY, []) or []
+        if not selected_account_code:
+            selected_account_code, _selected_account_name = _expense_plan_suggested_account(
+                exp_accounts, plan.get("supplier") or "", plan.get("document_type") or ""
+            )
+        account_options = _expense_plan_account_options_html(exp_accounts, selected_account_code)
+        top_repeat = repeated[0] if repeated else {}
+        if top_repeat:
+            summary = (
+                f"Likely instalment: {_exp_money(top_repeat.get('amount'))} "
+                f"seen {int(top_repeat.get('count') or 0)} times"
+            )
+            summary_tone = "emerald"
+        elif plan.get("bank_matches"):
+            count = int((plan.get("match_meta") or {}).get("supplier_match_count") or len(plan.get("bank_matches") or []))
+            summary = f"{count} related bank payment{'s' if count != 1 else ''} found"
+            summary_tone = "amber"
+        else:
+            summary = "No matching bank payments found yet"
+            summary_tone = "gray"
+        dup = plan.get("duplicate") or {}
+        dup_html = ""
+        if dup.get("duplicate"):
+            dup_html = (
+                "<div class='rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800'>"
+                "<strong>Possible duplicate:</strong> this looks like a "
+                f"{escape(str(dup.get('reason') or 'previous upload'))}."
+                "</div>"
+            )
+        refs_html = "".join(
+            f"<span class='rounded-full bg-gray-100 px-2 py-0.5 text-xs font-semibold text-gray-700'>{escape(ref)}</span>"
+            for ref in (plan.get("refs") or [])
+        ) or "<span class='text-xs text-gray-400'>No reference found</span>"
+        main_amount_html = ""
+        all_matches = plan.get("bank_matches") or []
+        if not selected_keys:
+            if repeated and (repeated[0].get("rows") or []):
+                selected_keys = {
+                    _expense_plan_match_key(r)
+                    for r in (repeated[0].get("rows") or [])[:8]
+                }
+            elif all_matches:
+                selected_keys = {_expense_plan_match_key(all_matches[0])}
+        if selected_match_key:
+            selected_row = next((r for r in all_matches if _expense_plan_match_key(r) == selected_match_key), None)
+        else:
+            selected_row = all_matches[0] if all_matches else None
+        selected_rows = [
+            r for r in all_matches
+            if _expense_plan_match_key(r) in selected_keys
+        ]
+        prepared_count = sum(
+            1 for key in selected_keys
+            if str((prepared_matches.get(key) or {}).get("xero_bank_transaction_id") or "").strip()
+        )
+        if selected_row:
+            main_amount_html = (
+                "<div class='rounded-lg bg-gray-50 px-3 py-2'>"
+                "<div class='text-[11px] font-bold uppercase tracking-wide text-gray-400'>Likely payment set</div>"
+                f"<div class='mt-0.5 text-lg font-black text-gray-900'>{len(selected_rows) or 1} payment{'s' if (len(selected_rows) or 1) != 1 else ''}</div>"
+                f"<div class='text-xs text-gray-500'>{prepared_count} prepared in Xero</div>"
+                "</div>"
+            )
+        repeated_html = ""
+        for group in repeated[:3]:
+            rows = "".join(_expense_plan_row_html(row) for row in (group.get("rows") or [])[:6])
+            repeated_html += (
+                "<details class='rounded-xl border border-emerald-200 bg-white overflow-hidden'>"
+                "<summary class='list-none cursor-pointer px-3 py-2 flex items-center justify-between'>"
+                f"<span class='font-bold text-emerald-900'>{_exp_money(group.get('amount'))}</span>"
+                f"<span class='text-xs text-emerald-700'>{int(group.get('count') or 0)} matching bank lines</span>"
+                "</summary><div class='border-t border-emerald-100'>"
+                + rows + "</div></details>"
+            )
+        if not repeated_html:
+            rows = "".join(_expense_plan_row_html(row) for row in (plan.get("bank_matches") or [])[:10])
+            repeated_html = rows or (
+                "<div class='rounded-xl border border-dashed border-gray-300 bg-white p-4 "
+                "text-sm text-gray-500 text-center'>No bank-feed matches found. Upload/update the bank CSV, then upload this plan again.</div>"
+            )
+        doc_href = f"/expenses/{escape(token)}/instalment-plan/{escape(plan_id)}/document"
+        doc_button = (
+            "<button type='button' data-exp-receipt-options='1' "
+            f"data-title='{escape(plan.get('supplier') or 'Uploaded plan', quote=True)}' "
+            f"data-date='{escape(plan.get('document_type') or '', quote=True)}' "
+            f"data-photo='{doc_href}' "
+            "data-hide-open='1' "
+            "data-can-change='0' "
+            "class='rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5 "
+            "text-xs font-bold text-gray-700'>View document</button>"
+        )
+        status_html = ""
+        xero_error = str(plan.get("xero_error") or "").strip()
+        if (plan.get("status") or "") == "prepared_in_xero":
+            status_html = (
+                "<div class='rounded-xl border border-emerald-200 bg-emerald-50 p-3 "
+                "text-sm font-semibold text-emerald-800'>&#10003; Xero match pack prepared for "
+                f"{prepared_count} selected payment{'s' if prepared_count != 1 else ''}. "
+                "Open Xero reconciliation and match each bank line to the prepared transaction.</div>"
+            )
+        elif (plan.get("status") or "") == "approved":
+            status_html = (
+                "<div class='rounded-xl border border-amber-200 bg-amber-50 p-3 "
+                "text-sm font-semibold text-amber-800'>Plan reviewed, but the Xero match pack "
+                "has not been prepared yet.</div>"
+            )
+        elif (plan.get("status") or "") == "dismissed":
+            status_html = (
+                "<div class='rounded-xl border border-gray-200 bg-gray-50 p-3 "
+                "text-sm font-semibold text-gray-700'>Plan dismissed. It will not be used unless uploaded again.</div>"
+            )
+        if xero_error:
+            status_html += (
+                "<div class='rounded-xl border border-red-200 bg-red-50 p-3 "
+                f"text-sm font-semibold text-red-800'>Xero issue: {escape(xero_error)}</div>"
+            )
+        match_choices = _expense_plan_choice_html(all_matches, selected_keys, prepared_matches)
+        no_account_note = (
+            "<div class='mt-1 text-xs text-amber-700'>No saved Xero account list is available. "
+            "Reconnect/load Xero settings once, then reopen this page.</div>"
+            if not exp_accounts else ""
+        )
+        contact_value = str(plan.get("xero_contact_name") or plan.get("supplier") or "").strip()
+        reference_value = str(plan.get("xero_reference") or "").strip()
+        if not reference_value:
+            reference_value = _expense_plan_default_reference(plan_id, contact_value, selected_row)
+        description_value = str(plan.get("xero_description") or "").strip()
+        if not description_value:
+            description_value = (
+                f"{contact_value or 'Supplier'} instalment / direct debit payment"
+            )
+        tax_selected = str(plan.get("xero_tax_type") or "").strip()
+        if not tax_selected and re.search(r"\binsurance\b", f"{plan.get('supplier') or ''} {plan.get('document_type') or ''}", re.I):
+            tax_selected = "NONE"
+        tax_options = "".join([
+            f"<option value=''{'' if tax_selected else ' selected'}>Use Xero/account default</option>",
+            f"<option value='NONE'{' selected' if tax_selected == 'NONE' else ''}>No VAT</option>",
+            f"<option value='INPUT2'{' selected' if tax_selected == 'INPUT2' else ''}>20% VAT on purchases</option>",
+        ])
+        selected_total = len(selected_keys)
+        all_selected_prepared = bool(selected_total) and prepared_count >= selected_total
+        prepare_button = (
+            "Selected already prepared"
+            if all_selected_prepared else
+            f"Prepare {selected_total or 1} Xero match{'es' if (selected_total or 1) != 1 else ''}"
+        )
+        prepare_disabled = ""
+        prepare_classes = "rounded-xl bg-emerald-600 px-3 py-3 text-sm font-bold text-white"
+        return _page(f"""
+        <main data-receipt-page class="max-w-xl mx-auto p-4 space-y-4">
+          <div class="pt-2 flex items-center justify-between">
+            <a href="/expenses/{escape(token)}" class="text-sm text-indigo-600">&larr; Back</a>
+            <span class="text-xs text-gray-500">Payment plan setup</span>
+          </div>
+          <section class="rounded-2xl border border-gray-200 bg-white p-4 space-y-3">
+            <div class="flex items-start justify-between gap-3">
+              <div>
+                <div class="text-xs uppercase tracking-wide text-gray-400">Instalment / direct debit plan</div>
+                <h1 class="text-xl font-bold text-gray-900 mt-1">{escape(plan.get('supplier') or 'Uploaded plan')}</h1>
+                <div class="text-xs text-gray-500 mt-1">{escape(plan.get('filename') or '')}</div>
+                <div class="text-xs font-semibold text-indigo-700 mt-1">{escape(plan.get('document_type') or 'Uploaded document')}</div>
+              </div>
+              {doc_button}
+            </div>
+            <div class="rounded-xl border border-{summary_tone}-200 bg-{summary_tone}-50 p-3 text-sm font-semibold text-{summary_tone}-900">
+              {escape(summary)}
+            </div>
+            {status_html}
+            {dup_html}
+            <div class="rounded-xl border border-gray-100 bg-white p-3">
+              <div class="text-xs font-bold text-gray-400 uppercase tracking-wide mb-2">Document summary</div>
+              <div class="space-y-2">
+                <div><span class="text-xs text-gray-500">Supplier</span><br><span class="font-semibold text-gray-900">{escape(plan.get('supplier') or '')}</span></div>
+                <div><span class="text-xs text-gray-500">Type</span><br><span class="font-semibold text-gray-900">{escape(plan.get('document_type') or 'Uploaded document')}</span></div>
+                <div><span class="text-xs text-gray-500">Reference / policy clues</span><br><span class="inline-flex flex-wrap gap-1.5 mt-1">{refs_html}</span></div>
+                {main_amount_html}
+              </div>
+            </div>
+          </section>
+          <form method="post" action="/expenses/{escape(token)}/instalment-plan/{escape(plan_id)}/save" class="space-y-3">
+            <div>
+              <h2 class="text-sm font-bold text-gray-900">Choose the bank-feed payments</h2>
+              <p class="text-xs text-gray-500">These labels are the exact text from the uploaded bank feed. Tick the past/current payments this plan should prepare in Xero. New future payments can be prepared after the next bank CSV update.</p>
+            </div>
+            <div class="space-y-2">{match_choices}</div>
+            <div class="rounded-xl border border-gray-200 bg-white p-3">
+              <label class="block text-xs font-bold uppercase tracking-wide text-gray-400 mb-1">Xero expense account</label>
+              <select name="account_code" class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm">
+                {account_options}
+              </select>
+              {no_account_note}
+            </div>
+            <div class="rounded-xl border border-gray-200 bg-white p-3 space-y-3">
+              <div>
+                <label class="block text-xs font-bold uppercase tracking-wide text-gray-400 mb-1">Supplier / Xero contact</label>
+                <input name="contact_name" value="{escape(contact_value, quote=True)}"
+                       class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm">
+              </div>
+              <div>
+                <label class="block text-xs font-bold uppercase tracking-wide text-gray-400 mb-1">Reference</label>
+                <input name="reference" value="{escape(reference_value, quote=True)}"
+                       class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm">
+              </div>
+              <div>
+                <label class="block text-xs font-bold uppercase tracking-wide text-gray-400 mb-1">Description shown in Xero</label>
+                <input name="description" value="{escape(description_value, quote=True)}"
+                       class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm">
+              </div>
+              <div>
+                <label class="block text-xs font-bold uppercase tracking-wide text-gray-400 mb-1">VAT treatment</label>
+                <select name="tax_type" class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm">
+                  {tax_options}
+                </select>
+              </div>
+            </div>
+            <div class="grid grid-cols-2 gap-2">
+              <button type="submit" name="action" value="dismiss"
+                      class="rounded-xl border border-gray-200 bg-white px-3 py-3 text-sm font-bold text-gray-600">
+                Dismiss
+              </button>
+              <button type="submit" name="action" value="approve"{prepare_disabled}
+                      class="{prepare_classes}">
+                {escape(prepare_button)}
+              </button>
+            </div>
+            <p class="text-xs text-gray-500 text-center">This creates a matching Spend Money transaction in Xero and attaches the document. You still use Xero reconciliation to press OK against the bank line.</p>
+          </form>
+        </main>
+        {_expense_receipt_viewer_modal_html()}
+        """)
+
+    @app.post("/expenses/<token>/instalment-plan/<plan_id>/save")
+    def expense_engineer_instalment_plan_save(token: str, plan_id: str):
+        db = config.admin_db_file
+        eng = exp_store.get_engineer_by_token(db, token)
+        if not eng or not eng.get("active"):
+            return _exp_error_page("This expenses link is not active.")
+        if session.get("engineer_id") != eng["id"]:
+            return redirect(url_for("portal_login"))
+        plans = get_json_setting(db, "expense_instalment_plans", {}) or {}
+        plan = plans.get(plan_id)
+        if not plan or int(plan.get("engineer_id") or 0) != int(eng["id"]):
+            return _exp_error_page("Payment plan not found.", 404)
+        action = (request.form.get("action") or "").strip().lower()
+        if action == "dismiss":
+            plan["status"] = "dismissed"
+            plan["dismissed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+            plan["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+            plans[plan_id] = plan
+            set_json_setting(db, "expense_instalment_plans", plans)
+            return redirect(f"/expenses/{token}/instalment-plan/{plan_id}")
+        if action != "approve":
+            return redirect(f"/expenses/{token}/instalment-plan/{plan_id}")
+        match_keys = [
+            str(k or "").strip()
+            for k in request.form.getlist("match_keys")
+            if str(k or "").strip()
+        ]
+        # Backwards compatibility for any open tab still posting the old radio
+        # field from the single-payment version.
+        old_match_key = (request.form.get("match_key") or "").strip()
+        if old_match_key and old_match_key not in match_keys:
+            match_keys.append(old_match_key)
+        account_code = (request.form.get("account_code") or "").strip()
+        exp_accounts = get_json_setting(db, _XERO_EXP_ACCT_SNAPSHOT_KEY, []) or []
+        account_code, account_name = _resolve_expense_account_choice(account_code, exp_accounts)
+        raw_text = str(plan.get("raw_text_preview") or "")
+        supplier = _expense_plan_supplier(str(plan.get("filename") or ""), raw_text)
+        money_values = _expense_plan_money_values(raw_text)
+        bank_matches, _meta = _expense_plan_bank_matches(eng, supplier, raw_text, money_values)
+        match_by_key = {_expense_plan_match_key(r): r for r in bank_matches}
+        if not match_keys and bank_matches:
+            repeated = ((_meta or {}).get("repeated_amounts") or [])
+            if repeated and (repeated[0].get("rows") or []):
+                match_keys = [
+                    _expense_plan_match_key(r)
+                    for r in (repeated[0].get("rows") or [])[:8]
+                    if _expense_plan_match_key(r) in match_by_key
+                ]
+            else:
+                match_keys = [_expense_plan_match_key(bank_matches[0])]
+        selected_pairs = [
+            (key, match_by_key[key])
+            for key in match_keys
+            if key in match_by_key
+        ]
+        if not selected_pairs:
+            return _exp_error_page("Choose at least one bank-feed payment before approving this plan.", 400)
+        if not account_code:
+            return _exp_error_page("Choose a Xero expense account before approving this plan.", 400)
+        contact_name = (request.form.get("contact_name") or "").strip()
+        reference = (request.form.get("reference") or "").strip()
+        description = (request.form.get("description") or "").strip()
+        tax_type = (request.form.get("tax_type") or "").strip()
+        ok_count = 0
+        messages: list[str] = []
+        for match_key, selected in selected_pairs:
+            ok, msg = _expense_plan_prepare_xero(
+                eng,
+                plan,
+                selected=selected,
+                match_key=match_key,
+                account_code=account_code,
+                account_name=account_name,
+                contact_name=contact_name,
+                reference=reference,
+                description=description,
+                tax_type=tax_type,
+            )
+            if ok:
+                ok_count += 1
+            if msg:
+                messages.append(msg)
+        plan["selected_match_keys"] = [key for key, _selected in selected_pairs]
+        plan["selected_match_key"] = selected_pairs[0][0]
+        plan["selected_bank_match"] = selected_pairs[0][1]
+        prepared_matches = plan.get("xero_prepared_matches") or {}
+        prepared_total = sum(
+            1 for key in plan["selected_match_keys"]
+            if str((prepared_matches.get(key) or {}).get("xero_bank_transaction_id") or "").strip()
+        )
+        if prepared_total:
+            plan["status"] = "prepared_in_xero"
+            if prepared_total < len(selected_pairs):
+                plan["xero_error"] = (
+                    f"Prepared {prepared_total} of {len(selected_pairs)} selected payments. "
+                    + " ".join(messages)[0:220]
+                )
+        plans[plan_id] = plan
+        set_json_setting(db, "expense_instalment_plans", plans)
+        return redirect(f"/expenses/{token}/instalment-plan/{plan_id}")
+
+    @app.get("/expenses/<token>/instalment-plan/<plan_id>/document")
+    def expense_engineer_instalment_plan_document(token: str, plan_id: str):
+        db = config.admin_db_file
+        eng = exp_store.get_engineer_by_token(db, token)
+        if not eng or not eng.get("active"):
+            return _exp_error_page("This expenses link is not active.")
+        if session.get("engineer_id") != eng["id"]:
+            return redirect(url_for("portal_login"))
+        plan = (get_json_setting(db, "expense_instalment_plans", {}) or {}).get(plan_id)
+        if not plan or int(plan.get("engineer_id") or 0) != int(eng["id"]):
+            return _exp_error_page("Payment plan not found.", 404)
+        path = os.path.abspath(str(plan.get("stored_file") or ""))
+        upload_root = os.path.abspath(config.receipts_upload_dir)
+        if not path.startswith(upload_root) or not os.path.exists(path):
+            return _exp_error_page("Document file is no longer stored locally.", 404)
+        with open(path, "rb") as fh:
+            head = fh.read(16)
+        mime = _exp_sniff_mime(head) or str(plan.get("mime_type") or "application/octet-stream")
+        return send_file(path, mimetype=mime)
+
     @app.get("/expenses/<token>/customer-receipts")
     def expense_customer_receipt_jobs(token: str):
+        if not CUSTOMER_RECEIPT_PORTAL_ENABLED:
+            return redirect(f"/expenses/{token}")
         db = config.admin_db_file
         eng = exp_store.get_engineer_by_token(db, token)
         if not eng or not eng.get("active"):
@@ -14462,6 +19167,8 @@ body {{ background:#f7f6f3 !important; }}
 
     @app.get("/expenses/<token>/customer-receipts/<path:cal_id>/<event_id>")
     def expense_customer_receipt_upload_page(token: str, cal_id: str, event_id: str):
+        if not CUSTOMER_RECEIPT_PORTAL_ENABLED:
+            return _exp_error_page("Customer receipt calendar uploads have been switched off.", 410)
         db = config.admin_db_file
         eng = exp_store.get_engineer_by_token(db, token)
         if not eng or not eng.get("active"):
@@ -14499,7 +19206,8 @@ body {{ background:#f7f6f3 !important; }}
           {warn}
           <form id="cust-receipt-form" method="post"
                 action="/expenses/{escape(token)}/customer-receipts/{escape(cal_id)}/{escape(event_id)}"
-                enctype="multipart/form-data">
+                enctype="multipart/form-data"
+                class="space-y-3">
             <label for="cust-receipt-file"
                    class="flex flex-col items-center justify-center w-full h-44 rounded-2xl bg-emerald-600 text-white cursor-pointer active:bg-emerald-700 shadow-sm">
               <span class="text-4xl">&#128247;</span>
@@ -14508,6 +19216,14 @@ body {{ background:#f7f6f3 !important; }}
             </label>
             <input id="cust-receipt-file" type="file" name="receipt_file"
                    accept="image/*" capture="environment"
+                   style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none">
+            <label for="cust-receipt-upload-file"
+                   class="flex items-center justify-center gap-2 w-full rounded-2xl border border-emerald-200 bg-emerald-50 text-emerald-900 px-4 py-3 cursor-pointer active:bg-emerald-100 shadow-sm">
+              <span class="text-xl">&#128444;</span>
+              <span class="text-sm font-semibold">Upload from phone</span>
+            </label>
+            <input id="cust-receipt-upload-file" type="file" name="receipt_file"
+                   accept="image/*"
                    style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none">
           </form>
         </main>
@@ -14525,6 +19241,8 @@ body {{ background:#f7f6f3 !important; }}
 
     @app.post("/expenses/<token>/customer-receipts/<path:cal_id>/<event_id>")
     def expense_customer_receipt_upload(token: str, cal_id: str, event_id: str):
+        if not CUSTOMER_RECEIPT_PORTAL_ENABLED:
+            return _exp_error_page("Customer receipt calendar uploads have been switched off.", 410)
         db = config.admin_db_file
         eng = exp_store.get_engineer_by_token(db, token)
         if not eng or not eng.get("active"):
@@ -14579,6 +19297,7 @@ body {{ background:#f7f6f3 !important; }}
                 "raw_text": (parsed.get("raw_text") or "")[:3000],
                 "ocr_error": parsed.get("ocr_error") or "",
             })
+            _customer_receipt_jobs_cache_clear_for_engineer(eng)
             try:
                 ev = build_calendar_service(config).events().get(calendarId=cal_id, eventId=event_id).execute()
                 old_desc = ev.get("description") or ""
@@ -14643,11 +19362,17 @@ body {{ background:#f7f6f3 !important; }}
         if session.get("engineer_id") != eng["id"]:
             return redirect(url_for("portal_login"))
 
+        ajax_upload = (
+            (request.form.get("ajax_upload") or "").strip() == "1"
+            or request.headers.get("X-Requested-With") == "XMLHttpRequest"
+        )
         files = [
             f for f in request.files.getlist("receipt_file")
             if f and (f.filename or "").strip()
         ]
         if not files:
+            if ajax_upload:
+                return jsonify({"ok": False, "error": "no_file", "ids": []}), 400
             return redirect(f"/expenses/{token}")
         payment_source, owner_paid_account_code = _expense_normalise_payment_source(
             eng, request.form.get("payment_source")
@@ -14770,12 +19495,107 @@ body {{ background:#f7f6f3 !important; }}
             try:
                 created.append(_create_receipt_from_file(file))
             except ValueError as exc:
+                if ajax_upload:
+                    return jsonify({"ok": False, "error": str(exc), "ids": []}), 400
                 return _exp_error_page(str(exc), 400)
         if not created:
+            if ajax_upload:
+                return jsonify({"ok": False, "error": "no_receipts", "ids": []}), 400
             return redirect(f"/expenses/{token}")
+        ids = ",".join(str(r["id"]) for r in created if r and r.get("id"))
+        if ajax_upload:
+            return jsonify({
+                "ok": True,
+                "ids": [str(r["id"]) for r in created if r and r.get("id")],
+            })
         if len(created) == 1:
             return redirect(f"/expenses/{token}/review/{created[0]['id']}")
-        ids = ",".join(str(r["id"]) for r in created if r and r.get("id"))
+        return redirect(f"/expenses/{token}/review-upload?ids={urllib.parse.quote(ids)}")
+
+    @app.get("/expenses/<token>/office-uploads")
+    def expense_engineer_open_office_uploads(token: str):
+        """Open receipt files the office uploaded and assigned to this engineer.
+
+        Receipt Dump stores these as dump items first. When the engineer taps
+        the banner, convert active assigned items into normal pending-review
+        receipts so the phone flow is identical to receipts they uploaded
+        themselves. Repeated taps are idempotent because imported dump items are
+        skipped and linked via match_receipt_id.
+        """
+        db = config.admin_db_file
+        eng = exp_store.get_engineer_by_token(db, token)
+        if not eng or not eng.get("active"):
+            return _exp_error_page("This expenses link is not active.")
+        if session.get("engineer_id") != eng["id"]:
+            return redirect(url_for("portal_login"))
+
+        with sqlite3.connect(db) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT i.*
+                FROM expense_dump_items i
+                JOIN expense_dump_batches b ON b.id = i.batch_id
+                WHERE (b.engineer_id = ? OR i.assigned_engineer_id = ?)
+                  AND b.status = 'ready'
+                  AND COALESCE(b.is_test, 0) = 0
+                  AND i.status IN ('new','needs_account','possible_duplicate','suspicious')
+                ORDER BY b.created_at ASC, i.seq ASC, i.created_at ASC
+                LIMIT 50
+                """,
+                (eng["id"], eng["id"]),
+            ).fetchall()
+
+        receipt_ids: list[str] = []
+        for row in rows:
+            item = dump_store._hydrate(dict(row))  # type: ignore[attr-defined]
+            if not item:
+                continue
+            existing_rid = str(item.get("match_receipt_id") or "").strip()
+            if existing_rid:
+                existing = exp_store.get_receipt(db, existing_rid)
+                if existing and existing.get("engineer_id") == eng["id"]:
+                    receipt_ids.append(existing_rid)
+                    dump_store.update_item(
+                        db,
+                        item["id"],
+                        status=dump_store.STATUS_IMPORTED,
+                    )
+                    continue
+            rec = exp_store.create_receipt(
+                db,
+                engineer_id=eng["id"],
+                merchant=item.get("merchant", ""),
+                purchased_on=item.get("purchased_on", ""),
+                amount_inc=item.get("amount_inc"),
+                amount_ex=item.get("amount_ex"),
+                vat_amount=item.get("vat_amount"),
+                currency=item.get("currency", "GBP"),
+                ocr_merchant=item.get("merchant", ""),
+                ocr_amount=item.get("amount_inc"),
+                ocr_date=item.get("purchased_on", ""),
+                ocr_raw=item.get("ocr_raw", ""),
+                ocr_error=item.get("ocr_error", ""),
+                stored_file=item.get("stored_file", ""),
+                filename=item.get("filename", ""),
+                mime_type=item.get("mime_type", ""),
+                category_account_code=item.get("category_account_code", ""),
+                category_account_name=item.get("category_account_name", ""),
+                segments=item.get("segments") or [],
+                payment_source="company_card",
+                status="pending_review",
+            )
+            receipt_ids.append(str(rec["id"]))
+            dump_store.update_item(
+                db,
+                item["id"],
+                status=dump_store.STATUS_IMPORTED,
+                match_receipt_id=str(rec["id"]),
+            )
+
+        if not receipt_ids:
+            return redirect(f"/expenses/{token}")
+        ids = ",".join(receipt_ids)
         return redirect(f"/expenses/{token}/review-upload?ids={urllib.parse.quote(ids)}")
 
     @app.get("/expenses/<token>/review-upload")
@@ -14798,10 +19618,30 @@ body {{ background:#f7f6f3 !important; }}
         return_to = f"/expenses/{token}/review-upload?ids={urllib.parse.quote(','.join(ids))}"
         rows = []
         approved = 0
+        pending_ids = []
+        approved_ready_ids = []
         for rec in receipts:
             status = rec.get("status") or ""
             if status != "pending_review":
                 approved += 1
+            if status == "pending_review":
+                pending_ids.append(str(rec.get("id") or ""))
+            if (
+                status == "approved"
+                and not (rec.get("xero_id") or "").strip()
+                and not rec.get("settlement_id")
+                and (
+                    (
+                        (rec.get("payment_source") or "company_card") == "company_card"
+                        and (eng.get("kind") or "") == "company_card"
+                    )
+                    or (
+                        (rec.get("payment_source") or "company_card") == "owner_paid"
+                        and _expense_owner_no_payout(eng)
+                    )
+                )
+            ):
+                approved_ready_ids.append(str(rec.get("id") or ""))
             merchant = rec.get("merchant") or rec.get("ocr_merchant") or rec.get("filename") or "Receipt"
             amount = _exp_money(rec.get("amount_inc"), rec.get("currency") or "GBP")
             date = _exp_uk_date(rec.get("purchased_on") or "")
@@ -14820,13 +19660,81 @@ body {{ background:#f7f6f3 !important; }}
                 "</div></a>"
             )
         all_done = approved == len(receipts)
+        next_href = ""
+        if pending_ids:
+            next_href = (
+                f"/expenses/{escape(token)}/review/{escape(pending_ids[0])}"
+                f"?return_to={urllib.parse.quote(return_to)}"
+            )
+        flash = (request.args.get("flash") or "").strip()
+        flash_html = ""
+        if flash == "deleted":
+            flash_html = (
+                "<div class='rounded-xl border border-gray-200 bg-gray-50 "
+                "p-3 text-sm text-gray-700 text-center'>Receipt removed. "
+                "You are still in the review queue.</div>"
+            )
+        elif flash == "duplicate":
+            flash_html = (
+                "<div class='rounded-xl border border-red-200 bg-red-50 "
+                "p-3 text-sm text-red-800 text-center'>Duplicate ignored. "
+                "You are still in the review queue.</div>"
+            )
+        elif flash == "xero_batch":
+            sent = escape(request.args.get("sent") or "0")
+            blocked = escape(request.args.get("blocked") or "0")
+            remaining = escape(request.args.get("remaining") or "0")
+            flash_html = (
+                "<div class='rounded-xl border border-emerald-200 bg-emerald-50 "
+                "p-3 text-sm text-emerald-800 text-center'>"
+                f"Xero submit run complete: {sent} sent, {blocked} need a check, "
+                f"{remaining} approved receipt(s) still waiting.</div>"
+            )
         done_html = ""
         if all_done:
             done_html = (
                 "<div class='rounded-xl border border-emerald-200 bg-emerald-50 "
                 "p-3 text-sm text-emerald-800 text-center'>All uploaded receipts "
-                "are approved.</div>"
+                "are checked.</div>"
             )
+        next_html = ""
+        if next_href:
+            next_html = (
+                f"<a href='{next_href}' class='block w-full rounded-xl bg-emerald-600 "
+                "px-4 py-3 text-center text-sm font-bold text-white active:bg-emerald-700'>"
+                "Review next receipt</a>"
+            )
+        submit_html = ""
+        if approved_ready_ids:
+            if all_done:
+                submit_html = (
+                    "<form method='post' action='/expenses/"
+                    + escape(token) + "/review-upload/submit' "
+                    "class='rounded-xl border border-indigo-200 bg-indigo-50 p-3 space-y-2'>"
+                    f"<input type='hidden' name='ids' value='{escape(','.join(ids))}'>"
+                    f"<div class='text-sm font-bold text-indigo-950'>Submit {len(approved_ready_ids)} checked receipt"
+                    f"{'s' if len(approved_ready_ids) != 1 else ''} to Xero</div>"
+                    "<div class='text-xs text-indigo-800'>This is the only point where the app contacts Xero. "
+                    "If Xero is busy or the safety limit is warm, the remaining receipts stay approved and can be resumed.</div>"
+                    "<div class='h-2 overflow-hidden rounded-full bg-indigo-100'>"
+                    "<div class='h-full w-full rounded-full bg-indigo-500'></div></div>"
+                    "<button type='submit' class='w-full rounded-xl bg-indigo-600 px-4 py-3 text-sm font-bold text-white active:bg-indigo-700'>"
+                    "Submit approved to Xero</button>"
+                    "</form>"
+                )
+            elif pending_ids:
+                submit_html = (
+                    "<div class='rounded-xl border border-indigo-100 bg-indigo-50 p-3 text-xs "
+                    "font-semibold text-indigo-800'>Checked receipts are being saved locally. "
+                    "When the review queue is finished, you can submit the approved set to Xero in one controlled run.</div>"
+                )
+            else:
+                submit_html = (
+                    "<div class='rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs "
+                    "font-semibold text-amber-800'>Some checked receipts are still waiting because "
+                    "the Xero safety limit was reached. Reopen this review queue later and the app "
+                    "will continue from the remaining receipts.</div>"
+                )
         return _page(f"""
         <main data-receipt-page class="max-w-xl mx-auto p-4 space-y-4">
           <div class="pt-2 flex items-center justify-between">
@@ -14842,10 +19750,36 @@ body {{ background:#f7f6f3 !important; }}
             <a href="/expenses/{escape(token)}"
                class="text-sm font-semibold text-indigo-600">Finish</a>
           </div>
+          {flash_html}
+          {next_html}
+          {submit_html}
           {done_html}
           <div class="space-y-2">{''.join(rows)}</div>
         </main>
         """)
+
+    @app.post("/expenses/<token>/review-upload/submit")
+    def expense_engineer_review_upload_submit(token: str):
+        db = config.admin_db_file
+        eng = exp_store.get_engineer_by_token(db, token)
+        if not eng or not eng.get("active"):
+            return _exp_error_page("This expenses link is not active.")
+        if session.get("engineer_id") != eng["id"]:
+            return redirect(url_for("portal_login"))
+        raw_ids = (request.form.get("ids") or "").strip()
+        ids = [x.strip() for x in raw_ids.split(",") if x.strip()]
+        if not ids:
+            return redirect(f"/expenses/{token}")
+        result = _submit_review_upload_receipts_to_xero(eng, ids)
+        return_to = (
+            f"/expenses/{token}/review-upload?ids={urllib.parse.quote(','.join(ids))}"
+        )
+        return redirect(
+            return_to
+            + f"&flash=xero_batch&sent={result.get('sent', 0)}"
+            + f"&blocked={result.get('blocked', 0)}"
+            + f"&remaining={result.get('remaining', 0)}"
+        )
 
     @app.get("/expenses/<token>/review/<rid>")
     def expense_engineer_review(token: str, rid: str):
@@ -14862,6 +19796,47 @@ body {{ background:#f7f6f3 !important; }}
         if not return_to.startswith(f"/expenses/{token}/review-upload"):
             return_to = ""
         back_href = return_to or f"/expenses/{token}"
+        review_ids: list[str] = []
+        next_review_href = ""
+        review_position_html = ""
+        if return_to:
+            try:
+                parsed_return = urllib.parse.urlparse(return_to)
+                review_ids = [
+                    x.strip()
+                    for x in urllib.parse.parse_qs(parsed_return.query).get("ids", [""])[0].split(",")
+                    if x.strip()
+                ]
+            except Exception:
+                review_ids = []
+            current_index = review_ids.index(rid) if rid in review_ids else -1
+            for candidate_id in review_ids[current_index + 1 if current_index >= 0 else 0:]:
+                candidate = exp_store.get_receipt(db, candidate_id)
+                if (
+                    candidate
+                    and candidate.get("engineer_id") == eng["id"]
+                    and (candidate.get("status") or "") == "pending_review"
+                ):
+                    next_review_href = (
+                        f"/expenses/{escape(token)}/review/{escape(candidate_id)}"
+                        f"?return_to={urllib.parse.quote(return_to)}"
+                    )
+                    break
+            pending_left = 0
+            for candidate_id in review_ids:
+                candidate = exp_store.get_receipt(db, candidate_id)
+                if (
+                    candidate
+                    and candidate.get("engineer_id") == eng["id"]
+                    and (candidate.get("status") or "") == "pending_review"
+                ):
+                    pending_left += 1
+            review_position_html = (
+                "<div class='rounded-xl border border-indigo-100 bg-indigo-50 p-3 "
+                "text-xs text-indigo-800'>"
+                f"{pending_left} receipt{'s' if pending_left != 1 else ''} still need checking in this queue."
+                "</div>"
+            )
 
         _settings = get_expense_settings(db)
         vat_rate = _settings["vat_rate"]
@@ -14871,8 +19846,12 @@ body {{ background:#f7f6f3 !important; }}
         # Category = which Xero expense account this receipt is coded against
         # (fuel, advertising, plant & hire, etc.). Default to the engineer's
         # account, then the global default, so engineers usually just confirm it.
-        _at, _tid, _ = _load_xero_at_tid(config)
-        exp_accounts, _ = _get_xero_expense_accounts(_at, _tid, config.admin_db_file)
+        exp_accounts = get_json_setting(db, _XERO_EXP_ACCT_SNAPSHOT_KEY, []) or []
+        if not exp_accounts:
+            _at, _tid, _ = _load_xero_at_tid(config)
+            exp_accounts, _ = _get_xero_expense_accounts(
+                _at, _tid, config.admin_db_file
+            )
         category_html = ""
         if exp_accounts:
             selected_raw = (
@@ -14935,6 +19914,16 @@ body {{ background:#f7f6f3 !important; }}
             + _vat_mode_card("mixed", "Mixed VAT", "some items only")
             + "</div>"
             "<p id='vat_mode_hint' class='text-xs text-gray-400 mt-1'></p>"
+            "<div id='mixed_vat_fields' class='hidden mt-3 rounded-lg border border-emerald-200 bg-emerald-50 p-3'>"
+            "<div class='text-xs font-semibold text-emerald-900 mb-2'>Split the total by VAT treatment</div>"
+            "<div class='grid grid-cols-2 gap-3'>"
+            "<div><label class='block text-[11px] font-medium text-emerald-800 mb-1'>VAT-rated portion (inc VAT)</label>"
+            "<input id='mixed_vat_gross' type='number' min='0' step='0.01' inputmode='decimal' "
+            "class='w-full rounded-lg border border-emerald-300 bg-white px-3 py-2 text-base' placeholder='0.00'></div>"
+            "<div><label class='block text-[11px] font-medium text-emerald-800 mb-1'>No-VAT portion</label>"
+            "<input id='mixed_no_vat_gross' type='number' min='0' step='0.01' inputmode='decimal' "
+            "class='w-full rounded-lg border border-emerald-300 bg-white px-3 py-2 text-base' placeholder='0.00'></div>"
+            "</div><p id='mixed_vat_total_hint' class='text-[11px] text-emerald-700 mt-2'></p></div>"
             "</div>"
         )
         segments = rec.get("segments") or []
@@ -14972,6 +19961,14 @@ body {{ background:#f7f6f3 !important; }}
                 "text-xs text-amber-800'>We couldn't read this receipt automatically &mdash; "
                 "please fill in the details below.</div>"
             )
+        xero_error_note = ""
+        if (rec.get("xero_error") or "").strip():
+            xero_error_note = (
+                "<div class='rounded-lg bg-red-50 border border-red-200 p-3 "
+                "text-xs text-red-800'>"
+                + escape(str(rec.get("xero_error") or ""))
+                + "</div>"
+            )
 
         photo_html = (
             f"<a href='/expenses/{escape(token)}/photo/{escape(rid)}' target='_blank' "
@@ -14991,7 +19988,24 @@ body {{ background:#f7f6f3 !important; }}
                 f"text-xs text-blue-800'>This receipt is already "
                 f"{escape(rec.get('status'))}. You can still correct the details.</div>"
             )
-        duplicate_warning_html = _receipt_duplicate_warning_html(rec, eng)
+        duplicate_warning_html = _receipt_duplicate_warning_html(
+            rec,
+            eng,
+            image_url_for_receipt=lambda _rid: (
+                "/expenses/" + escape(token) + "/photo/" + escape(str(_rid))
+                + "?preview=1"
+            ),
+            xero_attachment_url_for_match=lambda _endpoint, _xid: (
+                "/expenses/" + escape(token) + "/receipt/" + escape(rid)
+                + "/xero-duplicate/" + escape(str(_endpoint)) + "/"
+                + escape(str(_xid)) + "?preview=1"
+            ),
+            accept_url=(
+                "/expenses/" + escape(token) + "/receipt/" + escape(rid)
+                + "/accept-duplicate"
+            ),
+            accept_return_to=return_to,
+        )
         can_delete = (
             (rec.get("status") or "").strip().lower() in {"pending_review", "approved"}
             and not (rec.get("xero_id") or "").strip()
@@ -15003,6 +20017,7 @@ body {{ background:#f7f6f3 !important; }}
                 f"<form method='post' action='/expenses/{escape(token)}/receipt/"
                 f"{escape(rid)}/delete' "
                 "onsubmit=\"return confirm('Delete this receipt before it is submitted?')\">"
+                f"<input type='hidden' name='return_to' value='{escape(return_to)}'>"
                 "<button type='submit' class='w-full py-3 rounded-xl border "
                 "border-rose-200 bg-white text-rose-700 font-semibold text-sm "
                 "active:bg-rose-50'>Delete receipt</button>"
@@ -15036,6 +20051,19 @@ body {{ background:#f7f6f3 !important; }}
         else:
             source_html = "<input type='hidden' name='payment_source' value='owner_paid'>"
 
+        submit_buttons_html = (
+            "<button type='submit' name='go_next' value='1' "
+            "class='w-full py-4 rounded-xl bg-emerald-600 text-white font-semibold text-base "
+            "active:bg-emerald-700'>Approve &amp; next &#10003;</button>"
+            "<button type='submit' name='go_next' value='0' "
+            "class='w-full py-3 rounded-xl border border-gray-200 bg-white text-gray-700 "
+            "font-semibold text-sm active:bg-gray-50'>Approve &amp; return to list</button>"
+            if return_to else
+            "<button type='submit' "
+            "class='w-full py-4 rounded-xl bg-emerald-600 text-white font-semibold text-base "
+            "active:bg-emerald-700'>Approve &amp; Save &#10003;</button>"
+        )
+
         return _page(
             f"""
             <main class="max-w-xl mx-auto p-4 space-y-4">
@@ -15045,9 +20073,12 @@ body {{ background:#f7f6f3 !important; }}
               </div>
               {photo_html}
               {ocr_note}
+              {xero_error_note}
               {status_note}
               {duplicate_warning_html}
-              <form method="post" action="/expenses/{escape(token)}/review/{escape(rid)}"
+              {review_position_html}
+              {_expense_receipt_viewer_modal_html()}
+              <form id="receipt-review-form" method="post" action="/expenses/{escape(token)}/review/{escape(rid)}"
                     class="space-y-4 rounded-xl border border-gray-200 bg-white p-4">
                 <input type="hidden" name="return_to" value="{escape(return_to)}">
                 <div id="vat_meta" data-rate="{vat_rate}"></div>
@@ -15066,7 +20097,7 @@ body {{ background:#f7f6f3 !important; }}
                 {category_html}
                 {segment_html}
                 <div>
-                  <label class="block text-xs font-medium text-gray-500 mb-1">Total paid (inc VAT)</label>
+                  <label class="block text-xs font-medium text-gray-500 mb-1">Total paid</label>
                   <input id="amount_inc" type="number" step="0.01" inputmode="decimal"
                          name="amount_inc" value="{inc_v}"
                          class="w-full rounded-lg border border-gray-300 px-3 py-2 text-lg font-semibold"
@@ -15081,18 +20112,15 @@ body {{ background:#f7f6f3 !important; }}
                            class="w-full rounded-lg border border-gray-300 px-3 py-2 text-base">
                   </div>
                   <div>
-                    <label class="block text-xs font-medium text-gray-500 mb-1">VAT</label>
+                    <label class="block text-xs font-medium text-gray-500 mb-1">VAT amount</label>
                     <input id="vat_amount" type="number" step="0.01" inputmode="decimal"
                            name="vat_amount" value="{vat_v}"
                            class="w-full rounded-lg border border-gray-300 px-3 py-2 text-base">
                   </div>
                 </div>
-                <button type="submit"
-                        class="w-full py-4 rounded-xl bg-emerald-600 text-white font-semibold text-base
-                               active:bg-emerald-700">
-                  Approve &amp; Save &#10003;
-                </button>
+                <div class="space-y-2">{submit_buttons_html}</div>
               </form>
+              {f'<a href="{next_review_href}" class="block text-center text-sm font-semibold text-indigo-600">Skip to next receipt</a>' if next_review_href else ''}
               {delete_html}
             </main>
             <script>
@@ -15102,7 +20130,20 @@ body {{ background:#f7f6f3 !important; }}
               var vat = document.getElementById('vat_amount');
               var meta = document.getElementById('vat_meta');
               var hint = document.getElementById('vat_mode_hint');
+              var mixedFields = document.getElementById('mixed_vat_fields');
+              var mixedVatGross = document.getElementById('mixed_vat_gross');
+              var mixedNoVatGross = document.getElementById('mixed_no_vat_gross');
+              var mixedTotalHint = document.getElementById('mixed_vat_total_hint');
               var rate = parseFloat(meta.getAttribute('data-rate')) || 0;
+              var syncing = false;
+              function numberValue(field) {{
+                var value = parseFloat(field && field.value);
+                return isFinite(value) ? value : 0;
+              }}
+              function selectMode(value) {{
+                var radio = document.querySelector('input[name="vat_mode"][value="' + value + '"]');
+                if (radio) radio.checked = true;
+              }}
               function mode() {{
                 var picked = document.querySelector('input[name="vat_mode"]:checked');
                 return picked ? picked.value : 'standard';
@@ -15113,14 +20154,46 @@ body {{ background:#f7f6f3 !important; }}
                 if (m === 'no_vat') {{
                   hint.textContent = 'Use this when the receipt does not show reclaimable VAT.';
                 }} else if (m === 'mixed') {{
-                  hint.textContent = 'Use this when only some receipt lines have VAT. Check the Ex VAT and VAT boxes before saving.';
+                  hint.textContent = 'Enter how much of the total had VAT and how much had no VAT.';
                 }} else {{
                   hint.textContent = 'Use this for ordinary VAT receipts where the whole total is standard-rated.';
                 }}
+                if (mixedFields) mixedFields.classList.toggle('hidden', m !== 'mixed');
               }}
-              function recalc(force) {{
-                var v = parseFloat(inc.value) || 0;
-                if (v <= 0) {{ return; }}
+              function syncMixedFromTotals() {{
+                var total = numberValue(inc);
+                var vatValue = Math.max(0, Math.min(total, numberValue(vat)));
+                var vatFraction = rate > 0 ? rate / (100 + rate) : 0;
+                var ratedGross = vatFraction > 0 ? vatValue / vatFraction : 0;
+                ratedGross = Math.max(0, Math.min(total, ratedGross));
+                mixedVatGross.value = ratedGross.toFixed(2);
+                mixedNoVatGross.value = Math.max(0, total - ratedGross).toFixed(2);
+                if (mixedTotalHint) mixedTotalHint.textContent = 'Allocated total: £' + total.toFixed(2);
+              }}
+              function syncTotalsFromMixed(changed) {{
+                if (syncing) return;
+                syncing = true;
+                var total = numberValue(inc);
+                var ratedGross = Math.max(0, Math.min(total, numberValue(mixedVatGross)));
+                var noVatGross = Math.max(0, Math.min(total, numberValue(mixedNoVatGross)));
+                if (changed === 'rated') {{
+                  noVatGross = Math.max(0, total - ratedGross);
+                  mixedNoVatGross.value = noVatGross.toFixed(2);
+                }} else {{
+                  ratedGross = Math.max(0, total - noVatGross);
+                  mixedVatGross.value = ratedGross.toFixed(2);
+                }}
+                var ratedNet = rate > 0 ? ratedGross / (1 + rate / 100) : ratedGross;
+                var vatValue = ratedGross - ratedNet;
+                ex.value = (ratedNet + noVatGross).toFixed(2);
+                vat.value = vatValue.toFixed(2);
+                if (mixedTotalHint) mixedTotalHint.textContent = 'Allocated total: £' + (ratedGross + noVatGross).toFixed(2);
+                syncing = false;
+              }}
+              function recalcFromTotal() {{
+                if (syncing) return;
+                syncing = true;
+                var v = numberValue(inc);
                 var m = mode();
                 if (m === 'no_vat') {{
                   ex.value = v.toFixed(2);
@@ -15129,22 +20202,112 @@ body {{ background:#f7f6f3 !important; }}
                   var exVal = rate ? (v / (1 + rate / 100)) : v;
                   ex.value = exVal.toFixed(2);
                   vat.value = (v - exVal).toFixed(2);
-                }} else if (force) {{
-                  // Mixed VAT is editable because only part of the receipt may
-                  // be VAT-rated. Do not overwrite the parser/user values on
-                  // normal total edits.
+                }} else {{
+                  var currentVat = Math.max(0, Math.min(v, numberValue(vat)));
+                  vat.value = currentVat.toFixed(2);
+                  ex.value = (v - currentVat).toFixed(2);
                 }}
+                syncing = false;
+                if (m === 'mixed') syncMixedFromTotals();
                 updateHint();
               }}
-              inc.addEventListener('input', function() {{ recalc(false); }});
+              function recalcPair(changed) {{
+                if (syncing) return;
+                syncing = true;
+                var total = numberValue(inc);
+                if (changed === 'vat') {{
+                  var vatValue = Math.max(0, Math.min(total, numberValue(vat)));
+                  ex.value = (total - vatValue).toFixed(2);
+                }} else {{
+                  var exValue = Math.max(0, Math.min(total, numberValue(ex)));
+                  vat.value = (total - exValue).toFixed(2);
+                }}
+                var expectedEx = rate ? total / (1 + rate / 100) : total;
+                if (Math.abs(numberValue(ex) - expectedEx) > 0.02) selectMode('mixed');
+                syncing = false;
+                updateHint();
+                if (mode() === 'mixed') syncMixedFromTotals();
+              }}
+              inc.addEventListener('input', recalcFromTotal);
+              vat.addEventListener('input', function() {{ recalcPair('vat'); }});
+              ex.addEventListener('input', function() {{ recalcPair('ex'); }});
+              mixedVatGross.addEventListener('input', function() {{ syncTotalsFromMixed('rated'); }});
+              mixedNoVatGross.addEventListener('input', function() {{ syncTotalsFromMixed('no_vat'); }});
               document.querySelectorAll('input[name="vat_mode"]').forEach(function(r) {{
-                r.addEventListener('change', function() {{ recalc(true); }});
+                r.addEventListener('change', function() {{
+                  updateHint();
+                  if (mode() === 'mixed') syncMixedFromTotals();
+                  else recalcFromTotal();
+                }});
               }});
               updateHint();
+              if (mode() === 'mixed') syncMixedFromTotals();
             }})();
             </script>
             """
         )
+
+    @app.post("/expenses/<token>/bank-feed-updated-dismiss")
+    def expense_engineer_dismiss_bank_feed_updated(token: str):
+        db = config.admin_db_file
+        eng = exp_store.get_engineer_by_token(db, token)
+        if not eng or not eng.get("active"):
+            return _exp_error_page("This expenses link is not active.")
+        if session.get("engineer_id") != eng["id"]:
+            return redirect(url_for("portal_login"))
+        stamp = (request.form.get("feed_stamp") or "").strip()
+        if stamp:
+            try:
+                dismissed = get_json_setting(db, "engineer_bank_feed_update_dismissals", {}) or {}
+                dismissed[str(eng.get("id") or "")] = stamp
+                set_json_setting(db, "engineer_bank_feed_update_dismissals", dismissed)
+            except Exception as exc:
+                print(f"[expenses] bank feed notice dismiss failed: {exc}", flush=True)
+        return redirect(f"/expenses/{token}")
+
+    @app.post("/expenses/<token>/receipt/<rid>/payment-account")
+    def expense_engineer_receipt_payment_account(token: str, rid: str):
+        db = config.admin_db_file
+        eng = exp_store.get_engineer_by_token(db, token)
+        if not eng or not eng.get("active"):
+            return _exp_error_page("This expenses link is not active.")
+        if session.get("engineer_id") != eng["id"]:
+            return redirect(url_for("portal_login"))
+        rec = exp_store.get_receipt(db, rid)
+        if not rec or rec.get("engineer_id") != eng["id"]:
+            return _exp_error_page("Receipt not found.")
+        if rec.get("settlement_id"):
+            return _exp_error_page(
+                "This receipt is already linked to a payout, so its payment account cannot be changed here.",
+                400,
+            )
+        raw_choice = (request.form.get("account_choice") or "").strip()
+        try:
+            choice = json.loads(raw_choice)
+        except Exception:
+            choice = {}
+        source = "owner_paid" if choice.get("source") == "owner_paid" else "company_card"
+        feed_id = str(choice.get("feed") or "").strip()
+        payment_account = str(choice.get("payment") or "").strip()
+        if source == "owner_paid" and not payment_account:
+            return _exp_error_page("Choose a personal / owner-paid account.", 400)
+        if source == "company_card" and not (feed_id or payment_account):
+            return _exp_error_page("Choose a card or payment account.", 400)
+        updates = {
+            "payment_source": source,
+            "owner_paid_account_code": payment_account if source == "owner_paid" else "",
+            "payment_account_code_override": payment_account if source == "company_card" else "",
+            "feed_account_id_override": feed_id if source == "company_card" else "",
+        }
+        current_error = str(rec.get("xero_error") or "").strip()
+        if current_error.lower().startswith((
+            "cannot submit to xero yet",
+            "xero submit failed",
+            "xero is paused",
+        )):
+            updates["xero_error"] = ""
+        exp_store.update_receipt(db, rid, **updates)
+        return redirect(f"/expenses/{token}?flash=account_changed")
 
     @app.post("/expenses/<token>/review/<rid>")
     def expense_engineer_review_save(token: str, rid: str):
@@ -15157,6 +20320,48 @@ body {{ background:#f7f6f3 !important; }}
         rec = exp_store.get_receipt(db, rid)
         if not rec or rec.get("engineer_id") != eng["id"]:
             return _exp_error_page("Receipt not found.")
+        return_to = (request.form.get("return_to") or "").strip()
+        if not return_to.startswith(f"/expenses/{token}/review-upload"):
+            return_to = ""
+        go_next = request.form.get("go_next") == "1"
+
+        def _next_review_url() -> str:
+            if not return_to:
+                return ""
+            try:
+                parsed_return = urllib.parse.urlparse(return_to)
+                review_ids = [
+                    x.strip()
+                    for x in urllib.parse.parse_qs(parsed_return.query).get("ids", [""])[0].split(",")
+                    if x.strip()
+                ]
+            except Exception:
+                review_ids = []
+            try:
+                start_index = review_ids.index(rid) + 1
+            except ValueError:
+                start_index = 0
+            for candidate_id in review_ids[start_index:]:
+                candidate = exp_store.get_receipt(db, candidate_id)
+                if (
+                    candidate
+                    and candidate.get("engineer_id") == eng["id"]
+                    and (candidate.get("status") or "") == "pending_review"
+                ):
+                    return (
+                        f"/expenses/{token}/review/{urllib.parse.quote(candidate_id)}"
+                        f"?return_to={urllib.parse.quote(return_to)}"
+                    )
+            return ""
+
+        def _review_done_redirect() -> str:
+            if go_next:
+                nxt = _next_review_url()
+                if nxt:
+                    return redirect(nxt)
+            if return_to:
+                return redirect(return_to)
+            return redirect(f"/expenses/{token}?flash=approved")
 
         def _num(name):
             raw = (request.form.get(name) or "").strip()
@@ -15176,12 +20381,19 @@ body {{ background:#f7f6f3 !important; }}
         )
 
         updates = dict(
-            merchant=(request.form.get("merchant") or "").strip()[:120],
+            merchant=_clean_receipt_merchant(
+                request.form.get("merchant") or "",
+                request.form.get("merchant") or "",
+            )[:120],
             purchased_on=(request.form.get("purchased_on") or "").strip(),
             amount_inc=amount_inc,
             amount_ex=amount_ex,
             vat_amount=vat_amount,
-            status="approved",
+            status=(
+                "submitted"
+                if (rec.get("xero_id") or "").strip()
+                else "approved"
+            ),
         )
         payment_source, owner_paid_account_code = _expense_normalise_payment_source(
             eng,
@@ -15197,8 +20409,14 @@ body {{ background:#f7f6f3 !important; }}
         # category instead of silently clearing it.
         if "category_account_code" in request.form:
             category_code = (request.form.get("category_account_code") or "").strip()
-            _at, _tid, _ = _load_xero_at_tid(config)
-            _exp_accounts, _ = _get_xero_expense_accounts(_at, _tid, config.admin_db_file)
+            _exp_accounts = get_json_setting(
+                db, _XERO_EXP_ACCT_SNAPSHOT_KEY, []
+            ) or []
+            if not _exp_accounts:
+                _at, _tid, _ = _load_xero_at_tid(config)
+                _exp_accounts, _ = _get_xero_expense_accounts(
+                    _at, _tid, config.admin_db_file
+                )
             category_code, category_name = _resolve_expense_account_choice(
                 category_code, _exp_accounts
             )
@@ -15223,17 +20441,66 @@ body {{ background:#f7f6f3 !important; }}
             actor=f"engineer:{eng.get('name') or eng.get('username') or eng.get('id')}",
         )
         exp_store.update_receipt(db, rid, **updates)
+        refreshed = exp_store.get_receipt(db, rid) or rec
+        dup = _receipt_unresolved_exact_duplicate(refreshed, eng)
+        if dup:
+            exp_store.update_receipt(
+                db,
+                rid,
+                xero_error=_receipt_duplicate_block_message(refreshed, dup),
+            )
+            if return_to:
+                return redirect(return_to)
+            return redirect(f"/expenses/{token}/review/{escape(rid)}?duplicate=1")
+        if (refreshed.get("xero_id") or "").strip():
+            _sync_receipt_correction_to_xero(eng, rec, refreshed)
+            exp_store.update_receipt(db, rid, status="submitted")
+            return _review_done_redirect()
+        if return_to:
+            # In multi-receipt review mode, do not submit on every "next" tap.
+            # The checked set is submitted only from the explicit batch button,
+            # keeping review fast and preventing hidden Xero bursts.
+            return _review_done_redirect()
+        return redirect(f"/expenses/{token}?flash=approved")
+
+    @app.post("/expenses/<token>/receipt/<rid>/accept-duplicate")
+    def expense_engineer_accept_duplicate(token: str, rid: str):
+        db = config.admin_db_file
+        eng = exp_store.get_engineer_by_token(db, token)
+        if not eng or not eng.get("active"):
+            return _exp_error_page("This expenses link is not active.")
+        if session.get("engineer_id") != eng["id"]:
+            return redirect(url_for("portal_login"))
+        rec = exp_store.get_receipt(db, rid)
+        if not rec or rec.get("engineer_id") != eng["id"]:
+            return _exp_error_page("Receipt not found.")
+        status = (rec.get("status") or "").strip().lower()
         if (
-            updates.get("payment_source") == "owner_paid"
-            and _expense_owner_no_payout(eng)
+            status not in {"pending_review", "approved", "failed", "submitted", "ignored"}
+            or rec.get("settlement_id")
         ):
-            _submit_owner_no_payout_receipt_to_xero(eng, rid)
-        elif updates.get("payment_source") == "company_card":
-            _submit_company_card_receipt_to_xero(eng, rid)
+            return _exp_error_page(
+                "This receipt is linked to a payout, so it cannot be marked as a "
+                "duplicate here.",
+                400,
+            )
+        exp_store.update_receipt(
+            db,
+            rid,
+            status="ignored",
+            xero_error="Accepted as duplicate by user; not submitted to Xero.",
+        )
+        wants_json = (
+            request.headers.get("X-Requested-With") == "fetch"
+            or "application/json" in (request.headers.get("Accept") or "")
+        )
+        if wants_json:
+            return jsonify({"ok": True, "id": rid, "status": "ignored"})
         return_to = (request.form.get("return_to") or "").strip()
         if return_to.startswith(f"/expenses/{token}/review-upload"):
-            return redirect(return_to)
-        return redirect(f"/expenses/{token}?flash=approved")
+            joiner = "&" if "?" in return_to else "?"
+            return redirect(return_to + joiner + "flash=duplicate")
+        return redirect(f"/expenses/{token}?flash=duplicate")
 
     @app.post("/expenses/<token>/receipt/<rid>/delete")
     def expense_engineer_delete_receipt(token: str, rid: str):
@@ -15248,18 +20515,21 @@ body {{ background:#f7f6f3 !important; }}
             return _exp_error_page("Receipt not found.")
         status = (rec.get("status") or "").strip().lower()
         if (
-            status not in {"pending_review", "approved"}
-            or (rec.get("xero_id") or "").strip()
+            status not in {"pending_review", "approved", "failed", "submitted", "ignored"}
             or rec.get("settlement_id")
         ):
             return _exp_error_page(
-                "This receipt has already been submitted or linked to a payment, "
-                "so it cannot be deleted from the engineer screen.",
+                "This receipt is linked to a payout, so it cannot be deleted from "
+                "the engineer screen.",
                 400,
             )
         stored_file = rec.get("stored_file") or ""
         exp_store.delete_receipt(db, rid)
         _exp_safe_remove_file(db, stored_file)
+        return_to = (request.form.get("return_to") or "").strip()
+        if return_to.startswith(f"/expenses/{token}/review-upload"):
+            joiner = "&" if "?" in return_to else "?"
+            return redirect(return_to + joiner + "flash=deleted")
         return redirect(f"/expenses/{token}?flash=deleted")
 
     @app.get("/expenses/<token>/photo/<rid>")
@@ -15289,6 +20559,25 @@ body {{ background:#f7f6f3 !important; }}
                     except OSError:
                         pass
                 mime = _exp_sniff_mime(data[:16]) or "application/octet-stream"
+                if (
+                    request.args.get("preview") == "1"
+                    and request.args.get("raw") != "1"
+                    and mime.startswith("image/")
+                ):
+                    raw_href = escape(request.path + "?raw=1", quote=True)
+                    return Response(
+                        "<!doctype html><html><head><meta name='viewport' "
+                        "content='width=device-width,initial-scale=1'>"
+                        "<style>html,body{margin:0;width:100%;height:100%;"
+                        "background:#f8fafc;overflow:auto;}body{min-height:100vh;display:flex;"
+                        "align-items:center;justify-content:center;}"
+                        "img{display:block;max-width:100vw;max-height:100dvh;"
+                        "width:100vw;height:100dvh;object-fit:contain;touch-action:"
+                        "pinch-zoom;}</style></head><body>"
+                        f"<img src='{raw_href}' alt='Receipt preview'>"
+                        "</body></html>",
+                        mimetype="text/html",
+                    )
                 resp = Response(data, mimetype=mime)
                 resp.headers["X-Content-Type-Options"] = "nosniff"
                 return resp
@@ -15296,13 +20585,33 @@ body {{ background:#f7f6f3 !important; }}
         with open(path, "rb") as fh:
             head = fh.read(16)
         safe_mime = _exp_sniff_mime(head)
+        if (
+            safe_mime
+            and safe_mime.startswith("image/")
+            and request.args.get("preview") == "1"
+            and request.args.get("raw") != "1"
+        ):
+            raw_href = escape(request.path + "?raw=1", quote=True)
+            return Response(
+                "<!doctype html><html><head><meta name='viewport' "
+                "content='width=device-width,initial-scale=1'>"
+                "<style>html,body{margin:0;width:100%;height:100%;"
+                "background:#f8fafc;overflow:auto;}body{min-height:100vh;display:flex;"
+                "align-items:center;justify-content:center;}"
+                "img{display:block;max-width:100vw;max-height:100dvh;"
+                "width:100vw;height:100dvh;object-fit:contain;touch-action:"
+                "pinch-zoom;}</style></head><body>"
+                f"<img src='{raw_href}' alt='Receipt preview'>"
+                "</body></html>",
+                mimetype="text/html",
+            )
         if safe_mime and safe_mime.startswith("image/"):
             resp = send_file(path, mimetype=safe_mime)
         elif safe_mime == "application/pdf":
             resp = send_file(
                 path,
                 mimetype="application/pdf",
-                as_attachment=True,
+                as_attachment=request.args.get("preview") != "1",
                 download_name="receipt.pdf",
             )
         else:
@@ -15314,6 +20623,23 @@ body {{ background:#f7f6f3 !important; }}
             )
         resp.headers["X-Content-Type-Options"] = "nosniff"
         return resp
+
+    @app.get("/expenses/<token>/receipt/<rid>/xero-duplicate/<endpoint>/<xid>")
+    def expense_engineer_xero_duplicate_attachment(
+        token: str, rid: str, endpoint: str, xid: str
+    ):
+        db = config.admin_db_file
+        eng = exp_store.get_engineer_by_token(db, token)
+        if not eng or not eng.get("active"):
+            return _exp_error_page("Not found.", 404)
+        if session.get("engineer_id") != eng["id"]:
+            return redirect(url_for("portal_login"))
+        rec = exp_store.get_receipt(db, rid)
+        if not rec or rec.get("engineer_id") != eng["id"]:
+            return _exp_error_page("Not found.", 404)
+        if not _receipt_xero_duplicate_attachment_allowed(rec, eng, endpoint, xid):
+            return _exp_error_page("That Xero document is not a duplicate candidate for this receipt.", 403)
+        return _xero_duplicate_attachment_response(endpoint, xid)
 
     # ── Field Expenses: LIVE parser test mode (no submission to Xero) ─────────
     #
@@ -16298,6 +21624,13 @@ body {{ background:#f7f6f3 !important; }}
                 "<p class='text-xs text-gray-600 max-w-lg'>Creates one payment reference, "
                 "groups the currently approved receipts under it, and keeps them unpaid "
                 "until the batch is marked paid or found in the bank feed.</p>"
+                "<label class='flex items-center gap-1.5 text-xs text-gray-600'>"
+                "<span>Actual paid</span>"
+                "<span class='text-gray-400'>£</span>"
+                "<input name='actual_paid' type='number' step='0.01' min='0' "
+                f"placeholder='{unbatched:.2f}' "
+                "class='w-24 rounded border border-gray-300 px-2 py-1 text-xs'>"
+                "</label>"
                 f"{prepare_btn}</form>"
                 f"{settlement_html}"
                 "</div>"
@@ -16560,6 +21893,18 @@ body {{ background:#f7f6f3 !important; }}
                     "<p class='text-xs text-gray-400 mt-1'>Connect the company bank on the "
                     "<a href='/cardfeed' class='text-indigo-600'>Card feed</a> page to link a card.</p>"
                 )
+            customer_calendar_field_html = ""
+            if CUSTOMER_RECEIPT_PORTAL_ENABLED:
+                customer_calendar_field_html = (
+                    "<div class='sm:col-span-2'>"
+                    "<label class='block text-xs text-gray-500 mb-1'>Customer receipt calendar "
+                    "<span class='text-gray-400 font-normal'>(used for the customer card-receipt job list)</span></label>"
+                    f"<select name='customer_calendar_id' class='{_sel_cls}'>"
+                    + _calendar_options_html(e.get("customer_calendar_id") or "")
+                    + "</select>"
+                    "<p class='text-[11px] text-gray-400 mt-1'>Set this to the engineer's own diary so their customer-receipt screen does not scan every calendar.</p>"
+                    "</div>"
+                )
             eng_cards.append(
                 f"<details id='person-{int(e['id'])}' class='rounded-xl border border-gray-200 bg-white overflow-hidden group scroll-mt-24'>"
                 "<summary class='flex items-center justify-between gap-2 p-4 cursor-pointer "
@@ -16604,14 +21949,7 @@ body {{ background:#f7f6f3 !important; }}
                 "Linked card <span class='text-gray-400 font-normal'>(which Plaid card does this person hold?)</span>"
                 f"{_card_mark}</label>"
                 f"{card_field}</div>"
-                "<div class='sm:col-span-2'>"
-                "<label class='block text-xs text-gray-500 mb-1'>Customer receipt calendar "
-                "<span class='text-gray-400 font-normal'>(used for the customer card-receipt job list)</span></label>"
-                f"<select name='customer_calendar_id' class='{_sel_cls}'>"
-                + _calendar_options_html(e.get("customer_calendar_id") or "")
-                + "</select>"
-                "<p class='text-[11px] text-gray-400 mt-1'>Set this to the engineer's own diary so their customer-receipt screen does not scan every calendar.</p>"
-                "</div>"
+                f"{customer_calendar_field_html}"
                 "<div><label class='block text-xs text-gray-500 mb-1'>Name</label>"
                 f"<input name='name' value='{escape(e['name'])}' "
                 "class='w-full rounded border border-gray-300 px-2 py-1 text-sm'></div>"
@@ -16725,6 +22063,13 @@ body {{ background:#f7f6f3 !important; }}
                 + ">Immediately after admin recognition</option>",
             ]
         )
+        bank_reminder_day = int(settings.get("bank_feed_reminder_day", 0) or 0)
+        bank_reminder_options = "".join(
+            "<option value='" + str(i) + "' "
+            + ("selected" if i == bank_reminder_day else "")
+            + ">" + escape(name) + "</option>"
+            for i, name in enumerate(_WEEKDAY_NAMES)
+        )
         xero_allowed, xero_reason, _xero_submit_time = _expense_xero_submit_status()
         xero_status_cls = (
             "bg-emerald-50 text-emerald-800 border-emerald-200"
@@ -16738,27 +22083,109 @@ body {{ background:#f7f6f3 !important; }}
         # ── Storage section ─────────────────────────────────────────────────
         receipts_with_images = exp_store.list_receipts_with_images(db)
         eng_by_id = {e["id"]: e for e in engineers}
-        done_statuses = {"submitted", "settled", "failed"}
-        clearable_count = sum(
-            1 for r in receipts_with_images if r.get("status") in done_statuses
+        today_for_cleanup = dt.datetime.now().date()
+        default_cleanup_start = (today_for_cleanup - dt.timedelta(days=120)).isoformat()
+        default_cleanup_end = today_for_cleanup.isoformat()
+        cleanup_start = (
+            request.args.get("vat_cleanup_start") or default_cleanup_start
+        ).strip()
+        cleanup_end = (
+            request.args.get("vat_cleanup_end") or default_cleanup_end
+        ).strip()
+        cleanup_error = (request.args.get("msg") or "").strip()
+        try:
+            cleanup_plan = _expense_image_cleanup_plan(db, cleanup_start, cleanup_end)
+        except ValueError as exc:
+            cleanup_error = str(exc)
+            cleanup_start = default_cleanup_start
+            cleanup_end = default_cleanup_end
+            cleanup_plan = _expense_image_cleanup_plan(db, cleanup_start, cleanup_end)
+        cleanup_history = get_json_setting(
+            db, _EXPENSE_VAT_CLEANUP_HISTORY_KEY, []
+        ) or []
+        recent_cleanup_rows = []
+        for run in list(cleanup_history)[-3:][::-1]:
+            recent_cleanup_rows.append(
+                "<div class='text-[11px] text-gray-500'>"
+                f"{escape(str(run.get('start') or ''))} to "
+                f"{escape(str(run.get('end') or ''))}: "
+                f"{int(run.get('cleared') or 0)} image(s), "
+                f"{escape(_expense_bytes_label(run.get('bytes') or 0))}</div>"
+            )
+        cleanup_done = escape(request.args.get("vat_cleanup_done") or "")
+        cleanup_notice = (
+            "<div class='rounded-lg border border-emerald-200 bg-emerald-50 "
+            "p-2 text-xs text-emerald-800'>"
+            f"Archived {cleanup_done} local image file(s). Receipt records and "
+            "Xero links were kept.</div>"
+            if cleanup_done else ""
+        )
+        cleanup_error_html = (
+            "<div class='rounded-lg border border-red-200 bg-red-50 p-2 text-xs "
+            f"text-red-700'>{escape(cleanup_error)}</div>"
+            if cleanup_error else ""
+        )
+        cleanup_confirm = ""
+        if cleanup_plan["safe_count"]:
+            cleanup_confirm = (
+                "<form method='post' action='/receipts/expenses/vat-image-cleanup' "
+                "onsubmit=\"return confirm('Archive local images for this VAT period? "
+                "The receipt rows and Xero links will stay in the app.')\" "
+                "class='mt-3'>"
+                f"<input type='hidden' name='start' value='{escape(cleanup_plan['start'])}'>"
+                f"<input type='hidden' name='end' value='{escape(cleanup_plan['end'])}'>"
+                "<button type='submit' class='w-full rounded-lg bg-gray-900 px-3 py-2 "
+                "text-sm font-semibold text-white hover:bg-black'>"
+                "Mark VAT period done &amp; archive safe local images</button>"
+                "</form>"
+            )
+        cleanup_panel = (
+            "<div class='rounded-xl border border-indigo-100 bg-indigo-50/60 p-3 mb-4'>"
+            "<div class='flex items-start justify-between gap-3'>"
+            "<div>"
+            "<h3 class='text-sm font-semibold text-indigo-950'>VAT period image cleanup</h3>"
+            "<p class='text-xs text-indigo-800/80 mt-0.5'>"
+            "Use this after a VAT period is finished. The app keeps the receipt row, "
+            "figures, duplicate clues and Xero link, then removes only safe local previews.</p>"
+            "</div></div>"
+            f"{cleanup_notice}{cleanup_error_html}"
+            "<form method='get' action='/receipts/expenses' class='grid grid-cols-2 gap-2 mt-3'>"
+            "<label class='block text-[11px] font-semibold text-indigo-900'>Start"
+            f"<input type='date' name='vat_cleanup_start' value='{escape(cleanup_start)}' "
+            "class='mt-1 w-full rounded border border-indigo-200 bg-white px-2 py-1.5 text-xs'></label>"
+            "<label class='block text-[11px] font-semibold text-indigo-900'>End"
+            f"<input type='date' name='vat_cleanup_end' value='{escape(cleanup_end)}' "
+            "class='mt-1 w-full rounded border border-indigo-200 bg-white px-2 py-1.5 text-xs'></label>"
+            "<div class='col-span-2'>"
+            "<button type='submit' class='rounded-lg border border-indigo-200 bg-white px-3 py-1.5 "
+            "text-xs font-semibold text-indigo-800 hover:bg-indigo-100'>Check period</button>"
+            "</div></form>"
+            "<div class='grid grid-cols-2 gap-2 mt-3'>"
+            "<div class='rounded-lg bg-white/80 border border-emerald-100 p-2'>"
+            "<div class='text-[11px] uppercase font-semibold text-emerald-700'>Safe to archive</div>"
+            f"<div class='text-xl font-bold text-emerald-900'>{cleanup_plan['safe_count']}</div>"
+            f"<div class='text-[11px] text-emerald-700'>{escape(_expense_bytes_label(cleanup_plan['safe_bytes']))}</div>"
+            "</div>"
+            "<div class='rounded-lg bg-white/80 border border-amber-100 p-2'>"
+            "<div class='text-[11px] uppercase font-semibold text-amber-700'>Kept for review</div>"
+            f"<div class='text-xl font-bold text-amber-900'>{cleanup_plan['retained_count']}</div>"
+            f"<div class='text-[11px] text-amber-700'>{escape(_expense_bytes_label(cleanup_plan['retained_bytes']))}</div>"
+            "</div></div>"
+            f"{cleanup_confirm}"
+            + (
+                "<div class='mt-3 border-t border-indigo-100 pt-2'>"
+                "<div class='text-[11px] font-semibold text-indigo-900 mb-1'>Recent cleanup</div>"
+                + "".join(recent_cleanup_rows)
+                + "</div>"
+                if recent_cleanup_rows else ""
+            )
+            + "</div>"
         )
 
         if receipts_with_images:
-            bulk_btn = ""
-            if clearable_count:
-                bulk_btn = (
-                    "<form method='post' action='/receipts/expenses/bulk-clear-images' "
-                    "class='inline' onsubmit=\"return confirm('Remove image files from all "
-                    f"{clearable_count} submitted/settled/failed receipt(s)? "
-                    "The receipt records will be kept.')\">"
-                    "<button type='submit' class='text-xs px-3 py-1.5 rounded-lg border "
-                    "border-amber-300 bg-amber-50 text-amber-800 hover:bg-amber-100'>"
-                    f"Clear {clearable_count} image(s)</button></form>"
-                )
-
             receipt_rows = []
             return_to = "/receipts/expenses"
-            for r in receipts_with_images:
+            for r in receipts_with_images[:25]:
                 eng = eng_by_id.get(r.get("engineer_id") or 0)
                 eng_name = escape(eng["name"]) if eng else "—"
                 merchant = escape(r.get("merchant") or r.get("ocr_merchant") or "Receipt")
@@ -16803,21 +22230,27 @@ body {{ background:#f7f6f3 !important; }}
 
             storage_html = (
                 "<section class='rounded-xl border border-gray-200 bg-white p-4'>"
+                f"{cleanup_panel}"
                 "<div class='flex items-center justify-between mb-1'>"
                 "<h2 class='font-semibold text-gray-900'>Receipt images</h2>"
-                f"{bulk_btn}"
                 "</div>"
                 "<p class='text-xs text-gray-500 mb-3'>"
                 f"{len(receipts_with_images)} receipt(s) still have a stored image file. "
-                "Clearing an image frees disk space — the receipt record and Xero entry "
-                "are not affected.</p>"
+                "Individual clearing is still available for one-off fixes. The dated VAT cleanup above "
+                "is safer for normal housekeeping.</p>"
                 + "".join(receipt_rows)
+                + (
+                    f"<div class='text-xs text-gray-400 pt-2'>Showing latest 25 of "
+                    f"{len(receipts_with_images)} stored-image receipts.</div>"
+                    if len(receipts_with_images) > 25 else ""
+                )
                 + "</section>"
             )
         else:
             storage_html = (
                 "<section class='rounded-xl border border-dashed border-gray-200 "
                 "bg-white p-4 text-sm text-gray-500'>"
+                f"{cleanup_panel}"
                 "No stored receipt images &mdash; nothing to clean up.</section>"
             )
 
@@ -16847,16 +22280,18 @@ body {{ background:#f7f6f3 !important; }}
             + _create_card_inner
             + "</div>"
         )
-        _create_calendar_field_html = (
-            "<div class='sm:col-span-3'>"
-            "<label class='block text-xs text-gray-500 mb-1'>Customer receipt calendar</label>"
-            "<select name='customer_calendar_id' "
-            "class='w-full rounded border border-gray-300 bg-white px-3 py-2 text-sm'>"
-            + _calendar_options_html("")
-            + "</select>"
-            "<p class='text-[11px] text-gray-400 mt-1'>Choose the engineer's own calendar for card-terminal receipt uploads.</p>"
-            "</div>"
-        )
+        _create_calendar_field_html = ""
+        if CUSTOMER_RECEIPT_PORTAL_ENABLED:
+            _create_calendar_field_html = (
+                "<div class='sm:col-span-3'>"
+                "<label class='block text-xs text-gray-500 mb-1'>Customer receipt calendar</label>"
+                "<select name='customer_calendar_id' "
+                "class='w-full rounded border border-gray-300 bg-white px-3 py-2 text-sm'>"
+                + _calendar_options_html("")
+                + "</select>"
+                "<p class='text-[11px] text-gray-400 mt-1'>Choose the engineer's own calendar for card-terminal receipt uploads.</p>"
+                "</div>"
+            )
         if owner_paid_accounts:
             _create_owner_account_inner = (
                 "<select name='owner_paid_account_code' "
@@ -16905,6 +22340,7 @@ body {{ background:#f7f6f3 !important; }}
         engineer_by_id = {int(e["id"]): e for e in engineers if e.get("id") is not None}
         pending_by_person: dict[int, dict] = {}
         approved_by_person: dict[int, dict] = {}
+        ignored_duplicate_by_person: dict[int, dict] = {}
         status_receipts_by_person: dict[int, dict[str, list[dict]]] = {}
 
         def _add_person_total(bucket: dict[int, dict], engineer_id, amount: float) -> None:
@@ -16943,6 +22379,14 @@ body {{ background:#f7f6f3 !important; }}
                     status_receipts_by_person.setdefault(
                         int(r.get("engineer_id")), {}
                     ).setdefault("pending_review", []).append(r)
+                except (TypeError, ValueError):
+                    pass
+            elif st == "ignored" and "duplicate" in (r.get("xero_error") or "").lower():
+                _add_person_total(ignored_duplicate_by_person, r.get("engineer_id"), amt)
+                try:
+                    status_receipts_by_person.setdefault(
+                        int(r.get("engineer_id")), {}
+                    ).setdefault("ignored_duplicate", []).append(r)
                 except (TypeError, ValueError):
                     pass
 
@@ -17048,10 +22492,59 @@ body {{ background:#f7f6f3 !important; }}
                 + f"</{tag}>"
             )
 
+        active_dump_reviews_by_person: dict[int, dict] = {}
+        try:
+            active_dump_batches = dump_store.list_batches(db, limit=100)
+        except Exception:
+            active_dump_batches = []
+        for batch in active_dump_batches:
+            status = str(batch.get("status") or "").strip().lower()
+            if status not in {"ready", "processing", "finalizing"}:
+                continue
+            try:
+                eid = int(batch.get("engineer_id") or 0)
+            except (TypeError, ValueError):
+                eid = 0
+            if not eid:
+                continue
+            try:
+                items = dump_store.list_items(db, str(batch.get("id") or ""))
+            except Exception:
+                items = []
+            review_items = [
+                it for it in items
+                if str(it.get("status") or "") in dump_store.ACTIVE_STATUSES
+            ]
+            if not review_items:
+                continue
+            amount = 0.0
+            for it in review_items:
+                try:
+                    amount += float(it.get("amount_inc") or 0)
+                except (TypeError, ValueError):
+                    pass
+            bucket = active_dump_reviews_by_person.setdefault(
+                eid, {"count": 0, "amount": 0.0, "batches": []}
+            )
+            bucket["count"] += len(review_items)
+            bucket["amount"] += amount
+            bucket["batches"].append({
+                "batch": batch,
+                "count": len(review_items),
+                "amount": amount,
+            })
+        active_dump_review_count = sum(
+            int(v.get("count") or 0) for v in active_dump_reviews_by_person.values()
+        )
+
         urgent_notes = []
         if status_counts.get("pending_review", 0):
             urgent_notes.append(
                 f"{status_counts.get('pending_review', 0)} receipt(s) waiting for review"
+            )
+        if active_dump_review_count:
+            urgent_notes.append(
+                f"{active_dump_review_count} receipt dump item(s) waiting for review"
             )
         if approved_total > 0:
             urgent_notes.append(f"{_exp_money(approved_total)} approved and ready for admin action")
@@ -17085,15 +22578,16 @@ body {{ background:#f7f6f3 !important; }}
         except Exception:
             _csv_status = {}
         last_bank_upload = str(_csv_status.get("last_upload_at") or "").strip()
-        last_bank_upload_date = _parse_date(last_bank_upload)
-        bank_upload_stale = not last_bank_upload_date or last_bank_upload_date < this_monday
+        bank_upload_stale, bank_reminder_day_name, _last_upload_for_due, _bank_reminder_day = (
+            _field_expenses_bank_upload_due()
+        )
         upload_cls = (
             "border-amber-300 bg-amber-50 text-amber-950 animate-pulse"
             if bank_upload_stale else
             "border-emerald-200 bg-emerald-50 text-emerald-950"
         )
         upload_status_text = (
-            "Statement upload due: update the bank CSV for this week."
+            f"Statement upload due: update the bank CSV for this week. Reminder day is {bank_reminder_day_name}."
             if bank_upload_stale else
             f"Bank statement updated {last_bank_upload[:16]}."
         )
@@ -17117,23 +22611,43 @@ body {{ background:#f7f6f3 !important; }}
         ]
         recon_start = min(card_dates) if card_dates else (today_local - dt.timedelta(days=365))
         recon_start = max(recon_start, today_local - dt.timedelta(days=365))
-        xero_reconciled_lines = _engineer_reconciled_lines(recon_start, today_local)
+        xero_reconciled_lines = _engineer_reconciled_lines(
+            recon_start, today_local, allow_refresh=True
+        )
 
-        def _xero_has_reconciled_spend(amount: float, day: dt.date) -> bool:
+        try:
+            xero_statement_rows = xero_statement.get_reconciled_rows(db)
+        except Exception:
+            xero_statement_rows = []
+
+        def _xero_has_reconciled_spend(
+            amount: float,
+            day: dt.date,
+            merchant_name: str = "",
+            *,
+            xero_account_id: str = "",
+            xero_account_name: str = "",
+        ) -> bool:
             """Best-effort Xero filter so old reconciled expenses don't look outstanding."""
-            if not xero_reconciled_lines:
-                return False
-            for ln in xero_reconciled_lines:
-                try:
-                    x_amt = float(ln[0])
-                except (TypeError, ValueError, IndexError):
-                    continue
-                x_day = _parse_date(ln[1]) if len(ln) > 1 else None
-                if abs(x_amt - amount) <= 1.0 and (
-                    x_day is None or abs((x_day - day).days) <= 10
-                ):
-                    return True
-            return False
+            if xero_statement.find_reconciled_match(
+                xero_statement_rows,
+                amount=amount,
+                date=day,
+                xero_account_id=xero_account_id,
+                xero_account_name=xero_account_name,
+                description=merchant_name,
+            ):
+                return True
+            return bool(
+                _field_expense_xero_resolved_reason(
+                    amount,
+                    day,
+                    merchant_name,
+                    xero_reconciled_lines,
+                    xero_account_id=xero_account_id,
+                    xero_account_name=xero_account_name,
+                )
+            )
 
         engineer_feed_by_id = {
             int(_e.get("id") or 0): str(_e.get("plaid_account_id") or "").strip()
@@ -17149,7 +22663,12 @@ body {{ background:#f7f6f3 !important; }}
             if _feed and (_r.get("payment_source") or "company_card") == "company_card":
                 receipts_by_feed.setdefault(_feed, []).append(_r)
 
-        def _receipt_candidates_for_feed(account_id: str, amount: float, day: dt.date):
+        def _receipt_candidates_for_feed(
+            account_id: str,
+            amount: float,
+            day: dt.date,
+            payment_name: str = "",
+        ):
             candidates = []
             for r in receipts_by_feed.get(account_id, []):
                 try:
@@ -17159,6 +22678,15 @@ body {{ background:#f7f6f3 !important; }}
                 if abs(ra - amount) > 1.0:
                     continue
                 rd = _parse_date(r.get("purchased_on") or r.get("created_at"))
+                receipt_name = str(r.get("merchant") or r.get("ocr_merchant") or "")
+                if not _marketplace_receipt_matches_card_name(
+                    receipt_name, payment_name
+                ):
+                    continue
+                if not _receipt_supplier_date_compatible(
+                    receipt_name, payment_name, rd, day
+                ):
+                    continue
                 if rd is None or abs((rd - day).days) <= 31:
                     candidates.append((abs((rd - day).days) if rd else 999, r))
             candidates.sort(key=lambda x: x[0])
@@ -17172,27 +22700,7 @@ body {{ background:#f7f6f3 !important; }}
             Expenses "missing receipts" total. For bank feeds, chase only clear
             card-purchase lines, e.g. Lloyds card marker "CD 6083".
             """
-            text = str(name or "")
-            upper = text.upper()
-            if amount <= 0:
-                return False
-            if any(
-                marker in upper
-                for marker in (
-                    "NON-GBP TRANS FEE",
-                    "SERVICE CHARGES",
-                    " LOAN ",
-                    "SALARY",
-                    " WAGE",
-                    " JUNE PAY",
-                    " PAY ",
-                    " RECEIPTS ",
-                    " EXPENSES ",
-                    "GARAGE RENT",
-                )
-            ):
-                return False
-            return bool(re.search(r"\bCD\s*\d{3,5}\b", text, re.I))
+            return _field_expense_bank_feed_candidate(name, amount)
 
         def _week_start(day: dt.date) -> dt.date:
             return day - dt.timedelta(days=day.weekday())
@@ -17242,11 +22750,22 @@ body {{ background:#f7f6f3 !important; }}
             txs.sort(key=lambda x: x["date"])
             used_receipts: set[str] = set()
             outstanding = []
+            acct_label_meta = _acct_labels.get(acct) or {}
+            xero_account_id = str(acct_label_meta.get("xero_account_id") or "")
+            xero_account_name = _linked_account_name(acct)
             for tx in txs:
-                if _xero_has_reconciled_spend(tx["amount"], tx["date"]):
+                if _xero_has_reconciled_spend(
+                    tx["amount"],
+                    tx["date"],
+                    tx.get("name") or "",
+                    xero_account_id=xero_account_id,
+                    xero_account_name=xero_account_name,
+                ):
                     continue
                 matched = False
-                for rec in _receipt_candidates_for_feed(acct, tx["amount"], tx["date"]):
+                for rec in _receipt_candidates_for_feed(
+                    acct, tx["amount"], tx["date"], str(tx.get("name") or "")
+                ):
                     rid = str(rec.get("id") or "")
                     if rid and rid in used_receipts:
                         continue
@@ -17393,7 +22912,15 @@ body {{ background:#f7f6f3 !important; }}
                     "text-center text-sm text-gray-500'>No image stored for this receipt.</div>"
                 )
                 duplicate_warning = _receipt_duplicate_warning_html(
-                    r, eng, include_xero=False
+                    r, eng, include_xero=False,
+                    image_url_for_receipt=lambda _rid: (
+                        "/receipts/expenses/receipt/" + escape(str(_rid)) + "/image"
+                    ),
+                    accept_url=(
+                        "/receipts/expenses/receipt/" + escape(str(r.get("id") or ""))
+                        + "/accept-duplicate"
+                    ),
+                    accept_return_to=request.full_path.rstrip("?"),
                 )
                 review_panel = (
                     f"<div id='exp-review-{rid}' class='exp-person-panel exp-review-panel hidden mt-3 rounded-xl "
@@ -17408,7 +22935,8 @@ body {{ background:#f7f6f3 !important; }}
                     f"{photo_html}"
                     "<div class='space-y-3'>"
                     f"{duplicate_warning}"
-                    f"<form method='post' action='/receipts/expenses/receipt/{rid}/review' class='space-y-3'>"
+                    f"<form method='post' action='/receipts/expenses/receipt/{rid}/review' "
+                    "data-admin-receipt-review-form='1' class='space-y-3'>"
                     "<input type='hidden' name='return_to' value='/receipts/expenses'>"
                     f"{source_html}"
                     "<div><label class='block text-xs font-semibold text-gray-500 mb-1'>Shop / supplier</label>"
@@ -17437,10 +22965,11 @@ body {{ background:#f7f6f3 !important; }}
                     "<button type='submit' name='status_action' value='save' class='rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm font-semibold text-gray-800 hover:bg-gray-50'>Save</button>"
                     "<button type='submit' name='status_action' value='approve' class='rounded-lg bg-emerald-600 px-3 py-2 text-sm font-semibold text-white hover:bg-emerald-700'>Approve &amp; save</button>"
                     "<button type='submit' name='status_action' value='pending' class='rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm font-semibold text-amber-800 hover:bg-amber-100'>Needs review</button>"
+                    "<span data-admin-review-status class='hidden text-xs font-semibold text-gray-500'></span>"
                     "</div></form></div></div></div>"
                 )
                 out.append(
-                    "<div class='flex items-center justify-between gap-3 py-2 border-b "
+                    f"<div data-admin-receipt-row='{rid}' class='flex items-center justify-between gap-3 py-2 border-b "
                     "border-gray-100 last:border-0'>"
                     "<div class='min-w-0'>"
                     f"<div class='text-sm font-semibold text-gray-900 truncate'>{merchant}</div>"
@@ -17459,6 +22988,34 @@ body {{ background:#f7f6f3 !important; }}
                 )
             return "".join(out)
 
+        def _dump_review_panel_rows(rows: list[dict]) -> str:
+            if not rows:
+                return ""
+            out = [
+                "<div class='mb-3 rounded-xl border border-amber-300 bg-white p-3'>"
+                "<div class='text-sm font-bold text-amber-950'>Receipt dump waiting for review</div>"
+                "<p class='mt-1 text-xs text-amber-800'>These receipts were uploaded in bulk and have not been moved into the normal receipt list or sent to Xero yet.</p>"
+                "<div class='mt-3 space-y-2'>"
+            ]
+            for row in rows:
+                batch = row.get("batch") or {}
+                bid = escape(str(batch.get("id") or ""))
+                label = escape(str(batch.get("label") or "Receipt dump"))
+                created = escape(_submitted_stamp(batch.get("created_at") or ""))
+                count = int(row.get("count") or 0)
+                amount = _exp_money(row.get("amount") or 0)
+                out.append(
+                    "<div class='flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-100 bg-amber-50 px-3 py-2'>"
+                    "<div class='min-w-0'>"
+                    f"<div class='truncate text-sm font-semibold text-gray-950'>{label}</div>"
+                    f"<div class='text-xs text-gray-600'>{count} item(s) · {amount} · {created}</div>"
+                    "</div>"
+                    f"<a href='/receipts/expenses/dump/{bid}' class='rounded-lg bg-amber-600 px-3 py-2 text-xs font-bold text-white hover:bg-amber-700'>Open dump review</a>"
+                    "</div>"
+                )
+            out.append("</div></div>")
+            return "".join(out)
+
         people_nav_bits = []
         for e in engineers:
             eid = int(e.get("id") or 0)
@@ -17471,11 +23028,16 @@ body {{ background:#f7f6f3 !important; }}
                 else ("Owner/director" if _expense_owner_no_payout(e) else "Company card")
             )
             chips = []
+            dump_review = active_dump_reviews_by_person.get(eid) or {}
             p_amt = (pending_by_person.get(eid) or {}).get("amount") or 0
+            p_amt = float(p_amt or 0) + float(dump_review.get("amount") or 0)
             a_amt = (approved_by_person.get(eid) or {}).get("amount") or 0
+            d_amt = (ignored_duplicate_by_person.get(eid) or {}).get("amount") or 0
             u_amt = (unpaid_by_person.get(eid) or {}).get("amount") or 0
             p_count = int((pending_by_person.get(eid) or {}).get("count") or 0)
+            p_count += int(dump_review.get("count") or 0)
             a_count = int((approved_by_person.get(eid) or {}).get("count") or 0)
+            d_count = int((ignored_duplicate_by_person.get(eid) or {}).get("count") or 0)
             if u_amt:
                 chips.append(
                     f"<span class='rounded-full bg-rose-100 px-2 py-0.5 text-[11px] font-semibold text-rose-800'>Owed {_exp_money(u_amt)}</span>"
@@ -17484,12 +23046,63 @@ body {{ background:#f7f6f3 !important; }}
                 chips.append(
                     "<span class='rounded-full bg-gray-100 px-2 py-0.5 text-[11px] font-semibold text-gray-500'>Clear</span>"
                 )
+            dump_card_account = ""
+            if str(e.get("plaid_account_id") or "").strip():
+                dump_card_account = _linked_account_name(str(e.get("plaid_account_id") or "").strip())
+            dump_panel = (
+                f"<div id='exp-panel-{eid}-dump' class='exp-person-panel hidden mt-3 rounded-2xl border-2 border-indigo-300 bg-indigo-50 p-4 shadow-sm'>"
+                "<div class='mb-3 flex items-start justify-between gap-3'>"
+                f"<div><h3 class='text-base font-bold text-indigo-950'>Upload receipts for {name}</h3>"
+                "<p class='mt-0.5 text-xs text-indigo-800'>This starts a receipt dump already assigned to this person, then opens the admin review screen.</p></div>"
+                "<button type='button' data-exp-close class='rounded-lg border border-indigo-300 bg-white px-3 py-2 text-base font-bold text-indigo-800 hover:bg-indigo-50'>Close</button>"
+                "</div>"
+                "<form method='post' action='/receipts/expenses/dump/start' "
+                "enctype='multipart/form-data' data-person-dump-form='1' "
+                "class='rounded-xl border border-indigo-200 bg-white p-4 space-y-3'>"
+                f"<input type='hidden' name='engineer_id' value='{eid}'>"
+                f"<input type='hidden' name='card_account' value='{escape(dump_card_account)}'>"
+                f"<input type='hidden' name='label' value='{name} receipt dump'>"
+                "<label class='flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-indigo-300 bg-indigo-50 px-4 py-8 text-center hover:bg-indigo-100'>"
+                "<span class='text-sm font-bold text-indigo-950'>Choose receipt photos / PDFs</span>"
+                "<span class='mt-1 text-xs text-indigo-700'>Multiple files allowed</span>"
+                "<span data-person-dump-file-count class='mt-2 hidden rounded-full bg-white px-2 py-0.5 text-xs font-semibold text-indigo-800'></span>"
+                "<input type='file' name='receipts' multiple accept='image/*,application/pdf' class='sr-only'>"
+                "</label>"
+                "<div class='flex items-center justify-between gap-3 flex-wrap'>"
+                "<label class='inline-flex items-center gap-2 text-xs text-gray-600'>"
+                "<input type='checkbox' name='test_mode' value='1' class='rounded border-gray-300 text-indigo-600'>"
+                "Test mode</label>"
+                "<button type='submit' class='rounded-lg bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-indigo-700 disabled:opacity-60'>Start dump for this person</button>"
+                "</div>"
+                + (
+                    f"<p class='text-[11px] text-indigo-700'>Linked account: {escape(dump_card_account)}</p>"
+                    if dump_card_account else
+                    "<p class='text-[11px] text-indigo-700'>No linked card/bank account is set for this person. The dump can still be reviewed and assigned to them.</p>"
+                )
+                + "<p data-person-dump-status class='hidden text-xs font-semibold text-indigo-700'></p>"
+                "</form>"
+                "</div>"
+            )
             p_panel = _receipt_panel_rows(
                 (status_receipts_by_person.get(eid) or {}).get("pending_review") or [],
                 e,
             )
+            dump_review_panel = _dump_review_panel_rows(dump_review.get("batches") or [])
+            if dump_review_panel:
+                receipt_pending_rows = (
+                    (status_receipts_by_person.get(eid) or {}).get("pending_review") or []
+                )
+                p_panel = dump_review_panel + (
+                    _receipt_panel_rows(receipt_pending_rows, e)
+                    if receipt_pending_rows else
+                    ""
+                )
             a_panel = _receipt_panel_rows(
                 (status_receipts_by_person.get(eid) or {}).get("approved") or [],
+                e,
+            )
+            d_panel = _receipt_panel_rows(
+                (status_receipts_by_person.get(eid) or {}).get("ignored_duplicate") or [],
                 e,
             )
             payout_card = payout_card_by_engineer.get(eid, "")
@@ -17498,8 +23111,29 @@ body {{ background:#f7f6f3 !important; }}
             payout_panel = ""
             card_btn = ""
             card_panel = ""
+            dup_btn = ""
+            dup_panel = ""
             account_notice = ""
             box_grid = "grid-cols-2"
+            if d_count:
+                box_grid = "grid-cols-3"
+                dup_btn = (
+                    f"<button type='button' data-exp-panel='exp-panel-{eid}-duplicates' "
+                    "class='text-left rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 text-gray-800 hover:bg-gray-100 hover:shadow-sm transition'>"
+                    "<span class='block text-[11px] font-semibold uppercase tracking-wide opacity-70'>Duplicates ignored</span>"
+                    f"<span class='mt-1 block text-2xl font-bold'>{d_count}</span>"
+                    f"<span class='mt-1 block text-xs opacity-75'>{_exp_money(d_amt)}</span>"
+                    "</button>"
+                )
+                dup_panel = (
+                    f"<div id='exp-panel-{eid}-duplicates' class='exp-person-panel hidden mt-3 rounded-xl border border-gray-200 bg-gray-50 p-3'>"
+                    "<div class='mb-2 flex items-center justify-between gap-2'>"
+                    f"<div><h3 class='text-sm font-bold text-gray-950'>{name} · Duplicates ignored</h3>"
+                    "<p class='text-xs text-gray-600'>These have been blocked from Xero. Open one if you want to compare or delete it.</p></div>"
+                    "<button type='button' data-exp-close class='rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-sm font-bold text-gray-800 hover:bg-gray-50'>Close</button>"
+                    "</div>"
+                    f"{d_panel}</div>"
+                )
             if payout_card:
                 box_grid = "grid-cols-3"
                 payout_btn = (
@@ -17605,11 +23239,12 @@ body {{ background:#f7f6f3 !important; }}
             people_nav_bits.append(
                 "<div class='rounded-2xl border border-gray-200 bg-white p-3 shadow-sm'>"
                 "<div class='grid grid-cols-1 md:grid-cols-[minmax(160px,0.75fr)_minmax(0,1.25fr)] gap-3 items-stretch'>"
-                f"<a href='#person-{eid}' class='flex flex-col justify-center rounded-xl bg-gray-50 px-3 py-3 hover:bg-indigo-50 transition'>"
+                f"<button type='button' data-exp-panel='exp-panel-{eid}-dump' class='text-left flex flex-col justify-center rounded-xl bg-gray-50 px-3 py-3 hover:bg-indigo-50 transition'>"
                 f"<span class='block truncate text-sm font-bold text-gray-950'>{name}</span>"
                 f"<span class='block text-[11px] text-gray-500'>{escape(kind_label)}</span>"
                 f"<span class='mt-2 flex flex-wrap gap-1'>{''.join(chips)}{account_notice}</span>"
-                "</a>"
+                "<span class='mt-2 text-[11px] font-semibold text-indigo-700'>Open receipt dump</span>"
+                "</button>"
                 f"<div class='grid {box_grid} gap-2'>"
                 f"<button type='button' data-exp-panel='exp-panel-{eid}-pending' "
                 "class='text-left rounded-xl border border-amber-200 bg-amber-50 px-3 py-3 text-amber-900 hover:bg-amber-100 hover:shadow-sm transition'>"
@@ -17625,6 +23260,7 @@ body {{ background:#f7f6f3 !important; }}
                 "</button>"
                 f"{payout_btn}"
                 f"{card_btn}"
+                f"{dup_btn}"
                 "</div></div>"
                 f"<div id='exp-panel-{eid}-pending' class='exp-person-panel hidden mt-3 rounded-xl border border-amber-200 bg-amber-50/60 p-3'>"
                 "<div class='mb-2 flex items-center justify-between gap-2'>"
@@ -17639,18 +23275,108 @@ body {{ background:#f7f6f3 !important; }}
                 "<button type='button' data-exp-close class='rounded-lg border border-emerald-300 bg-white px-3 py-1.5 text-sm font-bold text-emerald-800 hover:bg-emerald-50'>Close</button>"
                 "</div>"
                 f"{a_panel}</div>"
+                f"{dump_panel}"
                 f"{payout_panel}"
                 f"{card_panel}"
+                f"{dup_panel}"
                 "</div>"
             )
         people_nav_script = (
             "<script>(function(){"
             "function closePanels(root){(root||document).querySelectorAll('.exp-person-panel').forEach(function(p){p.classList.add('hidden');});}"
             "function closeReviewPanels(root){(root||document).querySelectorAll('.exp-review-panel').forEach(function(p){p.classList.add('hidden');});}"
+            "function personDumpSubmit(form){var fileInput=form.querySelector('input[type=file]');var status=form.querySelector('[data-person-dump-status]');var btn=form.querySelector('button[type=submit]');function msg(t){if(status){status.textContent=t;status.classList.remove('hidden');}}if(!fileInput||!fileInput.files||!fileInput.files.length){msg('Choose at least one receipt first.');return;}var files=Array.prototype.slice.call(fileInput.files,0,300);var meta=new FormData(form);meta.delete('receipts');if(btn){btn.disabled=true;btn.textContent='Starting...';}msg('Starting receipt dump for '+files.length+' file'+(files.length===1?'':'s')+'...');fetch('/receipts/expenses/dump/start',{method:'POST',body:meta}).then(function(r){if(!r.ok)throw new Error('Could not start dump');return r.json();}).then(function(data){if(!data.batch_id)throw new Error('Could not start dump');var done=0;function addNext(i){if(i>=files.length){if(btn)btn.textContent='Processing...';msg('All files uploaded. Reading receipts now...');return fetch('/receipts/expenses/dump/'+data.batch_id+'/finish',{method:'POST',body:new FormData()}).then(function(r){return r.json();}).then(function(d){window.location=(d&&d.url)||('/receipts/expenses/dump/'+data.batch_id);});}var fd=new FormData();fd.append('receipt',files[i],files[i].name||('receipt-'+(i+1)));if(btn)btn.textContent='Uploading '+(i+1)+'/'+files.length;msg('Uploading '+(i+1)+' of '+files.length+'...');return fetch('/receipts/expenses/dump/'+data.batch_id+'/add',{method:'POST',body:fd}).then(function(r){if(!r.ok)throw new Error('Upload failed');done++;return addNext(i+1);});}return addNext(0);}).catch(function(err){msg((err&&err.message)||'Upload failed.');if(btn){btn.disabled=false;btn.textContent='Upload receipt dump';}});}"
+            "var receiptVatRate=" + format(float(settings["vat_rate"] or 20.0), ".4f") + ";"
+            "var xeroQueueTimer=null;var xeroQueueBusy=false;"
+            "function scheduleReceiptXeroQueue(delay,engineerId){if(xeroQueueTimer)clearTimeout(xeroQueueTimer);xeroQueueTimer=setTimeout(function(){if(xeroQueueBusy)return;xeroQueueBusy=true;var fd=new FormData();if(engineerId)fd.append('engineer_id',engineerId);fetch('/receipts/expenses/process-approved-receipts',{method:'POST',body:fd,headers:{'X-Requested-With':'fetch','Accept':'application/json'}}).then(function(r){return r.json();}).then(function(data){if(data&&data.cooldown){return;}if(data&&data.sent){scheduleReceiptXeroQueue(12000,engineerId);}}).catch(function(){}).finally(function(){xeroQueueBusy=false;});},delay||2500);}"
+            "function nextReviewPanel(panel){var root=panel&&panel.closest('.exp-person-panel');if(!root)return null;var panels=Array.prototype.slice.call(root.querySelectorAll('.exp-review-panel'));var idx=panels.indexOf(panel);for(var i=idx+1;i<panels.length;i++){var rowId=panels[i].id.replace('exp-review-','');var row=root.querySelector('[data-admin-receipt-row=\"'+rowId+'\"]');if(row&&row.classList.contains('hidden'))continue;return panels[i];}return null;}"
+            "function receiptVatMode(form){var p=form&&form.querySelector('input[name=vat_mode]:checked');return p?p.value:'standard';}"
+            "function syncReceiptVat(form){if(!form)return;var gross=form.querySelector('[name=amount_inc]');var ex=form.querySelector('[name=amount_ex]');var vat=form.querySelector('[name=vat_amount]');if(!gross||!ex||!vat)return;var g=parseFloat(gross.value||'');if(!(g>=0))return;var mode=receiptVatMode(form);if(mode==='no_vat'){ex.value=g.toFixed(2);vat.value='0.00';return;}if(mode==='standard'){var net=receiptVatRate?g/(1+receiptVatRate/100):g;ex.value=net.toFixed(2);vat.value=(g-net).toFixed(2);return;}var v=parseFloat(vat.value||'');if(v>=0&&v<=g){ex.value=(g-v).toFixed(2);}}"
+            "function submitAdminReceiptReview(form,submitter){var panel=form.closest('.exp-review-panel');var status=form.querySelector('[data-admin-review-status]');var btn=submitter||form.querySelector('button[type=submit]');var oldText=btn?btn.textContent:'';function note(t,cls){if(status){status.textContent=t;status.className='text-xs font-semibold '+(cls||'text-gray-500');}}var fd=new FormData(form);if(btn&&btn.name)fd.set(btn.name,btn.value||'save');if(btn){btn.disabled=true;btn.textContent='Saving...';}note('Saving...','text-gray-500');fetch(form.action,{method:'POST',body:fd,headers:{'X-Requested-With':'fetch','Accept':'application/json'}}).then(function(r){return r.json().then(function(d){if(!r.ok||!d.ok)throw new Error((d&&d.error)||'Save failed');return d;});}).then(function(data){note(data.status==='approved'?'Approved locally - queued for Xero':'Saved','text-emerald-700');var action=(btn&&btn.value)||'';if(action==='approve'){var row=panel&&panel.previousElementSibling;if(row&&row.matches('[data-admin-receipt-row]')){row.classList.add('hidden');}if(panel)panel.classList.add('hidden');var next=panel&&nextReviewPanel(panel);if(next){next.classList.remove('hidden');next.scrollIntoView({block:'nearest',behavior:'smooth'});}scheduleReceiptXeroQueue(2500,data.engineer_id);}else if(action==='pending'){var row2=panel&&panel.previousElementSibling;if(row2&&row2.matches('[data-admin-receipt-row]'))row2.classList.remove('hidden');}}).catch(function(err){note((err&&err.message)||'Save failed','text-red-700');}).finally(function(){if(btn){btn.disabled=false;btn.textContent=oldText||'Save';}});}"
+            "function submitDuplicateAction(form){var panel=form.closest('.exp-review-panel');var btn=form.querySelector('button[type=submit]');var old=btn?btn.textContent:'';if(!confirm('Mark this receipt as an accepted duplicate and ignore it?'))return;if(btn){btn.disabled=true;btn.textContent='Saving...';}fetch(form.action,{method:'POST',body:new FormData(form),headers:{'X-Requested-With':'fetch','Accept':'application/json'}}).then(function(r){return r.json().then(function(d){if(!r.ok||!d.ok)throw new Error((d&&d.error)||'Save failed');return d;});}).then(function(){var row=panel&&panel.previousElementSibling;if(row&&row.matches('[data-admin-receipt-row]'))row.classList.add('hidden');if(panel)panel.classList.add('hidden');var next=panel&&nextReviewPanel(panel);if(next){next.classList.remove('hidden');next.scrollIntoView({block:'nearest',behavior:'smooth'});}}).catch(function(){if(btn)btn.textContent='Save failed';}).finally(function(){if(btn){btn.disabled=false;if(btn.textContent==='Saving...')btn.textContent=old||'Accept as duplicate';}});}"
             "document.addEventListener('click',function(e){"
             "var btn=e.target.closest('[data-exp-panel]');"
             "if(btn){var id=btn.getAttribute('data-exp-panel');var panel=document.getElementById(id);if(panel){var card=btn.closest('.rounded-2xl');if(id.indexOf('exp-review-')===0){closeReviewPanels(btn.closest('.exp-person-panel')||card);}else{closePanels(card);}panel.classList.remove('hidden');panel.scrollIntoView({block:'nearest',behavior:'smooth'});}return;}"
             "if(e.target.closest('[data-exp-close]')){var p=e.target.closest('.exp-person-panel');if(p)p.classList.add('hidden');}"
+            "});"
+            "document.addEventListener('change',function(e){var input=e.target.closest&&e.target.closest('[data-person-dump-form] input[type=file]');if(!input)return;var form=input.closest('[data-person-dump-form]');var count=form&&form.querySelector('[data-person-dump-file-count]');var n=input.files?input.files.length:0;if(count){if(n){count.textContent=n+' file'+(n===1?'':'s')+' selected';count.classList.remove('hidden');}else{count.classList.add('hidden');}}});"
+            "document.addEventListener('input',function(e){var form=e.target.closest&&e.target.closest('[data-admin-receipt-review-form]');if(!form)return;if(e.target.name==='amount_inc'||e.target.name==='vat_amount')syncReceiptVat(form);});"
+            "document.addEventListener('change',function(e){var form=e.target.closest&&e.target.closest('[data-admin-receipt-review-form]');if(!form)return;if(e.target.name==='vat_mode')syncReceiptVat(form);});"
+            "document.addEventListener('submit',function(e){var dup=e.target.closest&&e.target.closest('[data-duplicate-action-form]');if(!dup)return;var panel=dup.closest('.exp-review-panel');if(!panel)return;e.preventDefault();submitDuplicateAction(dup);});"
+            "document.addEventListener('submit',function(e){var form=e.target.closest&&e.target.closest('[data-person-dump-form]');if(form){e.preventDefault();personDumpSubmit(form);return;}var review=e.target.closest&&e.target.closest('[data-admin-receipt-review-form]');if(review){e.preventDefault();submitAdminReceiptReview(review,e.submitter);return;}});"
+            "})();</script>"
+        )
+        duplicate_compare_modal = (
+            "<div id='receipt-compare-modal' class='hidden fixed inset-0 z-50 "
+            "bg-gray-950/70 items-center justify-center p-3 sm:p-6'>"
+            "<div class='relative w-full max-w-6xl bg-white rounded-xl shadow-2xl "
+            "border border-gray-200 overflow-hidden'>"
+            "<div class='flex items-center justify-between gap-3 px-4 py-3 border-b border-gray-200'>"
+            "<div class='text-sm font-semibold text-gray-800'>Compare duplicate receipts</div>"
+            "<button type='button' data-receipt-compare-close='1' class='w-10 h-10 rounded-lg "
+            "text-gray-600 hover:bg-gray-100 text-2xl leading-none'>&times;</button>"
+            "</div>"
+            "<div class='grid grid-cols-1 md:grid-cols-2 gap-3 bg-gray-100 p-3 sm:p-4'>"
+            "<div><div id='receipt-compare-current-title' class='mb-2 text-xs font-bold text-gray-600'>Current receipt</div>"
+            "<img id='receipt-compare-current-img' class='max-h-[76vh] w-full object-contain bg-white rounded-lg shadow-sm' alt='Current receipt'></div>"
+            "<div><div id='receipt-compare-duplicate-title' class='mb-2 text-xs font-bold text-gray-600'>Possible duplicate</div>"
+            "<img id='receipt-compare-duplicate-img' class='max-h-[76vh] w-full object-contain bg-white rounded-lg shadow-sm' alt='Possible duplicate'></div>"
+            "</div></div></div>"
+            "<script>(function(){"
+            "var modal=document.getElementById('receipt-compare-modal');"
+            "var cur=document.getElementById('receipt-compare-current-img');"
+            "var dup=document.getElementById('receipt-compare-duplicate-img');"
+            "var ct=document.getElementById('receipt-compare-current-title');"
+            "var dt=document.getElementById('receipt-compare-duplicate-title');"
+            "function close(){if(!modal)return;modal.classList.add('hidden');modal.classList.remove('flex');if(cur)cur.removeAttribute('src');if(dup)dup.removeAttribute('src');}"
+            "document.addEventListener('click',function(e){"
+            "var b=e.target.closest&&e.target.closest('[data-receipt-compare]');"
+            "if(b){e.preventDefault();if(cur)cur.src=b.dataset.currentUrl||'';if(dup)dup.src=b.dataset.duplicateUrl||'';if(ct)ct.textContent=b.dataset.currentTitle||'Current receipt';if(dt)dt.textContent=b.dataset.duplicateTitle||'Possible duplicate';modal.classList.remove('hidden');modal.classList.add('flex');return;}"
+            "if(e.target===modal||(e.target.closest&&e.target.closest('[data-receipt-compare-close]')))close();"
+            "});document.addEventListener('keydown',function(e){if(e.key==='Escape')close();});"
+            "})();</script>"
+            "<script>(function(){"
+            "document.addEventListener('input',function(e){"
+            "var merchant=e.target.closest&&e.target.closest('[data-dump-merchant-input]');"
+            "if(merchant){var card=merchant.closest('[data-dump-item-card]');var title=card&&card.querySelector('[data-dump-merchant-display]');if(title){title.textContent=(merchant.value||'Receipt').trim()||'Receipt';}return;}"
+            "var vatChanged=e.target&&e.target.name==='vat_amount';"
+            "if(vatChanged){e.target.dataset.userEdited='1';return;}"
+            "var total=e.target.closest&&e.target.closest('[data-dump-total-input]');"
+            "if(!total)return;"
+            "var vat=document.getElementById(total.dataset.vatTarget||'');"
+            "if(!vat||vat.dataset.userEdited==='1')return;"
+            "var gross=parseFloat(total.value||'');"
+            "var rate=parseFloat(total.dataset.vatRate||'20')/100;"
+            "if(!(gross>=0)||!(rate>=0))return;"
+            "var ex=rate?gross/(1+rate):gross;"
+            "vat.value=(gross-ex).toFixed(2);"
+            "});"
+            "})();</script>"
+            "<script>(function(){"
+            "document.addEventListener('submit',function(e){"
+            "var form=e.target.closest&&e.target.closest('[data-dump-item-form]');"
+            "if(!form)return;"
+            "e.preventDefault();"
+            "var submitter=e.submitter||form.querySelector('button[type=submit],button[name=action]');"
+            "var status=form.querySelector('[data-dump-save-status]');"
+            "var oldText=submitter?submitter.textContent:'';"
+            "if(status){status.textContent='Saving...';status.classList.remove('hidden','text-red-700');status.classList.add('text-emerald-700');}"
+            "if(submitter){submitter.disabled=true;submitter.textContent='Saving...';}"
+            "var fd=new FormData(form);"
+            "if(submitter&&submitter.name){fd.set(submitter.name,submitter.value||'keep');}"
+            "fetch(form.action,{method:'POST',body:fd,headers:{'X-Requested-With':'fetch','Accept':'application/json'}})"
+            ".then(function(r){if(!r.ok)throw new Error('Save failed');return r.json();})"
+            ".then(function(data){if(!data||!data.ok)throw new Error((data&&data.error)||'Save failed');"
+            "var total=form.querySelector('[name=amount_inc]');var vat=form.querySelector('[name=vat_amount]');"
+            "var oldTotal=form.querySelector('[name=old_amount_inc]');var oldVat=form.querySelector('[name=old_vat_amount]');"
+            "if(data.amount_inc!==null&&data.amount_inc!==undefined&&total){total.value=Number(data.amount_inc).toFixed(2);total.dataset.oldTotal=total.value;if(oldTotal)oldTotal.value=total.value;}"
+            "if(data.vat_amount!==null&&data.vat_amount!==undefined&&vat){vat.value=Number(data.vat_amount).toFixed(2);vat.removeAttribute('data-user-edited');if(oldVat)oldVat.value=vat.value;}"
+            "var card=form.closest('[data-dump-item-card]');var amt=card&&card.querySelector('[data-dump-amount-display]');if(amt&&data.amount_display)amt.textContent=data.amount_display;"
+            "if(status){status.textContent='Saved';status.classList.remove('hidden');}"
+            "var action=submitter&&(submitter.value||'');if(card&&(action==='ignore'||action==='accept_duplicate')){card.classList.add('opacity-60');}"
+            "})"
+            ".catch(function(err){if(status){status.textContent=(err&&err.message)||'Save failed';status.classList.remove('hidden','text-emerald-700');status.classList.add('text-red-700');}})"
+            ".finally(function(){if(submitter){submitter.disabled=false;submitter.textContent=oldText||'Save';}});"
             "});"
             "})();</script>"
         )
@@ -17658,6 +23384,7 @@ body {{ background:#f7f6f3 !important; }}
             "<div class='mt-4 grid grid-cols-1 gap-3'>"
             + "".join(people_nav_bits)
             + people_nav_script
+            + duplicate_compare_modal
             + "</div>"
             if people_nav_bits else
             "<div class='mt-4 rounded-xl border border-dashed border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-500'>No people set up yet.</div>"
@@ -17779,6 +23506,14 @@ body {{ background:#f7f6f3 !important; }}
                             <label class="block text-xs text-gray-500 mb-1">Default payment/bank account</label>
                             {default_pay_field}
                           </div>
+                          <div>
+                            <label class="block text-xs text-gray-500 mb-1">Bank CSV reminder day</label>
+                            <select name="bank_feed_reminder_day"
+                                    class="w-full rounded border border-gray-300 px-3 py-2 text-sm bg-white">
+                              {bank_reminder_options}
+                            </select>
+                            <p class="text-xs text-gray-400 mt-1">The Bank Statement menu and upload panel pulse until that week&rsquo;s CSV has been uploaded.</p>
+                          </div>
                           <div class="sm:col-span-3 rounded-lg border border-blue-200 bg-blue-50 p-3 space-y-3">
                             <div class="flex items-center justify-between gap-2 flex-wrap">
                               <div>
@@ -17835,11 +23570,19 @@ body {{ background:#f7f6f3 !important; }}
         else:
             return redirect("/receipts/expenses?flash=not_found")
         ref = _subcontractor_batch_reference(eng)
+        amount_override = None
+        actual_paid_raw = (request.form.get("actual_paid") or "").strip()
+        if actual_paid_raw:
+            try:
+                amount_override = round(float(actual_paid_raw.replace(",", "")), 2)
+            except ValueError:
+                amount_override = None
         settlement, receipts = exp_store.create_prepared_settlement_for_engineer(
             db,
             engineer_id=engineer_id,
             reference=ref,
             payment_source=pay_source,
+            amount_override=amount_override,
             note=note,
         )
         if not settlement or not receipts:
@@ -18021,6 +23764,9 @@ body {{ background:#f7f6f3 !important; }}
                 "xero_submission_time": (
                     request.form.get("xero_submission_time") or "17:00"
                 ).strip(),
+                "bank_feed_reminder_day": (
+                    request.form.get("bank_feed_reminder_day") or "0"
+                ).strip(),
             },
         )
         return redirect("/receipts/expenses?flash=settings")
@@ -18040,6 +23786,19 @@ body {{ background:#f7f6f3 !important; }}
                 eng, force=True, limit=remaining
             )
         return redirect(f"/receipts/expenses?flash=xero_processed&n={processed}")
+
+    @app.post("/receipts/expenses/process-approved-receipts")
+    @require_login
+    def expense_admin_process_approved_receipts():
+        try:
+            engineer_id = int(request.form.get("engineer_id") or 0) or None
+        except (TypeError, ValueError):
+            engineer_id = None
+        result = _process_approved_direct_receipts_to_xero(
+            engineer_id=engineer_id,
+            limit=1,
+        )
+        return jsonify({"ok": True, **result})
 
     def _exp_safe_remove_file(db: str, stored_file: str) -> bool:
         """Remove *stored_file* from disk only when no dump item or expense receipt still
@@ -18132,9 +23891,14 @@ body {{ background:#f7f6f3 !important; }}
             status = "approved"
         elif action == "pending":
             status = "pending_review"
+        if (rec.get("xero_id") or "").strip() and status == "approved":
+            status = "submitted"
 
         updates = {
-            "merchant": (request.form.get("merchant") or "").strip()[:120],
+            "merchant": _clean_receipt_merchant(
+                request.form.get("merchant") or "",
+                request.form.get("merchant") or "",
+            )[:120],
             "purchased_on": (request.form.get("purchased_on") or "").strip(),
             "amount_inc": amount_inc,
             "amount_ex": amount_ex,
@@ -18172,6 +23936,15 @@ body {{ background:#f7f6f3 !important; }}
                 category_name,
             )
         elif action == "approve":
+            wants_json = (
+                request.headers.get("X-Requested-With") == "fetch"
+                or "application/json" in (request.headers.get("Accept") or "")
+            )
+            if wants_json:
+                return jsonify({
+                    "ok": False,
+                    "error": "Please choose what this receipt was for before approving it.",
+                }), 400
             return _exp_error_page(
                 "Please choose what this receipt was for before approving it.",
                 400,
@@ -18184,6 +23957,65 @@ body {{ background:#f7f6f3 !important; }}
             actor=f"admin:{session.get('admin_username') or 'admin'}",
         )
         exp_store.update_receipt(db, rid, **updates)
+        refreshed = exp_store.get_receipt(db, rid) or rec
+        if (refreshed.get("xero_id") or "").strip():
+            _sync_receipt_correction_to_xero(eng, rec, refreshed)
+            exp_store.update_receipt(db, rid, status="submitted")
+            refreshed = exp_store.get_receipt(db, rid) or refreshed
+        return_to = request.form.get("return_to") or "/receipts/expenses"
+        wants_json = (
+            request.headers.get("X-Requested-With") == "fetch"
+            or "application/json" in (request.headers.get("Accept") or "")
+        )
+        if wants_json:
+            return jsonify({
+                "ok": True,
+                "id": rid,
+                "engineer_id": eng["id"],
+                "status": refreshed.get("status") or status,
+                "merchant": refreshed.get("merchant") or "",
+                "amount_inc": refreshed.get("amount_inc"),
+                "vat_amount": refreshed.get("vat_amount"),
+                "xero_id": refreshed.get("xero_id") or "",
+                "queued_for_xero": (
+                    (refreshed.get("status") or "") == "approved"
+                    and not (refreshed.get("xero_id") or "").strip()
+                    and not refreshed.get("settlement_id")
+                ),
+            })
+        return redirect(return_to + ("&" if "?" in return_to else "?") + "flash=updated")
+
+    @app.post("/receipts/expenses/receipt/<rid>/accept-duplicate")
+    @require_login
+    def expense_admin_receipt_accept_duplicate(rid: str):
+        """Mark a pending receipt as a confirmed duplicate without deleting it."""
+        db = config.admin_db_file
+        rec = exp_store.get_receipt(db, rid)
+        if not rec:
+            return redirect("/receipts/expenses?flash=not_found")
+        status = (rec.get("status") or "").strip().lower()
+        if (
+            status not in {"pending_review", "approved"}
+            or (rec.get("xero_id") or "").strip()
+            or rec.get("settlement_id")
+        ):
+            return _exp_error_page(
+                "This receipt has already been submitted or linked to a payment, "
+                "so it cannot be marked as a duplicate.",
+                400,
+            )
+        exp_store.update_receipt(
+            db,
+            rid,
+            status="ignored",
+            xero_error="Accepted as duplicate by admin; not submitted to Xero.",
+        )
+        wants_json = (
+            request.headers.get("X-Requested-With") == "fetch"
+            or "application/json" in (request.headers.get("Accept") or "")
+        )
+        if wants_json:
+            return jsonify({"ok": True, "id": rid, "status": "ignored"})
         return_to = request.form.get("return_to") or "/receipts/expenses"
         return redirect(return_to + ("&" if "?" in return_to else "?") + "flash=updated")
 
@@ -18223,20 +24055,78 @@ body {{ background:#f7f6f3 !important; }}
         return_to = request.form.get("return_to") or "/receipts/expenses"
         return redirect(return_to + ("&" if "?" in return_to else "?") + "flash=deleted")
 
+    @app.post("/receipts/expenses/vat-image-cleanup")
+    @require_login
+    def expense_vat_image_cleanup():
+        """Archive local receipt images for a finished VAT period.
+
+        This deliberately does not delete receipt rows or touch Xero. It clears
+        local previews only for receipts that are already safely represented in
+        Xero, then removes the file from disk if nothing else still references it.
+        """
+        db = config.admin_db_file
+        start_s = (request.form.get("start") or "").strip()
+        end_s = (request.form.get("end") or "").strip()
+        try:
+            plan = _expense_image_cleanup_plan(db, start_s, end_s)
+        except ValueError as exc:
+            return redirect(
+                "/receipts/expenses?flash=vat_cleanup_error"
+                f"&msg={urllib.parse.quote(str(exc))}"
+            )
+        by_id = {str(row["receipt"].get("id") or ""): row for row in plan["safe"]}
+        cleared = 0
+        removed = 0
+        bytes_cleared = 0
+        for rid, row in by_id.items():
+            if not rid:
+                continue
+            rec = exp_store.get_receipt(db, rid)
+            if not rec or _expense_image_cleanup_safe_reason(rec):
+                continue
+            old_file = exp_store.clear_receipt_stored_file(db, rid)
+            if not old_file:
+                continue
+            cleared += 1
+            try:
+                bytes_cleared += int(row.get("size") or 0)
+            except (TypeError, ValueError):
+                pass
+            if _exp_safe_remove_file(db, old_file):
+                removed += 1
+        history = get_json_setting(db, _EXPENSE_VAT_CLEANUP_HISTORY_KEY, []) or []
+        history.append({
+            "start": plan["start"],
+            "end": plan["end"],
+            "cleared": cleared,
+            "removed": removed,
+            "bytes": bytes_cleared,
+            "retained": plan["retained_count"],
+            "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "actor": session.get("admin_username") or "admin",
+        })
+        set_json_setting(db, _EXPENSE_VAT_CLEANUP_HISTORY_KEY, history[-20:])
+        return redirect(
+            "/receipts/expenses"
+            f"?vat_cleanup_start={urllib.parse.quote(plan['start'])}"
+            f"&vat_cleanup_end={urllib.parse.quote(plan['end'])}"
+            f"&vat_cleanup_done={cleared}"
+            "&flash=vat_cleanup_done"
+        )
+
     @app.post("/receipts/expenses/bulk-clear-images")
     @require_login
     def expense_bulk_clear_images():
-        """Clear stored image files from all submitted and settled receipts.
+        """Legacy clear-all endpoint, kept but guarded.
 
-        The DB record stays — only the on-disk image is freed.  Files shared
-        with other receipts or dump items are skipped (not orphaned yet).
+        The DB record stays. Only receipts that are already cleanly represented
+        in Xero are eligible; failed/pending review receipts keep their images.
         """
         db = config.admin_db_file
         all_with_images = exp_store.list_receipts_with_images(db)
-        done_statuses = {"submitted", "settled", "failed"}
         cleared = 0
         for rec in all_with_images:
-            if (rec.get("status") or "") not in done_statuses:
+            if _expense_image_cleanup_safe_reason(rec):
                 continue
             old_file = exp_store.clear_receipt_stored_file(db, rec["id"])
             if old_file:
@@ -18632,14 +24522,17 @@ body {{ background:#f7f6f3 !important; }}
                 _acct_labels = cardfeed.get_account_labels(config.admin_db_file)
             except Exception:
                 _acct_labels = {}
+            try:
+                _xero_statement_rows = xero_statement.get_reconciled_rows(config.admin_db_file)
+            except Exception:
+                _xero_statement_rows = []
             c_norm = _norm_acct(chosen)
             n_feed_seen = n_feed_kept = 0
             for pt in cardfeed.get_cached_transactions(config.admin_db_file):
                 n_feed_seen += 1
                 acc_id = str(pt.get("account_id") or "").strip()
-                label_name = str(
-                    (_acct_labels.get(acc_id) or {}).get("xero_account_name") or ""
-                ).strip()
+                label_meta = _acct_labels.get(acc_id) or {}
+                label_name = str(label_meta.get("xero_account_name") or "").strip()
                 if c_norm and _acct_labels:
                     # Only filter when the admin has labelled at least one
                     # account — with no labels at all we can't tell accounts
@@ -18655,13 +24548,25 @@ body {{ background:#f7f6f3 !important; }}
                 pdate = (pt.get("date") or "")[:10]
                 if (total, pdate) in seen_xero:
                     continue
+                statement_match = None
+                try:
+                    statement_match = xero_statement.find_reconciled_match(
+                        _xero_statement_rows,
+                        amount=total,
+                        date=dt.date.fromisoformat(pdate),
+                        xero_account_id=str(label_meta.get("xero_account_id") or ""),
+                        xero_account_name=label_name or chosen,
+                        description=str(pt.get("name") or ""),
+                    )
+                except (TypeError, ValueError):
+                    statement_match = None
                 n_feed_kept += 1
                 txs.append({
                     "account": label_name or "Card (bank feed)",
                     "total": total,
                     "date": pdate,
                     "contact": pt.get("name") or "",
-                    "reconciled": False,
+                    "reconciled": bool(statement_match),
                     "has_attachment": False,
                     "used": False,
                 })
@@ -19309,9 +25214,8 @@ body {{ background:#f7f6f3 !important; }}
             _dump_xero_spend_cache[cache_key] = txs
 
         exact = []
+        nearby_merchant_matches = []
         for tx in _dump_xero_spend_cache.get(cache_key, []):
-            if tx.get("date") != day.isoformat():
-                continue
             try:
                 if abs(float(tx.get("amount") or 0) - amt) > 0.02:
                     continue
@@ -19319,20 +25223,33 @@ body {{ background:#f7f6f3 !important; }}
                 continue
             tx = dict(tx)
             tx["merchant_match"] = _merch_match(merchant, tx.get("contact"))
-            exact.append(tx)
-        if not exact:
+            try:
+                tx_day = dt.date.fromisoformat(str(tx.get("date") or "")[:10])
+                tx["date_diff_days"] = abs((tx_day - day).days)
+            except (TypeError, ValueError):
+                tx["date_diff_days"] = 999
+            if tx.get("date") == day.isoformat():
+                exact.append(tx)
+            elif tx["merchant_match"] and tx["date_diff_days"] <= 10:
+                # Card/bank posting dates often land a day or two after the
+                # receipt date. If amount is exact and supplier matches, reuse
+                # the existing Xero spend instead of creating a duplicate.
+                nearby_merchant_matches.append(tx)
+        candidates = exact or nearby_merchant_matches
+        if not candidates:
             return None
 
         # Prefer the most convincing exact match, but any same-date/same-amount
         # Xero SPEND line is enough to stop a duplicate import.
-        exact.sort(
+        candidates.sort(
             key=lambda tx: (
+                tx.get("date_diff_days", 999),
                 0 if tx.get("merchant_match") else 1,
                 0 if tx.get("has_attachment") else 1,
                 0 if tx.get("reconciled") else 1,
             )
         )
-        return exact[0]
+        return candidates[0]
 
     def _dump_attach_item_to_existing_xero_spend(item: dict, xero_match: dict) -> tuple[bool, str]:
         """Attach a dump receipt image to an existing Xero BankTransaction."""
@@ -19440,6 +25357,7 @@ body {{ background:#f7f6f3 !important; }}
         svc = ReceiptService(config)
         settings = get_expense_settings(db)
         vat_rate = settings["vat_rate"]
+        supplier_profile = _dump_supplier_profile(batch.get("supplier_profile") or "")
         engineer_id = batch.get("engineer_id")
         engineer = exp_store.get_engineer(db, int(engineer_id)) if engineer_id else None
 
@@ -19556,6 +25474,22 @@ body {{ background:#f7f6f3 !important; }}
                 }
             _ocr_s = time.perf_counter() - _t_stage
 
+            profile_result: dict = {}
+            profile_error = ""
+            if supplier_profile == "ringgo":
+                profile_result = _parse_ringgo_dump_receipt(
+                    result.get("raw_text", ""), exp_accounts
+                )
+                if profile_result.get("ok"):
+                    result = dict(result)
+                    for key in ("merchant", "date", "total", "net", "tax", "currency"):
+                        result[key] = profile_result.get(key)
+                else:
+                    profile_error = str(
+                        profile_result.get("error")
+                        or "RingGo validation did not pass."
+                    )
+
             # One photo can contain SEVERAL physical receipts (e.g. two pump
             # receipts side by side). Ask the AI (conservatively); when it
             # confidently finds 2+, the first is processed here as normal and
@@ -19563,7 +25497,8 @@ body {{ background:#f7f6f3 !important; }}
             # same photo.
             splits: list = []
             if (
-                result.get("raw_text")
+                not supplier_profile
+                and result.get("raw_text")
                 and not result.get("ocr_error")
                 and _looks_like_multi_receipt_text(result.get("raw_text", ""))
             ):
@@ -19588,47 +25523,61 @@ body {{ background:#f7f6f3 !important; }}
 
             ocr_net, ocr_tax = result.get("net"), result.get("tax")
             ocr_had_breakdown = ocr_net is not None or ocr_tax is not None
-            total, net, tax, zero_rated = _exp_reconcile_amounts_from_text(
-                result.get("total"), ocr_net, ocr_tax,
-                result.get("raw_text", ""), vat_rate
-            )
+            if supplier_profile == "ringgo" and profile_result.get("ok"):
+                total = profile_result["total"]
+                net = profile_result["net"]
+                tax = profile_result["tax"]
+                zero_rated = profile_result["segments"][0]["gross"]
+            else:
+                total, net, tax, zero_rated = _exp_reconcile_amounts_from_text(
+                    result.get("total"), ocr_net, ocr_tax,
+                    result.get("raw_text", ""), vat_rate
+                )
 
             segments = []
             cat_code = cat_name = ""
             ai_uncertain = False
             fallback_unresolved = ""
             _t_stage = time.perf_counter()
-            try:
-                segments = _ai_analyze_receipt(
-                    db, result.get("merchant", ""), result.get("raw_text", ""),
-                    total, exp_accounts, vat_rate,
-                )
-                if segments:
-                    primary = max(segments, key=lambda s: s.get("gross") or 0)
-                    cat_code, cat_name = primary["account_code"], primary["account_name"]
-                    if len(segments) > 1 and not ocr_had_breakdown:
-                        net = round(sum(s["net"] for s in segments), 2)
-                        tax = round(sum(s["vat"] for s in segments), 2)
-                        total = round(sum(s["gross"] for s in segments), 2)
-                else:
-                    cat_code, cat_name = _exp_categorize_receipt(
+            if supplier_profile == "ringgo" and profile_result.get("ok"):
+                segments = list(profile_result["segments"])
+                cat_code = profile_result["account_code"]
+                cat_name = profile_result["account_name"]
+            elif supplier_profile == "ringgo":
+                ai_uncertain = True
+            else:
+                try:
+                    segments = _ai_analyze_receipt(
                         db, result.get("merchant", ""), result.get("raw_text", ""),
-                        total, exp_accounts,
+                        total, exp_accounts, vat_rate,
                     )
-                    if not cat_code:
-                        ai_uncertain = True
-                        fallback = (
-                            ((engineer.get("expense_account_code") if engineer else "") or "").strip()
-                            or (settings.get("default_expense_account") or "").strip()
+                    if segments:
+                        primary = max(segments, key=lambda s: s.get("gross") or 0)
+                        cat_code = primary["account_code"]
+                        cat_name = primary["account_name"]
+                        if len(segments) > 1 and not ocr_had_breakdown:
+                            net = round(sum(s["net"] for s in segments), 2)
+                            tax = round(sum(s["vat"] for s in segments), 2)
+                            total = round(sum(s["gross"] for s in segments), 2)
+                    else:
+                        cat_code, cat_name = _exp_categorize_receipt(
+                            db, result.get("merchant", ""),
+                            result.get("raw_text", ""), total, exp_accounts,
                         )
-                        if fallback:
-                            cat_code, cat_name = _resolve_expense_account_choice(
-                                fallback, exp_accounts
+                        if not cat_code:
+                            ai_uncertain = True
+                            fallback = (
+                                ((engineer.get("expense_account_code") if engineer else "") or "").strip()
+                                or (settings.get("default_expense_account") or "").strip()
                             )
-                            if not cat_code:
-                                fallback_unresolved = fallback
-            except Exception:
-                pass
+                            if fallback:
+                                cat_code, cat_name = _resolve_expense_account_choice(
+                                    fallback, exp_accounts
+                                )
+                                if not cat_code:
+                                    fallback_unresolved = fallback
+                except Exception:
+                    pass
             _ai_s = time.perf_counter() - _t_stage
             # If the AI never produced an account (categorise failed or raised),
             # treat it as uncertain so the receipt is surfaced for a manual pick
@@ -19638,16 +25587,23 @@ body {{ background:#f7f6f3 !important; }}
             # Deterministic £40 fuel rule: under £40 → machinery fuel,
             # £40+ → van fuel; diesel is ALWAYS van fuel (machines take
             # unleaded). Done in code, never left to the LLM.
-            segments, cat_code, cat_name = _apply_receipt_account_guardrails(
-                segments, cat_code, cat_name, total, exp_accounts,
-                result.get("merchant", ""), result.get("raw_text", ""),
-            )
+            if not (supplier_profile == "ringgo" and profile_result.get("ok")):
+                segments, cat_code, cat_name = _apply_receipt_account_guardrails(
+                    segments, cat_code, cat_name, total, exp_accounts,
+                    result.get("merchant", ""), result.get("raw_text", ""),
+                )
 
             today = dt.datetime.now(dt.timezone.utc).date().isoformat()
             purchased_on = result.get("date") or today
 
-            status = dump_store.STATUS_NEW
-            dup_reason = ""
+            status = (
+                dump_store.STATUS_NEEDS_ACCOUNT
+                if profile_error else dump_store.STATUS_NEW
+            )
+            dup_reason = (
+                "RingGo safety validation blocked this receipt: " + profile_error
+                if profile_error else ""
+            )
             match_id = ""
             match_eid = None
             image_check: dict = {}
@@ -19663,6 +25619,10 @@ body {{ background:#f7f6f3 !important; }}
             elif full_hash in seen_in_batch or full_hash in prior_hashes:
                 status = dump_store.STATUS_DUPLICATE
                 dup_reason = "Duplicate of another uploaded receipt (identical image)."
+            elif profile_error:
+                # Supplier-profile batches fail closed. Do not use uncertain
+                # amounts for fuzzy duplicate, Xero, or bank-feed matching.
+                pass
             else:
                 this_key = _dump_norm_merchant(result.get("merchant", ""))
                 match = None
@@ -19765,6 +25725,37 @@ body {{ background:#f7f6f3 !important; }}
                             "will attach this photo to that existing Xero spend only — "
                             "no duplicate expense will be created."
                         )
+                if status == dump_store.STATUS_NEW:
+                    bill_match = _receipt_existing_xero_bill_match({
+                        "amount_inc": total,
+                        "purchased_on": purchased_on,
+                        "merchant": result.get("merchant", ""),
+                        "ocr_merchant": result.get("merchant", ""),
+                    })
+                    if bill_match:
+                        contact = (bill_match.get("contact") or "Xero supplier bill").strip()
+                        if bill_match.get("has_attachment"):
+                            status = dump_store.STATUS_DUPLICATE
+                            dup_reason = (
+                                "Already submitted in Xero as a supplier bill — "
+                                "same date "
+                                + _exp_uk_date(bill_match.get("date") or purchased_on)
+                                + ", same amount £"
+                                + format(float(bill_match.get("amount") or 0), ",.2f")
+                                + ", contact " + contact
+                                + ", receipt already attached in Xero."
+                            )
+                        else:
+                            dup_reason = (
+                                "Already in Xero as a supplier bill on "
+                                + _exp_uk_date(bill_match.get("date") or purchased_on)
+                                + " for £"
+                                + format(float(bill_match.get("amount") or 0), ",.2f")
+                                + ", contact " + contact
+                                + ", but no receipt image is attached yet. Importing "
+                                "this row will attach this photo to that existing Xero "
+                                "bill only — no duplicate expense will be created."
+                            )
 
             card_status = ""
             if status == dump_store.STATUS_NEW:
@@ -19860,6 +25851,11 @@ body {{ background:#f7f6f3 !important; }}
                 mime_type=content_type,
                 ocr_raw=(result.get("raw_text", "") or "")[:4000],
                 ocr_error=result.get("ocr_error", ""),
+                notes=(
+                    "RingGo profile validated; receipt "
+                    + str(profile_result.get("receipt_number") or "")
+                    if profile_result.get("ok") else ""
+                ),
             )
             _write_dump_progress(source_idx)
 
@@ -19929,6 +25925,34 @@ body {{ background:#f7f6f3 !important; }}
                                 "this row will attach this photo to that existing "
                                 "Xero spend only — no duplicate expense will be created."
                             )
+                    if s_status == dump_store.STATUS_NEW:
+                        s_bill_match = _receipt_existing_xero_bill_match({
+                            "amount_inc": s_total,
+                            "purchased_on": s_date,
+                            "merchant": s_merchant,
+                            "ocr_merchant": s_merchant,
+                        })
+                        if s_bill_match:
+                            if s_bill_match.get("has_attachment"):
+                                s_status = dump_store.STATUS_DUPLICATE
+                                s_reason = (
+                                    "Already submitted in Xero as a supplier bill — "
+                                    "same date "
+                                    + _exp_uk_date(s_bill_match.get("date") or s_date)
+                                    + ", same amount £"
+                                    + format(float(s_bill_match.get("amount") or 0), ",.2f")
+                                    + ", receipt already attached in Xero."
+                                )
+                            else:
+                                s_reason = (
+                                    "Already in Xero as a supplier bill on "
+                                    + _exp_uk_date(s_bill_match.get("date") or s_date)
+                                    + " for £"
+                                    + format(float(s_bill_match.get("amount") or 0), ",.2f")
+                                    + ", but no receipt image is attached yet. Importing "
+                                    "this row will attach this photo to that existing "
+                                    "Xero bill only — no duplicate expense will be created."
+                                )
                     if s_status == dump_store.STATUS_NEW:
                         s_card = _dump_card_feed_check(
                             engineer, s_total, s_date,
@@ -20050,6 +26074,30 @@ body {{ background:#f7f6f3 !important; }}
         except Exception:
             cs = {"has_data": False}
         months = max(1, round((cs.get("retention_days") or 366) / 30.5))
+        bank_upload_due, bank_reminder_day_name, last_upload_stamp, _reminder_day = (
+            _field_expenses_bank_upload_due()
+        )
+        due_panel_cls = (
+            "border-amber-300 bg-amber-50/70 animate-pulse"
+            if bank_upload_due else
+            "border-gray-200 bg-white"
+        )
+        due_form_cls = (
+            "border-amber-300 bg-amber-50 animate-pulse"
+            if bank_upload_due else
+            "border-gray-200 bg-gray-50"
+        )
+        due_header_html = (
+            "<div class='rounded-lg border border-amber-300 bg-amber-100 px-3 py-2 "
+            "text-xs font-semibold text-amber-900 animate-pulse'>"
+            f"Bank CSV upload is due for this week. Reminder day: {escape(bank_reminder_day_name)}.</div>"
+            if bank_upload_due else
+            (
+                "<div class='rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 "
+                "text-xs font-semibold text-emerald-800'>"
+                f"Bank CSV is up to date. Last upload: {escape(str(last_upload_stamp or cs.get('last_upload_at') or 'unknown'))}.</div>"
+            )
+        )
 
         # Account labels (Xero bank account names saved at upload time).
         try:
@@ -20059,6 +26107,78 @@ body {{ background:#f7f6f3 !important; }}
 
         # Live Xero bank accounts for the upload-form dropdown.
         xero_bank_accts = _get_xero_bank_accts_for_cardfeed()
+
+        def _xero_acct_options(default_label: str = "— which Xero account is this? —") -> str:
+            if not xero_bank_accts:
+                return ""
+            _upload_opts = []
+            for _xb in xero_bank_accts:
+                _xid = escape(_xb.get('AccountID') or '')
+                _xnm = escape(_xb.get('Name') or '')
+                _xbn = escape(_xb.get('BankAccountNumber') or '')
+                _upload_opts.append(f"<option value='{_xid}|{_xnm}|{_xbn}'>{_xnm}</option>")
+            return f"<option value=''>{escape(default_label)}</option>" + "".join(_upload_opts)
+
+        try:
+            xstmt = xero_statement.status(db)
+        except Exception:
+            xstmt = {"has_data": False, "row_count": 0}
+        xstmt_summary = (
+            f"{int(xstmt.get('row_count') or 0):,} reconciled Xero row(s) on file"
+            if xstmt.get("has_data") else
+            "No Xero reconciled statement report uploaded yet"
+        )
+        xstmt_dates = ""
+        if xstmt.get("date_from") or xstmt.get("date_to"):
+            xstmt_dates = (
+                f" · {escape(str(xstmt.get('date_from') or ''))}"
+                f" → {escape(str(xstmt.get('date_to') or ''))}"
+            )
+        xstmt_last = (
+            f"Last upload: {escape(str(xstmt.get('last_upload_at') or 'unknown'))}"
+            if xstmt.get("has_data") else
+            "Export from Xero's Bank statements / reconciliation report and upload it here."
+        )
+        if xero_bank_accts:
+            xstmt_account_html = (
+                "<select name='xero_acct' required "
+                "class='min-w-[13rem] text-xs border border-gray-300 rounded-lg px-2 py-1.5 bg-white'>"
+                + _xero_acct_options("choose matching Xero account")
+                + "</select>"
+            )
+        else:
+            xstmt_account_html = (
+                "<input name='xero_acct_name' placeholder='Xero account name' required "
+                "class='min-w-[13rem] text-xs border border-gray-300 rounded-lg px-2 py-1.5 bg-white'>"
+            )
+        xstmt_clear = (
+            "<form method='post' action='/cardfeed/xero-statement-clear' "
+            "onsubmit=\"return confirm('Delete uploaded Xero reconciled statement status?');\">"
+            "<button type='submit' class='px-3 py-1.5 border border-gray-300 "
+            "text-gray-700 rounded-lg text-xs font-semibold hover:bg-gray-50'>Clear Xero status</button>"
+            "</form>"
+            if xstmt.get("has_data") else
+            ""
+        )
+        xstmt_html = (
+            "<div class='rounded-xl border border-blue-200 bg-blue-50/70 p-4 space-y-3'>"
+            "<div class='flex flex-wrap items-start justify-between gap-3'>"
+            "<div><h3 class='text-sm font-bold text-blue-950'>Xero reconciled statement report</h3>"
+            f"<p class='text-xs text-blue-800'>{escape(xstmt_summary)}{xstmt_dates}</p>"
+            f"<p class='text-[11px] text-blue-700 mt-0.5'>{xstmt_last}</p></div>"
+            f"{xstmt_clear}</div>"
+            "<form method='post' action='/cardfeed/xero-statement-upload' enctype='multipart/form-data' "
+            "class='flex flex-wrap items-center gap-2 rounded-lg border border-dashed border-blue-200 bg-white/75 px-3 py-2'>"
+            + xstmt_account_html +
+            "<input type='file' name='csv_file' accept='.csv,text/csv' required multiple "
+            "class='max-w-full text-xs text-gray-600 file:mr-2 file:px-2 file:py-1 "
+            "file:rounded-md file:border-0 file:bg-blue-50 file:text-blue-700 "
+            "file:text-xs file:font-medium hover:file:bg-blue-100'/>"
+            "<button type='submit' class='px-3 py-1.5 bg-blue-700 text-white "
+            "rounded-lg text-xs font-semibold hover:bg-blue-800'>Upload Xero report</button>"
+            "<span class='text-[11px] text-blue-700'>Exact date + amount matches turn rows green.</span>"
+            "</form></div>"
+        )
 
         # Build a map of account_id → engineer name(s) so we can label each feed.
         try:
@@ -20171,6 +26291,35 @@ body {{ background:#f7f6f3 !important; }}
                         "Link in Field Expenses &rarr;</a>"
                     )
                 month_bar = _month_bar_html(a.get("months") or {})
+                if xero_id_saved or xero_name:
+                    xero_value = "|".join([xero_id_saved, xero_name, lbl.get("bank_number") or ""])
+                    upload_account_html = (
+                        f"<input type='hidden' name='xero_acct' value='{escape(xero_value)}'>"
+                        f"<span class='text-[11px] text-gray-400'>Uploading into {escape(xero_name or 'this account')}</span>"
+                    )
+                elif xero_bank_accts:
+                    upload_account_html = (
+                        "<select name='xero_acct' required "
+                        "class='min-w-[13rem] text-xs border border-gray-300 rounded-lg px-2 py-1.5 bg-white'>"
+                        + _xero_acct_options("choose Xero account")
+                        + "</select>"
+                    )
+                else:
+                    upload_account_html = ""
+                account_upload_html = (
+                    "<form method='post' action='/cardfeed/csv-upload' enctype='multipart/form-data' "
+                    "class='mt-2 flex flex-wrap items-center gap-2 rounded-lg border border-dashed "
+                    f"{due_form_cls} px-3 py-2'>"
+                    + upload_account_html +
+                    "<input type='file' name='csv_file' accept='.csv,text/csv' required multiple "
+                    "class='max-w-full text-xs text-gray-600 file:mr-2 file:px-2 file:py-1 "
+                    "file:rounded-md file:border-0 file:bg-indigo-50 file:text-indigo-700 "
+                    "file:text-xs file:font-medium hover:file:bg-indigo-100'/>"
+                    "<button type='submit' class='px-3 py-1.5 bg-indigo-600 text-white "
+                    "rounded-lg text-xs font-semibold hover:bg-indigo-700'>Upload CSV</button>"
+                    "<span class='text-[11px] text-gray-400'>Overlapping months are safe.</span>"
+                    "</form>"
+                )
                 rows += (
                     "<tr class='border-t border-gray-100'>"
                     f"<td class='py-2 pr-4'>{acct_html}</td>"
@@ -20183,6 +26332,7 @@ body {{ background:#f7f6f3 !important; }}
                     f"<td colspan='4' class='pb-3 pt-0'>"
                     f"<div class='text-[10px] text-gray-400 mb-0.5 uppercase tracking-wide'>Coverage — last 12 months</div>"
                     f"{month_bar}"
+                    f"{account_upload_html}"
                     f"</td>"
                     "</tr>"
                 )
@@ -20260,51 +26410,60 @@ body {{ background:#f7f6f3 !important; }}
                 )
             clear_html = ""
 
-        # Upload form — include Xero bank account selector if available.
-        if xero_bank_accts:
-            _upload_opts = []
-            for _xb in xero_bank_accts:
-                _xid = escape(_xb.get('AccountID') or '')
-                _xnm = escape(_xb.get('Name') or '')
-                _xbn = escape(_xb.get('BankAccountNumber') or '')
-                _upload_opts.append(f"<option value='{_xid}|{_xnm}|{_xbn}'>{_xnm}</option>")
-            xero_opts = "<option value=''>— which Xero account is this? —</option>" + "".join(_upload_opts)
+        # First upload form — once accounts exist, uploads move onto each account
+        # row above so admin does not have to use a separate selector.
+        if xero_bank_accts and not accts_on_file:
             acct_select = (
                 "<div>"
                 "<label class='block text-xs text-gray-500 mb-1'>Xero bank account "
                 "<span class='text-gray-400'>(optional — names the account; used to detect mismatches)</span></label>"
-                f"<select name='xero_acct' class='w-full sm:w-auto text-sm border "
-                f"border-gray-300 rounded-lg px-3 py-2'>{xero_opts}</select>"
+                "<select name='xero_acct' class='w-full sm:w-auto text-sm border "
+                f"border-gray-300 rounded-lg px-3 py-2'>{_xero_acct_options()}</select>"
                 "</div>"
             )
         else:
             acct_select = ""
+        upload_section = ""
+        if not accts_on_file:
+            upload_section = (
+                "<div class='border-t border-gray-100 pt-4 space-y-3'>"
+                "<p class='text-xs text-gray-500'>Upload one or more monthly CSV exports. "
+                "Select multiple files at once (hold Shift or Cmd/Ctrl) to import several months together. "
+                "Duplicates across overlapping files are skipped automatically.</p>"
+                "<form method='post' action='/cardfeed/csv-upload' "
+                f"enctype='multipart/form-data' class='space-y-2 rounded-xl border border-dashed {due_form_cls} p-3'>"
+                + acct_select +
+                "<div class='flex flex-wrap items-center gap-3'>"
+                "<label class='block text-xs text-gray-500'>CSV file(s)</label>"
+                "<input type='file' name='csv_file' accept='.csv,text/csv' required multiple "
+                "class='text-sm text-gray-600 file:mr-3 file:px-3 file:py-1.5 "
+                "file:rounded-lg file:border-0 file:bg-indigo-50 file:text-indigo-700 "
+                "file:text-sm file:font-medium hover:file:bg-indigo-100'/>"
+                "<button type='submit' class='px-4 py-2 bg-indigo-600 text-white "
+                "rounded-lg text-sm font-medium hover:bg-indigo-700'>Upload</button>"
+                + clear_html +
+                "</div></form>"
+                "<p class='text-xs text-gray-400'>Transactions are kept for up to "
+                + str(months) + " months. Re-uploading overlapping exports is safe &mdash; "
+                "duplicates are skipped automatically.</p>"
+                "</div>"
+            )
+        elif clear_html:
+            upload_section = (
+                "<div class='border-t border-gray-100 pt-4 flex items-center justify-between gap-3'>"
+                "<p class='text-xs text-gray-400'>Use the upload controls beside each account above. "
+                "Re-uploading overlapping exports is safe &mdash; duplicates are skipped automatically.</p>"
+                + clear_html +
+                "</div>"
+            )
 
         return (
-            "<div class='rounded-xl border border-gray-200 bg-white p-6 shadow-sm space-y-4'>"
+            f"<div class='rounded-xl border {due_panel_cls} p-6 shadow-sm space-y-4'>"
             "<h2 class='text-base font-semibold text-gray-900'>Statement upload (CSV)</h2>"
-            + status_html +
-            "<div class='border-t border-gray-100 pt-4 space-y-3'>"
-            "<p class='text-xs text-gray-500'>Upload one or more monthly CSV exports. "
-            "Select multiple files at once (hold Shift or Cmd/Ctrl) to import several months together. "
-            "Duplicates across overlapping files are skipped automatically.</p>"
-            "<form method='post' action='/cardfeed/csv-upload' "
-            "enctype='multipart/form-data' class='space-y-2'>"
-            + acct_select +
-            "<div class='flex flex-wrap items-center gap-3'>"
-            "<label class='block text-xs text-gray-500'>CSV file(s)</label>"
-            "<input type='file' name='csv_file' accept='.csv,text/csv' required multiple "
-            "class='text-sm text-gray-600 file:mr-3 file:px-3 file:py-1.5 "
-            "file:rounded-lg file:border-0 file:bg-indigo-50 file:text-indigo-700 "
-            "file:text-sm file:font-medium hover:file:bg-indigo-100'/>"
-            "<button type='submit' class='px-4 py-2 bg-indigo-600 text-white "
-            "rounded-lg text-sm font-medium hover:bg-indigo-700'>Upload</button>"
-            + clear_html +
-            "</div></form>"
-            "<p class='text-xs text-gray-400'>Transactions are kept for up to "
-            + str(months) + " months. Re-uploading overlapping exports is safe &mdash; "
-            "duplicates are skipped automatically.</p>"
-            "</div>"
+            + due_header_html +
+            status_html +
+            xstmt_html +
+            upload_section +
             "</div>"
         )
 
@@ -20610,15 +26769,13 @@ body {{ background:#f7f6f3 !important; }}
                 print(f"[cardfeed] csv upload error ({fname}): {e}", flush=True)
                 errors.append(f"{fname}: couldn't parse — check it's a Lloyds CSV export")
 
-        # Build result message.
-        file_word = "file" if len(files) == 1 else "files"
-        bits = [f"Processed {len(files)} {file_word}"]
-        if total_added:
-            bits.append(f"{total_added} new transaction(s) imported")
-        if total_dup:
-            bits.append(f"{total_dup} already on file")
-        if total_old:
-            bits.append(f"{total_old} older than the 12-month window")
+        # Build an explicit result message. Always show both figures so a
+        # multi-file upload cannot make "new" and "already present" ambiguous.
+        bits = [
+            _cardfeed_csv_upload_summary(
+                len(files), total_added, total_dup, total_old
+            )
+        ]
         if labelled_accounts:
             bits.append(f"labelled as '{xero_acct_name}'")
 
@@ -20632,7 +26789,69 @@ body {{ background:#f7f6f3 !important; }}
             err_detail = "; ".join(errors)
             session["save_notice"] = f"error:Some files failed: {err_detail}"
         else:
+            set_json_setting(
+                config.admin_db_file,
+                "engineer_bank_feed_notice_stamp",
+                dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+            )
             session["save_notice"] = "success:" + ", ".join(bits) + "."
+        return redirect("/cardfeed")
+
+    @app.post("/cardfeed/xero-statement-upload")
+    @require_login
+    def cardfeed_xero_statement_upload():
+        files = request.files.getlist("csv_file")
+        files = [f for f in files if f and (f.filename or "").strip()]
+        if not files:
+            session["save_notice"] = "error:Choose at least one Xero CSV report to upload."
+            return redirect("/cardfeed")
+
+        xero_acct_raw = (request.form.get("xero_acct") or "").strip()
+        xero_acct_id = xero_acct_name = ""
+        if xero_acct_raw:
+            parts = xero_acct_raw.split("|")
+            xero_acct_id = parts[0] if len(parts) > 0 else ""
+            xero_acct_name = parts[1] if len(parts) > 1 else ""
+        else:
+            xero_acct_name = (request.form.get("xero_acct_name") or "").strip()
+        if not (xero_acct_id or xero_acct_name):
+            session["save_notice"] = "error:Choose which Xero account the report is for."
+            return redirect("/cardfeed")
+
+        total_added = total_dup = total_old = 0
+        errors: list[str] = []
+        for f in files:
+            fname = f.filename or "file"
+            try:
+                data = f.read()
+                if len(data) > 10 * 1024 * 1024:
+                    errors.append(f"{fname}: too large (max 10 MB)")
+                    continue
+                res = xero_statement.ingest_csv(
+                    config.admin_db_file,
+                    data,
+                    xero_account_id=xero_acct_id,
+                    xero_account_name=xero_acct_name,
+                )
+                total_added += int(res.get("added") or 0)
+                total_dup += int(res.get("skipped_duplicates") or 0)
+                total_old += int(res.get("too_old") or 0)
+            except ValueError as e:
+                errors.append(f"{fname}: {str(e)[:220]}")
+            except Exception as e:
+                print(f"[cardfeed] xero statement upload error ({fname}): {e}", flush=True)
+                errors.append(f"{fname}: couldn't parse the Xero CSV report")
+
+        if errors:
+            session["save_notice"] = "error:Some Xero report files failed: " + "; ".join(errors)
+        else:
+            bits = [
+                f"{total_added} reconciled Xero row(s) imported",
+                f"{total_dup} already on file",
+            ]
+            if total_old:
+                bits.append(f"{total_old} older than the retention window")
+            session["save_notice"] = "success:Xero statement status updated — " + ", ".join(bits) + "."
         return redirect("/cardfeed")
 
     @app.post("/cardfeed/csv-label")
@@ -20672,6 +26891,17 @@ body {{ background:#f7f6f3 !important; }}
                 session["save_notice"] = "error:Couldn't save label — select a Xero account first."
         else:
             session["save_notice"] = "error:Couldn't save label — select a Xero account first."
+        return redirect("/cardfeed")
+
+    @app.post("/cardfeed/xero-statement-clear")
+    @require_login
+    def cardfeed_xero_statement_clear():
+        try:
+            xero_statement.clear(config.admin_db_file)
+            session["save_notice"] = "success:Uploaded Xero statement status cleared."
+        except Exception as e:
+            print(f"[cardfeed] xero statement clear error: {e}", flush=True)
+            session["save_notice"] = "error:Couldn't clear the Xero statement status."
         return redirect("/cardfeed")
 
     @app.post("/cardfeed/csv-clear")
@@ -20870,6 +27100,12 @@ body {{ background:#f7f6f3 !important; }}
                 "bg-amber-100 text-amber-700 align-middle'>TEST</span>"
                 if is_test_b else ""
             )
+            profile_tag = (
+                "<span class='ml-2 text-[10px] font-semibold px-1.5 py-0.5 rounded "
+                "bg-fuchsia-100 text-fuchsia-700 align-middle'>RINGGO</span>"
+                if _dump_supplier_profile(b.get("supplier_profile") or "") == "ringgo"
+                else ""
+            )
             rows += (
                 "<div class='flex items-stretch border-b border-gray-100 "
                 "hover:bg-gray-50'>"
@@ -20877,7 +27113,7 @@ body {{ background:#f7f6f3 !important; }}
                 "min-w-0 px-4 py-3'>"
                 "<div class='flex items-center justify-between'>"
                 "<span class='text-sm font-medium text-gray-800'>"
-                + escape(b.get("label") or b["id"]) + test_tag + "</span>"
+                + escape(b.get("label") or b["id"]) + test_tag + profile_tag + "</span>"
                 "<span class='text-xs text-gray-400'>" + escape(str(b.get("created_at", ""))[:16]) + "</span>"
                 "</div><div class='text-xs text-gray-500 mt-0.5'>"
                 + str(b.get("total_count", 0)) + " receipts · " + escape(chips or "—")
@@ -21164,6 +27400,19 @@ body {{ background:#f7f6f3 !important; }}
             "</script>"
             "</div>"
             "<div><label class='block text-sm font-medium text-gray-700 mb-1'>"
+            "Receipt type"
+            + _dump_tooltip("Choose a supplier-specific profile when every file in "
+                            "the batch comes from that supplier. The profile uses "
+                            "strict layout and arithmetic checks and blocks any file "
+                            "that does not reconcile exactly.")
+            + "</label><select name='supplier_profile' id='dump-supplier-profile' "
+            "class='block w-full rounded-lg border-gray-300 text-sm'>"
+            "<option value=''>Standard / mixed suppliers (AI)</option>"
+            "<option value='ringgo'>RingGo Parking — validated mixed VAT</option>"
+            "</select><p class='mt-1 text-xs text-gray-500'>RingGo mode keeps the "
+            "0% parking charge and each 20% fee separate, checks every subtotal, "
+            "and blocks anything that is not an exact match.</p></div>"
+            "<div><label class='block text-sm font-medium text-gray-700 mb-1'>"
             "Person / card these belong to"
             + _dump_tooltip("Used to spot cross-person duplicates and to pick a "
                             "fallback expense account.")
@@ -21255,6 +27504,9 @@ body {{ background:#f7f6f3 !important; }}
             engineer_id=eid,
             subcontractor_account=(request.form.get("subcontractor_account") or "").strip(),
             card_account=(request.form.get("card_account") or "").strip(),
+            supplier_profile=_dump_supplier_profile(
+                request.form.get("supplier_profile") or ""
+            ),
             is_test=is_test,
         )
         payloads = []
@@ -21329,6 +27581,9 @@ body {{ background:#f7f6f3 !important; }}
             engineer_id=eid,
             subcontractor_account=(request.form.get("subcontractor_account") or "").strip(),
             card_account=(request.form.get("card_account") or "").strip(),
+            supplier_profile=_dump_supplier_profile(
+                request.form.get("supplier_profile") or ""
+            ),
             is_test=is_test,
         )
         # Remember the last card used so the upload form preselects it next
@@ -21630,6 +27885,15 @@ body {{ background:#f7f6f3 !important; }}
         sym = "\u00a3"
         amt = item.get("amount_inc")
         amt_s = (sym + format(float(amt), ",.2f")) if amt is not None else "—"
+        batch_engineer = None
+        if batch and batch.get("engineer_id"):
+            try:
+                batch_engineer = exp_store.get_engineer(
+                    config.admin_db_file, int(batch.get("engineer_id"))
+                )
+            except Exception:
+                batch_engineer = None
+        is_sub_batch = bool(batch_engineer and batch_engineer.get("kind") == "subcontractor")
 
         # Card-feed match pill (from the read-only bank reconciliation), shown on
         # the card itself so the status lives with the receipt instead of in a
@@ -21793,11 +28057,13 @@ body {{ background:#f7f6f3 !important; }}
                 + (" — " + escape(ic.get("reason")) if ic.get("reason") else "") + "</div>"
             )
         view_html = ""
+        current_img_url = ""
         if item.get("stored_file"):
             img_url = (
                 "/receipts/expenses/dump/" + batch_id + "/item/"
                 + item["id"] + "/image"
             )
+            current_img_url = img_url
             is_preview_image = str(item.get("mime_type") or "").lower().startswith("image/")
             preview_attrs = (
                 "data-preview-url='" + img_url + "' "
@@ -21817,6 +28083,19 @@ body {{ background:#f7f6f3 !important; }}
                 ".639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178z'/>"
                 "<path stroke-linecap='round' stroke-linejoin='round' d='M15 12a3 3 0 "
                 "11-6 0 3 3 0 016 0z'/></svg>View receipt</a>"
+            )
+        compare_html = ""
+        match_receipt_id = str(item.get("match_receipt_id") or "").strip()
+        if current_img_url and match_receipt_id:
+            compare_html = (
+                "<button type='button' "
+                "class='inline-flex items-center gap-1 ml-1 mt-2 px-2.5 py-1 text-xs "
+                "font-medium bg-red-100 text-red-800 rounded-lg hover:bg-red-200' "
+                "data-receipt-compare='1' "
+                f"data-current-url='{escape(current_img_url)}' "
+                f"data-current-title='{escape(item.get('merchant') or 'Current receipt')}' "
+                f"data-duplicate-url='/receipts/expenses/receipt/{escape(match_receipt_id)}/image' "
+                "data-duplicate-title='Existing saved receipt'>Compare duplicate</button>"
             )
         xero_link_html = ""
         xero_bank_transaction_id = str(
@@ -21858,25 +28137,106 @@ body {{ background:#f7f6f3 !important; }}
                 "font-medium text-gray-500 hover:text-sky-700 hover:bg-sky-50 rounded-md' "
                 "title='Open the matched Xero bank transaction'>Open in Xero</a>"
             )
-        links_html = view_html + xero_link_html
+        links_html = view_html + compare_html + xero_link_html
         controls = ""
         is_active = item["status"] in dump_store.ACTIVE_STATUSES
         if is_active:
+            duplicate_clue = (
+                item.get("status") in (
+                    dump_store.STATUS_POSSIBLE_DUP,
+                    dump_store.STATUS_SUSPICIOUS,
+                )
+                or bool(match_receipt_id)
+                or "duplicate" in reason.lower()
+                or "already submitted" in reason.lower()
+                or "already in xero" in reason.lower()
+            )
+            ignore_label = "Remove"
+            duplicate_button = (
+                "<button name='action' value='accept_duplicate' class='px-2.5 py-1 text-xs "
+                "font-medium bg-red-700 text-white rounded-lg'>Mark duplicate</button>"
+                if duplicate_clue else ""
+            )
+            sub_note = (
+                "<div class='basis-full text-[11px] text-gray-500'>Approved receipts "
+                "will be added to " + escape(batch_engineer.get("name") or "this subcontractor")
+                + "'s owed receipts. They are not treated as company-card spends.</div>"
+                if is_sub_batch else ""
+            )
+            merchant_value = escape(item.get("merchant") or item.get("filename") or "")
+            amount_value = (
+                format(float(item.get("amount_inc")), ".2f")
+                if item.get("amount_inc") is not None else ""
+            )
+            vat_value = (
+                format(float(item.get("vat_amount")), ".2f")
+                if item.get("vat_amount") is not None else ""
+            )
+            ex_value = (
+                format(float(item.get("amount_ex")), ".2f")
+                if item.get("amount_ex") is not None else ""
+            )
+            vat_rate = float(get_expense_settings(config.admin_db_file).get("vat_rate") or 20.0)
+            safe_item_id = escape(str(item["id"]))
+            vat_mode = _exp_vat_mode(
+                item.get("amount_inc"),
+                item.get("amount_ex"),
+                item.get("vat_amount"),
+                vat_rate,
+            )
+            def _dump_vat_opt(value: str, label: str) -> str:
+                checked = "checked" if vat_mode == value else ""
+                return (
+                    "<label class='inline-flex items-center gap-1 rounded-lg border "
+                    "border-gray-200 bg-white px-2 py-1 text-[11px] font-semibold text-gray-700'>"
+                    f"<input type='radio' name='vat_mode' value='{value}' {checked} "
+                    "data-dump-vat-mode='1'>"
+                    f"{label}</label>"
+                )
             opts = _exp_acct_options(
                 exp_accounts, ai_code,
                 default_label="— choose account —",
             )
             controls = (
                 "<form method='post' action='/receipts/expenses/dump/" + batch_id
-                + "/item/" + item["id"] + "' class='flex flex-wrap items-center "
-                "gap-2 mt-2'>"
-                "<select name='account_code' class='rounded-lg border-gray-300 "
+                + "/item/" + item["id"] + "' class='mt-3 space-y-2' "
+                "data-dump-item-form='1'>"
+                "<input type='hidden' name='old_amount_inc' value='" + amount_value + "'>"
+                "<input type='hidden' name='old_vat_amount' value='" + vat_value + "'>"
+                "<div class='grid grid-cols-1 sm:grid-cols-3 gap-2'>"
+                "<label class='block text-[11px] font-medium text-gray-500'>Supplier"
+                "<input type='text' name='merchant' value='" + merchant_value + "' "
+                "class='mt-1 w-full rounded-lg border-gray-300 text-xs py-1.5' "
+                "placeholder='Supplier name' data-dump-merchant-input='1' "
+                "oninput=\"var c=this.closest('[data-dump-item-card]');var t=c&&c.querySelector('[data-dump-merchant-display]');if(t){t.textContent=(this.value||'Receipt').trim()||'Receipt';}\"></label>"
+                "<label class='block text-[11px] font-medium text-gray-500'>Total paid"
+                "<input type='number' step='0.01' inputmode='decimal' name='amount_inc' "
+                "value='" + amount_value + "' class='mt-1 w-full rounded-lg "
+                "border-gray-300 text-xs py-1.5 font-semibold' placeholder='0.00' "
+                "data-dump-total-input='1' data-vat-target='dump-vat-" + safe_item_id + "' "
+                "data-ex-target='dump-ex-" + safe_item_id + "' "
+                "data-old-total='" + amount_value + "' data-old-vat='" + vat_value + "' "
+                "data-vat-rate='" + format(vat_rate, ".2f") + "'></label>"
+                "<label class='block text-[11px] font-medium text-gray-500'>VAT"
+                "<input type='number' step='0.01' inputmode='decimal' name='vat_amount' "
+                "id='dump-vat-" + safe_item_id + "' value='" + vat_value + "' class='mt-1 w-full rounded-lg "
+                "border-gray-300 text-xs py-1.5' placeholder='0.00' "
+                "oninput=\"this.setAttribute('data-user-edited','1')\"></label>"
+                "<div class='rounded-lg bg-gray-50 px-2 py-1 text-[11px] text-gray-500'>"
+                "Ex VAT <span id='dump-ex-" + safe_item_id + "' data-dump-ex-output='1' "
+                "class='font-semibold text-gray-800'>£" + (ex_value or "0.00") + "</span></div>"
+                "</div><div class='flex flex-wrap items-center gap-2'>"
+                + _dump_vat_opt("standard", "VAT applied")
+                + _dump_vat_opt("no_vat", "No VAT")
+                + _dump_vat_opt("mixed", "Mixed VAT")
+                + "<select name='account_code' class='rounded-lg border-gray-300 "
                 "text-xs py-1'>" + opts + "</select>"
-                "<button name='action' value='keep' class='px-2.5 py-1 text-xs "
-                "font-medium bg-emerald-600 text-white rounded-lg'>Keep</button>"
                 "<button name='action' value='ignore' class='px-2.5 py-1 text-xs "
-                "font-medium bg-gray-200 text-gray-700 rounded-lg'>Ignore</button>"
-                "</form>"
+                "font-medium bg-gray-200 text-gray-700 rounded-lg'>" + ignore_label + "</button>"
+                + duplicate_button
+                + "<span data-dump-save-status class='hidden text-xs font-semibold text-emerald-700'>Saved</span>"
+                + "</div>" + sub_note
+                + "</form>"
             )
         # For inactive items (duplicates, ignored, imported) wrap the duplicate
         # reason and image-check inside a collapsible. The "View receipt" button
@@ -21908,24 +28268,24 @@ body {{ background:#f7f6f3 !important; }}
             select_html = (
                 "<label class='shrink-0 inline-flex items-center justify-center "
                 "w-8 h-8 rounded-lg border border-emerald-200 bg-emerald-50 "
-                "cursor-pointer' title='Untick if you do not want to import this "
-                "receipt in this submission'>"
+                "cursor-pointer' title='Tick once you have checked this receipt. "
+                "Ticking saves the values currently shown on this row.'>"
                 "<input form='dump-import-form' type='checkbox' "
                 "name='selected_item_id' value='" + escape(item["id"]) + "' "
-                "checked class='rounded border-gray-300 text-emerald-600 "
-                "dump-import-check'></label>"
+                "data-dump-review-check='1' class='rounded border-gray-300 "
+                "text-emerald-600 dump-import-check'></label>"
             )
         return (
-            "<div class='px-4 py-3 border-b border-gray-100'>"
+            "<div class='px-4 py-3 border-b border-gray-100' data-dump-item-card='1'>"
             "<div class='flex items-center justify-between gap-3'>"
             + select_html
             + "<div class='min-w-0 flex-1'><div class='text-sm font-medium text-gray-800 "
-            "truncate'>" + escape(item.get("merchant") or item.get("filename") or "Receipt")
+            "truncate' data-dump-merchant-display='1'>" + escape(item.get("merchant") or item.get("filename") or "Receipt")
             + "</div><div class='text-xs text-gray-500'>"
             + escape(_exp_uk_date(item.get("purchased_on") or "")) + " · "
             + escape(item.get("category_account_name") or "no account")
             + "</div></div><div class='shrink-0 text-right'>"
-            "<div class='text-sm font-semibold text-gray-900'>" + amt_s + "</div>"
+            "<div class='text-sm font-semibold text-gray-900' data-dump-amount-display='1'>" + amt_s + "</div>"
             + ("<div class='mt-1'>" + pill_html + "</div>" if pill_html else "")
             + "</div></div>"
             + extras + controls + "</div>"
@@ -22066,9 +28426,9 @@ body {{ background:#f7f6f3 !important; }}
             + sym + format(not_submitted_vat, ",.2f") + " VAT</span></div>"
             "</div>"
             "<div class='grid grid-cols-1 sm:grid-cols-4 gap-2 text-gray-700'>"
-            + _card("Ready to submit", ready,
+            + _card("Ready to review", ready,
                     "border-emerald-200 bg-emerald-50 text-emerald-800",
-                    "Ticked receipts import when you press the button.")
+                    "Tick rows once checked; only ticked rows import.")
             + _card("Needs review", needs,
                     "border-amber-200 bg-amber-50 text-amber-800",
                     "Pick an account, confirm duplicates, or review the warning.")
@@ -22082,18 +28442,28 @@ body {{ background:#f7f6f3 !important; }}
         )
 
     def _dump_refresh_account_guardrails(db: str, items: list, exp_accounts: list) -> list:
-        """Re-apply current deterministic coding rules to existing dump rows.
+        """Re-apply current deterministic parsing/coding rules to dump rows.
 
-        This lets a batch created before a guardrail improvement render with the
-        corrected account instead of preserving an older AI mistake forever.
-        Imported rows are left untouched because they already represent a Xero
-        submission.
+        This lets a batch created before a parser/guardrail improvement render
+        with corrected totals, dates and accounts instead of preserving an older
+        OCR/AI mistake forever. Imported rows are left untouched because they
+        already represent a Xero submission.
         """
-        if not exp_accounts:
-            return items
+        settings = get_expense_settings(db)
+        vat_rate = settings["vat_rate"]
         refreshed: list = []
         for item in items:
             if item.get("status") == dump_store.STATUS_IMPORTED:
+                refreshed.append(item)
+                continue
+            if "[manual-review]" in str(item.get("notes") or ""):
+                refreshed.append(item)
+                continue
+            repaired = _exp_repair_dump_item_values_from_raw(item, vat_rate)
+            if repaired:
+                updated = dump_store.update_item(db, item["id"], **repaired)
+                item = updated or {**item, **repaired}
+            if not exp_accounts:
                 refreshed.append(item)
                 continue
             segments = item.get("segments") or []
@@ -22240,16 +28610,15 @@ body {{ background:#f7f6f3 !important; }}
             (dump_store.STATUS_NEEDS_ACCOUNT, "Needs an account — please pick one", "amber"),
             (dump_store.STATUS_SUSPICIOUS, "Suspicious — possible cross-person duplicate", "red"),
             (dump_store.STATUS_POSSIBLE_DUP, "Possible duplicates", "amber"),
-            (dump_store.STATUS_NEW, "Ready to import", "emerald"),
+            (dump_store.STATUS_NEW, "Ready to review — tick correct rows", "emerald"),
             (dump_store.STATUS_DUPLICATE, "Ignored — duplicates / already reconciled", "gray"),
             (dump_store.STATUS_IMPORTED, "Imported", "sky"),
             (dump_store.STATUS_IGNORED, "Ignored by you", "gray"),
         ]
-        # Read-only card-feed reconciliation, computed once. The per-receipt
-        # match status is shown as a pill on each item card (in the grouped
-        # sections), and the leftover card transactions go in a collapsible at
-        # the bottom of the page.
-        recon = _dump_bank_feed_recon(items, batch)
+        # Read-only card-feed reconciliation only applies to company-card/owner
+        # batches. Subcontractor receipts are paid back through owed balances, so
+        # asking for a card here is misleading and can create unnecessary Xero work.
+        recon = {"rows": [], "no_card": False} if is_sub else _dump_bank_feed_recon(items, batch)
         recon_map = {
             r["item"]["id"]: r
             for r in ((recon or {}).get("rows") or [])
@@ -22265,10 +28634,7 @@ body {{ background:#f7f6f3 !important; }}
                 _dump_item_card(it, exp_accounts, eng_map, batch_id,
                                 detailed=is_test, recon_map=recon_map,
                                 batch=batch,
-                                selectable=(
-                                    status == dump_store.STATUS_NEW
-                                    and not is_test and not is_sub
-                                ))
+                                selectable=(status == dump_store.STATUS_NEW and not is_test))
                 for it in sel
             )
             sections += (
@@ -22291,15 +28657,20 @@ body {{ background:#f7f6f3 !important; }}
                 + format(total_ready, ",.2f") + "</div>"
             )
             if is_sub:
-                # Subcontractors get a reconciliation preview before importing.
+                eng_name = escape((sub_summary or {}).get("engineer", {}).get("name") or "this subcontractor")
                 import_bar = (
-                    "<div class='sticky bottom-4 bg-white rounded-xl border "
+                    "<form id='dump-import-form' method='post' "
+                    "action='/receipts/expenses/dump/" + batch_id
+                    + "/import' class='sticky bottom-4 bg-white rounded-xl border "
                     "border-emerald-200 shadow-lg p-4 flex items-center "
-                    "justify-between'>" + count_line
-                    + "<a href='/receipts/expenses/dump/" + batch_id
-                    + "/confirm' class='bg-emerald-600 hover:bg-emerald-700 text-white "
-                    "text-sm font-semibold px-4 py-2 rounded-lg'>Review &amp; "
-                    "import…</a></div>"
+                    "justify-between gap-4'><input type='hidden' "
+                    "name='selected_import' value='1'><div>" + count_line
+                    + "<div class='text-xs text-gray-500 mt-0.5'>Ticked receipts "
+                    "will be added to " + eng_name + "'s owed receipts. Untick "
+                    "or remove anything you do not want to include.</div></div>"
+                    + "<button class='bg-emerald-600 hover:bg-emerald-700 text-white "
+                    "text-sm font-semibold px-4 py-2 rounded-lg'>Add selected to "
+                    + eng_name + "'s owed receipts</button></form>"
                 )
             else:
                 import_bar = (
@@ -22331,6 +28702,34 @@ body {{ background:#f7f6f3 !important; }}
                 + str(n_show) + " receipt(s) would be put forward. To actually import, "
                 "upload a new batch with Test mode switched off.</div></div>"
             )
+        imported_notice = ""
+        if "imported" in request.args and not is_test:
+            try:
+                imported_n = int(request.args.get("imported") or 0)
+            except ValueError:
+                imported_n = 0
+            if imported_n > 0:
+                if is_sub:
+                    eng_name = escape((sub_summary or {}).get("engineer", {}).get("name") or "this subcontractor")
+                    msg = (
+                        str(imported_n) + " receipt(s) added to " + eng_name
+                        + "'s owed receipts. They will now appear in the payout area."
+                    )
+                else:
+                    msg = (
+                        str(imported_n)
+                        + " receipt(s) moved into Field Expenses for review/submission."
+                    )
+                imported_notice = (
+                    "<div class='bg-emerald-50 border border-emerald-200 rounded-xl "
+                    "p-4 mb-6 text-sm font-semibold text-emerald-800'>" + msg + "</div>"
+                )
+            else:
+                imported_notice = (
+                    "<div class='bg-amber-50 border border-amber-200 rounded-xl "
+                    "p-4 mb-6 text-sm font-semibold text-amber-800'>No receipts were "
+                    "imported. Tick at least one ready receipt before pressing submit.</div>"
+                )
 
         balance_html = _dump_balance_panel(sub_summary)
         outstanding_html = _dump_outstanding_panel(recon, batch_id)
@@ -22388,6 +28787,100 @@ body {{ background:#f7f6f3 !important; }}
             "closePreview();}});"
             "document.addEventListener('keydown',function(e){if(e.key==='Escape')closePreview();});"
             "})();</script>"
+            "<div id='receipt-compare-modal' class='hidden fixed inset-0 z-50 "
+            "bg-gray-950/70 items-center justify-center p-3 sm:p-6'>"
+            "<div class='relative w-full max-w-6xl bg-white rounded-xl shadow-2xl "
+            "border border-gray-200 overflow-hidden'>"
+            "<div class='flex items-center justify-between gap-3 px-4 py-3 border-b border-gray-200'>"
+            "<div class='text-sm font-semibold text-gray-800'>Compare duplicate receipts</div>"
+            "<button type='button' data-receipt-compare-close='1' class='w-10 h-10 rounded-lg "
+            "text-gray-600 hover:bg-gray-100 text-2xl leading-none'>&times;</button>"
+            "</div><div class='grid grid-cols-1 md:grid-cols-2 gap-3 bg-gray-100 p-3 sm:p-4'>"
+            "<div><div id='receipt-compare-current-title' class='mb-2 text-xs font-bold text-gray-600'>Current receipt</div>"
+            "<img id='receipt-compare-current-img' class='max-h-[76vh] w-full object-contain bg-white rounded-lg shadow-sm' alt='Current receipt'></div>"
+            "<div><div id='receipt-compare-duplicate-title' class='mb-2 text-xs font-bold text-gray-600'>Possible duplicate</div>"
+            "<img id='receipt-compare-duplicate-img' class='max-h-[76vh] w-full object-contain bg-white rounded-lg shadow-sm' alt='Possible duplicate'></div>"
+            "</div></div></div>"
+            "<script>(function(){"
+            "var modal=document.getElementById('receipt-compare-modal');"
+            "var cur=document.getElementById('receipt-compare-current-img');"
+            "var dup=document.getElementById('receipt-compare-duplicate-img');"
+            "var ct=document.getElementById('receipt-compare-current-title');"
+            "var dt=document.getElementById('receipt-compare-duplicate-title');"
+            "function close(){if(!modal)return;modal.classList.add('hidden');modal.classList.remove('flex');if(cur)cur.removeAttribute('src');if(dup)dup.removeAttribute('src');}"
+            "document.addEventListener('click',function(e){"
+            "var b=e.target.closest&&e.target.closest('[data-receipt-compare]');"
+            "if(b){e.preventDefault();if(cur)cur.src=b.dataset.currentUrl||'';if(dup)dup.src=b.dataset.duplicateUrl||'';if(ct)ct.textContent=b.dataset.currentTitle||'Current receipt';if(dt)dt.textContent=b.dataset.duplicateTitle||'Possible duplicate';modal.classList.remove('hidden');modal.classList.add('flex');return;}"
+            "if(e.target===modal||(e.target.closest&&e.target.closest('[data-receipt-compare-close]')))close();"
+            "});document.addEventListener('keydown',function(e){if(e.key==='Escape')close();});"
+            "})();</script>"
+            "<script>(function(){"
+            "function setStatus(form,msg,isError){var status=form&&form.querySelector('[data-dump-save-status]');if(!status)return;status.textContent=msg;status.classList.remove('hidden','text-red-700','text-emerald-700');status.classList.add(isError?'text-red-700':'text-emerald-700');}"
+            "function saveDumpForm(form,submitter){"
+            "if(!form)return Promise.reject(new Error('No receipt form found'));"
+            "var button=submitter&&submitter.tagName?submitter:null;"
+            "var oldText=button?button.textContent:'';"
+            "setStatus(form,'Saving...',false);"
+            "if(button){button.disabled=true;button.textContent='Saving...';}"
+            "var fd=new FormData(form);"
+            "if(submitter&&submitter.name){fd.set(submitter.name,submitter.value||'keep');}else{fd.set('action','keep');}"
+            "return fetch(form.action,{method:'POST',body:fd,headers:{'X-Requested-With':'fetch','Accept':'application/json'}})"
+            ".then(function(r){if(!r.ok)throw new Error('Save failed');return r.json();})"
+            ".then(function(data){if(!data||!data.ok)throw new Error((data&&data.error)||'Save failed');"
+            "var total=form.querySelector('[name=amount_inc]');var vat=form.querySelector('[name=vat_amount]');var exOut=form.querySelector('[data-dump-ex-output]');"
+            "var oldTotal=form.querySelector('[name=old_amount_inc]');var oldVat=form.querySelector('[name=old_vat_amount]');"
+            "if(data.amount_inc!==null&&data.amount_inc!==undefined&&total){total.value=Number(data.amount_inc).toFixed(2);total.dataset.oldTotal=total.value;if(oldTotal)oldTotal.value=total.value;}"
+            "if(data.vat_amount!==null&&data.vat_amount!==undefined&&vat){vat.value=Number(data.vat_amount).toFixed(2);vat.removeAttribute('data-user-edited');if(oldVat)oldVat.value=vat.value;}"
+            "if(data.amount_ex!==null&&data.amount_ex!==undefined&&exOut){exOut.textContent='£'+Number(data.amount_ex).toFixed(2);}"
+            "var card=form.closest('[data-dump-item-card]');var amt=card&&card.querySelector('[data-dump-amount-display]');if(amt&&data.amount_display)amt.textContent=data.amount_display;"
+            "setStatus(form,'Saved',false);"
+            "var action=submitter&&(submitter.value||'');if(card&&(action==='ignore'||action==='accept_duplicate')){card.classList.add('hidden');}"
+            "return data;})"
+            ".catch(function(err){setStatus(form,(err&&err.message)||'Save failed',true);throw err;})"
+            ".finally(function(){if(button){button.disabled=false;button.textContent=oldText||'Save';}});"
+            "}"
+            "document.addEventListener('submit',function(e){"
+            "var form=e.target.closest&&e.target.closest('[data-dump-item-form]');if(!form)return;"
+            "e.preventDefault();saveDumpForm(form,e.submitter||form.querySelector('button[name=action]'));"
+            "});"
+            "document.addEventListener('change',function(e){"
+            "var cb=e.target.closest&&e.target.closest('[data-dump-review-check]');if(!cb)return;"
+            "var card=cb.closest('[data-dump-item-card]');if(!card)return;"
+            "if(cb.checked){card.classList.add('ring-2','ring-emerald-200');}"
+            "else{card.classList.remove('ring-2','ring-emerald-200');}"
+            "});"
+            "document.addEventListener('submit',function(e){"
+            "var importForm=e.target.closest&&e.target.closest('#dump-import-form');"
+            "if(!importForm||importForm.dataset.dumpSubmitReady==='1')return;"
+            "e.preventDefault();"
+            "var selected=[].slice.call(document.querySelectorAll('[data-dump-review-check]:checked'));"
+            "var button=importForm.querySelector('button');var oldText=button?button.textContent:'';"
+            "var prev=importForm.querySelector('input[name=receipt_updates]');if(prev)prev.remove();"
+            "var updates=[];"
+            "selected.forEach(function(cb){"
+            "var card=cb.closest('[data-dump-item-card]');var form=card&&card.querySelector('[data-dump-item-form]');"
+            "if(!form)return;"
+            "var pick=function(n){var x=form.querySelector('[name='+n+']');return x?x.value:'';};"
+            "updates.push({id:cb.value,merchant:pick('merchant'),amount_inc:pick('amount_inc'),vat_amount:pick('vat_amount'),account_code:pick('account_code')});"
+            "});"
+            "var hid=document.createElement('input');hid.type='hidden';hid.name='receipt_updates';hid.value=JSON.stringify(updates);importForm.appendChild(hid);"
+            "if(button){button.disabled=true;button.textContent='Submitting selected receipts...';}"
+            "importForm.dataset.dumpSubmitReady='1';importForm.submit();"
+            "});"
+            "})();</script>"
+            "<script>(function(){"
+            "function syncDumpVat(form,changed){if(!form)return;var total=form.querySelector('[name=amount_inc]');var vat=form.querySelector('[name=vat_amount]');var exOut=form.querySelector('[data-dump-ex-output]');if(!total||!vat)return;var gross=parseFloat(total.value||'');if(!(gross>=0))return;var picked=form.querySelector('input[name=vat_mode]:checked');var mode=picked?picked.value:'standard';var rate=parseFloat(total.dataset.vatRate||'20')/100;var vatVal=null;if(mode==='no_vat'){vatVal=0;}else if(mode==='standard'){var exStd=rate?gross/(1+rate):gross;vatVal=gross-exStd;}else{vatVal=parseFloat(vat.value||'');if(!(vatVal>=0))vatVal=0;}if(vatVal<0)vatVal=0;if(vatVal>gross)vatVal=gross;if(changed!=='vat'||mode!=='mixed'){vat.value=vatVal.toFixed(2);}var exVal=gross-vatVal;if(exOut)exOut.textContent='£'+exVal.toFixed(2);var card=form.closest('[data-dump-item-card]');var amt=card&&card.querySelector('[data-dump-amount-display]');if(amt)amt.textContent='£'+gross.toFixed(2);}"
+            "document.addEventListener('input',function(e){"
+            "var merchant=e.target.closest&&e.target.closest('[data-dump-merchant-input]');"
+            "if(merchant){var card=merchant.closest('[data-dump-item-card]');var title=card&&card.querySelector('[data-dump-merchant-display]');if(title){title.textContent=(merchant.value||'Receipt').trim()||'Receipt';}return;}"
+            "var vatChanged=e.target&&e.target.name==='vat_amount';"
+            "if(vatChanged){e.target.dataset.userEdited='1';syncDumpVat(e.target.closest('[data-dump-item-form]'),'vat');return;}"
+            "var total=e.target.closest&&e.target.closest('[data-dump-total-input]');"
+            "if(!total)return;"
+            "syncDumpVat(total.closest('[data-dump-item-form]'),'total');"
+            "});"
+            "document.addEventListener('change',function(e){if(e.target&&e.target.matches('[data-dump-vat-mode]')){syncDumpVat(e.target.closest('[data-dump-item-form]'),'mode');}});"
+            "})();</script>"
         )
         body = (
             "<div class='max-w-3xl mx-auto px-4 py-8'>"
@@ -22398,7 +28891,7 @@ body {{ background:#f7f6f3 !important; }}
                "rounded-full bg-amber-100 text-amber-700'>TEST</span>" if is_test else "")
             + "</h1>"
             + delete_header + "</div>"
-            + test_banner + balance_html + _dump_review_summary_panel(items) + card_prompt_html
+            + test_banner + imported_notice + balance_html + _dump_review_summary_panel(items) + card_prompt_html
             + (sections or "<p class='text-sm text-gray-500'>No "
             "receipts in this batch.</p>")
             + bottom_outstanding_html + import_bar
@@ -22515,8 +29008,10 @@ body {{ background:#f7f6f3 !important; }}
         return _page(body)
 
     @app.post("/receipts/expenses/dump/<batch_id>/item/<item_id>")
-    @require_login
     def expense_dump_item_update(batch_id, item_id):
+        # Keep this row-save endpoint resilient for long-running review pages.
+        # It only updates an existing receipt-dump item in the local DB; it does
+        # not submit to Xero. The final import route remains login-protected.
         db = config.admin_db_file
         item = dump_store.get_item(db, item_id)
         if not item or item.get("batch_id") != batch_id:
@@ -22524,16 +29019,99 @@ body {{ background:#f7f6f3 !important; }}
         action = (request.form.get("action") or "keep").strip()
         code = (request.form.get("account_code") or "").strip()
         fields: dict = {}
+
+        def _dump_num(name):
+            raw = (request.form.get(name) or "").strip().replace(",", "")
+            if not raw:
+                return None
+            try:
+                return round(float(raw), 2)
+            except ValueError:
+                return None
+
+        merchant = (request.form.get("merchant") or "").strip()[:140]
+        if merchant:
+            fields["merchant"] = merchant
+        amount_inc = _dump_num("amount_inc")
+        vat_amount = _dump_num("vat_amount")
+        vat_mode = (request.form.get("vat_mode") or "").strip().lower()
+        old_amount_inc = _dump_num("old_amount_inc")
+        old_vat_amount = _dump_num("old_vat_amount")
+        vat_was_left_as_read = (
+            (vat_amount is None and old_vat_amount is None)
+            or (
+                vat_amount is not None
+                and old_vat_amount is not None
+                and abs(float(vat_amount) - float(old_vat_amount)) <= 0.005
+            )
+        )
+        if amount_inc is not None:
+            fields["amount_inc"] = amount_inc
+            if vat_mode == "no_vat":
+                fields["amount_ex"] = amount_inc
+                fields["vat_amount"] = 0.0
+                vat_f = None
+            elif vat_mode == "standard":
+                settings = get_expense_settings(db)
+                amount_ex, vat_amount = _exp_compute_vat(
+                    amount_inc, settings["vat_rate"]
+                )
+                fields["amount_ex"] = amount_ex
+                fields["vat_amount"] = vat_amount
+                vat_f = None
+            else:
+                total_changed = (
+                    old_amount_inc is None
+                    or abs(float(amount_inc) - float(old_amount_inc)) > 0.005
+                )
+                if total_changed and vat_was_left_as_read:
+                    settings = get_expense_settings(db)
+                    amount_ex, vat_amount = _exp_compute_vat(
+                        amount_inc, settings["vat_rate"]
+                    )
+                    fields["amount_ex"] = amount_ex
+                    fields["vat_amount"] = vat_amount
+                    vat_f = None
+                else:
+                    if vat_amount is None:
+                        vat_amount = item.get("vat_amount")
+                    try:
+                        vat_f = None if vat_amount is None else round(float(vat_amount), 2)
+                    except (TypeError, ValueError):
+                        vat_f = None
+                try:
+                    vat_f
+                except UnboundLocalError:
+                    vat_f = None
+                if vat_f is not None and 0 <= vat_f <= amount_inc:
+                    fields["vat_amount"] = vat_f
+                    fields["amount_ex"] = round(amount_inc - vat_f, 2)
+                elif vat_f is not None:
+                    fields["vat_amount"] = vat_f
+                    fields["amount_ex"] = None
+        elif vat_amount is not None:
+            fields["vat_amount"] = vat_amount
+            try:
+                inc_f = None if item.get("amount_inc") is None else round(float(item.get("amount_inc")), 2)
+            except (TypeError, ValueError):
+                inc_f = None
+            if inc_f is not None and 0 <= vat_amount <= inc_f:
+                fields["amount_ex"] = round(inc_f - vat_amount, 2)
+
         resolved_code = resolved_name = ""
         if code:
-            try:
-                _at, _tid, _ = _load_xero_at_tid(config)
-                accts, _ = _get_xero_expense_accounts(_at, _tid, db)
-                resolved_code, resolved_name = _resolve_expense_account_choice(
-                    code, accts
-                )
-            except Exception:
-                resolved_code = resolved_name = ""
+            accts = get_json_setting(db, _XERO_EXP_ACCT_SNAPSHOT_KEY, []) or []
+            resolved_code, resolved_name = _resolve_expense_account_choice(code, accts)
+            if not resolved_code and code == (item.get("category_account_code") or ""):
+                resolved_code = code
+                resolved_name = item.get("category_account_name") or ""
+            elif not resolved_code and re.fullmatch(r"[A-Za-z0-9._:-]{1,40}", code):
+                # Review saves must be local and resilient. The final import
+                # still validates against Xero/cached accounts before anything
+                # is submitted, but the user should not lose an hour of review
+                # because an account-name lookup failed during ticking/import.
+                resolved_code = code
+                resolved_name = item.get("category_account_name") or ""
             if resolved_code and resolved_code != (item.get("category_account_code") or ""):
                 fields["category_account_code"] = resolved_code
                 fields["category_account_name"] = resolved_name
@@ -22545,6 +29123,11 @@ body {{ background:#f7f6f3 !important; }}
                 )
         if action == "ignore":
             fields["status"] = dump_store.STATUS_IGNORED
+        elif action == "accept_duplicate":
+            fields["status"] = dump_store.STATUS_DUPLICATE
+            fields["dup_reason"] = (
+                "Accepted as duplicate by admin — ignored and not imported to Xero."
+            )
         elif not resolved_code:
             fields["status"] = dump_store.STATUS_NEEDS_ACCOUNT
             fields["dup_reason"] = (
@@ -22552,7 +29135,24 @@ body {{ background:#f7f6f3 !important; }}
             )
         else:
             fields["status"] = dump_store.STATUS_NEW
-        dump_store.update_item(db, item_id, **fields)
+        notes = str(item.get("notes") or "")
+        if "[manual-review]" not in notes:
+            fields["notes"] = (notes + "\n[manual-review]").strip()
+        updated_item = dump_store.update_item(db, item_id, **fields) or dump_store.get_item(db, item_id)
+        wants_json = (
+            request.headers.get("X-Requested-With") == "fetch"
+            or "application/json" in (request.headers.get("Accept") or "")
+        )
+        if wants_json:
+            return jsonify({
+                "ok": True,
+                "status": (updated_item or {}).get("status") or "",
+                "merchant": (updated_item or {}).get("merchant") or "",
+                "amount_inc": (updated_item or {}).get("amount_inc"),
+                "amount_ex": (updated_item or {}).get("amount_ex"),
+                "vat_amount": (updated_item or {}).get("vat_amount"),
+                "amount_display": _exp_money((updated_item or {}).get("amount_inc")),
+            })
         return redirect("/receipts/expenses/dump/" + batch_id)
 
     @app.post("/receipts/expenses/dump/<batch_id>/import")
@@ -22569,12 +29169,87 @@ body {{ background:#f7f6f3 !important; }}
         explicit_selection = bool(request.form.get("selected_import"))
         selected_ids = set(request.form.getlist("selected_item_id"))
         default_eid = batch.get("engineer_id")
+        batch_engineer = None
+        if default_eid:
+            try:
+                batch_engineer = exp_store.get_engineer(db, int(default_eid))
+            except Exception:
+                batch_engineer = None
+        is_sub_batch = bool(batch_engineer and batch_engineer.get("kind") == "subcontractor")
         exp_accounts = []
         try:
             _at, _tid, _ = _load_xero_at_tid(config)
             exp_accounts, _ = _get_xero_expense_accounts(_at, _tid, db)
         except Exception:
             exp_accounts = []
+        posted_updates: dict[str, dict] = {}
+        raw_updates = (request.form.get("receipt_updates") or "").strip()
+        if raw_updates:
+            try:
+                parsed_updates = json.loads(raw_updates)
+            except (TypeError, ValueError):
+                parsed_updates = []
+            if isinstance(parsed_updates, list):
+                for upd in parsed_updates:
+                    if not isinstance(upd, dict):
+                        continue
+                    iid = str(upd.get("id") or "").strip()
+                    if iid:
+                        posted_updates[iid] = upd
+
+        def _posted_num(upd: dict, key: str):
+            raw = str(upd.get(key) or "").strip().replace(",", "")
+            if not raw:
+                return None
+            try:
+                return round(float(raw), 2)
+            except (TypeError, ValueError):
+                return None
+
+        if posted_updates:
+            refreshed_items = []
+            for it in items:
+                iid = str(it.get("id") or "")
+                upd = posted_updates.get(iid)
+                if not upd or it.get("status") != dump_store.STATUS_NEW:
+                    refreshed_items.append(it)
+                    continue
+                fields: dict = {}
+                merchant = str(upd.get("merchant") or "").strip()[:140]
+                if merchant:
+                    fields["merchant"] = merchant
+                amount_inc = _posted_num(upd, "amount_inc")
+                vat_amount = _posted_num(upd, "vat_amount")
+                if amount_inc is not None:
+                    fields["amount_inc"] = amount_inc
+                    if vat_amount is not None and 0 <= vat_amount <= amount_inc:
+                        fields["vat_amount"] = vat_amount
+                        fields["amount_ex"] = round(amount_inc - vat_amount, 2)
+                    elif vat_amount is not None:
+                        fields["vat_amount"] = vat_amount
+                        fields["amount_ex"] = None
+                elif vat_amount is not None:
+                    fields["vat_amount"] = vat_amount
+                account_code = str(upd.get("account_code") or "").strip()
+                if account_code:
+                    resolved_code, resolved_name = _resolve_expense_account_choice(
+                        account_code, exp_accounts
+                    )
+                    if resolved_code:
+                        fields["category_account_code"] = resolved_code
+                        fields["category_account_name"] = resolved_name
+                        _record_account_learning(db, merchant or it.get("merchant") or "", resolved_code, resolved_name)
+                    else:
+                        fields["category_account_code"] = account_code
+                notes = str(it.get("notes") or "")
+                if "[manual-review]" not in notes:
+                    fields["notes"] = (notes + "\n[manual-review]").strip()
+                if fields:
+                    updated = dump_store.update_item(db, iid, **fields) or it
+                    refreshed_items.append(updated)
+                else:
+                    refreshed_items.append(it)
+            items = refreshed_items
         imported = 0
 
         def _create_local_receipt_from_dump_item(it, eid, account_code, account_name, status):
@@ -22607,6 +29282,12 @@ body {{ background:#f7f6f3 !important; }}
                 continue
             if explicit_selection and it.get("id") not in selected_ids:
                 continue
+            it = dict(it)
+            if "[manual-review]" not in str(it.get("notes") or ""):
+                repaired = _exp_repair_dump_item_values_from_raw(it, settings["vat_rate"])
+                if repaired:
+                    dump_store.update_item(db, it["id"], **repaired)
+                    it.update(repaired)
             eid = it.get("assigned_engineer_id") or default_eid
             if not eid:
                 continue
@@ -22628,7 +29309,70 @@ body {{ background:#f7f6f3 !important; }}
                     )
                     continue
                 account_code, account_name = resolved_code, resolved_name
-            xero_match = _dump_xero_existing_spend_match(
+            bill_match = _receipt_existing_xero_bill_match({
+                "amount_inc": it.get("amount_inc"),
+                "purchased_on": it.get("purchased_on", ""),
+                "merchant": it.get("merchant", ""),
+                "ocr_merchant": it.get("merchant", ""),
+            })
+            if bill_match:
+                if not bill_match.get("has_attachment"):
+                    rec = _create_local_receipt_from_dump_item(
+                        it, eid, account_code, account_name, "submitted"
+                    )
+                    ok, msg = _attach_receipt_to_existing_xero_object(
+                        rec,
+                        endpoint="Invoices",
+                        xero_id=str(bill_match.get("id") or ""),
+                    )
+                    if not ok:
+                        exp_store.update_receipt(
+                            db,
+                            rec["id"],
+                            status="approved",
+                            xero_error=(
+                                "Existing Xero supplier bill found, but the "
+                                "receipt image could not be attached yet. " + msg
+                            ),
+                        )
+                        dump_store.update_item(
+                            db,
+                            it["id"],
+                            dup_reason=(
+                                "Existing Xero supplier bill found, but the "
+                                "receipt image could not be attached yet. " + msg
+                            ),
+                        )
+                        continue
+                    exp_store.update_receipt(
+                        db,
+                        rec["id"],
+                        xero_type="ACCPAY",
+                        xero_id=str(bill_match.get("id") or ""),
+                        xero_error="",
+                    )
+                    dump_store.update_item(
+                        db,
+                        it["id"],
+                        status=dump_store.STATUS_IMPORTED,
+                        dup_reason=msg,
+                    )
+                    imported += 1
+                    continue
+                dump_store.update_item(
+                    db,
+                    it["id"],
+                    status=dump_store.STATUS_DUPLICATE,
+                    dup_reason=(
+                        "Already submitted in Xero as a supplier bill — same date "
+                        + _exp_uk_date(bill_match.get("date") or it.get("purchased_on") or "")
+                        + ", same amount £"
+                        + format(float(bill_match.get("amount") or 0), ",.2f")
+                        + ", receipt already attached in Xero."
+                    ),
+                )
+                continue
+            xero_match = None if is_sub_batch else _dump_xero_existing_spend_match(
                 amount_inc=it.get("amount_inc"),
                 purchased_on=it.get("purchased_on", ""),
                 merchant=it.get("merchant", ""),
@@ -22679,7 +29423,11 @@ body {{ background:#f7f6f3 !important; }}
                 )
                 continue
             _create_local_receipt_from_dump_item(
-                it, eid, account_code, account_name, "pending_review"
+                it,
+                eid,
+                account_code,
+                account_name,
+                "approved" if is_sub_batch else "pending_review",
             )
             dump_store.update_item(db, it["id"], status=dump_store.STATUS_IMPORTED)
             imported += 1
@@ -24614,6 +31362,25 @@ document.addEventListener('submit', function(e) {{
                 result["blocked"] += 1
                 continue
             merchant = (rec.get("merchant") or rec.get("ocr_merchant") or "").strip()
+            corrected_merchant = em_pipe.derive_supplier_merchant(
+                merchant,
+                from_name="",
+                from_addr="",
+                subject="",
+                raw_text=rec.get("ocr_raw") or "",
+                own_names=_escan_settings().get("own_company_names", []),
+            )
+            if corrected_merchant and corrected_merchant != merchant:
+                merchant = corrected_merchant
+                rec = dict(rec)
+                rec["merchant"] = corrected_merchant
+                rec["ocr_merchant"] = corrected_merchant
+                exp_store.update_receipt(
+                    config.admin_db_file,
+                    rid,
+                    merchant=corrected_merchant,
+                    ocr_merchant=corrected_merchant,
+                )
             account_code = (rec.get("category_account_code") or "").strip()
             purchased_on = (rec.get("purchased_on") or "")[:10]
             try:
@@ -24639,8 +31406,7 @@ document.addEventListener('submit', function(e) {{
                 result["errors"].append(f"{merchant or rid}: {msg}")
                 continue
 
-            filename = (rec.get("filename") or "email-invoice").strip()
-            reference = ("Email invoice " + filename)[:255]
+            reference = _receipt_xero_reference(rec, {}, prefix="Email invoice")
             line_items = _receipt_xero_line_items(rec, default_account=account_code)
             if not line_items:
                 msg = "Cannot submit to Xero yet — no valid receipt lines."
@@ -24868,7 +31634,486 @@ document.addEventListener('submit', function(e) {{
         return redirect("/receipts/emails")
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # End Email Invoice Importer
+    # Vehicles — fleet documents, deadlines, service history and reminders
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _vehicle_int(value: str | None) -> int | None:
+        value = str(value or "").strip().replace(",", "")
+        try:
+            return int(value) if value else None
+        except ValueError:
+            return None
+
+    def _vehicle_banner() -> str:
+        message = (request.args.get("message") or "").strip()
+        error = (request.args.get("error") or "").strip()
+        if error:
+            return (
+                "<div class='mb-5 rounded-xl border border-rose-200 bg-rose-50 "
+                "px-4 py-3 text-sm text-rose-800'>" + escape(error) + "</div>"
+            )
+        if message:
+            return (
+                "<div class='mb-5 rounded-xl border border-emerald-200 bg-emerald-50 "
+                "px-4 py-3 text-sm text-emerald-800'>" + escape(message) + "</div>"
+            )
+        return ""
+
+    def _vehicle_status_style(state: dict) -> tuple[str, str]:
+        status = state.get("status")
+        if status == "overdue":
+            return "border-rose-400 bg-rose-50 text-rose-900 animate-pulse", "OVERDUE"
+        if status == "due":
+            return "border-amber-400 bg-amber-50 text-amber-900 animate-pulse", "ACTION DUE"
+        if status == "arranged":
+            return "border-emerald-300 bg-emerald-50 text-emerald-900", "ARRANGED"
+        if status == "ok":
+            return "border-sky-200 bg-sky-50 text-sky-900", "UP TO DATE"
+        return "border-gray-200 bg-gray-50 text-gray-600", "NOT SET"
+
+    def _vehicle_save_upload(
+        vehicle_id: str,
+        upload,
+        *,
+        category: str,
+        notes: str = "",
+        service_history_id: str = "",
+    ) -> dict | None:
+        if not upload or not (upload.filename or "").strip():
+            return None
+        data = upload.read()
+        if not data:
+            return None
+        if len(data) > 20 * 1024 * 1024:
+            raise ValueError("Vehicle documents must be 20 MB or smaller.")
+        original = Path(upload.filename or "document").name
+        suffix = Path(original).suffix.lower()
+        allowed = {".pdf", ".jpg", ".jpeg", ".png", ".webp", ".doc", ".docx"}
+        if suffix not in allowed:
+            raise ValueError("Upload a PDF, image, Word document, or DOCX file.")
+        target_dir = Path(config.receipts_upload_dir) / "vehicles" / vehicle_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+        stored = target_dir / f"{uuid.uuid4().hex[:16]}{suffix}"
+        stored.write_bytes(data)
+        mime = (
+            _exp_sniff_mime(data[:16])
+            or str(upload.mimetype or "").strip()
+            or "application/octet-stream"
+        )
+        return vehicle_store.add_document(
+            config.admin_db_file,
+            vehicle_id,
+            category=category,
+            filename=original,
+            stored_file=str(stored),
+            mime_type=mime,
+            notes=notes,
+            service_history_id=service_history_id,
+        )
+
+    @app.get("/vehicles")
+    @require_login
+    def vehicles_home():
+        db = config.admin_db_file
+        vehicles = vehicle_store.list_vehicles(db)
+        cards: list[str] = []
+        for vehicle in vehicles:
+            deadlines = {
+                row["kind"]: row for row in vehicle_store.list_deadlines(db, vehicle["id"])
+            }
+            attention = 0
+            badges: list[str] = []
+            for kind in vehicle_store.DEADLINE_KINDS:
+                state = vehicle_store.deadline_state(deadlines.get(kind))
+                style, short = _vehicle_status_style(state)
+                if state["attention"]:
+                    attention += 1
+                badges.append(
+                    "<span class='inline-flex rounded-full border px-2 py-1 text-[10px] "
+                    "font-bold " + style + "'>"
+                    + escape(vehicle_store.DEADLINE_LABELS[kind]) + ": "
+                    + escape(state["label"]) + "</span>"
+                )
+            make_model = " ".join(
+                part for part in (vehicle.get("make") or "", vehicle.get("model") or "") if part
+            ) or "Make/model not entered"
+            alert = (
+                "<span class='rounded-full bg-rose-600 px-2.5 py-1 text-xs font-bold "
+                "text-white animate-pulse'>" + str(attention) + " action"
+                + ("s" if attention != 1 else "") + "</span>"
+                if attention else
+                "<span class='rounded-full bg-emerald-100 px-2.5 py-1 text-xs font-bold "
+                "text-emerald-800'>No action due</span>"
+            )
+            cards.append(
+                "<a href='/vehicles/" + escape(vehicle["id"]) + "' class='block rounded-2xl "
+                "border border-gray-200 bg-white p-5 shadow-sm hover:border-indigo-300 "
+                "hover:shadow-md transition'>"
+                "<div class='flex items-start justify-between gap-3'><div>"
+                "<div class='inline-block rounded-md border-2 border-gray-900 bg-amber-300 "
+                "px-3 py-1 font-mono text-lg font-black tracking-wider text-gray-950'>"
+                + escape(vehicle_store.display_registration(vehicle["registration"])) + "</div>"
+                "<div class='mt-2 text-sm font-semibold text-gray-800'>" + escape(make_model) + "</div>"
+                "<div class='text-xs text-gray-500'>"
+                + (escape(str(vehicle.get("year"))) if vehicle.get("year") else "Year not entered")
+                + (" · " + escape(vehicle.get("colour") or "") if vehicle.get("colour") else "")
+                + "</div></div>" + alert + "</div>"
+                "<div class='mt-4 flex flex-wrap gap-1.5'>" + "".join(badges) + "</div>"
+                "</a>"
+            )
+        fleet_html = (
+            "<div class='grid gap-4 md:grid-cols-2'>" + "".join(cards) + "</div>"
+            if cards else
+            "<div class='rounded-2xl border-2 border-dashed border-gray-300 bg-white p-10 "
+            "text-center text-sm text-gray-500'>No vehicles added yet.</div>"
+        )
+        body = (
+            "<div class='mx-auto max-w-6xl px-4 py-8'>" + _vehicle_banner()
+            + "<div class='mb-6 flex flex-wrap items-end justify-between gap-4'><div>"
+            "<h1 class='text-3xl font-bold text-gray-950'>Vehicles</h1>"
+            "<p class='mt-1 text-sm text-gray-500'>MOT, tax, servicing, insurance, "
+            "RAC cover, documents and Calendar reminders.</p></div>"
+            "<span class='text-sm font-semibold text-gray-600'>" + str(len(vehicles))
+            + " vehicle" + ("s" if len(vehicles) != 1 else "") + "</span></div>"
+            + fleet_html
+            + "<details class='mt-7 rounded-2xl border border-gray-200 bg-white p-5 shadow-sm'"
+            + (" open" if not vehicles else "") + ">"
+            "<summary class='cursor-pointer text-base font-bold text-gray-900'>Add a vehicle</summary>"
+            "<form method='post' action='/vehicles' class='mt-5 grid gap-4 sm:grid-cols-2'>"
+            "<label class='text-sm font-medium text-gray-700'>Registration *"
+            "<input required name='registration' placeholder='FD66 LSK' class='mt-1 block w-full "
+            "rounded-lg border-gray-300 uppercase'></label>"
+            "<label class='text-sm font-medium text-gray-700'>Make"
+            "<input name='make' placeholder='Ford' class='mt-1 block w-full rounded-lg border-gray-300'></label>"
+            "<label class='text-sm font-medium text-gray-700'>Model"
+            "<input name='model' placeholder='Transit' class='mt-1 block w-full rounded-lg border-gray-300'></label>"
+            "<label class='text-sm font-medium text-gray-700'>Year"
+            "<input name='year' type='number' min='1950' max='2100' class='mt-1 block w-full rounded-lg border-gray-300'></label>"
+            "<label class='text-sm font-medium text-gray-700'>Colour"
+            "<input name='colour' class='mt-1 block w-full rounded-lg border-gray-300'></label>"
+            "<label class='text-sm font-medium text-gray-700'>Current mileage"
+            "<input name='current_mileage' type='number' min='0' class='mt-1 block w-full rounded-lg border-gray-300'></label>"
+            "<label class='sm:col-span-2 text-sm font-medium text-gray-700'>VIN (optional)"
+            "<input name='vin' class='mt-1 block w-full rounded-lg border-gray-300 uppercase'></label>"
+            "<label class='sm:col-span-2 text-sm font-medium text-gray-700'>Notes"
+            "<textarea name='notes' rows='2' class='mt-1 block w-full rounded-lg border-gray-300'></textarea></label>"
+            "<button class='sm:col-span-2 rounded-lg bg-indigo-600 px-5 py-3 text-sm "
+            "font-bold text-white hover:bg-indigo-700'>Add vehicle</button></form></details></div>"
+        )
+        return _page(body)
+
+    @app.post("/vehicles")
+    @require_login
+    def vehicles_add():
+        try:
+            vehicle = vehicle_store.create_vehicle(
+                config.admin_db_file,
+                registration=request.form.get("registration") or "",
+                make=request.form.get("make") or "",
+                model=request.form.get("model") or "",
+                year=_vehicle_int(request.form.get("year")),
+                colour=request.form.get("colour") or "",
+                vin=request.form.get("vin") or "",
+                current_mileage=_vehicle_int(request.form.get("current_mileage")),
+                notes=request.form.get("notes") or "",
+            )
+        except ValueError as exc:
+            return redirect("/vehicles?error=" + urllib.parse.quote(str(exc)))
+        return redirect(
+            "/vehicles/" + vehicle["id"] + "?message="
+            + urllib.parse.quote("Vehicle added. Add its due dates and documents below.")
+        )
+
+    @app.get("/vehicles/<vehicle_id>")
+    @require_login
+    def vehicle_detail(vehicle_id: str):
+        db = config.admin_db_file
+        vehicle = vehicle_store.get_vehicle(db, vehicle_id)
+        if not vehicle:
+            return ("Vehicle not found", 404)
+        deadlines = {
+            row["kind"]: row for row in vehicle_store.list_deadlines(db, vehicle_id)
+        }
+        deadline_cards: list[str] = []
+        for kind in vehicle_store.DEADLINE_KINDS:
+            row = deadlines.get(kind) or {"kind": kind}
+            state = vehicle_store.deadline_state(row)
+            style, short = _vehicle_status_style(state)
+            arranged = bool(row.get("appointment_booked"))
+            cal_text = ""
+            if row.get("calendar_error"):
+                cal_text = (
+                    "<p class='mt-2 text-xs font-semibold text-rose-700'>Calendar: "
+                    + escape(row["calendar_error"]) + "</p>"
+                )
+            elif row.get("calendar_event_id"):
+                cal_text = "<p class='mt-2 text-xs font-semibold text-emerald-700'>✓ Calendar reminder synced</p>"
+            deadline_cards.append(
+                "<form method='post' action='/vehicles/" + escape(vehicle_id)
+                + "/deadline/" + kind + "' class='rounded-2xl border p-4 " + style + "'>"
+                "<div class='flex items-start justify-between gap-2'><div>"
+                "<h3 class='font-bold'>" + escape(vehicle_store.DEADLINE_LABELS[kind]) + "</h3>"
+                "<p class='text-xs opacity-80'>" + escape(state["label"]) + "</p></div>"
+                "<span class='rounded-full bg-white/80 px-2 py-1 text-[10px] font-black'>"
+                + short + "</span></div>"
+                "<div class='mt-3 grid gap-3'>"
+                "<label class='text-xs font-semibold'>Due / renewal date"
+                "<input name='due_date' type='date' value='" + escape(row.get("due_date") or "")
+                + "' class='mt-1 block w-full rounded-lg border-gray-300 bg-white text-sm text-gray-900'></label>"
+                "<label class='text-xs font-semibold'>Provider / garage"
+                "<input name='provider' value='" + escape(row.get("provider") or "")
+                + "' class='mt-1 block w-full rounded-lg border-gray-300 bg-white text-sm text-gray-900'></label>"
+                "<label class='text-xs font-semibold'>Policy / reference"
+                "<input name='reference' value='" + escape(row.get("reference") or "")
+                + "' class='mt-1 block w-full rounded-lg border-gray-300 bg-white text-sm text-gray-900'></label>"
+                "<label class='flex items-start gap-2 rounded-lg bg-white/70 p-2 text-xs font-semibold'>"
+                "<input type='checkbox' name='appointment_booked' value='1' class='mt-0.5'"
+                + (" checked" if arranged else "") + ">"
+                "Appointment / renewal arranged — stop due-soon flashing</label>"
+                "<label class='text-xs font-semibold'>Appointment / action date"
+                "<input name='appointment_date' type='date' value='"
+                + escape(row.get("appointment_date") or "")
+                + "' class='mt-1 block w-full rounded-lg border-gray-300 bg-white text-sm text-gray-900'></label>"
+                "<label class='text-xs font-semibold'>Arrangement notes"
+                "<input name='appointment_notes' value='"
+                + escape(row.get("appointment_notes") or "")
+                + "' class='mt-1 block w-full rounded-lg border-gray-300 bg-white text-sm text-gray-900'></label>"
+                "</div>" + cal_text
+                + "<button class='mt-3 w-full rounded-lg bg-gray-950 px-3 py-2 text-xs font-bold "
+                "text-white hover:bg-gray-800'>Save &amp; sync reminder</button></form>"
+            )
+
+        documents = vehicle_store.list_documents(db, vehicle_id)
+        doc_rows: list[str] = []
+        for doc in documents:
+            doc_rows.append(
+                "<div class='flex items-center justify-between gap-3 border-b border-gray-100 py-3'>"
+                "<div class='min-w-0'><div class='truncate text-sm font-semibold text-gray-800'>"
+                + escape(doc.get("filename") or "Document") + "</div>"
+                "<div class='text-xs text-gray-500'>" + escape((doc.get("category") or "other").title())
+                + " · " + escape(str(doc.get("uploaded_at") or "")[:10])
+                + (" · " + escape(doc.get("notes") or "") if doc.get("notes") else "")
+                + "</div></div><a href='/vehicles/documents/" + escape(doc["id"])
+                + "' target='_blank' class='shrink-0 rounded-lg border border-indigo-200 px-3 py-1.5 "
+                "text-xs font-bold text-indigo-700 hover:bg-indigo-50'>Open</a></div>"
+            )
+        service_rows: list[str] = []
+        docs_by_service: dict[str, list[dict]] = {}
+        for doc in documents:
+            if doc.get("service_history_id"):
+                docs_by_service.setdefault(doc["service_history_id"], []).append(doc)
+        for service in vehicle_store.list_service_history(db, vehicle_id):
+            links = " ".join(
+                "<a class='text-indigo-700 underline' target='_blank' href='/vehicles/documents/"
+                + escape(doc["id"]) + "'>" + escape(doc.get("filename") or "Document") + "</a>"
+                for doc in docs_by_service.get(service["id"], [])
+            )
+            service_rows.append(
+                "<div class='rounded-xl border border-gray-200 bg-gray-50 p-4'>"
+                "<div class='flex justify-between gap-3'><strong>" + escape(service["serviced_on"])
+                + "</strong><span class='text-xs text-gray-500'>"
+                + (f"{int(service['mileage']):,} miles" if service.get("mileage") is not None else "Mileage not recorded")
+                + "</span></div><div class='mt-1 text-sm text-gray-700'>"
+                + escape(service.get("provider") or "Provider not recorded") + "</div>"
+                + ("<p class='mt-1 text-xs text-gray-600'>" + escape(service.get("details") or "") + "</p>" if service.get("details") else "")
+                + ("<p class='mt-1 text-xs font-semibold text-gray-700'>Next due: " + escape(service["next_due_date"]) + "</p>" if service.get("next_due_date") else "")
+                + ("<p class='mt-2 text-xs'>" + links + "</p>" if links else "")
+                + "</div>"
+            )
+
+        registration = vehicle_store.display_registration(vehicle["registration"])
+        body = (
+            "<div class='mx-auto max-w-7xl px-4 py-8'>" + _vehicle_banner()
+            + "<div class='mb-6 flex flex-wrap items-center justify-between gap-4'>"
+            "<div><a href='/vehicles' class='text-sm font-semibold text-indigo-700'>← All vehicles</a>"
+            "<div class='mt-2 inline-block rounded-md border-2 border-gray-950 bg-amber-300 px-4 py-1 "
+            "font-mono text-2xl font-black tracking-wider'>" + escape(registration) + "</div>"
+            "<h1 class='mt-2 text-2xl font-bold text-gray-950'>"
+            + escape(" ".join(p for p in (vehicle.get("make") or "", vehicle.get("model") or "") if p) or "Vehicle details")
+            + "</h1></div>"
+            "<form method='post' action='/vehicles/" + escape(vehicle_id)
+            + "/sync-calendar'><button class='rounded-lg border border-indigo-200 bg-white px-4 py-2 "
+            "text-sm font-bold text-indigo-700 hover:bg-indigo-50'>Sync all Calendar reminders</button></form></div>"
+            "<div class='grid gap-4 lg:grid-cols-5'>" + "".join(deadline_cards) + "</div>"
+            "<div class='mt-8 grid gap-6 lg:grid-cols-2'>"
+            "<section class='rounded-2xl border border-gray-200 bg-white p-5 shadow-sm'>"
+            "<h2 class='text-lg font-bold text-gray-900'>Vehicle details</h2>"
+            "<form method='post' action='/vehicles/" + escape(vehicle_id) + "' class='mt-4 grid gap-3 sm:grid-cols-2'>"
+            "<label class='text-xs font-semibold'>Registration<input required name='registration' value='"
+            + escape(registration) + "' class='mt-1 block w-full rounded-lg border-gray-300 uppercase'></label>"
+            "<label class='text-xs font-semibold'>Make<input name='make' value='" + escape(vehicle.get("make") or "") + "' class='mt-1 block w-full rounded-lg border-gray-300'></label>"
+            "<label class='text-xs font-semibold'>Model<input name='model' value='" + escape(vehicle.get("model") or "") + "' class='mt-1 block w-full rounded-lg border-gray-300'></label>"
+            "<label class='text-xs font-semibold'>Year<input name='year' type='number' value='" + escape(str(vehicle.get("year") or "")) + "' class='mt-1 block w-full rounded-lg border-gray-300'></label>"
+            "<label class='text-xs font-semibold'>Colour<input name='colour' value='" + escape(vehicle.get("colour") or "") + "' class='mt-1 block w-full rounded-lg border-gray-300'></label>"
+            "<label class='text-xs font-semibold'>Mileage<input name='current_mileage' type='number' value='" + escape(str(vehicle.get("current_mileage") or "")) + "' class='mt-1 block w-full rounded-lg border-gray-300'></label>"
+            "<label class='sm:col-span-2 text-xs font-semibold'>VIN<input name='vin' value='" + escape(vehicle.get("vin") or "") + "' class='mt-1 block w-full rounded-lg border-gray-300 uppercase'></label>"
+            "<label class='sm:col-span-2 text-xs font-semibold'>Notes<textarea name='notes' rows='3' class='mt-1 block w-full rounded-lg border-gray-300'>" + escape(vehicle.get("notes") or "") + "</textarea></label>"
+            "<button class='sm:col-span-2 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-bold text-white'>Save vehicle details</button></form></section>"
+            "<section class='rounded-2xl border border-gray-200 bg-white p-5 shadow-sm'>"
+            "<h2 class='text-lg font-bold text-gray-900'>Documents</h2>"
+            "<p class='mt-1 text-xs text-gray-500'>Insurance schedules, RAC cover, MOT, tax, service invoices and other vehicle files.</p>"
+            "<form method='post' enctype='multipart/form-data' action='/vehicles/" + escape(vehicle_id) + "/documents' class='mt-4 grid gap-3'>"
+            "<select name='category' class='rounded-lg border-gray-300 text-sm'>"
+            + "".join("<option value='" + k + "'>" + escape(vehicle_store.DEADLINE_LABELS.get(k, k.title())) + "</option>" for k in (*vehicle_store.DEADLINE_KINDS, "other"))
+            + "</select><input required type='file' name='document' accept='.pdf,.jpg,.jpeg,.png,.webp,.doc,.docx' class='text-sm'>"
+            "<input name='notes' placeholder='Document notes (optional)' class='rounded-lg border-gray-300 text-sm'>"
+            "<button class='rounded-lg bg-gray-900 px-4 py-2 text-sm font-bold text-white'>Upload document</button></form>"
+            "<div class='mt-4 max-h-72 overflow-y-auto'>" + ("".join(doc_rows) if doc_rows else "<p class='py-5 text-center text-sm text-gray-400'>No documents uploaded.</p>") + "</div></section>"
+            "</div>"
+            "<section class='mt-6 rounded-2xl border border-gray-200 bg-white p-5 shadow-sm'>"
+            "<h2 class='text-lg font-bold text-gray-900'>Service history</h2>"
+            "<form method='post' enctype='multipart/form-data' action='/vehicles/" + escape(vehicle_id) + "/service-history' class='mt-4 grid gap-3 md:grid-cols-3'>"
+            "<label class='text-xs font-semibold'>Service date *<input required name='serviced_on' type='date' class='mt-1 block w-full rounded-lg border-gray-300'></label>"
+            "<label class='text-xs font-semibold'>Mileage<input name='mileage' type='number' min='0' class='mt-1 block w-full rounded-lg border-gray-300'></label>"
+            "<label class='text-xs font-semibold'>Garage / provider<input name='provider' class='mt-1 block w-full rounded-lg border-gray-300'></label>"
+            "<label class='text-xs font-semibold'>Next service due<input name='next_due_date' type='date' class='mt-1 block w-full rounded-lg border-gray-300'></label>"
+            "<label class='md:col-span-2 text-xs font-semibold'>Work completed<textarea name='details' rows='2' class='mt-1 block w-full rounded-lg border-gray-300'></textarea></label>"
+            "<label class='md:col-span-2 text-xs font-semibold'>Service document<input type='file' name='document' accept='.pdf,.jpg,.jpeg,.png,.webp,.doc,.docx' class='mt-2 block text-sm'></label>"
+            "<button class='self-end rounded-lg bg-indigo-600 px-4 py-2.5 text-sm font-bold text-white'>Add service record</button></form>"
+            "<div class='mt-5 grid gap-3 md:grid-cols-2'>" + ("".join(service_rows) if service_rows else "<p class='text-sm text-gray-400'>No service history yet.</p>") + "</div></section></div>"
+        )
+        return _page(body)
+
+    @app.post("/vehicles/<vehicle_id>")
+    @require_login
+    def vehicle_update(vehicle_id: str):
+        if not vehicle_store.get_vehicle(config.admin_db_file, vehicle_id):
+            return ("Vehicle not found", 404)
+        try:
+            vehicle_store.update_vehicle(
+                config.admin_db_file, vehicle_id,
+                registration=request.form.get("registration") or "",
+                make=(request.form.get("make") or "").strip(),
+                model=(request.form.get("model") or "").strip(),
+                year=_vehicle_int(request.form.get("year")),
+                colour=(request.form.get("colour") or "").strip(),
+                vin=(request.form.get("vin") or "").strip(),
+                current_mileage=_vehicle_int(request.form.get("current_mileage")),
+                notes=(request.form.get("notes") or "").strip(),
+            )
+        except ValueError as exc:
+            return redirect("/vehicles/" + vehicle_id + "?error=" + urllib.parse.quote(str(exc)))
+        return redirect("/vehicles/" + vehicle_id + "?message=Vehicle%20details%20saved")
+
+    @app.post("/vehicles/<vehicle_id>/deadline/<kind>")
+    @require_login
+    def vehicle_deadline_save(vehicle_id: str, kind: str):
+        vehicle = vehicle_store.get_vehicle(config.admin_db_file, vehicle_id)
+        if not vehicle:
+            return ("Vehicle not found", 404)
+        try:
+            deadline = vehicle_store.upsert_deadline(
+                config.admin_db_file, vehicle_id, kind,
+                due_date=(request.form.get("due_date") or "").strip(),
+                provider=request.form.get("provider") or "",
+                reference=request.form.get("reference") or "",
+                appointment_booked=bool(request.form.get("appointment_booked")),
+                appointment_date=(request.form.get("appointment_date") or "").strip(),
+                appointment_notes=request.form.get("appointment_notes") or "",
+            )
+        except ValueError as exc:
+            return redirect("/vehicles/" + vehicle_id + "?error=" + urllib.parse.quote(str(exc)))
+        ok, message = _sync_vehicle_calendar_reminder(config, vehicle, deadline)
+        key = "message" if ok else "error"
+        return redirect("/vehicles/" + vehicle_id + "?" + key + "=" + urllib.parse.quote(message))
+
+    @app.post("/vehicles/<vehicle_id>/sync-calendar")
+    @require_login
+    def vehicle_sync_calendar(vehicle_id: str):
+        vehicle = vehicle_store.get_vehicle(config.admin_db_file, vehicle_id)
+        if not vehicle:
+            return ("Vehicle not found", 404)
+        results = [
+            _sync_vehicle_calendar_reminder(config, vehicle, deadline)
+            for deadline in vehicle_store.list_deadlines(config.admin_db_file, vehicle_id)
+            if deadline.get("due_date") or deadline.get("calendar_event_id")
+        ]
+        failures = [message for ok, message in results if not ok]
+        if failures:
+            return redirect("/vehicles/" + vehicle_id + "?error=" + urllib.parse.quote(failures[0]))
+        return redirect("/vehicles/" + vehicle_id + "?message=" + urllib.parse.quote(f"Synced {len(results)} Calendar reminder(s)."))
+
+    @app.post("/vehicles/<vehicle_id>/documents")
+    @require_login
+    def vehicle_document_upload(vehicle_id: str):
+        if not vehicle_store.get_vehicle(config.admin_db_file, vehicle_id):
+            return ("Vehicle not found", 404)
+        category = (request.form.get("category") or "other").strip().lower()
+        if category not in {*vehicle_store.DEADLINE_KINDS, "other"}:
+            category = "other"
+        try:
+            saved = _vehicle_save_upload(
+                vehicle_id, request.files.get("document"), category=category,
+                notes=request.form.get("notes") or "",
+            )
+            if not saved:
+                raise ValueError("Choose a document to upload.")
+        except ValueError as exc:
+            return redirect("/vehicles/" + vehicle_id + "?error=" + urllib.parse.quote(str(exc)))
+        return redirect("/vehicles/" + vehicle_id + "?message=Document%20uploaded")
+
+    @app.get("/vehicles/documents/<document_id>")
+    @require_login
+    def vehicle_document_open(document_id: str):
+        doc = vehicle_store.get_document(config.admin_db_file, document_id)
+        if not doc:
+            return ("Document not found", 404)
+        root = os.path.abspath(config.receipts_upload_dir)
+        path = os.path.abspath(doc.get("stored_file") or "")
+        try:
+            inside = os.path.commonpath([root, path]) == root
+        except ValueError:
+            inside = False
+        if not inside or not os.path.isfile(path):
+            return ("Document file is no longer available", 404)
+        mime = str(doc.get("mime_type") or "application/octet-stream")
+        inline = mime == "application/pdf" or mime.startswith("image/")
+        return send_file(
+            path,
+            mimetype=mime,
+            as_attachment=not inline,
+            download_name=Path(doc.get("filename") or path).name,
+        )
+
+    @app.post("/vehicles/<vehicle_id>/service-history")
+    @require_login
+    def vehicle_service_add(vehicle_id: str):
+        vehicle = vehicle_store.get_vehicle(config.admin_db_file, vehicle_id)
+        if not vehicle:
+            return ("Vehicle not found", 404)
+        next_due = (request.form.get("next_due_date") or "").strip()
+        try:
+            service = vehicle_store.add_service_history(
+                config.admin_db_file, vehicle_id,
+                serviced_on=(request.form.get("serviced_on") or "").strip(),
+                mileage=_vehicle_int(request.form.get("mileage")),
+                provider=request.form.get("provider") or "",
+                details=request.form.get("details") or "",
+                next_due_date=next_due,
+            )
+            _vehicle_save_upload(
+                vehicle_id, request.files.get("document"), category="service",
+                notes="Service record " + service["serviced_on"],
+                service_history_id=service["id"],
+            )
+            if next_due:
+                deadline = vehicle_store.upsert_deadline(
+                    config.admin_db_file, vehicle_id, "service",
+                    due_date=next_due,
+                    provider=service.get("provider") or "",
+                )
+                _sync_vehicle_calendar_reminder(config, vehicle, deadline)
+            if service.get("mileage") is not None:
+                vehicle_store.update_vehicle(
+                    config.admin_db_file, vehicle_id,
+                    current_mileage=int(service["mileage"]),
+                )
+        except ValueError as exc:
+            return redirect("/vehicles/" + vehicle_id + "?error=" + urllib.parse.quote(str(exc)))
+        return redirect("/vehicles/" + vehicle_id + "?message=Service%20history%20added")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # End Vehicles / Email Invoice Importer
     # ═══════════════════════════════════════════════════════════════════════════
 
     return app

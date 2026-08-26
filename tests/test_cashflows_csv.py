@@ -188,6 +188,26 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(st.sales[1].fee, Decimal("12.00"))
         self.assertEqual(st.sales[1].net, Decimal("1188.50"))
 
+    def test_cashflows_sale_times_are_converted_to_london_time(self):
+        text = _csv(
+            [
+                '"1","2026-07-22","10:44:39","Sale AAA","Sale Settlement","","100.00","0.00"',
+            ]
+        )
+        st = parse_merchant_csv(text)
+        self.assertEqual(st.sales[0].date.isoformat(), "2026-07-22")
+        self.assertEqual(st.sales[0].time, "11:44:39")
+
+    def test_late_cashflows_sale_can_move_to_next_london_day(self):
+        text = _csv(
+            [
+                '"1","2026-07-22","23:30:00","Sale AAA","Sale Settlement","","100.00","0.00"',
+            ]
+        )
+        st = parse_merchant_csv(text)
+        self.assertEqual(st.sales[0].date.isoformat(), "2026-07-23")
+        self.assertEqual(st.sales[0].time, "00:30:00")
+
     def test_rejects_non_statement_file(self):
         with self.assertRaises(CsvParseError):
             parse_merchant_csv("just,some,random\n1,2,3\n")

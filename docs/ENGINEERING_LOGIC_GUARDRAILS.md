@@ -12,6 +12,81 @@ If you change logic in the files referenced below, update this document in the s
 - `app/state.py`: persistent markers for processed/sent/paid/draft-sync and retry cooldowns.
 - `app/receipts/*`: scaffold-only receipt module (feature-flagged, isolated, no live write-through yet).
 
+### Email Invoice Supplier Identity
+
+Observed incident:
+- A Brown & Brown / Close Brothers insurance fee document was imported from an
+  email sent by an individual broker.
+- OCR/app logic used the sender/person name (`Charlie Hughes`) as the supplier.
+- The Email Invoice Importer then created a Xero ACCPAY supplier bill using
+  that name as the Xero contact, even though the document said payment was
+  payable to `Brown & Brown Insurance Brokers (UK) Limited`.
+
+Permanent rules:
+- Email invoice supplier identity must prefer explicit document payment
+  instructions such as `cheque payable to ...` or `Account Name: ...` over an
+  individual sender name.
+- Supplier payment details such as `Bank Details: INDIGO SERVICE SOLUTIONS LTD
+  A/c No...` are also explicit supplier evidence and must beat an invoice
+  address block showing our own company name.
+- The final Xero submit path must re-run this supplier correction for already
+  scanned rows before creating a supplier bill.
+- Person-name senders from brokers/accountants are not strong supplier evidence
+  when the OCR text names a different payable company.
+
+### Expense Receipts / Xero Duplicate Checks
+
+Observed incident:
+- A Troy Asda fuel receipt for £7.13 was already in Xero as a paid supplier
+  bill (`ACCPAY`) under contact `Asda`, with line description `Troy Unleaded`.
+- The receipt dump had mainly checked Xero bank/spend transactions at the dump
+  stage. That missed supplier bills already created by Hubdoc/old admin flows.
+- OCR also read noisy text as `£996.00` even though the receipt showed
+  `Total £7.13`, `Mastercard £7.13`, and `£5.94 + £1.19 VAT = £7.13`.
+
+Permanent rules:
+- Every receipt route that can create or import an expense must check all three
+  duplicate sources before creating a new Xero item:
+  - local `expense_receipts`,
+  - Xero `BankTransactions` / spend-money entries,
+  - Xero supplier bills (`Invoices` with `Type=="ACCPAY"`).
+- Receipt Dump must run supplier-bill checks both during the scan/preview and
+  again during the final import. The import step is the final safety gate.
+- If an existing Xero supplier bill has an attachment, mark the dump item as a
+  duplicate and do not create another receipt/bill.
+- If an existing Xero supplier bill exists without an attachment, attach the
+  receipt image to that bill and link the local receipt to the existing bill.
+- Obvious noisy OCR totals must not override strong paid/card totals. For
+  example, text like `Total 996 ... £7.13` must resolve to the real card-paid
+  total when the VAT summary and card line support it.
+- Subcontractor receipt dumps are not exempt from Xero bill duplicate checks:
+  old admin may have posted reimbursed receipts directly as supplier bills.
+
+### Legacy Calendar Receipt Links
+
+Observed decision:
+- The old workflow put receipt-upload links on Google Calendar entries and
+  could mark customer/card receipt entries as overdue/red when the photo had
+  not been attached.
+- That is no longer part of the live engineer workflow. Engineers should use
+  the Powwash Expenses portal, not calendar receipt links.
+
+Permanent rules:
+- `LEGACY_CALENDAR_RECEIPTS_ENABLED` must remain off unless Ben explicitly asks
+  to restore signed receipt links inside Google Calendar entries.
+- `CUSTOMER_RECEIPT_PORTAL_ENABLED` may stay on. This is the engineer portal
+  screen where a user chooses a CARD job and uploads the customer card-terminal
+  receipt from inside the Powwash Expenses portal.
+- `CUSTOMER_RECEIPT_OVERDUE_MARKERS_ENABLED` must remain off unless Ben
+  explicitly asks to restore calendar overdue/red marker behaviour.
+- Do not add new receipt-upload links to calendar descriptions.
+- Do not scan calendar jobs for customer receipt overdue state unless
+  `CUSTOMER_RECEIPT_OVERDUE_MARKERS_ENABLED` is explicitly enabled.
+- Do not add `Customer receipt needed` markers or force receipt-related red/pink
+  calendar colours.
+- Existing historical `customer_receipt_details` data may still be used as a
+  Cashflows matching signal; disabling the calendar workflow must not delete it.
+
 ## Critical Invariants
 
 - Never change existing invoice/calendar behavior without preserving:
@@ -412,7 +487,8 @@ Current contract:
 - `RECEIPTS_ENABLED=false` => no receipt feature execution.
 - Receipt scaffold stores data only in `RECEIPTS_STORE_FILE`.
 - Runtime receipt settings are stored in admin DB key `receipts_settings`.
-- Signed receipt upload links are only injected for `PAYMENT TYPE = CARD` entries that show `Invoice sent ✅`.
+- Legacy signed calendar receipt upload links are disabled. Engineers use the
+  Powwash Expenses portal for customer card-terminal receipts.
 - Receipt upload flow can call Google Document AI when receipts are enabled and parser settings are filled.
 - Field Expenses receipt photos and approvals must save immediately, but
   lower-priority Xero bill/payment writes for subcontractor settlements are
@@ -422,6 +498,12 @@ Current contract:
 - Engineer-facing receipt pages must never create Xero bills as a hidden side
   effect. They may record that a payment settled receipts locally, then leave
   Xero submission waiting for admin timing/manual action.
+- Field Expenses resolved/unresolved displays must use one meaning everywhere:
+  a card/bank CSV row is resolved when it is matched by an app receipt, a Xero
+  spend/payment/bill/attachment signal, or an uploaded Xero reconciled statement
+  row. A partial Xero resolved cache may keep rows green inside its covered
+  dates, but it must not stop an admin-triggered refresh for a wider CSV range
+  such as Ben's Sep-Nov history.
 - Automatic admin-page processing and the admin "Run due Xero submissions now"
   action are capped at 5 settlement bills per page load/click. Do not remove
   that cap without adding an equivalent Xero pressure guard.
@@ -559,6 +641,15 @@ Current rule:
 
 ## Field Expenses / Receipt Dump Guardrails
 
+- Before changing Field Expenses matching, confirm whether a linked feed is a
+  real card statement or a normal bank account. Normal bank-account CSVs include
+  customer receipts, wages, loans, transfers, Stripe/Cashflows deposits and
+  other non-expense movements. They must not be treated as engineer receipt
+  debt. Clear card-purchase markers from those feeds should be chased as
+  missing receipts, and known supplier spend names may also be chased when the
+  bank export has no card marker. Do not broaden this to every positive bank
+  row. A Xero-reconciled bank movement may be displayed as resolved, but it must
+  not inflate "missing receipts" totals.
 - Receipt dump bank matching must never guess across all bank accounts. If a
   dump has no chosen card/bank account, show a clear "bank matching has not run"
   prompt and require the user to choose the account first.
@@ -586,3 +677,81 @@ Current rule:
   transaction means the expense is already submitted in Xero and must not be
   imported again. Cache these Xero reads by date window so a large dump does not
   create one Xero request per photo.
+- Individual Field Expenses receipt submission must use the same Xero-before-
+  create protection. If a Xero `SPEND` has the exact same amount and either the
+  same date, or a matching supplier/contact within a short posting-date window,
+  attach the receipt to that existing Xero item instead of creating a new spend.
+  This prevents card posting-date shifts, e.g. receipt date one day before the
+  reconciled Xero spend date, from becoming duplicate expenses.
+- Email Invoice Importer supplier correction must be applied consistently after
+  OCR. If payment instructions name a payable supplier such as Brown & Brown but
+  the email sender is a person, the corrected supplier must be used for the Xero
+  contact, bill reference, line description and stored app item. Do not create
+  supplier bills that show the sender/person as the payable contact.
+- The same supplier correction applies to Field Expenses. If OCR reads
+  `Pow Services Limited` from the invoice address block but the receipt/invoice
+  text contains a supplier bank-detail line such as `Bank Details: INDIGO
+  SERVICE SOLUTIONS LTD`, the supplier/payee line wins. Do not create Xero
+  spend records under our own company contact merely because the document was
+  addressed to us.
+- Field Expenses resolved-state matching must support one bank/card-feed row
+  being reconciled in Xero by several same-supplier Xero rows. This is common
+  for marketplace suppliers such as Amazon, where one bank feed line may match
+  multiple Xero bills/payments. Use the cached Xero resolved lines and a bounded
+  sum check; do not add per-row live Xero reads to engineer phone page loads.
+- Field Expenses matching may also treat a same-day supplier payment plus a
+  generic Xero reconciliation adjustment as resolved when those parts sum
+  exactly to the bank/card line. This covers Xero splits such as `Payment:
+  Equip2Clean` plus `Reconciliation adjustment`. The selected group must still
+  include at least one supplier-overlap row; never let a generic adjustment
+  alone or an unrelated supplier make a row green.
+- A warm Xero resolved-state cache must still be used when it only partially
+  covers the phone portal's requested date range. Old CSV months can make the
+  requested range wider than the cache; do not discard the cache and paint
+  in-range rows amber/unresolved. Rows outside the cache may stay visible, but
+  rows inside the cache must keep their resolved state.
+- Xero being paused/disabled must prevent new Xero API calls, but it must not
+  stop the portal using already stored local Xero cache data. Ignoring the
+  cache during a Xero pause makes previously resolved card rows look unresolved
+  even though no new evidence has changed.
+- If the cache is expired but overlaps the visible portal rows, render from the
+  stale cache and refresh in the background. Do not return an empty/unknown
+  status while the refresh is running, because that makes engineers see old
+  rows as unresolved for no business reason.
+- Field Expenses has two separate "green" meanings and they must not be mixed:
+  `receipt matched` means a receipt/photo in the app has reached Xero;
+  `reconciled in Xero` means the bank statement side is already reconciled.
+  Do not add a broad ACCPAY/bill scan to engineer phone page cache warming; it
+  creates too many Xero calls and causes cold-cache display regressions. If a
+  supplier bill should clear an engineer row, it must come from the local
+  `expense_receipts` record or an explicit imported Xero statement report.
+- Do not assume Xero's `BankTransactions`/`Payments` API data is the same as
+  the Xero UI `Bank statements` tab. A statement line can appear reconciled in
+  the Xero UI without being visible as a same-date/same-amount SPEND
+  `BankTransaction` to the app. To mark a CSV bank line green from Xero's bank
+  statement status, use an explicit statement-line data source such as Xero
+  Finance API BankStatementsPlus if available, or an imported reconciliation
+  report/export. The manual Xero report path is
+  `app/xero_statement_feed.py` plus `/cardfeed/xero-statement-upload`; it must
+  remain an exact date + exact amount + linked Xero account match and must not
+  create live Xero calls from engineer phone pages. Do not invent resolved
+  status from near amount matches alone.
+- Local receipt images are not the permanent archive; Xero is. But image
+  cleanup must be explicit, dated, and admin-driven. Do not purge receipt
+  images automatically on page load. Only archive local previews after the admin
+  marks a VAT period as finished, and only for receipts that are already
+  submitted/settled in Xero with a clean Xero ID and no Xero error. Keep the
+  receipt row, amounts, supplier, duplicate metadata, status, and Xero link so
+  duplicate detection and historic reporting continue to work after the local
+  image file has been removed.
+- Engineer multi-receipt review must stay quick and must not fire one Xero
+  submission on every tap-through. In `/expenses/<token>/review-upload`, saving
+  a receipt should mark it approved and move the user through the queue; Xero
+  writes happen from the separate guarded "Submit approved to Xero" action.
+  Review pages should use saved Xero account snapshots first and must not make
+  a fresh Xero Accounts read for every receipt screen.
+- Receipt Dump multi-receipt splitting must be conservative. If the AI creates
+  an extra item from the same photo and that extra item's total is just the VAT
+  amount from the main visible receipt, treat it as OCR/background scrap unless
+  it has its own clear payment block. This prevents one photographed receipt
+  from becoming a false second supplier task.

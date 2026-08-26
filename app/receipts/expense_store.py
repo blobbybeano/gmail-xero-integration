@@ -33,6 +33,7 @@ RECEIPT_STATUSES = (
     "submitted",       # successfully recorded in Xero
     "failed",          # Xero submission failed
     "settled",         # subcontractor: paid back and reconciled
+    "ignored",         # confirmed duplicate / not to submit
 )
 
 
@@ -91,6 +92,8 @@ def _ensure_tables(db_path: str) -> None:
                 segments_json TEXT NOT NULL DEFAULT '[]',
                 payment_source TEXT NOT NULL DEFAULT 'company_card',
                 owner_paid_account_code TEXT NOT NULL DEFAULT '',
+                payment_account_code_override TEXT NOT NULL DEFAULT '',
+                feed_account_id_override TEXT NOT NULL DEFAULT '',
                 xero_type TEXT NOT NULL DEFAULT '',
                 xero_id TEXT NOT NULL DEFAULT '',
                 xero_error TEXT NOT NULL DEFAULT '',
@@ -145,6 +148,16 @@ def _ensure_tables(db_path: str) -> None:
             conn.execute(
                 "ALTER TABLE expense_receipts "
                 "ADD COLUMN owner_paid_account_code TEXT NOT NULL DEFAULT ''"
+            )
+        if "payment_account_code_override" not in _cols:
+            conn.execute(
+                "ALTER TABLE expense_receipts "
+                "ADD COLUMN payment_account_code_override TEXT NOT NULL DEFAULT ''"
+            )
+        if "feed_account_id_override" not in _cols:
+            conn.execute(
+                "ALTER TABLE expense_receipts "
+                "ADD COLUMN feed_account_id_override TEXT NOT NULL DEFAULT ''"
             )
         # Migrations: per-engineer login credentials + linked bank card.
         _eng_cols = {
@@ -390,6 +403,8 @@ def create_receipt(
     segments: list | None = None,
     payment_source: str = "company_card",
     owner_paid_account_code: str = "",
+    payment_account_code_override: str = "",
+    feed_account_id_override: str = "",
     status: str = "pending_review",
 ) -> dict[str, Any]:
     rid = f"exp-{uuid.uuid4().hex[:12]}"
@@ -405,8 +420,9 @@ def create_receipt(
                  ocr_date, ocr_raw, ocr_error, stored_file, filename,
                  mime_type, category_account_code, category_account_name,
                  segments_json, payment_source, owner_paid_account_code,
+                 payment_account_code_override, feed_account_id_override,
                  created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 rid, engineer_id, status, merchant, purchased_on, amount_inc,
@@ -415,6 +431,8 @@ def create_receipt(
                 mime_type, category_account_code, category_account_name,
                 json.dumps(segments or []), payment_source,
                 owner_paid_account_code.strip(),
+                payment_account_code_override.strip(),
+                feed_account_id_override.strip(),
                 now, now,
             ),
         )
@@ -428,6 +446,7 @@ def update_receipt(db_path: str, receipt_id: str, **fields) -> dict[str, Any] | 
         "vat_amount", "currency", "xero_type", "xero_id", "xero_error",
         "settlement_id", "category_account_code", "category_account_name",
         "segments", "payment_source", "owner_paid_account_code",
+        "payment_account_code_override", "feed_account_id_override",
     }
     sets = {k: v for k, v in fields.items() if k in allowed}
     if "segments" in sets:
@@ -584,22 +603,40 @@ def amount_unpaid_to_engineer(
         source_clause = " AND r.payment_source = ?"
         params.append(payment_source)
     with _conn(db_path) as conn:
-        row = conn.execute(
+        unbatched = conn.execute(
             f"""
             SELECT COALESCE(SUM(COALESCE(r.amount_inc, 0)), 0) AS total
             FROM expense_receipts r
-            LEFT JOIN expense_settlements s ON s.id = r.settlement_id
             WHERE r.engineer_id = ?
               AND r.status IN ('approved', 'submitted')
               {source_clause}
-              AND (
-                r.settlement_id IS NULL
-                OR COALESCE(s.status, '') IN ('prepared', 'pending', 'review')
-              )
+              AND r.settlement_id IS NULL
             """,
             params,
         ).fetchone()
-    return float(row["total"] or 0.0)
+        settlement_params: list[Any] = [engineer_id, engineer_id]
+        settlement_source_clause = ""
+        if payment_source:
+            settlement_source_clause = " AND r.payment_source = ?"
+            settlement_params.append(payment_source)
+        prepared = conn.execute(
+            f"""
+            SELECT COALESCE(SUM(COALESCE(s.amount, 0)), 0) AS total
+            FROM expense_settlements s
+            WHERE s.engineer_id = ?
+              AND COALESCE(s.status, '') IN ('prepared', 'pending', 'review')
+              AND EXISTS (
+                SELECT 1
+                FROM expense_receipts r
+                WHERE r.settlement_id = s.id
+                  AND r.engineer_id = ?
+                  AND r.status IN ('approved', 'submitted')
+                  {settlement_source_clause}
+              )
+            """,
+            settlement_params,
+        ).fetchone()
+    return round(float(unbatched["total"] or 0.0) + float(prepared["total"] or 0.0), 2)
 
 
 def list_unsettled_receipts_for_engineer(
@@ -682,6 +719,7 @@ def create_prepared_settlement_for_engineer(
     engineer_id: int,
     reference: str,
     payment_source: str | None = None,
+    amount_override: float | None = None,
     note: str = "",
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     """Create an office-prepared payout batch from all currently owed receipts.
@@ -696,9 +734,21 @@ def create_prepared_settlement_for_engineer(
     )
     if not receipts:
         return None, []
-    amount = round(sum(float(r.get("amount_inc") or 0) for r in receipts), 2)
+    receipt_total = round(sum(float(r.get("amount_inc") or 0) for r in receipts), 2)
+    amount = receipt_total
+    if amount_override is not None:
+        try:
+            amount = round(float(amount_override or 0), 2)
+        except (TypeError, ValueError):
+            amount = receipt_total
     if amount <= 0:
         return None, []
+    if abs(amount - receipt_total) > 0.01:
+        adjustment_note = (
+            f"Actual amount paid £{amount:.2f}; receipt total £{receipt_total:.2f}; "
+            f"adjustment £{amount - receipt_total:+.2f}."
+        )
+        note = (note.strip() + " " + adjustment_note).strip()
     settlement = create_settlement(
         db_path,
         engineer_id=engineer_id,

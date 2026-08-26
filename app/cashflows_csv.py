@@ -24,6 +24,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .admin_store import get_cashflows_reconciled_refs, get_openai_settings
 from .cashflows_calendar import build_calendar_pool
@@ -56,6 +57,8 @@ EXPECTED_COLUMNS = (
     "Credit",
     "Balance",
 )
+
+CASHFLOWS_TARGET_TZ = ZoneInfo("Europe/London")
 
 DEFAULT_INVOICE_MATCH_DAYS = 7
 DEFAULT_BANK_MATCH_DAYS = 5
@@ -94,6 +97,41 @@ def _sale_ref_from_fee(description: str) -> str:
     if "Sale Ref:" in (description or ""):
         return description.split("Sale Ref:")[-1].strip()
     return ""
+
+
+def _cashflows_sale_local_datetime(date_text: str, time_text: str) -> tuple[dt.date | None, str]:
+    """Cashflows merchant CSV timestamps are treated as UTC, then shown/matched in London time.
+
+    Cashflows exports have repeatedly appeared one hour behind the London diary
+    during BST.  Keeping the conversion here means all downstream matching sees
+    the local customer-payment time and date, including late-night sales that
+    cross midnight.
+    """
+    raw_date = _date(date_text)
+    raw_time = _clean_cell(time_text)
+    if raw_date is None or not raw_time:
+        return raw_date, raw_time
+    parts = raw_time.split(":")
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1]) if len(parts) > 1 else 0
+        second = int(parts[2]) if len(parts) > 2 else 0
+        if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
+            raise ValueError
+        source_tz_name = os.getenv("CASHFLOWS_CSV_SOURCE_TIMEZONE", "UTC").strip() or "UTC"
+        source_tz = ZoneInfo(source_tz_name)
+        local_dt = dt.datetime(
+            raw_date.year,
+            raw_date.month,
+            raw_date.day,
+            hour,
+            minute,
+            second,
+            tzinfo=source_tz,
+        ).astimezone(CASHFLOWS_TARGET_TZ)
+        return local_dt.date(), local_dt.strftime("%H:%M:%S")
+    except Exception:
+        return raw_date, raw_time
 
 
 @dataclass
@@ -234,7 +272,8 @@ def parse_merchant_csv(text: str) -> ParsedStatement:
     for raw in rows[1:]:
         row_type = cell(raw, "Type")
         csv_ref = cell(raw, "Ref")
-        date = _date(cell(raw, "Date"))
+        raw_date_text = cell(raw, "Date")
+        date = _date(raw_date_text)
         description = cell(raw, "Description")
         debit = _money(cell(raw, "Debit"))
         credit = _money(cell(raw, "Credit"))
@@ -242,14 +281,18 @@ def parse_merchant_csv(text: str) -> ParsedStatement:
 
         if row_type == SALE_TYPE:
             sale_ref = _sale_ref_from_sale(description)
+            local_date, local_time = _cashflows_sale_local_datetime(
+                raw_date_text,
+                cell(raw, "Time"),
+            )
             sale = CsvSale(
                 csv_ref=csv_ref,
                 sale_ref=sale_ref,
-                date=date,
-                matured=date,
+                date=local_date,
+                matured=local_date,
                 gross=credit,
                 fee=Decimal("0.00"),
-                time=cell(raw, "Time"),
+                time=local_time,
             )
             sales.append(sale)
             if sale_ref:
