@@ -216,6 +216,53 @@ class ExpenseSettlementTests(unittest.TestCase):
             expense_store.amount_unpaid_to_engineer(self.db_path, eng["id"]), 85.00
         )
 
+    def test_settlement_xero_submission_claim_blocks_repeated_posts(self):
+        eng = expense_store.create_engineer(
+            self.db_path,
+            name="Troy",
+            kind="subcontractor",
+            xero_contact_name="Troy",
+            expense_account_code="310",
+            payment_account_code="090",
+        )
+        expense_store.create_receipt(
+            self.db_path,
+            engineer_id=eng["id"],
+            merchant="Fuel",
+            purchased_on="2026-07-10",
+            amount_inc=12.50,
+            status="approved",
+        )
+        settlement, _receipts = expense_store.create_prepared_settlement_for_engineer(
+            self.db_path,
+            engineer_id=eng["id"],
+            reference="TROY-763",
+        )
+
+        self.assertIsNotNone(settlement)
+        first, first_result = expense_store.claim_settlement_xero_submission(
+            self.db_path, settlement["id"]
+        )
+        second, second_result = expense_store.claim_settlement_xero_submission(
+            self.db_path, settlement["id"]
+        )
+
+        self.assertEqual(first_result, "claimed")
+        self.assertTrue(first["xero_submit_started_at"])
+        self.assertEqual(second_result, "in_progress")
+        self.assertTrue(second["xero_submit_started_at"])
+
+        expense_store.update_settlement(
+            self.db_path,
+            settlement["id"],
+            xero_bill_id="xero-bill-1",
+            xero_submit_started_at="",
+        )
+        _third, third_result = expense_store.claim_settlement_xero_submission(
+            self.db_path, settlement["id"]
+        )
+        self.assertEqual(third_result, "already_synced")
+
     def test_owner_paid_company_card_receipts_can_be_batched_separately(self):
         eng = expense_store.create_engineer(
             self.db_path,

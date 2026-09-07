@@ -15286,14 +15286,121 @@ body {{ background:#f7f6f3 !important; }}
         # on the settlement note; the remainder stays owed locally.
         amount_paid = round(sum(li["UnitAmount"] for li in line_items), 2)
 
+        claimed_settlement, claim_result = exp_store.claim_settlement_xero_submission(
+            config.admin_db_file,
+            int(settlement["id"]),
+        )
+        if claim_result == "already_synced":
+            return str((claimed_settlement or {}).get("xero_bill_id") or "").strip()
+        if claim_result == "in_progress":
+            print(
+                f"[subcontractor-bill] duplicate submit blocked "
+                f"engineer={eng.get('id')} ref={ref}",
+                flush=True,
+            )
+            return ""
+        if claim_result != "claimed" or not claimed_settlement:
+            return ""
+        settlement = claimed_settlement
+
         try:
             client = build_xero_client(config)
             if client is None:
                 exp_store.update_settlement(
                     config.admin_db_file, settlement["id"],
                     xero_error="Xero not connected — bill not raised.",
+                    xero_submit_started_at="",
                 )
                 return ""
+
+            existing_bill = None
+            if ref and amount_paid > 0:
+                try:
+                    base_date = dt.date.fromisoformat(paid_on or dt.date.today().isoformat())
+                except ValueError:
+                    base_date = dt.date.today()
+                try:
+                    candidates = client.get_purchase_bills(
+                        start_date=base_date - dt.timedelta(days=3),
+                        end_date=base_date + dt.timedelta(days=3),
+                    ).get("Invoices") or []
+                    for candidate in candidates:
+                        if str(candidate.get("Reference") or "").strip() != ref:
+                            continue
+                        try:
+                            candidate_total = round(float(candidate.get("Total") or 0), 2)
+                        except (TypeError, ValueError):
+                            candidate_total = 0.0
+                        if abs(candidate_total - amount_paid) <= 0.01:
+                            existing_bill = candidate
+                            break
+                except Exception as lookup_exc:
+                    print(
+                        f"[subcontractor-bill] existing lookup failed "
+                        f"engineer={eng.get('id')} ref={ref}: {lookup_exc}",
+                        flush=True,
+                    )
+
+            if existing_bill:
+                bill_id = str(existing_bill.get("InvoiceID") or "").strip()
+                if not bill_id:
+                    exp_store.update_settlement(
+                        config.admin_db_file, settlement["id"],
+                        xero_error="Existing Xero bill match had no InvoiceID — not recorded.",
+                        xero_submit_started_at="",
+                    )
+                    return ""
+                try:
+                    amount_due = round(float(existing_bill.get("AmountDue") or 0), 2)
+                except (TypeError, ValueError):
+                    amount_due = 0.0
+                if amount_due > 0.01:
+                    owner_paid_batch = bool(billable) and all(
+                        (r.get("payment_source") or "company_card") == "owner_paid"
+                        for r in billable
+                    )
+                    pay_acct = (
+                        (eng.get("owner_paid_account_code") or "").strip()
+                        if owner_paid_batch
+                        else (eng.get("payment_account_code") or "").strip()
+                    )
+                    try:
+                        client.record_invoice_payment(
+                            bill_id,
+                            min(amount_paid, amount_due),
+                            account_code=pay_acct,
+                            when=paid_on,
+                        )
+                    except Exception as pe:
+                        exp_store.update_settlement(
+                            config.admin_db_file, settlement["id"],
+                            xero_bill_id=bill_id,
+                            xero_error=f"Existing bill found but payment failed: {pe}",
+                            xero_submit_started_at="",
+                        )
+                        return bill_id
+                exp_store.update_settlement(
+                    config.admin_db_file, settlement["id"],
+                    xero_bill_id=bill_id,
+                    xero_error="",
+                    xero_submit_started_at="",
+                )
+                for r in billable:
+                    try:
+                        exp_store.update_receipt(
+                            config.admin_db_file, r["id"],
+                            xero_type="ACCPAY", xero_id=bill_id,
+                        )
+                    except Exception:
+                        pass
+                print(
+                    f"[subcontractor-bill] reused existing bill "
+                    f"engineer={eng.get('id')} ref={ref} bill={bill_id} "
+                    f"paid={amount_paid}",
+                    flush=True,
+                )
+                return bill_id
+
             bill = client.create_bill(
                 contact=contact,
                 line_items=line_items,
@@ -15307,6 +15414,7 @@ body {{ background:#f7f6f3 !important; }}
                 exp_store.update_settlement(
                     config.admin_db_file, settlement["id"],
                     xero_error="DRY_RUN — bill + payment simulated, not written.",
+                    xero_submit_started_at="",
                 )
                 print(f"[subcontractor-bill] DRY_RUN engineer={eng.get('id')} "
                       f"ref={ref} lines={len(line_items)} amount={amount_paid}",
@@ -15319,6 +15427,7 @@ body {{ background:#f7f6f3 !important; }}
                 exp_store.update_settlement(
                     config.admin_db_file, settlement["id"],
                     xero_error="Bill create returned no InvoiceID — not recorded.",
+                    xero_submit_started_at="",
                 )
                 print(f"[subcontractor-bill] no InvoiceID engineer={eng.get('id')} "
                       f"ref={ref}", flush=True)
@@ -15358,6 +15467,7 @@ body {{ background:#f7f6f3 !important; }}
                         config.admin_db_file, settlement["id"],
                         xero_bill_id=bill_id,
                         xero_error=f"Bill raised but payment failed: {pe}",
+                        xero_submit_started_at="",
                     )
                     print(f"[subcontractor-bill] payment failed bill={bill_id}: {pe}",
                           flush=True)
@@ -15371,6 +15481,7 @@ body {{ background:#f7f6f3 !important; }}
                     + "; ".join(attach_failures[:3])
                     if attach_failures else ""
                 ),
+                xero_submit_started_at="",
             )
             # Link the bill onto each settled receipt for traceability/pull-back.
             for r in billable:
@@ -15389,6 +15500,7 @@ body {{ background:#f7f6f3 !important; }}
             exp_store.update_settlement(
                 config.admin_db_file, settlement["id"],
                 xero_error=f"Bill create failed: {e}",
+                xero_submit_started_at="",
             )
             print(f"[subcontractor-bill] failed engineer={eng.get('id')}: {e}",
                   flush=True)
@@ -21540,6 +21652,7 @@ body {{ background:#f7f6f3 !important; }}
                         mark_paid = (
                             "<form method='post' "
                             f"action='/receipts/expenses/settlement/{sid}/mark-paid' "
+                            "data-expense-submit-once data-loading-text='Sending to Xero...' "
                             "class='flex items-center gap-1.5 flex-wrap'>"
                             "<input name='paid_on' type='date' "
                             f"value='{dt.datetime.now(dt.timezone.utc).date().isoformat()}' "
@@ -21551,7 +21664,9 @@ body {{ background:#f7f6f3 !important; }}
                     elif status in {"paid", "overpaid"}:
                         mark_paid = (
                             "<form method='post' "
-                            f"action='/receipts/expenses/settlement/{sid}/send-xero' class='inline'>"
+                            f"action='/receipts/expenses/settlement/{sid}/send-xero' "
+                            "data-expense-submit-once data-loading-text='Sending to Xero...' "
+                            "class='inline'>"
                             "<button type='submit' class='rounded border border-blue-300 "
                             "bg-blue-50 px-2 py-1 text-xs font-semibold text-blue-800'>"
                             "Send to Xero now</button></form>"
@@ -21615,6 +21730,7 @@ body {{ background:#f7f6f3 !important; }}
                 "</div></div>"
                 "<form method='post' "
                 f"action='/receipts/expenses/{sub['id']}/prepare-payment' "
+                "data-expense-submit-once data-loading-text='Preparing batch...' "
                 "class='mt-3 flex items-center justify-between gap-2 flex-wrap'>"
                 + (
                     "<input type='hidden' name='payment_source' value='owner_paid'>"
@@ -23303,6 +23419,7 @@ body {{ background:#f7f6f3 !important; }}
             "document.addEventListener('input',function(e){var form=e.target.closest&&e.target.closest('[data-admin-receipt-review-form]');if(!form)return;if(e.target.name==='amount_inc'||e.target.name==='vat_amount')syncReceiptVat(form);});"
             "document.addEventListener('change',function(e){var form=e.target.closest&&e.target.closest('[data-admin-receipt-review-form]');if(!form)return;if(e.target.name==='vat_mode')syncReceiptVat(form);});"
             "document.addEventListener('submit',function(e){var dup=e.target.closest&&e.target.closest('[data-duplicate-action-form]');if(!dup)return;var panel=dup.closest('.exp-review-panel');if(!panel)return;e.preventDefault();submitDuplicateAction(dup);});"
+            "document.addEventListener('submit',function(e){var form=e.target.closest&&e.target.closest('[data-expense-submit-once]');if(!form)return;if(form.dataset.submitting==='1'){e.preventDefault();return;}form.dataset.submitting='1';var text=form.getAttribute('data-loading-text')||'Working...';var buttons=form.querySelectorAll('button');buttons.forEach(function(b){b.disabled=true;b.dataset.oldText=b.textContent;b.textContent=text;});var bar=document.createElement('div');bar.className='basis-full mt-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-800';bar.innerHTML='<div>'+text+'</div><div class=\"mt-2 h-1.5 overflow-hidden rounded-full bg-emerald-100\"><div class=\"h-full w-2/3 rounded-full bg-emerald-500 animate-pulse\"></div></div>';form.appendChild(bar);});"
             "document.addEventListener('submit',function(e){var form=e.target.closest&&e.target.closest('[data-person-dump-form]');if(form){e.preventDefault();personDumpSubmit(form);return;}var review=e.target.closest&&e.target.closest('[data-admin-receipt-review-form]');if(review){e.preventDefault();submitAdminReceiptReview(review,e.submitter);return;}});"
             "})();</script>"
         )

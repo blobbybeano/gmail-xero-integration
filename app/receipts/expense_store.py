@@ -210,6 +210,11 @@ def _ensure_tables(db_path: str) -> None:
                 "ALTER TABLE expense_settlements "
                 "ADD COLUMN xero_error TEXT NOT NULL DEFAULT ''"
             )
+        if "xero_submit_started_at" not in _set_cols:
+            conn.execute(
+                "ALTER TABLE expense_settlements "
+                "ADD COLUMN xero_submit_started_at TEXT NOT NULL DEFAULT ''"
+            )
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_exp_settle_txid "
             "ON expense_settlements (plaid_tx_id) WHERE plaid_tx_id <> ''"
@@ -729,43 +734,76 @@ def create_prepared_settlement_for_engineer(
     bank feed.  That keeps the engineer-facing unpaid total honest while still
     stopping the same receipts being prepared twice.
     """
-    receipts = list_unsettled_receipts_for_engineer(
-        db_path, engineer_id, payment_source=payment_source
-    )
-    if not receipts:
-        return None, []
-    receipt_total = round(sum(float(r.get("amount_inc") or 0) for r in receipts), 2)
-    amount = receipt_total
-    if amount_override is not None:
-        try:
-            amount = round(float(amount_override or 0), 2)
-        except (TypeError, ValueError):
-            amount = receipt_total
-    if amount <= 0:
-        return None, []
-    if abs(amount - receipt_total) > 0.01:
-        adjustment_note = (
-            f"Actual amount paid £{amount:.2f}; receipt total £{receipt_total:.2f}; "
-            f"adjustment £{amount - receipt_total:+.2f}."
-        )
-        note = (note.strip() + " " + adjustment_note).strip()
-    settlement = create_settlement(
-        db_path,
-        engineer_id=engineer_id,
-        reference=reference,
-        amount=amount,
-        paid_on="",
-        status="prepared",
-        plaid_tx_id="",
-        note=note,
-    )
     with _conn(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        source_clause = ""
+        params: list[Any] = [engineer_id]
+        if payment_source:
+            source_clause = " AND payment_source = ?"
+            params.append(payment_source)
+        rows = conn.execute(
+            f"""
+            SELECT * FROM expense_receipts
+            WHERE engineer_id = ?
+              AND status IN ('approved', 'submitted')
+              AND settlement_id IS NULL
+              AND COALESCE(amount_inc, 0) > 0
+              {source_clause}
+            ORDER BY purchased_on ASC, created_at ASC
+            """,
+            params,
+        ).fetchall()
+        receipts = [_row_to_dict(r) for r in rows]
+        if not receipts:
+            conn.commit()
+            return None, []
+
+        receipt_total = round(sum(float(r.get("amount_inc") or 0) for r in receipts), 2)
+        amount = receipt_total
+        if amount_override is not None:
+            try:
+                amount = round(float(amount_override or 0), 2)
+            except (TypeError, ValueError):
+                amount = receipt_total
+        if amount <= 0:
+            conn.commit()
+            return None, []
+        if abs(amount - receipt_total) > 0.01:
+            adjustment_note = (
+                f"Actual amount paid £{amount:.2f}; receipt total £{receipt_total:.2f}; "
+                f"adjustment £{amount - receipt_total:+.2f}."
+            )
+            note = (note.strip() + " " + adjustment_note).strip()
+
+        now = _now_iso()
+        cur = conn.execute(
+            """
+            INSERT INTO expense_settlements
+                (engineer_id, reference, amount, paid_on, status, plaid_tx_id,
+                 note, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                engineer_id,
+                reference.strip(),
+                amount,
+                "",
+                "prepared",
+                "",
+                note,
+                now,
+            ),
+        )
+        settlement_id = int(cur.lastrowid)
         conn.executemany(
             "UPDATE expense_receipts SET settlement_id = ?, updated_at = ? WHERE id = ?",
-            [(settlement["id"], _now_iso(), r["id"]) for r in receipts],
+            [(settlement_id, now, r["id"]) for r in receipts],
         )
+        row = conn.execute(
+            "SELECT * FROM expense_settlements WHERE id = ?", (settlement_id,)
+        ).fetchone()
         conn.commit()
-    return settlement, list_receipts_for_settlement(db_path, settlement["id"])
+    return _row_to_dict(row), list_receipts_for_settlement(db_path, settlement_id)
 
 
 def list_settlements_for_engineer(db_path: str, engineer_id: int) -> list[dict[str, Any]]:
@@ -788,7 +826,8 @@ def get_settlement(db_path: str, settlement_id: int) -> dict[str, Any] | None:
 
 def update_settlement(db_path: str, settlement_id: int, **fields) -> dict[str, Any] | None:
     allowed = {
-        "status", "note", "xero_bill_id", "xero_error", "paid_on", "plaid_tx_id",
+        "status", "note", "xero_bill_id", "xero_error", "paid_on",
+        "plaid_tx_id", "xero_submit_started_at",
     }
     sets = {k: (v if v is not None else "") for k, v in fields.items() if k in allowed}
     if not sets:
@@ -808,3 +847,61 @@ def update_settlement(db_path: str, settlement_id: int, **fields) -> dict[str, A
             "SELECT * FROM expense_settlements WHERE id = ?", (settlement_id,)
         ).fetchone()
     return _row_to_dict(row)
+
+
+def claim_settlement_xero_submission(
+    db_path: str,
+    settlement_id: int,
+    *,
+    stale_after_seconds: int = 15 * 60,
+) -> tuple[dict[str, Any] | None, str]:
+    """Atomically claim a settlement before creating its Xero bill.
+
+    Returns (settlement, result), where result is one of:
+    - "claimed": this caller may submit to Xero
+    - "already_synced": the settlement already has a Xero bill
+    - "in_progress": another request is already submitting it
+    - "not_found": no settlement exists
+
+    This is the backend protection against double-clicks, mobile retries, and
+    slow Xero attachment uploads racing each other.
+    """
+    now = _now_iso()
+    with _conn(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM expense_settlements WHERE id = ?", (settlement_id,)
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return None, "not_found"
+
+        current = _row_to_dict(row) or {}
+        if (current.get("xero_bill_id") or "").strip():
+            conn.commit()
+            return current, "already_synced"
+
+        started = str(current.get("xero_submit_started_at") or "").strip()
+        if started:
+            try:
+                started_at = datetime.fromisoformat(started)
+                if started_at.tzinfo is None:
+                    started_at = started_at.replace(tzinfo=timezone.utc)
+                age = (datetime.now(timezone.utc) - started_at).total_seconds()
+            except Exception:
+                age = 0
+            if age < stale_after_seconds:
+                conn.commit()
+                return current, "in_progress"
+
+        conn.execute(
+            "UPDATE expense_settlements "
+            "SET xero_submit_started_at = ?, xero_error = ? "
+            "WHERE id = ? AND COALESCE(xero_bill_id, '') = ''",
+            (now, "Xero submission in progress.", settlement_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM expense_settlements WHERE id = ?", (settlement_id,)
+        ).fetchone()
+        conn.commit()
+    return _row_to_dict(row), "claimed"
