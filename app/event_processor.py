@@ -937,6 +937,35 @@ def _bold_invoice_amounts(description: str | None) -> str:
     return text
 
 
+_CONTACT_FIELD_LABELS = (
+    "Customer name",
+    "Customer email address",
+    "Customer email",
+    "Customer contact number",
+    "Invoice profile",
+    "Invoce profile",
+    "Invoice name",
+    "Invoice address line 1",
+    "Invoice address line 2",
+    "Invoice city",
+    "Invoice postcode",
+    "Invoice country",
+)
+
+
+def _extract_contact_field(text: str, labels: tuple[str, ...]) -> str:
+    import re
+
+    all_labels = sorted(_CONTACT_FIELD_LABELS, key=len, reverse=True)
+    label_pattern = "|".join(re.escape(label) for label in labels)
+    stop_pattern = "|".join(re.escape(label) for label in all_labels)
+    match = re.search(
+        rf"(?is)(?:^|\s)(?:{label_pattern})\s*:\s*(.*?)(?=\s+(?:{stop_pattern})\s*:|$)",
+        text,
+    )
+    return (match.group(1).strip() if match else "")
+
+
 def parse_customer_fields(description: str | None) -> Dict:
     """
     Extract customer fields from the event description.
@@ -958,21 +987,12 @@ def parse_customer_fields(description: str | None) -> Dict:
     if contact_match:
         text = contact_match.group(1)
 
-    name_val = ""
-    email_val = ""
-    phone_val = ""
-
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        lower = line.lower()
-        if lower.startswith("customer name:"):
-            name_val = line.split(":", 1)[1].strip()
-        elif lower.startswith("customer email address:"):
-            email_val = line.split(":", 1)[1].strip()
-        elif lower.startswith("customer email:"):
-            email_val = line.split(":", 1)[1].strip()
-        elif lower.startswith("customer contact number:"):
-            phone_val = line.split(":", 1)[1].strip()
+    name_val = _extract_contact_field(text, ("Customer name",))
+    email_val = _extract_contact_field(
+        text,
+        ("Customer email address", "Customer email"),
+    )
+    phone_val = _extract_contact_field(text, ("Customer contact number",))
 
     if name_val:
         result["name"] = _normalize_name(_strip_error_hint(name_val))

@@ -6,6 +6,7 @@ from app.event_processor import (
     extract_invoice_lines,
     extract_sales_lines,
     normalize_user_sections,
+    parse_customer_fields,
     parse_invoice_contact_overrides,
     preserve_latest_user_controls,
     clear_process_draft_yes,
@@ -127,6 +128,19 @@ class InvoiceSalesParsingTests(unittest.TestCase):
 
         self.assertIn("PAYMENT TYPE (CARD/INVOICE) =", updated)
         self.assertNotIn("PAYMENT TYPE (CARD/INVOICE) = CARD", updated)
+
+    def test_customer_fields_parse_when_contact_block_is_collapsed(self):
+        description = (
+            "[contact] Customer name: Emma Prosser "
+            "Customer email address: emma.prosser1997@gmail.com "
+            "Customer contact number: +44 7713 112131 [/contact]"
+        )
+
+        customer = parse_customer_fields(description)
+
+        self.assertEqual(customer["name"], "Emma Prosser")
+        self.assertEqual(customer["email"], "emma.prosser1997@gmail.com")
+        self.assertEqual(customer["phone"], "447713112131")
 
     def test_explicit_payment_value_is_preserved(self):
         description = (

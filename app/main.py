@@ -2808,7 +2808,13 @@ def run() -> None:
                                 event_updated = updated.get("updated") or event_updated
                             state = set_processed_update_marker(state, event_key, event_updated)
                             continue
-                    if is_processed(state, event_key):
+                    processed_but_missing_draft = bool(
+                        has_done
+                        and invoice_lines
+                        and not get_invoice_for_event(state, event_key)
+                        and not sent_state
+                    )
+                    if is_processed(state, event_key) and not processed_but_missing_draft:
                         # If we have a stored contact, update it only when the event changed.
                         existing_contact_id = get_contact_for_event(state, event_key)
                         last_contact_update = get_contact_update_marker(
