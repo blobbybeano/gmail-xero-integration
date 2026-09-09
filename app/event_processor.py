@@ -482,6 +482,29 @@ def upsert_invoice_profile_missing_hint(description: str | None, *, missing: boo
     return text[: m.start()] + rebuilt + text[m.end() :]
 
 
+def clear_process_draft_yes(description: str | None) -> str:
+    """Clear a user-entered PROCESS DRAFT yes after a blocking validation failure.
+
+    This keeps the prompt visible but removes Y/YES so the calendar poller will
+    not keep retrying the same invalid invoice profile until a human edits and
+    confirms the draft again.
+    """
+    import re
+
+    text = (description or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not text:
+        return text
+
+    def repl(match: re.Match) -> str:
+        return match.group("prefix").rstrip() + " "
+
+    return re.sub(
+        r"(?im)^(?P<prefix>\s*PROCESS\s+DRAFT\s*\(\s*Y\s*/\s*N\s*\)\s*=\s*)(?:Y|YES)\s*$",
+        repl,
+        text,
+    )
+
+
 def _looks_like_invoice_line(line: str) -> bool:
     import re
 

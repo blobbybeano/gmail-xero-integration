@@ -2,11 +2,13 @@ import unittest
 
 from app.event_processor import (
     compute_invoice_totals,
+    done_choice_is_yes,
     extract_invoice_lines,
     extract_sales_lines,
     normalize_user_sections,
     parse_invoice_contact_overrides,
     preserve_latest_user_controls,
+    clear_process_draft_yes,
     send_choice_is_no,
     send_choice_is_yes,
     sync_invoice_block_from_xero,
@@ -319,6 +321,37 @@ class InvoiceSalesParsingTests(unittest.TestCase):
 
         self.assertIn("Invoice profile: Sinead Gloster \u274c Customer does not exist", updated)
         self.assertNotIn("Invoce profile:", updated)
+
+    def test_missing_invoice_profile_can_clear_process_draft_yes(self):
+        description = (
+            "[contact]\n"
+            "Invoice profile: Missing Customer\n"
+            "[/contact]\n\n"
+            "[invoice]\n"
+            "Gutter cleaning = £100+VAT\n"
+            "[/invoice]\n"
+            "PROCESS DRAFT (Y/N) =Y"
+        )
+
+        updated = upsert_invoice_profile_missing_hint(description, missing=True)
+        updated = clear_process_draft_yes(updated)
+
+        self.assertIn(
+            "Invoice profile: Missing Customer \u274c Customer does not exist",
+            updated,
+        )
+        self.assertIn("PROCESS DRAFT (Y/N) = ", updated)
+        self.assertFalse(done_choice_is_yes(updated))
+
+    def test_clear_process_draft_yes_handles_spaced_yes(self):
+        description = "PROCESS DRAFT (Y/N) = YES\nSEND NOW (Y/N) =Y"
+
+        updated = clear_process_draft_yes(description)
+
+        self.assertIn("PROCESS DRAFT (Y/N) = ", updated)
+        self.assertIn("SEND NOW (Y/N) =Y", updated)
+        self.assertFalse(done_choice_is_yes(updated))
+        self.assertTrue(send_choice_is_yes(updated))
 
 
 if __name__ == "__main__":

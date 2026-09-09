@@ -43,6 +43,7 @@ from .event_processor import (
     compute_invoice_totals,
     done_choice_is_yes,
     ensure_notes_template,
+    clear_process_draft_yes,
     normalize_user_sections,
     send_choice_is_no,
     send_choice_is_yes,
@@ -2840,6 +2841,7 @@ def run() -> None:
                                         event.get("description") or "",
                                         missing=True,
                                     )
+                                    hinted_desc = clear_process_draft_yes(hinted_desc)
                                     safe_update(
                                         event_id=event.get("id"),
                                         description=hinted_desc,
@@ -4091,6 +4093,7 @@ def run() -> None:
                                         event.get("description") or "",
                                         missing=True,
                                     )
+                                    hinted_desc = clear_process_draft_yes(hinted_desc)
                                     safe_update(
                                         event_id=event.get("id"),
                                         description=hinted_desc,
