@@ -1989,7 +1989,8 @@ def upsert_job_photo_links(
         lines.pop()
     if upload_url:
         lines.append(f"{JOB_PHOTO_LABEL} {upload_url}")
-    return "\n".join(lines).rstrip() + "\n"
+    updated = "\n".join(lines).rstrip() + "\n"
+    return preserve_app_ledger_suffix(updated, description)
 
 
 def parse_app_ledger(description: str | None) -> dict[str, str]:

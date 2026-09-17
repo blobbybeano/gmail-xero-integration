@@ -81,6 +81,9 @@ Customer name: Carol Canaan
 Photos upload: https://old/upload
 Technician photos: https://old/tech
 View photos: https://old/gallery
+
+App status: Sent - 39e93301
+[app]s=sent;r=ok;fp=3c0562b811;x=1;w=none;inv=39e93301[/app]
 """
 
         updated = upsert_job_photo_links(
@@ -95,6 +98,7 @@ View photos: https://old/gallery
         self.assertNotIn("Photos upload:", updated)
         self.assertNotIn("Technician photos:", updated)
         self.assertNotIn("View photos:", updated)
+        self.assertTrue(updated.rstrip().endswith("[app]s=sent;r=ok;fp=3c0562b811;x=1;w=none;inv=39e93301[/app]"))
 
 
 if __name__ == "__main__":
