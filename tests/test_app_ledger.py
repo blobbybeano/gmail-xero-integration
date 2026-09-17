@@ -1,6 +1,10 @@
 import unittest
 
-from app.event_processor import parse_app_ledger, upsert_app_ledger
+from app.event_processor import (
+    parse_app_ledger,
+    upsert_app_ledger,
+    upsert_invoice_summary,
+)
 from app.state import bump_xero_action_attempts, get_xero_action_attempts
 
 
@@ -45,6 +49,28 @@ App status: Old status
 
         self.assertEqual(get_xero_action_attempts(state, "cal:event", "send", "aaa"), 2)
         self.assertEqual(get_xero_action_attempts(state, "cal:event", "send", "bbb"), 0)
+
+    def test_status_rewrite_preserves_app_ledger_at_bottom(self):
+        original = """[invoice]
+GC = £100+VAT
+[/invoice]
+PROCESS DRAFT (Y/N) =
+
+[app-status]
+Invoice total (ex VAT): £100.00
+Invoice total (inc VAT): £120.00
+[/app-status]
+
+App status: Sent - 39e93301
+[app]s=sent;r=ok;fp=3c0562b811;x=1;w=none;inv=39e93301[/app]
+"""
+
+        updated = upsert_invoice_summary(original, 100.0, 120.0, sent=False)
+
+        self.assertEqual(updated.count("[app]"), 1)
+        self.assertIn("App status: Sent - 39e93301", updated)
+        self.assertTrue(updated.rstrip().endswith("[app]s=sent;r=ok;fp=3c0562b811;x=1;w=none;inv=39e93301[/app]"))
+        self.assertEqual(parse_app_ledger(updated)["inv"], "39e93301")
 
 
 if __name__ == "__main__":

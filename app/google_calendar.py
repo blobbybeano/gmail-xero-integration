@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, List
 
 from google.auth.transport.requests import Request
+from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
@@ -18,24 +19,37 @@ from .config import AppConfig
 
 def _load_credentials(config: AppConfig) -> Credentials:
     # Prefer the admin token written by the web OAuth flow, fall back to legacy token
+    scope_candidates: list[list[str]] = []
+    for scopes in (
+        getattr(config, "google_admin_scopes", None) or config.google_scopes,
+        config.google_scopes,
+        ["https://www.googleapis.com/auth/calendar"],
+    ):
+        scope_list = list(scopes or [])
+        if scope_list and scope_list not in scope_candidates:
+            scope_candidates.append(scope_list)
     for token_file in [config.google_admin_token_file, config.google_token_file]:
         token_path = Path(token_file)
         if not token_path.exists():
             continue
-        try:
-            creds = Credentials.from_authorized_user_file(
-                token_path.as_posix(),
-                getattr(config, "google_admin_scopes", None) or config.google_scopes,
-            )
-        except Exception:
-            continue
-        if creds and creds.valid:
-            return creds
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            token_path.write_text(creds.to_json())
+        for scopes in scope_candidates:
+            try:
+                creds = Credentials.from_authorized_user_file(
+                    token_path.as_posix(),
+                    scopes,
+                )
+            except Exception:
+                continue
             if creds.valid:
                 return creds
+            if creds and creds.expired and creds.refresh_token:
+                try:
+                    creds.refresh(Request())
+                except RefreshError:
+                    continue
+                token_path.write_text(creds.to_json())
+                if creds.valid:
+                    return creds
 
     raise RuntimeError(
         "No valid Google credentials found. "

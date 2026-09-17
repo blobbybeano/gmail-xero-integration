@@ -3573,6 +3573,16 @@ def run() -> None:
                                         submitted_at=submitted_at_display,
                                         cleanup_warning=cash_cleanup_warning,
                                     )
+                                    updated_description = upsert_app_ledger(
+                                        updated_description,
+                                        message=f"Cash complete - {invoice_id[:8]}" if invoice_id else "Cash complete",
+                                        state="complete",
+                                        reason="cash",
+                                        fingerprint=send_action_fp,
+                                        xero_attempts=send_attempts,
+                                        wait="none",
+                                        invoice=invoice_id[:8] if invoice_id else "",
+                                    )
                                     if updated_description != (event.get("description") or ""):
                                         updated = safe_update(
                                             event_id=event.get("id"),
@@ -4754,6 +4764,16 @@ def run() -> None:
                                         submitter=submitter_display,
                                         submitted_at=submitted_at_display,
                                         cleanup_warning=cash_cleanup_warning,
+                                    )
+                                    updated_description = upsert_app_ledger(
+                                        updated_description,
+                                        message=f"Cash complete - {invoice_id[:8]}" if invoice_id else "Cash complete",
+                                        state="complete",
+                                        reason="cash",
+                                        fingerprint=send_action_fp,
+                                        xero_attempts=send_attempts,
+                                        wait="none",
+                                        invoice=invoice_id[:8] if invoice_id else "",
                                     )
                                     if updated_description != (event.get("description") or ""):
                                         updated = safe_update(

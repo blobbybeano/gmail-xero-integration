@@ -1707,7 +1707,10 @@ def upsert_invoice_summary(
     if cleaned:
         summary_lines = [""] + summary_lines
     updated = cleaned + summary_lines
-    return _set_entry_status_emoji(_normalize_entry_layout("\n".join(updated)), "orange")
+    return preserve_app_ledger_suffix(
+        _set_entry_status_emoji(_normalize_entry_layout("\n".join(updated)), "orange"),
+        description,
+    )
 
 
 def upsert_send_confirmation(
@@ -1746,7 +1749,10 @@ def upsert_send_confirmation(
     updated = cleaned + summary_lines
     pay_mode = payment_choice(description)
     status = "green" if pay_mode in {"card", "cash"} else "yellow"
-    return _set_entry_status_emoji(_normalize_entry_layout("\n".join(updated)), status)
+    return preserve_app_ledger_suffix(
+        _set_entry_status_emoji(_normalize_entry_layout("\n".join(updated)), status),
+        description,
+    )
 
 
 def upsert_no_email_confirmation(
@@ -1785,7 +1791,10 @@ def upsert_no_email_confirmation(
     updated = cleaned + summary_lines
     pay_mode = payment_choice(description)
     status = "green" if pay_mode in {"card", "cash"} else "yellow"
-    return _set_entry_status_emoji(_normalize_entry_layout("\n".join(updated)), status)
+    return preserve_app_ledger_suffix(
+        _set_entry_status_emoji(_normalize_entry_layout("\n".join(updated)), status),
+        description,
+    )
 
 
 def upsert_cash_confirmation(
@@ -1817,9 +1826,12 @@ def upsert_cash_confirmation(
         cleaned.pop()
     if cleaned:
         summary_lines = [""] + summary_lines
-    return _set_entry_status_emoji(
-        _normalize_entry_layout("\n".join(cleaned + summary_lines)),
-        "green",
+    return preserve_app_ledger_suffix(
+        _set_entry_status_emoji(
+            _normalize_entry_layout("\n".join(cleaned + summary_lines)),
+            "green",
+        ),
+        description,
     )
 
 
@@ -1879,9 +1891,12 @@ def upsert_send_failure(
         cleaned.pop()
     if cleaned:
         summary_lines = [""] + summary_lines
-    return _set_entry_status_emoji(
-        _normalize_entry_layout("\n".join(cleaned + summary_lines)),
-        "orange",
+    return preserve_app_ledger_suffix(
+        _set_entry_status_emoji(
+            _normalize_entry_layout("\n".join(cleaned + summary_lines)),
+            "orange",
+        ),
+        description,
     )
 
 
@@ -1998,6 +2013,31 @@ def parse_app_ledger(description: str | None) -> dict[str, str]:
         if key:
             out[key] = value.strip()
     return out
+
+
+def _app_ledger_suffix(description: str | None) -> str:
+    import re
+
+    text = description or ""
+    ledger_match = re.search(r"\[app\].*?\[/app\]", text, flags=re.I | re.S)
+    if not ledger_match:
+        return ""
+    status_match = re.search(r"(?im)^\s*App status:\s*.*$", text)
+    suffix: list[str] = []
+    if status_match:
+        suffix.append(status_match.group(0).strip())
+    suffix.append(" ".join(ledger_match.group(0).split()))
+    return "\n".join(suffix).strip()
+
+
+def preserve_app_ledger_suffix(description: str | None, original: str | None) -> str:
+    suffix = _app_ledger_suffix(original)
+    if not suffix:
+        return description or ""
+    base = strip_app_ledger(description)
+    if base:
+        return _normalize_entry_layout(f"{base}\n\n{suffix}")
+    return _normalize_entry_layout(suffix)
 
 
 def strip_app_ledger(description: str | None) -> str:
