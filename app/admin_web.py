@@ -21754,6 +21754,7 @@ body {{ background:#f7f6f3 !important; }}
                         "Payment batch blocked. Resolve duplicate receipt warnings for this person first, "
                         "then prepare or pay the batch."
                     ),
+                    "duplicate_reopened": "Duplicate receipt reopened for review.",
                     "payout_paid_xero": "Subcontractor payout marked paid and sent to Xero.",
                     "payout_paid_waiting": (
                         "Subcontractor payout marked paid. Xero did not complete; check the "
@@ -23421,9 +23422,16 @@ body {{ background:#f7f6f3 !important; }}
                     "</div>"
                     "<div class='shrink-0 text-right'>"
                     f"<div class='text-sm font-bold text-gray-700'>{amount}</div>"
+                    "<div class='mt-1 flex flex-wrap justify-end gap-1'>"
                     f"<a href='/receipts/expenses/receipt/{rid}/image' target='_blank' "
-                    "class='mt-1 inline-flex rounded-lg border border-gray-200 bg-white px-2.5 py-1 "
+                    "class='inline-flex rounded-lg border border-gray-200 bg-white px-2.5 py-1 "
                     "text-xs font-semibold text-gray-700 hover:bg-gray-50'>View receipt</a>"
+                    f"<form method='post' action='/receipts/expenses/receipt/{rid}/reopen-duplicate' "
+                    "onsubmit=\"return confirm('Reopen this accepted duplicate for review? It may block payout batches until reviewed again.');\">"
+                    "<button type='submit' class='inline-flex rounded-lg border border-amber-300 "
+                    "bg-amber-50 px-2.5 py-1 text-xs font-semibold text-amber-800 hover:bg-amber-100'>"
+                    "Reopen for review</button></form>"
+                    "</div>"
                     "</div>"
                     "</div>"
                 )
@@ -24504,6 +24512,33 @@ body {{ background:#f7f6f3 !important; }}
             return jsonify({"ok": True, "id": rid, "status": "ignored"})
         return_to = request.form.get("return_to") or "/receipts/expenses"
         return redirect(return_to + ("&" if "?" in return_to else "?") + "flash=updated")
+
+    @app.post("/receipts/expenses/receipt/<rid>/reopen-duplicate")
+    @require_login
+    def expense_admin_receipt_reopen_duplicate(rid: str):
+        """Move an accepted duplicate back into the normal review queue."""
+        db = config.admin_db_file
+        rec = exp_store.get_receipt(db, rid)
+        if not rec:
+            return redirect("/receipts/expenses?flash=not_found")
+        status = (rec.get("status") or "").strip().lower()
+        if (
+            status != "ignored"
+            or "duplicate" not in (rec.get("xero_error") or "").lower()
+            or (rec.get("xero_id") or "").strip()
+            or rec.get("settlement_id")
+        ):
+            return _exp_error_page(
+                "Only accepted duplicates that are not linked to Xero or a payout can be reopened.",
+                400,
+            )
+        exp_store.update_receipt(
+            db,
+            rid,
+            status="pending_review",
+            xero_error="Reopened duplicate for admin review.",
+        )
+        return redirect("/receipts/expenses?flash=duplicate_reopened")
 
     @app.post("/receipts/expenses/receipt/<rid>/delete-image")
     @require_login
