@@ -32554,7 +32554,13 @@ document.addEventListener('submit', function(e) {{
                   }}
                 }} catch (err) {{}}
               }} else {{
-                label.textContent = 'Upload failed. Try again.';
+                var errorText = 'Upload failed. Try again.';
+                try {{
+                  var errData = JSON.parse(xhr.responseText || '{{}}');
+                  if (errData && errData.error) errorText = errData.error;
+                }} catch (err) {{}}
+                label.textContent = errorText;
+                pct.textContent = '';
               }}
             }};
             xhr.onerror = function() {{ label.textContent = 'Upload failed. Check signal and try again.'; }};
@@ -32595,20 +32601,54 @@ document.addEventListener('submit', function(e) {{
                 return jsonify({"ok": False, "error": "No files selected.", "uploaded": 0}), 400
             return redirect(f"/j/{urllib.parse.quote(code)}")
         uploaded = 0
-        for file in files[:50]:
-            data = file.read()
-            if not data:
-                continue
-            upload_job_photo(
-                config,
-                event_key=event_key,
-                file_bytes=data,
-                filename=file.filename or "job-photo",
-                mime_type=file.mimetype or "application/octet-stream",
-                category=category,
-                category_detail=category_detail,
-            )
-            uploaded += 1
+        try:
+            for file in files[:50]:
+                data = file.read()
+                if not data:
+                    continue
+                upload_job_photo(
+                    config,
+                    event_key=event_key,
+                    file_bytes=data,
+                    filename=file.filename or "job-photo",
+                    mime_type=file.mimetype or "application/octet-stream",
+                    category=category,
+                    category_detail=category_detail,
+                )
+                uploaded += 1
+        except HttpError as exc:
+            msg = str(exc)
+            if "insufficientPermissions" in msg or "ACCESS_TOKEN_SCOPE_INSUFFICIENT" in msg:
+                error_msg = (
+                    "Google Drive permission is missing. Reconnect Google in Settings, "
+                    "then try the upload again."
+                )
+            else:
+                error_msg = "Google Drive rejected the upload. Try again or check the Drive settings."
+            print(f"[job-photos] Upload failed: {error_msg} {exc}", flush=True)
+            if request.headers.get("X-Requested-With") == "fetch":
+                return jsonify({"ok": False, "error": error_msg, "uploaded": uploaded}), 403
+            return _job_photo_public_page(
+                "<section class='rounded-2xl border border-red-200 bg-white p-6 text-red-800'>"
+                "<h1 class='text-xl font-bold'>Upload failed</h1>"
+                f"<p class='mt-2 text-sm'>{escape(error_msg)}</p>"
+                f"<a href='/j/{escape(code)}' class='mt-4 inline-flex rounded-xl bg-red-700 px-4 py-3 text-sm font-bold text-white'>Back to upload</a>"
+                "</section>",
+                title="Upload failed",
+            ), 403
+        except Exception as exc:
+            error_msg = "Upload failed before the file could be saved. Try again."
+            print(f"[job-photos] Upload failed: {exc}", flush=True)
+            if request.headers.get("X-Requested-With") == "fetch":
+                return jsonify({"ok": False, "error": error_msg, "uploaded": uploaded}), 500
+            return _job_photo_public_page(
+                "<section class='rounded-2xl border border-red-200 bg-white p-6 text-red-800'>"
+                "<h1 class='text-xl font-bold'>Upload failed</h1>"
+                f"<p class='mt-2 text-sm'>{escape(error_msg)}</p>"
+                f"<a href='/j/{escape(code)}' class='mt-4 inline-flex rounded-xl bg-red-700 px-4 py-3 text-sm font-bold text-white'>Back to upload</a>"
+                "</section>",
+                title="Upload failed",
+            ), 500
         try:
             cal_id = str(event.get("_calendar_id") or "")
             event_id = str(event.get("id") or "")
