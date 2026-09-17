@@ -32475,42 +32475,10 @@ document.addEventListener('submit', function(e) {{
                 title="Photo link not available",
             ), 404
         title, date_label = _job_photo_event_title(event)
-        processed = job_photo_event_is_processed(event.get("description") or "")
         photos = list_job_photos(config.admin_db_file, event_key)
-        upload_title = "Upload technician photos" if processed else "Upload customer photos"
         hub_title = "Job photos"
-        file_hint = (
-            "Choose before/after photos, technical photos, or videos."
-            if processed
-            else "Choose customer-provided photos."
-        )
-        category_options = (
-            f"<option value='{CATEGORY_BEFORE_AFTER}'>{escape(CATEGORY_LABELS[CATEGORY_BEFORE_AFTER])}</option>"
-            f"<option value='{CATEGORY_UPDATE}'>{escape(CATEGORY_LABELS[CATEGORY_UPDATE])}</option>"
-            if processed
-            else f"<option value='{CATEGORY_CUSTOMER}'>{escape(CATEGORY_LABELS[CATEGORY_CUSTOMER])}</option>"
-        )
         view_card_tone = "border-emerald-200 bg-emerald-50 text-emerald-950" if photos else "border-gray-200 bg-white text-gray-900"
         view_count_tone = "text-emerald-700" if photos else "text-gray-500"
-        before_after_switch = (
-            """
-            <fieldset id="before-after-switch" class="rounded-2xl border border-gray-200 bg-white p-3">
-              <legend class="px-1 text-sm font-bold text-gray-800">Stage</legend>
-              <div class="grid grid-cols-2 gap-2">
-                <label class="cursor-pointer rounded-xl border border-sky-200 bg-sky-50 px-3 py-3 text-center text-sm font-bold text-sky-900">
-                  <input type="radio" name="category_detail" value="before" class="sr-only" checked>
-                  <span>Before</span>
-                </label>
-                <label class="cursor-pointer rounded-xl border border-gray-200 bg-white px-3 py-3 text-center text-sm font-bold text-gray-700">
-                  <input type="radio" name="category_detail" value="after" class="sr-only">
-                  <span>After</span>
-                </label>
-              </div>
-            </fieldset>
-            """
-            if processed
-            else ""
-        )
         body = f"""
         <section class="rounded-3xl border border-gray-200 bg-white p-5 shadow-sm">
           <p class="text-xs font-semibold uppercase tracking-wide text-sky-700">{escape(hub_title)}</p>
@@ -32526,30 +32494,58 @@ document.addEventListener('submit', function(e) {{
                 <a id="job-photo-gallery-link" href="/jp/{escape(code)}" class="rounded-xl bg-white/80 px-4 py-3 text-sm font-bold text-gray-900 shadow-sm ring-1 ring-black/5">Open</a>
               </div>
             </section>
-            <section class="rounded-2xl border border-sky-200 bg-sky-50 p-4 shadow-sm">
-              <h2 class="text-base font-bold text-sky-950">{escape(upload_title)}</h2>
-              <form id="job-photo-form" method="post" enctype="multipart/form-data" class="mt-4 space-y-4">
-                <label class="block text-sm font-bold text-gray-800">Photo type
-                  <select name="category" class="mt-2 block w-full rounded-xl border border-sky-200 bg-white px-3 py-3 text-base">
-                    {category_options}
-                  </select>
+            <details class="rounded-2xl border border-indigo-200 bg-indigo-50 shadow-sm">
+              <summary class="cursor-pointer list-none px-4 py-4 text-base font-bold text-indigo-950">Upload customer photos</summary>
+              <div class="space-y-3 border-t border-indigo-100 p-4">
+                <label class="block rounded-2xl border-2 border-dashed border-indigo-300 bg-white p-5 text-center">
+                  <span class="block text-sm font-bold text-indigo-900">Choose one or more files</span>
+                  <input type="file" multiple accept="image/*,video/*" class="job-photo-files mt-4 block w-full text-sm" data-category="{CATEGORY_CUSTOMER}">
                 </label>
-                {before_after_switch}
-                <div class="grid gap-3 sm:grid-cols-2">
-                  <label class="block rounded-2xl border-2 border-dashed border-sky-300 bg-white p-5 text-center">
-                    <span class="block text-sm font-bold text-sky-900">Choose one or more files</span>
-                    <span class="mt-1 block text-xs text-sky-700">{escape(file_hint)}</span>
-                    <input id="job-photo-files" type="file" name="photos" multiple accept="image/*,video/*" class="mt-4 block w-full text-sm">
-                  </label>
-                  <button id="job-photo-camera-button" type="button" class="rounded-2xl border-2 border-sky-300 bg-white p-5 text-center text-sky-900 shadow-sm">
-                    <span class="block text-sm font-bold">Open camera</span>
-                    <span class="mt-1 block text-xs text-sky-700">Take a picture or video now.</span>
-                  </button>
-                </div>
-                <input id="job-photo-camera" type="file" name="photos" accept="image/*,video/*" capture="environment" class="hidden">
-                <button id="job-photo-upload-button" class="w-full rounded-2xl bg-sky-700 px-5 py-4 text-base font-bold text-white shadow-sm">Upload selected</button>
-              </form>
-            </section>
+                <button type="button" class="job-photo-camera-button w-full rounded-2xl border-2 border-indigo-300 bg-white p-5 text-center text-indigo-900 shadow-sm" data-category="{CATEGORY_CUSTOMER}">
+                  <span class="block text-sm font-bold">Open camera</span>
+                </button>
+                <input type="file" accept="image/*,video/*" capture="environment" class="job-photo-camera hidden" data-category="{CATEGORY_CUSTOMER}">
+              </div>
+            </details>
+            <details class="rounded-2xl border border-sky-200 bg-sky-50 shadow-sm">
+              <summary class="cursor-pointer list-none px-4 py-4 text-base font-bold text-sky-950">Upload before / after photos</summary>
+              <div class="space-y-3 border-t border-sky-100 p-4">
+                <fieldset class="rounded-2xl border border-sky-200 bg-white p-3">
+                  <legend class="px-1 text-sm font-bold text-gray-800">Stage</legend>
+                  <div class="grid grid-cols-2 gap-2">
+                    <label class="job-stage-label cursor-pointer rounded-xl border border-sky-200 bg-sky-50 px-3 py-3 text-center text-sm font-bold text-sky-900">
+                      <input type="radio" name="job_photo_stage" value="before" class="sr-only" checked>
+                      <span>Before</span>
+                    </label>
+                    <label class="job-stage-label cursor-pointer rounded-xl border border-gray-200 bg-white px-3 py-3 text-center text-sm font-bold text-gray-700">
+                      <input type="radio" name="job_photo_stage" value="after" class="sr-only">
+                      <span>After</span>
+                    </label>
+                  </div>
+                </fieldset>
+                <label class="block rounded-2xl border-2 border-dashed border-sky-300 bg-white p-5 text-center">
+                  <span class="block text-sm font-bold text-sky-900">Choose one or more files</span>
+                  <input type="file" multiple accept="image/*,video/*" class="job-photo-files mt-4 block w-full text-sm" data-category="{CATEGORY_BEFORE_AFTER}">
+                </label>
+                <button type="button" class="job-photo-camera-button w-full rounded-2xl border-2 border-sky-300 bg-white p-5 text-center text-sky-900 shadow-sm" data-category="{CATEGORY_BEFORE_AFTER}">
+                  <span class="block text-sm font-bold">Open camera</span>
+                </button>
+                <input type="file" accept="image/*,video/*" capture="environment" class="job-photo-camera hidden" data-category="{CATEGORY_BEFORE_AFTER}">
+              </div>
+            </details>
+            <details class="rounded-2xl border border-slate-200 bg-slate-50 shadow-sm">
+              <summary class="cursor-pointer list-none px-4 py-4 text-base font-bold text-slate-950">Upload technical photos / videos</summary>
+              <div class="space-y-3 border-t border-slate-100 p-4">
+                <label class="block rounded-2xl border-2 border-dashed border-slate-300 bg-white p-5 text-center">
+                  <span class="block text-sm font-bold text-slate-900">Choose one or more files</span>
+                  <input type="file" multiple accept="image/*,video/*" class="job-photo-files mt-4 block w-full text-sm" data-category="{CATEGORY_UPDATE}">
+                </label>
+                <button type="button" class="job-photo-camera-button w-full rounded-2xl border-2 border-slate-300 bg-white p-5 text-center text-slate-900 shadow-sm" data-category="{CATEGORY_UPDATE}">
+                  <span class="block text-sm font-bold">Open camera</span>
+                </button>
+                <input type="file" accept="image/*,video/*" capture="environment" class="job-photo-camera hidden" data-category="{CATEGORY_UPDATE}">
+              </div>
+            </details>
           </div>
           <div id="job-photo-progress" class="mt-4 hidden rounded-2xl border border-sky-100 bg-sky-50 p-4">
             <div class="flex items-center justify-between gap-3 text-sm font-bold text-sky-900">
@@ -32565,25 +32561,18 @@ document.addEventListener('submit', function(e) {{
         </section>
         <script>
         (function() {{
-          var form = document.getElementById('job-photo-form');
-          var category = form && form.querySelector('select[name="category"]');
-          var stage = document.getElementById('before-after-switch');
-          var fileInput = document.getElementById('job-photo-files');
-          var cameraInput = document.getElementById('job-photo-camera');
-          var cameraButton = document.getElementById('job-photo-camera-button');
           var progress = document.getElementById('job-photo-progress');
           var bar = document.getElementById('job-photo-progress-bar');
           var pct = document.getElementById('job-photo-progress-percent');
           var label = document.getElementById('job-photo-progress-label');
           var viewCard = document.getElementById('job-photo-view-count');
           var galleryLink = document.getElementById('job-photo-gallery-link');
-          function updateStage() {{
-            if (!stage || !category) return;
-            stage.style.display = category.value === '{CATEGORY_BEFORE_AFTER}' ? 'block' : 'none';
+          function currentStage() {{
+            var checked = document.querySelector('input[name="job_photo_stage"]:checked');
+            return checked ? checked.value : 'before';
           }}
           function updateRadios() {{
-            if (!stage) return;
-            stage.querySelectorAll('label').forEach(function(lbl) {{
+            document.querySelectorAll('.job-stage-label').forEach(function(lbl) {{
               var input = lbl.querySelector('input');
               if (input && input.checked) {{
                 lbl.className = 'cursor-pointer rounded-xl border border-sky-200 bg-sky-50 px-3 py-3 text-center text-sm font-bold text-sky-900';
@@ -32595,12 +32584,11 @@ document.addEventListener('submit', function(e) {{
           function selectedFiles(input) {{
             return input && input.files && input.files.length ? input.files : null;
           }}
-          function upload(files) {{
+          function upload(files, categoryValue) {{
             if (!files || !files.length) return;
             var fd = new FormData();
-            fd.append('category', category ? category.value : '{CATEGORY_CUSTOMER}');
-            var checked = form.querySelector('input[name="category_detail"]:checked');
-            if (checked) fd.append('category_detail', checked.value);
+            fd.append('category', categoryValue || '{CATEGORY_CUSTOMER}');
+            if (categoryValue === '{CATEGORY_BEFORE_AFTER}') fd.append('category_detail', currentStage());
             Array.prototype.forEach.call(files, function(file) {{ fd.append('photos', file); }});
             progress.classList.remove('hidden');
             label.textContent = 'Uploading ' + files.length + ' file' + (files.length === 1 ? '' : 's') + '...';
@@ -32620,8 +32608,7 @@ document.addEventListener('submit', function(e) {{
                 bar.style.width = '100%';
                 pct.textContent = '100%';
                 label.textContent = 'Uploaded to Google Drive.';
-                fileInput.value = '';
-                cameraInput.value = '';
+                document.querySelectorAll('.job-photo-files,.job-photo-camera').forEach(function(input) {{ input.value = ''; }});
                 try {{
                   var data = JSON.parse(xhr.responseText || '{{}}');
                   if (galleryLink && data.gallery_url) {{
@@ -32646,15 +32633,26 @@ document.addEventListener('submit', function(e) {{
             xhr.onerror = function() {{ label.textContent = 'Upload failed. Check signal and try again.'; }};
             xhr.send(fd);
           }}
-          if (category) category.addEventListener('change', updateStage);
-          if (stage) stage.addEventListener('change', updateRadios);
-          if (cameraButton && cameraInput) cameraButton.addEventListener('click', function() {{ cameraInput.click(); }});
-          if (cameraInput) cameraInput.addEventListener('change', function() {{ upload(selectedFiles(cameraInput)); }});
-          if (form) form.addEventListener('submit', function(e) {{
-            e.preventDefault();
-            upload(selectedFiles(fileInput));
+          document.querySelectorAll('input[name="job_photo_stage"]').forEach(function(input) {{
+            input.addEventListener('change', updateRadios);
           }});
-          updateStage();
+          document.querySelectorAll('.job-photo-files').forEach(function(input) {{
+            input.addEventListener('change', function() {{
+              upload(selectedFiles(input), input.dataset.category);
+            }});
+          }});
+          document.querySelectorAll('.job-photo-camera-button').forEach(function(btn) {{
+            btn.addEventListener('click', function() {{
+              var categoryValue = btn.dataset.category;
+              var input = document.querySelector('.job-photo-camera[data-category="' + categoryValue + '"]');
+              if (input) input.click();
+            }});
+          }});
+          document.querySelectorAll('.job-photo-camera').forEach(function(input) {{
+            input.addEventListener('change', function() {{
+              upload(selectedFiles(input), input.dataset.category);
+            }});
+          }});
           updateRadios();
         }})();
         </script>
@@ -32666,12 +32664,9 @@ document.addEventListener('submit', function(e) {{
         _link, event_key, event = _job_photo_event_from_code(code)
         if not event_key or not event:
             return ("Photo link not available", 404)
-        processed = job_photo_event_is_processed(event.get("description") or "")
         category = (request.form.get("category") or CATEGORY_CUSTOMER).strip()
-        if not processed:
-            category = CATEGORY_CUSTOMER
         if category not in CATEGORY_LABELS:
-            category = CATEGORY_BEFORE_AFTER if processed else CATEGORY_CUSTOMER
+            category = CATEGORY_CUSTOMER
         category_detail = (request.form.get("category_detail") or "").strip().lower()
         if category != CATEGORY_BEFORE_AFTER or category_detail not in {"before", "after"}:
             category_detail = ""
@@ -32744,7 +32739,7 @@ document.addEventListener('submit', function(e) {{
                 upload_url=upload_url,
                 gallery_url=gallery_url,
                 has_photos=True,
-                processed=processed,
+                processed=job_photo_event_is_processed(event.get("description") or ""),
             )
             if cal_id and event_id:
                 update_event_description(config, event_id, new_desc, calendar_id=cal_id)
@@ -32780,10 +32775,21 @@ document.addEventListener('submit', function(e) {{
             uploaded_notice = "<div class='mb-4 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-bold text-emerald-800'>Uploaded to Google Drive.</div>"
         grouped: dict[str, list[dict]] = {}
         for photo in photos:
-            grouped.setdefault(str(photo.get("category") or CATEGORY_CUSTOMER), []).append(photo)
+            category = str(photo.get("category") or CATEGORY_CUSTOMER)
+            detail = str(photo.get("category_detail") or "").strip().lower()
+            key = category
+            if category == CATEGORY_BEFORE_AFTER and detail in {"before", "after"}:
+                key = detail
+            grouped.setdefault(key, []).append(photo)
         sections = []
-        for category in (CATEGORY_CUSTOMER, CATEGORY_BEFORE_AFTER, CATEGORY_UPDATE):
-            items = grouped.get(category) or []
+        row_defs = (
+            (CATEGORY_CUSTOMER, "Customer provided"),
+            ("before", "Before"),
+            ("after", "After"),
+            (CATEGORY_UPDATE, "Technical photos / videos"),
+        )
+        for row_key, row_label in row_defs:
+            items = grouped.get(row_key) or []
             if not items:
                 continue
             tiles = []
@@ -32791,30 +32797,24 @@ document.addEventListener('submit', function(e) {{
                 file_id = escape(str(item.get("file_id") or item.get("id") or ""))
                 name = escape(str(item.get("name") or "Photo"))
                 mime = str(item.get("mime_type") or "")
-                detail = str(item.get("category_detail") or "").strip().title()
-                detail_badge = (
-                    "<span class='mt-2 inline-flex rounded-full bg-sky-100 px-2 py-1 text-[11px] font-bold text-sky-800'>"
-                    + escape(detail)
-                    + "</span>"
-                    if category == CATEGORY_BEFORE_AFTER and detail in {"Before", "After"}
-                    else ""
-                )
                 src = f"/job-photo-file/{escape(code)}/{file_id}"
+                view_href = f"/job-photo-view/{escape(code)}/{file_id}"
                 if mime.startswith("video/"):
-                    media = f"<video controls preload='metadata' class='h-full w-full rounded-xl object-contain bg-black' src='{src}'></video>"
+                    media = f"<video preload='metadata' muted class='h-full w-full rounded-xl object-cover bg-black' src='{src}'></video>"
                 else:
-                    media = f"<img loading='lazy' class='h-full w-full rounded-xl object-contain bg-white' src='{src}' alt='{name}'>"
+                    media = f"<img loading='lazy' class='h-full w-full rounded-xl object-cover bg-white' src='{src}' alt='{name}'>"
                 tiles.append(
-                    "<figure class='rounded-2xl border border-gray-200 bg-gray-50 p-2 shadow-sm'>"
+                    "<a href='" + view_href + "' class='block w-36 shrink-0 rounded-2xl border border-gray-200 bg-gray-50 p-2 shadow-sm'>"
+                    "<figure>"
                     "<div class='aspect-[4/5] overflow-hidden rounded-xl bg-white'>" + media + "</div>"
                     "<figcaption class='mt-2 truncate px-1 text-xs text-gray-500'>" + name + "</figcaption>"
-                    + detail_badge
-                    + "</figure>"
+                    "</figure>"
+                    "</a>"
                 )
             sections.append(
-                "<section class='mt-6'><h2 class='text-sm font-bold uppercase tracking-wide text-gray-600'>"
-                + escape(CATEGORY_LABELS.get(category, category.title()))
-                + "</h2><div class='mt-3 grid grid-cols-2 gap-3 sm:grid-cols-3'>"
+                "<section class='mt-6'><h2 class='px-1 text-sm font-bold uppercase tracking-wide text-gray-600'>"
+                + escape(row_label)
+                + "</h2><div class='mt-3 flex gap-3 overflow-x-auto pb-2'>"
                 + "".join(tiles)
                 + "</div></section>"
             )
@@ -32828,13 +32828,48 @@ document.addEventListener('submit', function(e) {{
               <h1 class="mt-1 text-2xl font-bold text-gray-950">{escape(title)}</h1>
               <p class="mt-1 text-sm text-gray-500">{escape(date_label)}</p>
             </div>
-            <a href="/j/{escape(code)}" class="shrink-0 rounded-xl bg-sky-700 px-3 py-2 text-xs font-bold text-white">Add</a>
+            <a href="/j/{escape(code)}" class="shrink-0 rounded-xl bg-gray-900 px-3 py-2 text-xs font-bold text-white">Back</a>
           </div>
         </section>
         {empty}
         {''.join(sections)}
         """
         return _job_photo_public_page(body, title="Job gallery")
+
+    @app.get("/job-photo-view/<code>/<file_id>")
+    def job_photo_view_page(code: str, file_id: str):
+        _link, event_key, event = _job_photo_event_from_code(code)
+        if not event_key:
+            return ("Photo link not available", 404)
+        known = None
+        for item in list_job_photos(config.admin_db_file, event_key):
+            if file_id == str(item.get("file_id") or item.get("id") or ""):
+                known = item
+                break
+        if not known:
+            return ("File not found", 404)
+        title, date_label = _job_photo_event_title(event)
+        name = escape(str(known.get("name") or "Photo"))
+        mime = str(known.get("mime_type") or "")
+        src = f"/job-photo-file/{escape(code)}/{escape(file_id)}"
+        if mime.startswith("video/"):
+            media = f"<video controls autoplay class='max-h-[78vh] w-full rounded-2xl bg-black object-contain' src='{src}'></video>"
+        else:
+            media = f"<img class='max-h-[78vh] w-full rounded-2xl bg-white object-contain' src='{src}' alt='{name}'>"
+        body = f"""
+        <section class="rounded-3xl border border-gray-200 bg-white p-4 shadow-sm">
+          <div class="mb-4 flex items-start justify-between gap-4">
+            <div>
+              <p class="text-xs font-semibold uppercase tracking-wide text-sky-700">{escape(date_label)}</p>
+              <h1 class="mt-1 text-lg font-bold text-gray-950">{escape(title)}</h1>
+              <p class="mt-1 text-sm text-gray-500">{name}</p>
+            </div>
+            <a href="/jp/{escape(code)}" class="shrink-0 rounded-xl bg-gray-900 px-3 py-2 text-xs font-bold text-white">Back</a>
+          </div>
+          {media}
+        </section>
+        """
+        return _job_photo_public_page(body, title=name)
 
     @app.get("/job-photo-file/<code>/<file_id>")
     def job_photo_file(code: str, file_id: str):
