@@ -22744,6 +22744,8 @@ body {{ background:#f7f6f3 !important; }}
         engineer_by_id = {int(e["id"]): e for e in engineers if e.get("id") is not None}
         pending_by_person: dict[int, dict] = {}
         approved_by_person: dict[int, dict] = {}
+        submitted_by_person: dict[int, dict] = {}
+        xero_linked_by_person: dict[int, dict] = {}
         ignored_duplicate_by_person: dict[int, dict] = {}
         status_receipts_by_person: dict[int, dict[str, list[dict]]] = {}
 
@@ -22783,6 +22785,16 @@ body {{ background:#f7f6f3 !important; }}
                     status_receipts_by_person.setdefault(
                         int(r.get("engineer_id")), {}
                     ).setdefault("pending_review", []).append(r)
+                except (TypeError, ValueError):
+                    pass
+            elif st == "submitted":
+                _add_person_total(submitted_by_person, r.get("engineer_id"), amt)
+                if (r.get("xero_id") or "").strip():
+                    _add_person_total(xero_linked_by_person, r.get("engineer_id"), amt)
+                try:
+                    status_receipts_by_person.setdefault(
+                        int(r.get("engineer_id")), {}
+                    ).setdefault("submitted", []).append(r)
                 except (TypeError, ValueError):
                     pass
             elif st == "ignored" and "duplicate" in (r.get("xero_error") or "").lower():
@@ -23613,21 +23625,46 @@ body {{ background:#f7f6f3 !important; }}
                     e,
                     bank_feed=not is_card_receipt_feed,
                 )
+                submitted_summary = submitted_by_person.get(eid) or {}
+                xero_linked_summary = xero_linked_by_person.get(eid) or {}
+                submitted_count = int(submitted_summary.get("count") or 0)
+                submitted_amount = float(submitted_summary.get("amount") or 0)
+                xero_linked_count = int(xero_linked_summary.get("count") or 0)
+                xero_linked_amount = float(xero_linked_summary.get("amount") or 0)
                 receipt_box_label = "Card receipts" if is_card_receipt_feed else "Bank receipts"
                 receipt_panel_title = (
-                    "Outstanding card receipts"
+                    "Unmatched card payments"
                     if is_card_receipt_feed else
-                    "Outstanding bank-feed receipts"
+                    "Unmatched bank-feed payments"
                 )
                 receipt_empty_text = (
-                    "No outstanding card receipts."
+                    "No unmatched card payments."
                     if is_card_receipt_feed else
-                    "No outstanding bank-feed receipts."
+                    "No unmatched bank-feed payments."
                 )
                 receipt_help_text = (
-                    "This compares uploaded card payments with submitted receipts for this engineer, and excludes matching spend already reconciled in Xero when the cached Xero check is available."
+                    "Unmatched means the CSV/bank-feed payment is not currently paired with a submitted receipt and was not filtered as already reconciled in Xero. It does not mean this person has submitted no receipts."
                     if is_card_receipt_feed else
-                    "This compares the linked bank feed with submitted receipts for this person, and excludes matching spend already reconciled in Xero when the cached Xero check is available."
+                    "Unmatched means the linked bank-feed payment is not currently paired with a submitted receipt and was not filtered as already reconciled in Xero. It does not mean this person has submitted no receipts."
+                )
+                receipt_summary_html = (
+                    "<div class='mb-3 grid grid-cols-1 sm:grid-cols-3 gap-2'>"
+                    "<div class='rounded-lg border border-emerald-100 bg-emerald-50 px-3 py-2'>"
+                    "<div class='text-[11px] font-semibold uppercase tracking-wide text-emerald-700'>Submitted receipts</div>"
+                    f"<div class='mt-1 text-lg font-bold text-emerald-950'>{submitted_count}</div>"
+                    f"<div class='text-xs text-emerald-700'>{_exp_money(submitted_amount)}</div>"
+                    "</div>"
+                    "<div class='rounded-lg border border-emerald-100 bg-white px-3 py-2'>"
+                    "<div class='text-[11px] font-semibold uppercase tracking-wide text-emerald-700'>Linked to Xero</div>"
+                    f"<div class='mt-1 text-lg font-bold text-emerald-950'>{xero_linked_count}</div>"
+                    f"<div class='text-xs text-emerald-700'>{_exp_money(xero_linked_amount)}</div>"
+                    "</div>"
+                    "<div class='rounded-lg border border-amber-100 bg-amber-50 px-3 py-2'>"
+                    "<div class='text-[11px] font-semibold uppercase tracking-wide text-amber-700'>Unmatched bank payments</div>"
+                    f"<div class='mt-1 text-lg font-bold text-amber-950'>{len(outstanding)}</div>"
+                    f"<div class='text-xs text-amber-700'>{_exp_money(sum(float(r.get('amount') or 0) for r in outstanding))}</div>"
+                    "</div>"
+                    "</div>"
                 )
                 week_items = []
                 for start, rows in sorted(weekly_outstanding.items(), reverse=True)[:5]:
@@ -23658,13 +23695,48 @@ body {{ background:#f7f6f3 !important; }}
                     "<div class='rounded-xl border border-dashed border-sky-200 bg-white/70 px-3 py-3 text-sm text-sky-700'>"
                     f"{receipt_empty_text}</div>"
                 )
+                submitted_recent = sorted(
+                    (status_receipts_by_person.get(eid) or {}).get("submitted") or [],
+                    key=lambda r: str(r.get("created_at") or r.get("updated_at") or ""),
+                    reverse=True,
+                )[:8]
+                submitted_rows = []
+                for r in submitted_recent:
+                    rid = escape(str(r.get("id") or ""))
+                    merchant = escape(r.get("merchant") or r.get("ocr_merchant") or "Receipt")
+                    day = escape((r.get("purchased_on") or r.get("created_at") or "")[:10])
+                    xero_state = (
+                        "Linked to Xero"
+                        if (r.get("xero_id") or "").strip() else
+                        "Submitted"
+                    )
+                    submitted_rows.append(
+                        "<div class='flex items-center justify-between gap-3 py-2 border-b border-emerald-100 last:border-0'>"
+                        "<div class='min-w-0'>"
+                        f"<div class='text-sm font-semibold text-gray-900 truncate'>{merchant}</div>"
+                        f"<div class='text-[11px] text-gray-500'>{day} · {escape(xero_state)}</div>"
+                        "</div>"
+                        "<div class='shrink-0 text-right'>"
+                        f"<div class='text-sm font-bold text-gray-900'>{_exp_money(r.get('amount_inc') or 0)}</div>"
+                        + (
+                            f"<a href='/receipts/expenses/receipt/{rid}/image' target='_blank' "
+                            "class='mt-1 inline-flex text-[11px] font-semibold text-emerald-700'>View</a>"
+                            if r.get("stored_file") else ""
+                        )
+                        + "</div></div>"
+                    )
+                submitted_rows_html = "".join(submitted_rows) or (
+                    "<div class='rounded-xl border border-dashed border-emerald-200 bg-white/70 px-3 py-3 text-sm text-emerald-700'>"
+                    "No submitted receipts recorded for this person.</div>"
+                )
                 box_grid = "grid-cols-3"
                 card_btn = (
                     f"<button type='button' data-exp-panel='exp-panel-{eid}-card' "
                     "class='text-left rounded-xl border border-sky-200 bg-sky-50 px-3 py-3 text-sky-900 hover:bg-sky-100 hover:shadow-sm transition'>"
                     f"<span class='block text-[11px] font-semibold uppercase tracking-wide opacity-70'>{receipt_box_label}</span>"
                     f"<span class='mt-1 block text-2xl font-bold'>{len(outstanding)}</span>"
-                    f"<span class='mt-1 block text-xs opacity-75'>{_exp_money(sum(float(r.get('amount') or 0) for r in outstanding))} outstanding</span>"
+                    f"<span class='mt-1 block text-xs opacity-75'>{_exp_money(sum(float(r.get('amount') or 0) for r in outstanding))} unmatched</span>"
+                    f"<span class='mt-2 block border-t border-sky-200 pt-1 text-[11px] text-sky-700'>{submitted_count} submitted · {xero_linked_count} in Xero</span>"
                     "</button>"
                 )
                 card_panel = (
@@ -23673,11 +23745,16 @@ body {{ background:#f7f6f3 !important; }}
                     f"<h3 class='text-sm font-bold text-sky-950'>{name} · {receipt_panel_title}</h3>"
                     "<button type='button' data-exp-close class='rounded-lg border border-sky-300 bg-white px-3 py-1.5 text-sm font-bold text-sky-800 hover:bg-sky-50'>Close</button>"
                     "</div>"
+                    f"{receipt_summary_html}"
                     "<div class='grid grid-cols-1 sm:grid-cols-[220px_minmax(0,1fr)] gap-3'>"
                     "<div class='space-y-1'>"
                     + "".join(week_items)
                     + "</div>"
                     f"<div class='rounded-xl border border-sky-100 bg-white px-3'>{tx_rows_html}</div>"
+                    "</div>"
+                    "<div class='mt-3 rounded-xl border border-emerald-100 bg-white px-3'>"
+                    "<div class='border-b border-emerald-100 py-2 text-xs font-bold uppercase tracking-wide text-emerald-700'>Recent submitted receipts</div>"
+                    f"{submitted_rows_html}"
                     "</div>"
                     f"<p class='mt-2 text-[11px] text-sky-700'>{receipt_help_text}</p>"
                     "</div>"
