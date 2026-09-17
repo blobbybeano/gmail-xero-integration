@@ -16496,8 +16496,8 @@ body {{ background:#f7f6f3 !important; }}
             return ""
         return (
             "<div class='rounded-xl border-2 border-red-300 bg-red-50 p-4 text-sm text-red-900'>"
-            "<div class='text-base font-black tracking-wide text-red-800'>DUPLICATE CHECK</div>"
-            "<p class='mt-1 text-xs text-red-800'>This receipt looks like something already saved or already in Xero. If two receipt photos are shown, compare them before accepting it as a duplicate. If Xero already has the payment but no receipt, saving this receipt will attach it to that Xero payment instead of creating another one.</p>"
+            "<div class='text-base font-black tracking-wide text-red-800'>POSSIBLE DUPLICATE OR AI READ ERROR</div>"
+            "<p class='mt-1 text-xs text-red-800'>The app has spotted a similar receipt/Xero item using the extracted date, amount and supplier. If the AI read any of those wrong, edit the fields below and approve it. Only accept it as a duplicate when it is genuinely the same receipt/photo.</p>"
             "<ul class='mt-2 list-disc pl-5 space-y-1'>"
             + "".join(warnings)
             + "</ul>"
@@ -16508,8 +16508,8 @@ body {{ background:#f7f6f3 !important; }}
             )
             + (
                 "<div class='mt-3 rounded-lg bg-white/70 px-3 py-2 text-xs font-semibold text-red-800 ring-1 ring-red-200'>"
-                "If this is not a duplicate, use Approve &amp; next below. "
-                "If it is the same receipt, use Accept as duplicate."
+                "If this is an AI read error, correct the date/amount/supplier below and use Approve &amp; next. "
+                "If it is genuinely the same receipt, use Accept as duplicate."
                 "</div>"
                 if loose_xero_duplicate and not attach_only_xero_match else ""
             )
@@ -16523,7 +16523,7 @@ body {{ background:#f7f6f3 !important; }}
                 )
                     +
                     "<button type='submit' class='rounded-lg bg-red-700 px-3 py-2 text-xs font-bold text-white hover:bg-red-800'>"
-                    "Accept as duplicate</button></form>"
+                    "Accept as duplicate only</button></form>"
                     if accept_url and can_accept_duplicate else ""
                 )
                 + "</div>"
@@ -21958,10 +21958,10 @@ body {{ background:#f7f6f3 !important; }}
                 prepare_btn = (
                     "<button type='button' "
                     f"data-exp-panel='exp-panel-{int(sub['id'])}-pending' "
-                    "onclick=\"alert('Duplicate receipts need checking before this payment batch can be prepared. Open the pending review/duplicates for this person and accept or remove the extra copy first.');\" "
+                    "onclick=\"alert('Possible duplicate or AI read error needs checking before this payment batch can be prepared. Open the receipt review, compare the receipts, then either correct the AI-read fields and approve it or accept the extra copy as a duplicate.');\" "
                     "class='rounded-lg border border-red-300 bg-red-50 px-3 py-2 "
                     "text-sm font-semibold text-red-800 hover:bg-red-100'>"
-                    "Review duplicates first</button>"
+                    "Review possible duplicates first</button>"
                 )
             else:
                 prepare_btn = (
@@ -21986,13 +21986,14 @@ body {{ background:#f7f6f3 !important; }}
                 more = len(duplicate_blocks) - len(examples)
                 duplicate_warning_html = (
                     "<div class='mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-900'>"
-                    "<div class='font-bold'>Duplicate check required before payout</div>"
-                    "<p class='mt-1'>This person has receipt duplicates in the payable pile. "
-                    "Sort those first so the same receipt cannot be paid twice.</p>"
+                    "<div class='font-bold'>Possible duplicate or AI read error before payout</div>"
+                    "<p class='mt-1'>These receipts match another receipt by extracted date and amount. "
+                    "Check whether the AI read the receipt wrongly; if so, correct it and approve. "
+                    "Only accept it as a duplicate if it is genuinely the same receipt.</p>"
                     "<ul class='mt-1 list-disc pl-5'>"
                     + "".join(examples)
                     + (
-                        f"<li>{more} more duplicate check(s)</li>"
+                        f"<li>{more} more item(s) to check</li>"
                         if more > 0 else ""
                     )
                     + "</ul></div>"
@@ -28673,7 +28674,7 @@ body {{ background:#f7f6f3 !important; }}
             ignore_label = "Remove"
             duplicate_button = (
                 "<button name='action' value='accept_duplicate' class='px-2.5 py-1 text-xs "
-                "font-medium bg-red-700 text-white rounded-lg'>Mark duplicate</button>"
+                "font-medium bg-red-700 text-white rounded-lg'>Same receipt - ignore duplicate</button>"
                 if duplicate_clue else ""
             )
             sub_note = (
