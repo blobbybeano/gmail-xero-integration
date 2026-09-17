@@ -32409,6 +32409,16 @@ document.addEventListener('submit', function(e) {{
         processed = job_photo_event_is_processed(event.get("description") or "")
         photos = list_job_photos(config.admin_db_file, event_key)
         upload_title = "Upload technician photos" if processed else "Upload customer photos"
+        upload_hint = (
+            "Add before/after pictures, access photos, technical pictures, or short update videos for the completed job."
+            if processed
+            else "Add photos supplied by the customer before the draft is processed."
+        )
+        file_hint = (
+            "Choose before/after photos, technical photos, or videos."
+            if processed
+            else "Choose customer-provided photos."
+        )
         category_options = (
             f"<option value='{CATEGORY_BEFORE_AFTER}'>{escape(CATEGORY_LABELS[CATEGORY_BEFORE_AFTER])}</option>"
             f"<option value='{CATEGORY_UPDATE}'>{escape(CATEGORY_LABELS[CATEGORY_UPDATE])}</option>"
@@ -32425,6 +32435,7 @@ document.addEventListener('submit', function(e) {{
           <p class="text-xs font-semibold uppercase tracking-wide text-sky-700">{escape(upload_title)}</p>
           <h1 class="mt-1 text-2xl font-bold text-gray-950">{escape(title)}</h1>
           <p class="mt-1 text-sm text-gray-500">{escape(date_label)}</p>
+          <p class="mt-4 rounded-2xl border border-sky-100 bg-sky-50 px-4 py-3 text-sm font-semibold text-sky-900">{escape(upload_hint)}</p>
           <form method="post" enctype="multipart/form-data" class="mt-6 space-y-4">
             <label class="block text-sm font-bold text-gray-800">Photo type
               <select name="category" class="mt-2 block w-full rounded-xl border border-gray-300 px-3 py-3 text-base">
@@ -32433,7 +32444,7 @@ document.addEventListener('submit', function(e) {{
             </label>
             <label class="block rounded-2xl border-2 border-dashed border-sky-200 bg-sky-50/60 p-5 text-center">
               <span class="block text-sm font-bold text-sky-900">Choose photos or videos</span>
-              <span class="mt-1 block text-xs text-sky-700">Camera or photo library both work.</span>
+              <span class="mt-1 block text-xs text-sky-700">{escape(file_hint)} Camera or photo library both work.</span>
               <input required type="file" name="photos" multiple accept="image/*,video/*" class="mt-4 block w-full text-sm">
             </label>
             <button class="w-full rounded-2xl bg-sky-700 px-5 py-4 text-base font-bold text-white shadow-sm">Upload to Drive</button>

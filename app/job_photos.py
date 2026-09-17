@@ -12,7 +12,7 @@ from googleapiclient.http import MediaIoBaseUpload
 
 from .admin_store import get_json_setting, set_json_setting, get_job_photo_settings
 from .config import AppConfig
-from .event_processor import parse_customer_fields
+from .event_processor import parse_app_ledger, parse_customer_fields
 from .google_admin import load_admin_credentials, build_drive_service_from_creds
 from .google_calendar import build_calendar_service
 
@@ -26,8 +26,8 @@ CATEGORY_UPDATE = "update"
 
 CATEGORY_LABELS = {
     CATEGORY_CUSTOMER: "Customer provided photos",
-    CATEGORY_BEFORE_AFTER: "Before and afters",
-    CATEGORY_UPDATE: "Update footage",
+    CATEGORY_BEFORE_AFTER: "Before / after photos",
+    CATEGORY_UPDATE: "Technical photos / videos",
 }
 
 
@@ -83,11 +83,19 @@ def _invoice_number(description: str | None) -> str:
 
 def event_is_processed(description: str | None) -> bool:
     text = (description or "").lower()
+    ledger = parse_app_ledger(description)
+    ledger_state = (ledger.get("s") or "").strip().lower()
+    ledger_reason = (ledger.get("r") or "").strip().lower()
+    if ledger_state in {"complete", "sent"}:
+        return True
+    if ledger_reason in {"cash", "ok"} and ledger_state not in {"needs_input", "error", "failed"}:
+        return True
     return (
         "payment type (card/invoice)" in text
         or ("payment type" in text and ("card" in text or "invoice" in text or "cash" in text))
         or "invoice sent" in text
         or "invoice link:" in text
+        or "entry complete" in text
     )
 
 
