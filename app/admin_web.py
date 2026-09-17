@@ -90,7 +90,7 @@ from .google_admin import (
     oauth_exchange_code,
     save_admin_credentials,
 )
-from .google_calendar import update_event_description, build_calendar_service
+from .google_calendar import attach_drive_files_to_event, update_event_description, build_calendar_service
 from .job_photos import (
     CATEGORY_BEFORE_AFTER,
     CATEGORY_CUSTOMER,
@@ -32681,12 +32681,13 @@ document.addEventListener('submit', function(e) {{
                 return jsonify({"ok": False, "error": "No files selected.", "uploaded": 0}), 400
             return redirect(f"/j/{urllib.parse.quote(code)}")
         uploaded = 0
+        uploaded_rows: list[dict] = []
         try:
             for file in files[:50]:
                 data = file.read()
                 if not data:
                     continue
-                upload_job_photo(
+                row = upload_job_photo(
                     config,
                     event_key=event_key,
                     file_bytes=data,
@@ -32695,6 +32696,7 @@ document.addEventListener('submit', function(e) {{
                     category=category,
                     category_detail=category_detail,
                 )
+                uploaded_rows.append(row)
                 uploaded += 1
         except HttpError as exc:
             msg = str(exc)
@@ -32746,8 +32748,15 @@ document.addEventListener('submit', function(e) {{
             )
             if cal_id and event_id:
                 update_event_description(config, event_id, new_desc, calendar_id=cal_id)
+                if uploaded_rows:
+                    attach_drive_files_to_event(
+                        config,
+                        event_id,
+                        uploaded_rows,
+                        calendar_id=cal_id,
+                    )
         except Exception as exc:
-            print(f"[job-photos] Upload succeeded but calendar link refresh failed: {exc}", flush=True)
+            print(f"[job-photos] Upload succeeded but calendar update/attachment failed: {exc}", flush=True)
         if request.headers.get("X-Requested-With") == "fetch":
             photo_count = len(list_job_photos(config.admin_db_file, event_key))
             print(f"[job-photos] Uploaded {uploaded} file(s) for {event_key}; total={photo_count}", flush=True)

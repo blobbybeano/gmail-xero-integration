@@ -249,6 +249,66 @@ def update_event_description(
     raise RateLimitError("Google Calendar rate limit exceeded")
 
 
+def attach_drive_files_to_event(
+    config: AppConfig,
+    event_id: str,
+    files: list[dict],
+    *,
+    calendar_id: str | None = None,
+) -> Dict:
+    """Attach uploaded Drive files to a Calendar event without replacing existing attachments."""
+    service = build_calendar_service(config)
+    current = (
+        service.events()
+        .get(calendarId=calendar_id or config.google_calendar_id, eventId=event_id)
+        .execute()
+    )
+    attachments = list(current.get("attachments") or [])
+    seen = {
+        str(att.get("fileId") or att.get("fileUrl") or "").strip()
+        for att in attachments
+    }
+    for row in files:
+        file_id = str(row.get("file_id") or row.get("id") or "").strip()
+        file_url = str(row.get("web_view_link") or "").strip()
+        if not file_id or not file_url:
+            continue
+        if file_id in seen or file_url in seen:
+            continue
+        attachments.append(
+            {
+                "fileId": file_id,
+                "fileUrl": file_url,
+                "title": str(row.get("name") or "Job photo"),
+                "mimeType": str(row.get("mime_type") or "application/octet-stream"),
+            }
+        )
+        seen.add(file_id)
+        seen.add(file_url)
+    if not attachments:
+        return current
+    for attempt in range(3):
+        try:
+            return (
+                service.events()
+                .patch(
+                    calendarId=calendar_id or config.google_calendar_id,
+                    eventId=event_id,
+                    body={"attachments": attachments},
+                    supportsAttachments=True,
+                )
+                .execute()
+            )
+        except HttpError as exc:
+            if _is_rate_limit_error(exc):
+                if attempt < 2:
+                    time.sleep(2**attempt)
+                    continue
+                raise RateLimitError("Google Calendar rate limit exceeded") from exc
+            raise
+    raise RateLimitError("Google Calendar rate limit exceeded")
+
+
 def register_calendar_watch(
     config: AppConfig,
     calendar_id: str,

@@ -174,6 +174,59 @@ def _save_job_photo(db_path: str, event_key: str, row: dict[str, Any]) -> None:
     set_json_setting(db_path, _FILES_KEY, rows)
 
 
+def _extension_for_upload(filename: str, mime_type: str) -> str:
+    ext = Path(filename or "").suffix.lower()
+    if ext and len(ext) <= 10:
+        return ext
+    mime = (mime_type or "").lower()
+    if mime == "image/jpeg":
+        return ".jpg"
+    if mime == "image/png":
+        return ".png"
+    if mime == "image/heic":
+        return ".heic"
+    if mime == "image/webp":
+        return ".webp"
+    if mime == "video/mp4":
+        return ".mp4"
+    if mime == "video/quicktime":
+        return ".mov"
+    return ""
+
+
+def _photo_name_prefix(category: str, detail: str) -> str:
+    if category == CATEGORY_BEFORE_AFTER:
+        if detail == "before":
+            return "Before"
+        if detail == "after":
+            return "After"
+        return "Before After"
+    if category == CATEGORY_UPDATE:
+        return "Technical"
+    return "Customer"
+
+
+def _next_drive_filename(
+    db_path: str,
+    event_key: str,
+    *,
+    category: str,
+    detail: str,
+    original_filename: str,
+    mime_type: str,
+) -> str:
+    prefix = _photo_name_prefix(category, detail)
+    files = list_job_photos(db_path, event_key)
+    count = 1
+    for item in files:
+        if str(item.get("category") or "") != category:
+            continue
+        if category == CATEGORY_BEFORE_AFTER and str(item.get("category_detail") or "") != detail:
+            continue
+        count += 1
+    return f"{prefix} {count:02d}{_extension_for_upload(original_filename, mime_type)}"
+
+
 def _quote_drive(value: str) -> str:
     return (value or "").replace("\\", "\\\\").replace("'", "\\'")
 
@@ -267,7 +320,14 @@ def upload_job_photo(
     if not creds:
         raise ValueError("Google is not connected.")
     drive = build_drive_service_from_creds(creds)
-    safe_filename = Path(filename or "photo.jpg").name or "photo.jpg"
+    safe_filename = _next_drive_filename(
+        config.admin_db_file,
+        event_key,
+        category=category,
+        detail=detail,
+        original_filename=filename,
+        mime_type=mime_type,
+    )
     media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type or "application/octet-stream", resumable=False)
     created = (
         drive.files()
