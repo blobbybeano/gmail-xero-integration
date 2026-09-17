@@ -32804,7 +32804,7 @@ document.addEventListener('submit', function(e) {{
                 else:
                     media = f"<img loading='lazy' class='h-full w-full rounded-xl object-cover bg-white' src='{src}' alt='{name}'>"
                 tiles.append(
-                    "<a href='" + view_href + "' class='block w-36 shrink-0 rounded-2xl border border-gray-200 bg-gray-50 p-2 shadow-sm'>"
+                    "<a href='" + view_href + "' class='block w-48 shrink-0 rounded-2xl border border-gray-200 bg-gray-50 p-2 shadow-sm'>"
                     "<figure>"
                     "<div class='aspect-[4/5] overflow-hidden rounded-xl bg-white'>" + media + "</div>"
                     "<figcaption class='mt-2 truncate px-1 text-xs text-gray-500'>" + name + "</figcaption>"
@@ -32842,12 +32842,44 @@ document.addEventListener('submit', function(e) {{
         if not event_key:
             return ("Photo link not available", 404)
         known = None
-        for item in list_job_photos(config.admin_db_file, event_key):
+        photos = list_job_photos(config.admin_db_file, event_key)
+        row_order = {CATEGORY_CUSTOMER: 0, "before": 1, "after": 2, CATEGORY_UPDATE: 3}
+        ordered: list[dict] = []
+        for idx, item in enumerate(photos):
+            category = str(item.get("category") or CATEGORY_CUSTOMER)
+            detail = str(item.get("category_detail") or "").strip().lower()
+            row_key = category
+            if category == CATEGORY_BEFORE_AFTER and detail in {"before", "after"}:
+                row_key = detail
+            item = dict(item)
+            item["_sort_index"] = idx
+            item["_row_key"] = row_key
+            ordered.append(item)
+        ordered.sort(key=lambda x: (row_order.get(str(x.get("_row_key")), 99), int(x.get("_sort_index") or 0)))
+        current_index = -1
+        for idx, item in enumerate(ordered):
             if file_id == str(item.get("file_id") or item.get("id") or ""):
                 known = item
+                current_index = idx
                 break
         if not known:
             return ("File not found", 404)
+        prev_id = ""
+        next_id = ""
+        if current_index > 0:
+            prev_id = str(ordered[current_index - 1].get("file_id") or ordered[current_index - 1].get("id") or "")
+        if current_index >= 0 and current_index < len(ordered) - 1:
+            next_id = str(ordered[current_index + 1].get("file_id") or ordered[current_index + 1].get("id") or "")
+        prev_link = (
+            f"<a href='/job-photo-view/{escape(code)}/{escape(prev_id)}' class='rounded-xl border border-gray-200 bg-white px-4 py-3 text-sm font-bold text-gray-900 shadow-sm'>Previous</a>"
+            if prev_id
+            else "<span class='rounded-xl border border-gray-100 bg-gray-50 px-4 py-3 text-sm font-bold text-gray-300'>Previous</span>"
+        )
+        next_link = (
+            f"<a href='/job-photo-view/{escape(code)}/{escape(next_id)}' class='rounded-xl bg-sky-700 px-5 py-3 text-sm font-bold text-white shadow-sm'>Next</a>"
+            if next_id
+            else "<span class='rounded-xl border border-gray-100 bg-gray-50 px-5 py-3 text-sm font-bold text-gray-300'>Next</span>"
+        )
         title, date_label = _job_photo_event_title(event)
         name = escape(str(known.get("name") or "Photo"))
         mime = str(known.get("mime_type") or "")
@@ -32867,6 +32899,10 @@ document.addEventListener('submit', function(e) {{
             <a href="/jp/{escape(code)}" class="shrink-0 rounded-xl bg-gray-900 px-3 py-2 text-xs font-bold text-white">Back</a>
           </div>
           {media}
+          <div class="mt-4 grid grid-cols-2 gap-3">
+            {prev_link}
+            {next_link}
+          </div>
         </section>
         """
         return _job_photo_public_page(body, title=name)
