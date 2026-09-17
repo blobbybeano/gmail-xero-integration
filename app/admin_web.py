@@ -16993,13 +16993,6 @@ body {{ background:#f7f6f3 !important; }}
             status = (rec.get("status") or "").strip().lower()
             if status in {"ignored", "failed"}:
                 continue
-            if "duplicate" in (rec.get("xero_error") or "").lower():
-                blocks.append({
-                    "receipt": rec,
-                    "duplicate": {},
-                    "message": rec.get("xero_error") or "Duplicate needs review.",
-                })
-                continue
             amount = _amount_key(rec)
             day = (rec.get("purchased_on") or "")[:10]
             if day and amount > 0:
@@ -24371,6 +24364,10 @@ body {{ background:#f7f6f3 !important; }}
         if (rec.get("xero_id") or "").strip() and status == "approved":
             status = "submitted"
 
+        xero_error_update = rec.get("xero_error")
+        if action == "approve" and "duplicate" in (rec.get("xero_error") or "").lower():
+            xero_error_update = ""
+
         updates = {
             "merchant": _clean_receipt_merchant(
                 request.form.get("merchant") or "",
@@ -24381,6 +24378,7 @@ body {{ background:#f7f6f3 !important; }}
             "amount_ex": amount_ex,
             "vat_amount": vat_amount,
             "status": status,
+            "xero_error": xero_error_update,
         }
         payment_source, owner_paid_account_code = _expense_normalise_payment_source(
             eng,
