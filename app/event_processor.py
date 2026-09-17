@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Dict
 
 PROCESS_DRAFT_PROMPT = "PROCESS DRAFT (Y/N) ="
@@ -1973,6 +1974,13 @@ def upsert_job_photo_links(
     text = description or ""
     if not text:
         return text
+    text = re.sub(
+        r"(?is)(^|<br\s*/?>|\n)\s*"
+        r"(?:Photos:|Photos upload:|Technician photos:|Add job photos:|View photos:)"
+        r"\s*.*?(?=(?:<br\s*/?>|\n|$))",
+        "\n",
+        text,
+    )
     labels = (
         JOB_PHOTO_LABEL.lower(),
         JOB_PHOTO_UPLOAD_LABEL.lower(),

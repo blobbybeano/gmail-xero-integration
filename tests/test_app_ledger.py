@@ -101,6 +101,29 @@ App status: Sent - 39e93301
         self.assertNotIn("View photos:", updated)
         self.assertTrue(updated.rstrip().endswith("[app]s=sent;r=ok;fp=3c0562b811;x=1;w=none;inv=39e93301[/app]"))
 
+    def test_job_photo_links_remove_google_html_duplicate_links(self):
+        original = (
+            "[contact]<br>Customer name: Debbie<br>[/contact]<br>"
+            "Photos: <a href=\"https://old/j/abc\">https://old/j/abc</a>\n"
+            "Photos: https://old/j/abc\n"
+            "View photos: https://old/jp/abc\n"
+            "[app]s=sent;r=ok[/app]"
+        )
+
+        updated = upsert_job_photo_links(
+            original,
+            upload_url="https://app/j/abc",
+            gallery_url="https://app/jp/abc",
+            has_photos=True,
+            processed=True,
+        )
+
+        self.assertIn("Customer name: Debbie", updated)
+        self.assertEqual(updated.count("Photos:"), 1)
+        self.assertIn("Photos: https://app/j/abc", updated)
+        self.assertNotIn("View photos:", updated)
+        self.assertNotIn("https://old", updated)
+
 
 if __name__ == "__main__":
     unittest.main()
