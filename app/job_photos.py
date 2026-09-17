@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import io
+import json
 import re
 import secrets
 import time
@@ -32,7 +33,12 @@ CATEGORY_LABELS = {
 
 
 def drive_scope_configured(config: AppConfig) -> bool:
-    scopes = set(config.google_admin_scopes or config.google_scopes or [])
+    token_path = Path(config.google_admin_token_file)
+    try:
+        raw = json.loads(token_path.read_text()) if token_path.exists() else {}
+    except Exception:
+        raw = {}
+    scopes = set(raw.get("scopes") or [])
     return (
         "https://www.googleapis.com/auth/drive.file" in scopes
         or "https://www.googleapis.com/auth/drive" in scopes

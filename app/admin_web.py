@@ -7506,9 +7506,20 @@ function toggleReceiptsEnabled(requested) {{
         sheets_ok, sheets_msg = _sheets_status_data(config, creds, target)
         xero_ok, xero_msg, xero_tenant = _xero_status_data(config)
         google_ok = creds is not None
+        google_saved_scopes = set()
+        try:
+            _google_token_path = Path(config.google_admin_token_file)
+            if _google_token_path.exists():
+                google_saved_scopes = set((json.loads(_google_token_path.read_text()) or {}).get("scopes") or [])
+        except Exception:
+            google_saved_scopes = set()
+        google_missing_scopes = [
+            scope for scope in (config.google_admin_scopes or config.google_scopes or [])
+            if scope not in google_saved_scopes
+        ]
+        google_fully_authorised = bool(google_ok and not google_missing_scopes)
         google_gmail_ok = bool(
-            google_ok
-            and _gmail_mod.GMAIL_READONLY_SCOPE in (getattr(creds, "scopes", None) or set())
+            google_ok and _gmail_mod.GMAIL_READONLY_SCOPE in google_saved_scopes
         )
         _gmail_icon = (
             '<svg class="w-3.5 h-3.5 {c}" fill="none" stroke="currentColor" viewBox="0 0 24 24">'
@@ -7765,7 +7776,7 @@ function toggleReceiptsEnabled(requested) {{
         pending_auth_url = (
             session.get("oauth_auth_url")
             or str(get_json_setting(config.admin_db_file, "oauth_auth_url", "")).strip()
-        ) if not google_ok else ""
+        )
 
         calendars = []
         spreadsheets = []
@@ -8136,6 +8147,25 @@ function toggleReceiptsEnabled(requested) {{
         xero_redirect = escape(_req_base + "/xero/callback")
 
         # --- Pending Google auth URL block ---
+        google_scope_warning_html = ""
+        if google_ok and google_missing_scopes:
+            missing_names = []
+            for scope in google_missing_scopes:
+                if scope.endswith("/drive.file") or scope.endswith("/drive"):
+                    missing_names.append("Drive uploads")
+                elif scope.endswith("/spreadsheets"):
+                    missing_names.append("Sheets")
+                elif scope.endswith("/gmail.readonly"):
+                    missing_names.append("Gmail read-only")
+                elif scope.endswith("/calendar"):
+                    missing_names.append("Calendar")
+            google_scope_warning_html = (
+                '<div class="mt-3 p-3 bg-amber-50 border border-amber-200 rounded-xl">'
+                '<p class="text-xs font-semibold text-amber-800">Google is only partly connected.</p>'
+                f'<p class="text-xs text-amber-700 mt-1">Missing: {escape(", ".join(dict.fromkeys(missing_names)) or "extra Google permissions")}. '
+                'Click <strong>Reconnect</strong>, then open and approve the blue Google authorisation link.</p>'
+                '</div>'
+            )
         if pending_auth_url:
             _esc_url = escape(pending_auth_url)
             _js_url = pending_auth_url.replace("'", "\\'")
@@ -8257,7 +8287,7 @@ function toggleReceiptsEnabled(requested) {{
                     </div>
                   </div>
                   <div class="flex items-center gap-2">
-                    {_status_badge(google_ok, "Connected" if google_ok else "Not connected")}
+                    {_status_badge(google_fully_authorised, "Connected" if google_fully_authorised else ("Needs reconnect" if google_ok else "Not connected"))}
                     <svg class="w-4 h-4 text-gray-400 transition-transform duration-200 group-open:rotate-180 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
                     </svg>
@@ -8278,6 +8308,7 @@ function toggleReceiptsEnabled(requested) {{
                     {"" if creds_file_exists else '<p class="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">No credentials file uploaded yet. Select your JSON file and click <strong>Upload JSON</strong> first.</p>'}
                     {"" if not creds_file_exists else '<p class="text-xs text-green-700 bg-green-50 border border-green-200 rounded-lg px-3 py-2">&#10003; Credentials file uploaded. Click <strong>Connect Google</strong> to authorise.</p>'}
                   </div>
+                  {google_scope_warning_html}
                   {pending_auth_url_html}
                   <div class="flex gap-2 flex-wrap items-center pt-1">
                     <button type="button"
