@@ -8,6 +8,7 @@ SEND_PROMPT = "SEND NOW (Y/N) ="
 APP_LEDGER_START = "[app]"
 APP_LEDGER_END = "[/app]"
 RECEIPT_LINK_LABEL = "Submit transaction receipt:"
+JOB_PHOTO_LABEL = "Photos:"
 JOB_PHOTO_UPLOAD_LABEL = "Photos upload:"
 JOB_PHOTO_ADD_LABEL = "Technician photos:"
 JOB_PHOTO_LEGACY_ADD_LABEL = "Add job photos:"
@@ -1973,6 +1974,7 @@ def upsert_job_photo_links(
     if not text:
         return text
     labels = (
+        JOB_PHOTO_LABEL.lower(),
         JOB_PHOTO_UPLOAD_LABEL.lower(),
         JOB_PHOTO_ADD_LABEL.lower(),
         JOB_PHOTO_LEGACY_ADD_LABEL.lower(),
@@ -1986,10 +1988,7 @@ def upsert_job_photo_links(
     while lines and not lines[-1].strip():
         lines.pop()
     if upload_url:
-        label = JOB_PHOTO_ADD_LABEL if processed else JOB_PHOTO_UPLOAD_LABEL
-        lines.append(f"{label} {upload_url}")
-    if gallery_url and has_photos:
-        lines.append(f"{JOB_PHOTO_VIEW_LABEL} {gallery_url}")
+        lines.append(f"{JOB_PHOTO_LABEL} {upload_url}")
     return "\n".join(lines).rstrip() + "\n"
 
 

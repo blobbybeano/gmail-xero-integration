@@ -32409,6 +32409,7 @@ document.addEventListener('submit', function(e) {{
         processed = job_photo_event_is_processed(event.get("description") or "")
         photos = list_job_photos(config.admin_db_file, event_key)
         upload_title = "Upload technician photos" if processed else "Upload customer photos"
+        hub_title = "Job photos"
         upload_hint = (
             "Add before/after pictures, access photos, technical pictures, or short update videos for the completed job."
             if processed
@@ -32447,13 +32448,17 @@ document.addEventListener('submit', function(e) {{
         existing = (
             f"<a href='/jp/{escape(code)}' class='inline-flex items-center justify-center rounded-xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm font-bold text-sky-800'>View {len(photos)} saved photo{'s' if len(photos) != 1 else ''}</a>"
             if photos
-            else ""
+            else f"<a href='/jp/{escape(code)}' class='inline-flex items-center justify-center rounded-xl border border-gray-200 bg-white px-4 py-3 text-sm font-bold text-gray-600'>View photos</a>"
         )
         body = f"""
         <section class="rounded-3xl border border-gray-200 bg-white p-5 shadow-sm">
-          <p class="text-xs font-semibold uppercase tracking-wide text-sky-700">{escape(upload_title)}</p>
+          <p class="text-xs font-semibold uppercase tracking-wide text-sky-700">{escape(hub_title)}</p>
           <h1 class="mt-1 text-2xl font-bold text-gray-950">{escape(title)}</h1>
           <p class="mt-1 text-sm text-gray-500">{escape(date_label)}</p>
+          <div class="mt-5 grid gap-3 sm:grid-cols-2">
+            <a href="/jp/{escape(code)}" class="rounded-2xl border border-gray-200 bg-white px-4 py-4 text-sm font-bold text-gray-900 shadow-sm">View job photos<span class="mt-1 block text-xs font-semibold text-gray-500">{len(photos)} saved</span></a>
+            <a href="#job-photo-form" class="rounded-2xl border border-sky-200 bg-sky-50 px-4 py-4 text-sm font-bold text-sky-900 shadow-sm">{escape(upload_title)}<span class="mt-1 block text-xs font-semibold text-sky-700">Camera or file upload</span></a>
+          </div>
           <p class="mt-4 rounded-2xl border border-sky-100 bg-sky-50 px-4 py-3 text-sm font-semibold text-sky-900">{escape(upload_hint)}</p>
           <form id="job-photo-form" method="post" enctype="multipart/form-data" class="mt-6 space-y-4">
             <label class="block text-sm font-bold text-gray-800">Photo type
@@ -32579,7 +32584,7 @@ document.addEventListener('submit', function(e) {{
         }})();
         </script>
         """
-        return _job_photo_public_page(body, title=upload_title)
+        return _job_photo_public_page(body, title=hub_title)
 
     @app.post("/j/<code>")
     def job_photo_upload_submit(code: str):

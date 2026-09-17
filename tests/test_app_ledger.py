@@ -4,6 +4,7 @@ from app.event_processor import (
     parse_app_ledger,
     upsert_app_ledger,
     upsert_invoice_summary,
+    upsert_job_photo_links,
 )
 from app.state import bump_xero_action_attempts, get_xero_action_attempts
 
@@ -71,6 +72,29 @@ App status: Sent - 39e93301
         self.assertIn("App status: Sent - 39e93301", updated)
         self.assertTrue(updated.rstrip().endswith("[app]s=sent;r=ok;fp=3c0562b811;x=1;w=none;inv=39e93301[/app]"))
         self.assertEqual(parse_app_ledger(updated)["inv"], "39e93301")
+
+    def test_job_photo_links_use_one_stable_calendar_link(self):
+        original = """[contact]
+Customer name: Carol Canaan
+[/contact]
+
+Photos upload: https://old/upload
+Technician photos: https://old/tech
+View photos: https://old/gallery
+"""
+
+        updated = upsert_job_photo_links(
+            original,
+            upload_url="https://app/j/abc",
+            gallery_url="https://app/jp/abc",
+            has_photos=True,
+            processed=True,
+        )
+
+        self.assertIn("Photos: https://app/j/abc", updated)
+        self.assertNotIn("Photos upload:", updated)
+        self.assertNotIn("Technician photos:", updated)
+        self.assertNotIn("View photos:", updated)
 
 
 if __name__ == "__main__":
