@@ -8,6 +8,9 @@ SEND_PROMPT = "SEND NOW (Y/N) ="
 APP_LEDGER_START = "[app]"
 APP_LEDGER_END = "[/app]"
 RECEIPT_LINK_LABEL = "Submit transaction receipt:"
+JOB_PHOTO_UPLOAD_LABEL = "Photos upload:"
+JOB_PHOTO_ADD_LABEL = "Add job photos:"
+JOB_PHOTO_VIEW_LABEL = "View photos:"
 
 # Engineering note:
 # This file defines parsing and formatting invariants used by live automation.
@@ -1940,6 +1943,37 @@ def upsert_receipt_submit_link(description: str, upload_url: str | None) -> str:
     new_inner = "\n".join(kept).strip("\n")
     new_block = f"[app-status]\n{new_inner}\n[/app-status]"
     return description[: m.start()] + new_block + description[m.end() :]
+
+
+def upsert_job_photo_links(
+    description: str | None,
+    *,
+    upload_url: str | None,
+    gallery_url: str | None,
+    has_photos: bool = False,
+    processed: bool = False,
+) -> str:
+    text = description or ""
+    if not text:
+        return text
+    labels = (
+        JOB_PHOTO_UPLOAD_LABEL.lower(),
+        JOB_PHOTO_ADD_LABEL.lower(),
+        JOB_PHOTO_VIEW_LABEL.lower(),
+    )
+    lines = [
+        line
+        for line in text.splitlines()
+        if not line.strip().lower().startswith(labels)
+    ]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if upload_url:
+        label = JOB_PHOTO_ADD_LABEL if processed else JOB_PHOTO_UPLOAD_LABEL
+        lines.append(f"{label} {upload_url}")
+    if gallery_url and has_photos:
+        lines.append(f"{JOB_PHOTO_VIEW_LABEL} {gallery_url}")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def parse_app_ledger(description: str | None) -> dict[str, str]:

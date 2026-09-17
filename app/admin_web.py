@@ -63,6 +63,8 @@ from .admin_store import (
     set_receipts_settings,
     get_expense_settings,
     set_expense_settings,
+    get_job_photo_settings,
+    set_job_photo_settings,
     get_cashflows_settings,
     set_cashflows_settings,
     add_cashflows_reconciled_refs,
@@ -76,6 +78,7 @@ from .event_processor import (
     set_title_mail_emoji,
     sync_invoice_block_from_xero,
     upsert_receipt_submit_link,
+    upsert_job_photo_links,
 )
 from .google_admin import (
     build_calendar_service_from_creds,
@@ -88,6 +91,20 @@ from .google_admin import (
     save_admin_credentials,
 )
 from .google_calendar import update_event_description, build_calendar_service
+from .job_photos import (
+    CATEGORY_BEFORE_AFTER,
+    CATEGORY_CUSTOMER,
+    CATEGORY_LABELS,
+    CATEGORY_UPDATE,
+    create_job_photo_links,
+    drive_scope_configured,
+    event_is_processed as job_photo_event_is_processed,
+    extract_drive_folder_id,
+    get_drive_file_media,
+    list_job_photos,
+    resolve_job_photo_code,
+    upload_job_photo,
+)
 from .config import AppConfig
 from .xero_client import (
     load_xero_token,
@@ -6450,6 +6467,32 @@ def create_app() -> Flask:
         session["save_notice"] = "success:Receipt parser settings saved."
         return redirect(url_for("index"))
 
+    @app.post("/save-job-photo-settings")
+    @require_login
+    def save_job_photo_settings_route():
+        ttl_raw = (request.form.get("job_photo_link_ttl_days") or "0").strip()
+        try:
+            ttl_days = max(int(ttl_raw or "0"), 0)
+        except Exception:
+            ttl_days = 0
+        folder_id = extract_drive_folder_id(request.form.get("job_photo_drive_folder") or "")
+        set_job_photo_settings(
+            config.admin_db_file,
+            {
+                "enabled": bool(request.form.get("job_photos_enabled")),
+                "drive_parent_folder_id": folder_id,
+                "link_ttl_days": ttl_days,
+            },
+        )
+        if not drive_scope_configured(config):
+            session["save_notice"] = (
+                "error:Job photo settings saved, but Google Drive file scope is missing. "
+                "Reconnect Google after deployment."
+            )
+        else:
+            session["save_notice"] = "success:Job photo settings saved."
+        return redirect("/settings#job-photos")
+
     @app.post("/test-cashflows-connection")
     @require_login
     def test_cashflows_connection():
@@ -7507,6 +7550,17 @@ function toggleReceiptsEnabled(requested) {{
                 '</div>'
             )
         receipts_settings = get_receipts_settings(config.admin_db_file)
+        job_photo_settings = get_job_photo_settings(config.admin_db_file)
+        job_photos_enabled = bool(job_photo_settings.get("enabled", True))
+        job_photo_drive_folder = str(job_photo_settings.get("drive_parent_folder_id") or "").strip()
+        job_photo_ttl_days = int(job_photo_settings.get("link_ttl_days") or 0)
+        job_photo_scope_ok = drive_scope_configured(config)
+        job_photo_badge = _status_badge(job_photos_enabled, "Enabled" if job_photos_enabled else "Disabled")
+        job_photo_scope_note = (
+            '<span class="text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full">Drive upload scope configured</span>'
+            if job_photo_scope_ok
+            else '<span class="text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full">Reconnect Google with Drive file scope</span>'
+        )
         cashflows_settings = get_cashflows_settings(config.admin_db_file)
         openai_settings = get_openai_settings(config.admin_db_file)
         _oa_db_ok = bool(openai_settings.get("api_key"))
@@ -8430,6 +8484,65 @@ function toggleReceiptsEnabled(requested) {{
                       </div>
                     </div>
                   </details>
+                </div>
+              </details>
+
+              <!-- Job Photos Card -->
+              <details id="job-photos" class="bg-white rounded-2xl shadow-sm border border-gray-200 group">
+                <summary class="flex items-center justify-between p-5 cursor-pointer list-none select-none hover:bg-gray-50 rounded-2xl transition-colors">
+                  <div class="flex items-center gap-3">
+                    <div class="w-10 h-10 bg-sky-50 rounded-xl flex items-center justify-center shrink-0">
+                      <svg class="w-5 h-5 text-sky-700" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7h3l2-3h8l2 3h3v12a2 2 0 01-2 2H5a2 2 0 01-2-2V7z"/>
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 17a4 4 0 100-8 4 4 0 000 8z"/>
+                      </svg>
+                    </div>
+                    <div>
+                      <h3 class="font-semibold text-gray-900 text-sm">Job photos</h3>
+                      <p class="text-xs text-gray-500">Calendar upload links backed by Google Drive</p>
+                    </div>
+                  </div>
+                  <div class="flex items-center gap-2">
+                    {job_photo_badge}
+                    <svg class="w-4 h-4 text-gray-400 transition-transform duration-200 group-open:rotate-180 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+                    </svg>
+                  </div>
+                </summary>
+                <div class="px-5 pb-5 border-t border-gray-100 pt-4 space-y-4">
+                  <p class="text-xs text-gray-500">Adds compact links to formatted diary entries so staff can upload customer photos, then later before/after and update photos, without opening Google Drive manually.</p>
+                  <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <div class="sm:col-span-2">
+                      <label class="block text-xs font-medium text-gray-600 mb-1">Google Drive parent folder <span class="font-normal text-gray-400">(URL or folder ID)</span></label>
+                      <input name="job_photo_drive_folder" value="{escape(job_photo_drive_folder)}"
+                        placeholder="Leave blank to create Customer pictures in My Drive"
+                        class="w-full px-3 py-1.5 border border-gray-300 rounded-lg text-xs font-mono">
+                    </div>
+                    <div>
+                      <label class="block text-xs font-medium text-gray-600 mb-1">Link expiry days</label>
+                      <input type="number" min="0" max="365" name="job_photo_link_ttl_days" value="{job_photo_ttl_days}"
+                        class="w-full px-3 py-1.5 border border-gray-300 rounded-lg text-xs font-mono">
+                      <p class="text-[11px] text-gray-400 mt-1">0 means links do not expire.</p>
+                    </div>
+                  </div>
+                  <div class="flex items-center gap-3 flex-wrap">
+                    <label class="inline-flex items-center gap-2 text-xs text-gray-700">
+                      <input type="checkbox" name="job_photos_enabled" value="1" {"checked" if job_photos_enabled else ""} class="w-4 h-4">
+                      Enable calendar photo links
+                    </label>
+                    {job_photo_scope_note}
+                  </div>
+                  <div class="flex items-center gap-2 flex-wrap pt-2 border-t border-sky-100">
+                    <button type="submit" formaction="/save-job-photo-settings"
+                      class="px-3 py-1.5 text-xs font-medium text-white bg-sky-700 hover:bg-sky-800 rounded-lg transition-colors">
+                      Save job photo settings
+                    </button>
+                    <button type="submit" formmethod="get" formaction="/connect-google"
+                      class="px-3 py-1.5 text-xs font-medium text-sky-700 bg-sky-50 hover:bg-sky-100 rounded-lg transition-colors">
+                      Reconnect Google
+                    </button>
+                  </div>
+                  <p class="text-xs text-gray-500">Drive filing: <code>Customer pictures / Customers / customer - invoice - date / category</code>. Uploads are stored in Drive; this app only keeps file IDs and small metadata.</p>
                 </div>
               </details>
 
@@ -32232,6 +32345,232 @@ document.addEventListener('submit', function(e) {{
     # ═══════════════════════════════════════════════════════════════════════════
     # End Vehicles / Email Invoice Importer
     # ═══════════════════════════════════════════════════════════════════════════
+
+    def _job_photo_public_page(body: str, *, title: str = "Job photos") -> str:
+        return _BASE_HTML.format(
+            body=(
+                "<main class='min-h-screen bg-slate-50 px-4 py-5 sm:py-8'>"
+                "<div class='mx-auto w-full max-w-3xl'>"
+                f"{body}"
+                "</div></main>"
+            )
+        ).replace("<title>Powwash Bridge</title>", f"<title>{escape(title)}</title>")
+
+    def _job_photo_event_from_code(code: str):
+        try:
+            event_key = resolve_job_photo_code(config.admin_db_file, code)
+        except Exception:
+            return None, None, None
+        event_key = str(event_key or "").strip()
+        if ":" not in event_key:
+            return None, None, None
+        cal_id, event_id = event_key.split(":", 1)
+        try:
+            event = (
+                build_calendar_service(config)
+                .events()
+                .get(calendarId=cal_id, eventId=event_id)
+                .execute()
+            )
+            event["_calendar_id"] = cal_id
+        except Exception:
+            event = {"id": event_id, "_calendar_id": cal_id, "summary": "Calendar job", "description": ""}
+        return {"event_key": event_key}, event_key, event
+
+    def _job_photo_event_title(event: dict | None) -> tuple[str, str]:
+        if not event:
+            return "Calendar job", ""
+        summary = str(event.get("summary") or "Calendar job")
+        start = event.get("start") or {}
+        raw = str(start.get("dateTime") or start.get("date") or "")
+        date_label = raw[:10]
+        try:
+            if "T" in raw:
+                parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                date_label = parsed.astimezone().strftime("%d %b %Y, %H:%M")
+            elif raw:
+                parsed_date = dt.date.fromisoformat(raw[:10])
+                date_label = parsed_date.strftime("%d %b %Y")
+        except Exception:
+            pass
+        return summary, date_label
+
+    @app.get("/j/<code>")
+    def job_photo_upload_page(code: str):
+        _link, event_key, event = _job_photo_event_from_code(code)
+        if not event_key:
+            return _job_photo_public_page(
+                "<section class='rounded-2xl border border-red-200 bg-white p-6 text-red-800'>"
+                "<h1 class='text-xl font-bold'>Photo link not available</h1>"
+                "<p class='mt-2 text-sm'>This link has expired or is not recognised.</p></section>",
+                title="Photo link not available",
+            ), 404
+        title, date_label = _job_photo_event_title(event)
+        processed = job_photo_event_is_processed(event.get("description") or "")
+        photos = list_job_photos(config.admin_db_file, event_key)
+        upload_title = "Add job photos" if processed else "Upload customer photos"
+        category_options = (
+            f"<option value='{CATEGORY_BEFORE_AFTER}'>{escape(CATEGORY_LABELS[CATEGORY_BEFORE_AFTER])}</option>"
+            f"<option value='{CATEGORY_UPDATE}'>{escape(CATEGORY_LABELS[CATEGORY_UPDATE])}</option>"
+            f"<option value='{CATEGORY_CUSTOMER}'>{escape(CATEGORY_LABELS[CATEGORY_CUSTOMER])}</option>"
+            if processed
+            else f"<option value='{CATEGORY_CUSTOMER}'>{escape(CATEGORY_LABELS[CATEGORY_CUSTOMER])}</option>"
+        )
+        existing = (
+            f"<a href='/jp/{escape(code)}' class='inline-flex items-center justify-center rounded-xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm font-bold text-sky-800'>View {len(photos)} saved photo{'s' if len(photos) != 1 else ''}</a>"
+            if photos
+            else ""
+        )
+        body = f"""
+        <section class="rounded-3xl border border-gray-200 bg-white p-5 shadow-sm">
+          <p class="text-xs font-semibold uppercase tracking-wide text-sky-700">{escape(upload_title)}</p>
+          <h1 class="mt-1 text-2xl font-bold text-gray-950">{escape(title)}</h1>
+          <p class="mt-1 text-sm text-gray-500">{escape(date_label)}</p>
+          <form method="post" enctype="multipart/form-data" class="mt-6 space-y-4">
+            <label class="block text-sm font-bold text-gray-800">Photo type
+              <select name="category" class="mt-2 block w-full rounded-xl border border-gray-300 px-3 py-3 text-base">
+                {category_options}
+              </select>
+            </label>
+            <label class="block rounded-2xl border-2 border-dashed border-sky-200 bg-sky-50/60 p-5 text-center">
+              <span class="block text-sm font-bold text-sky-900">Choose photos or videos</span>
+              <span class="mt-1 block text-xs text-sky-700">Camera or photo library both work.</span>
+              <input required type="file" name="photos" multiple accept="image/*,video/*" class="mt-4 block w-full text-sm">
+            </label>
+            <button class="w-full rounded-2xl bg-sky-700 px-5 py-4 text-base font-bold text-white shadow-sm">Upload to Drive</button>
+          </form>
+          <div class="mt-4 flex flex-wrap gap-3">{existing}</div>
+          <p class="mt-5 text-xs leading-relaxed text-gray-500">Files are saved to Google Drive in this job's customer folder. This app keeps only the Drive file ID and upload details.</p>
+        </section>
+        """
+        return _job_photo_public_page(body, title=upload_title)
+
+    @app.post("/j/<code>")
+    def job_photo_upload_submit(code: str):
+        _link, event_key, event = _job_photo_event_from_code(code)
+        if not event_key or not event:
+            return ("Photo link not available", 404)
+        processed = job_photo_event_is_processed(event.get("description") or "")
+        category = (request.form.get("category") or CATEGORY_CUSTOMER).strip()
+        if not processed:
+            category = CATEGORY_CUSTOMER
+        if category not in CATEGORY_LABELS:
+            category = CATEGORY_BEFORE_AFTER if processed else CATEGORY_CUSTOMER
+        files = [f for f in request.files.getlist("photos") if f and (f.filename or "").strip()]
+        if not files:
+            return redirect(f"/j/{urllib.parse.quote(code)}")
+        uploaded = 0
+        for file in files[:50]:
+            data = file.read()
+            if not data:
+                continue
+            upload_job_photo(
+                config,
+                event_key=event_key,
+                file_bytes=data,
+                filename=file.filename or "job-photo",
+                mime_type=file.mimetype or "application/octet-stream",
+                category=category,
+            )
+            uploaded += 1
+        try:
+            cal_id = str(event.get("_calendar_id") or "")
+            event_id = str(event.get("id") or "")
+            upload_url, gallery_url = create_job_photo_links(
+                config.admin_db_file,
+                event_key,
+                _current_base_url().rstrip("/"),
+            )
+            new_desc = upsert_job_photo_links(
+                event.get("description") or "",
+                upload_url=upload_url,
+                gallery_url=gallery_url,
+                has_photos=True,
+                processed=processed,
+            )
+            if cal_id and event_id:
+                update_event_description(config, event_id, new_desc, calendar_id=cal_id)
+        except Exception as exc:
+            print(f"[job-photos] Upload succeeded but calendar link refresh failed: {exc}", flush=True)
+        return redirect(f"/jp/{urllib.parse.quote(code)}?uploaded={uploaded}")
+
+    @app.get("/jp/<code>")
+    def job_photo_gallery_page(code: str):
+        _link, event_key, event = _job_photo_event_from_code(code)
+        if not event_key:
+            return _job_photo_public_page(
+                "<section class='rounded-2xl border border-red-200 bg-white p-6 text-red-800'>"
+                "<h1 class='text-xl font-bold'>Gallery not available</h1>"
+                "<p class='mt-2 text-sm'>This link has expired or is not recognised.</p></section>",
+                title="Gallery not available",
+            ), 404
+        title, date_label = _job_photo_event_title(event)
+        photos = list_job_photos(config.admin_db_file, event_key)
+        uploaded_notice = ""
+        if (request.args.get("uploaded") or "").strip():
+            uploaded_notice = "<div class='mb-4 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-bold text-emerald-800'>Uploaded to Google Drive.</div>"
+        grouped: dict[str, list[dict]] = {}
+        for photo in photos:
+            grouped.setdefault(str(photo.get("category") or CATEGORY_CUSTOMER), []).append(photo)
+        sections = []
+        for category in (CATEGORY_CUSTOMER, CATEGORY_BEFORE_AFTER, CATEGORY_UPDATE):
+            items = grouped.get(category) or []
+            if not items:
+                continue
+            tiles = []
+            for item in items:
+                file_id = escape(str(item.get("file_id") or ""))
+                name = escape(str(item.get("name") or "Photo"))
+                mime = str(item.get("mime_type") or "")
+                src = f"/job-photo-file/{escape(code)}/{file_id}"
+                if mime.startswith("video/"):
+                    media = f"<video controls preload='metadata' class='h-full w-full rounded-xl object-contain bg-black' src='{src}'></video>"
+                else:
+                    media = f"<img loading='lazy' class='h-full w-full rounded-xl object-contain bg-white' src='{src}' alt='{name}'>"
+                tiles.append(
+                    "<figure class='rounded-2xl border border-gray-200 bg-gray-50 p-2 shadow-sm'>"
+                    "<div class='aspect-[4/5] overflow-hidden rounded-xl bg-white'>" + media + "</div>"
+                    "<figcaption class='mt-2 truncate px-1 text-xs text-gray-500'>" + name + "</figcaption>"
+                    "</figure>"
+                )
+            sections.append(
+                "<section class='mt-6'><h2 class='text-sm font-bold uppercase tracking-wide text-gray-600'>"
+                + escape(CATEGORY_LABELS.get(category, category.title()))
+                + "</h2><div class='mt-3 grid grid-cols-2 gap-3 sm:grid-cols-3'>"
+                + "".join(tiles)
+                + "</div></section>"
+            )
+        empty = "<p class='rounded-2xl border border-gray-200 bg-white p-6 text-center text-sm text-gray-500'>No photos uploaded yet.</p>" if not sections else ""
+        body = f"""
+        {uploaded_notice}
+        <section class="rounded-3xl border border-gray-200 bg-white p-5 shadow-sm">
+          <div class="flex items-start justify-between gap-4">
+            <div>
+              <p class="text-xs font-semibold uppercase tracking-wide text-sky-700">Job gallery</p>
+              <h1 class="mt-1 text-2xl font-bold text-gray-950">{escape(title)}</h1>
+              <p class="mt-1 text-sm text-gray-500">{escape(date_label)}</p>
+            </div>
+            <a href="/j/{escape(code)}" class="shrink-0 rounded-xl bg-sky-700 px-3 py-2 text-xs font-bold text-white">Add</a>
+          </div>
+        </section>
+        {empty}
+        {''.join(sections)}
+        """
+        return _job_photo_public_page(body, title="Job gallery")
+
+    @app.get("/job-photo-file/<code>/<file_id>")
+    def job_photo_file(code: str, file_id: str):
+        _link, event_key, _event = _job_photo_event_from_code(code)
+        if not event_key:
+            return ("Photo link not available", 404)
+        known_ids = {str(item.get("file_id") or "") for item in list_job_photos(config.admin_db_file, event_key)}
+        if file_id not in known_ids:
+            return ("File not found", 404)
+        data, mime, name = get_drive_file_media(config, file_id)
+        resp = Response(data, mimetype=mime or "application/octet-stream")
+        resp.headers["Content-Disposition"] = "inline; filename=" + urllib.parse.quote(Path(name or "job-photo").name)
+        resp.headers["Cache-Control"] = "private, max-age=3600"
+        return resp
 
     return app
 

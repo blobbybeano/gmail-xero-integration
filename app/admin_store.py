@@ -96,6 +96,38 @@ def set_json_setting(db_path: str, key: str, value: Any) -> None:
     _set_raw(db_path, key, json.dumps(value))
 
 
+def get_job_photo_settings(db_path: str) -> dict[str, Any]:
+    raw = get_json_setting(db_path, "job_photo_settings", {})
+    if not isinstance(raw, dict):
+        raw = {}
+    return {
+        "enabled": bool(raw.get("enabled", True)),
+        "drive_parent_folder_id": str(raw.get("drive_parent_folder_id") or "").strip(),
+        "link_ttl_days": max(int(raw.get("link_ttl_days") or 0), 0),
+    }
+
+
+def set_job_photo_settings(db_path: str, settings: dict[str, Any]) -> None:
+    current = get_job_photo_settings(db_path)
+    current.update(
+        {
+            "enabled": bool(settings.get("enabled", current.get("enabled", True))),
+            "drive_parent_folder_id": str(
+                settings.get(
+                    "drive_parent_folder_id",
+                    current.get("drive_parent_folder_id", ""),
+                )
+                or ""
+            ).strip(),
+            "link_ttl_days": max(
+                int(settings.get("link_ttl_days", current.get("link_ttl_days", 0)) or 0),
+                0,
+            ),
+        }
+    )
+    set_json_setting(db_path, "job_photo_settings", current)
+
+
 def get_cashflows_correlation_sheet_id(db_path: str) -> str:
     """Public Google Sheet ID used to distinguish CARD from INVOICE payments."""
     return str(get_json_setting(db_path, "cashflows_correlation_sheet_id", "")).strip()

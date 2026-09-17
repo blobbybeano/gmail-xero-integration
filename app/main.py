@@ -65,6 +65,7 @@ from .event_processor import (
     upsert_cash_confirmation,
     upsert_no_email_confirmation,
     upsert_send_confirmation,
+    upsert_job_photo_links,
     get_title_progress_dots,
     set_title_status_emoji,
     set_title_mail_emoji,
@@ -87,6 +88,12 @@ from .trigger import (
 )
 from .google_sheets import append_stats_row, ensure_header, update_invoice_paid_in_sheet
 from .google_admin import load_admin_credentials
+from .job_photos import (
+    create_job_photo_links,
+    event_is_processed as job_photo_event_is_processed,
+    get_job_photo_settings,
+    list_job_photos,
+)
 from .state import (
     get_cash_log_marker,
     get_contact_for_event,
@@ -1451,6 +1458,38 @@ def run() -> None:
                 return u[: -len("/xero/callback")]
         return ""
 
+    def _with_job_photo_links(event: dict, description: str | None) -> str:
+        """Add/update compact Drive-backed job-photo links in a calendar entry."""
+        text = description or ""
+        try:
+            settings = get_job_photo_settings(config.admin_db_file)
+            if not settings.get("enabled", True):
+                return text
+            event_id = str(event.get("id") or "").strip()
+            calendar_id = str(event.get("_calendar_id") or config.google_calendar_id or "").strip()
+            if not event_id or not calendar_id:
+                return text
+            event_key = f"{calendar_id}:{event_id}"
+            base = _webhook_base_url().rstrip("/")
+            if not base:
+                return text
+            upload_url, gallery_url = create_job_photo_links(
+                config.admin_db_file,
+                event_key,
+                base,
+            )
+            photos = list_job_photos(config.admin_db_file, event_key)
+            return upsert_job_photo_links(
+                text,
+                upload_url=upload_url,
+                gallery_url=gallery_url,
+                has_photos=bool(photos),
+                processed=job_photo_event_is_processed(text),
+            )
+        except Exception as exc:
+            print(f"[job-photos] Could not add calendar links: {exc}", flush=True)
+            return text
+
     # Safety overlap to avoid missing edits that land between poll cycles
     # (or between a fetch and last_sync update). State markers de-duplicate.
     _poll_overlap_seconds = int(os.getenv("POLL_OVERLAP_SECONDS", "1200") or "1200")
@@ -2268,6 +2307,7 @@ def run() -> None:
                         pass
                     else:
                         new_description = ensure_notes_template(event.get("description"))
+                        new_description = _with_job_photo_links(event, new_description)
                         if new_description != (event.get("description") or ""):
                             updated = safe_update(
                                 event_id=event.get("id"),
@@ -2602,6 +2642,10 @@ def run() -> None:
                     event_updated = event.get("updated") or ""
                     normalized_description = normalize_user_sections(
                         event.get("description") or ""
+                    )
+                    normalized_description = _with_job_photo_links(
+                        event,
+                        normalized_description,
                     )
                     if normalized_description != (event.get("description") or ""):
                         updated = safe_update(
