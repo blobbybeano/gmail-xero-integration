@@ -18170,16 +18170,17 @@ body {{ background:#f7f6f3 !important; }}
                 if not (other.get("stored_file") or (other.get("xero_id") or "").strip()):
                     continue
                 status = (other.get("status") or "").strip().lower()
+                if status == "ignored":
+                    continue
                 matches.append((
-                    0 if status != "ignored" else 1,
                     0 if (other.get("xero_id") or "").strip() else 1,
                     str(other.get("created_at") or ""),
                     other,
                 ))
             if not matches:
                 return None
-            matches.sort(key=lambda item: item[:3])
-            return matches[0][3]
+            matches.sort(key=lambda item: item[:2])
+            return matches[0][2]
 
         if duplicate_receipts:
             rows = []
@@ -23396,6 +23397,42 @@ body {{ background:#f7f6f3 !important; }}
                 )
             return "".join(out)
 
+        def _receipt_archive_panel_rows(rows: list[dict]) -> str:
+            if not rows:
+                return (
+                    "<div class='rounded-xl border border-dashed border-gray-200 bg-gray-50 "
+                    "px-3 py-3 text-sm text-gray-500'>No archived duplicates.</div>"
+                )
+            out = []
+            for r in rows[:20]:
+                merchant = escape(r.get("merchant") or r.get("ocr_merchant") or "Receipt")
+                day = escape((r.get("purchased_on") or r.get("created_at") or "")[:10])
+                amount = _exp_money(r.get("amount_inc"), r.get("currency") or "GBP")
+                rid = escape(str(r.get("id") or ""))
+                submitted = escape(_submitted_stamp(r.get("created_at") or r.get("updated_at") or ""))
+                reason = escape(str(r.get("xero_error") or "Accepted as duplicate."))
+                out.append(
+                    "<div class='flex items-center justify-between gap-3 py-2 border-b "
+                    "border-gray-100 last:border-0'>"
+                    "<div class='min-w-0'>"
+                    f"<div class='text-sm font-semibold text-gray-700 truncate'>{merchant}</div>"
+                    f"<div class='mt-0.5 flex flex-wrap gap-2'><span class='text-[11px] text-gray-400'>Receipt date {day}</span><span class='text-[11px] text-gray-500'>{submitted}</span></div>"
+                    f"<div class='mt-1 text-[11px] text-gray-500'>{reason}</div>"
+                    "</div>"
+                    "<div class='shrink-0 text-right'>"
+                    f"<div class='text-sm font-bold text-gray-700'>{amount}</div>"
+                    f"<a href='/receipts/expenses/receipt/{rid}/image' target='_blank' "
+                    "class='mt-1 inline-flex rounded-lg border border-gray-200 bg-white px-2.5 py-1 "
+                    "text-xs font-semibold text-gray-700 hover:bg-gray-50'>View receipt</a>"
+                    "</div>"
+                    "</div>"
+                )
+            if len(rows) > 20:
+                out.append(
+                    f"<div class='pt-2 text-xs text-gray-400'>Showing latest 20 of {len(rows)}.</div>"
+                )
+            return "".join(out)
+
         def _dump_review_panel_rows(rows: list[dict]) -> str:
             if not rows:
                 return ""
@@ -23509,9 +23546,8 @@ body {{ background:#f7f6f3 !important; }}
                 (status_receipts_by_person.get(eid) or {}).get("approved") or [],
                 e,
             )
-            d_panel = _receipt_panel_rows(
-                (status_receipts_by_person.get(eid) or {}).get("ignored_duplicate") or [],
-                e,
+            d_panel = _receipt_archive_panel_rows(
+                (status_receipts_by_person.get(eid) or {}).get("ignored_duplicate") or []
             )
             payout_card = payout_card_by_engineer.get(eid, "")
             payout_summary = payout_summary_by_engineer.get(eid) or {}
@@ -23528,7 +23564,7 @@ body {{ background:#f7f6f3 !important; }}
                 dup_btn = (
                     f"<button type='button' data-exp-panel='exp-panel-{eid}-duplicates' "
                     "class='text-left rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 text-gray-800 hover:bg-gray-100 hover:shadow-sm transition'>"
-                    "<span class='block text-[11px] font-semibold uppercase tracking-wide opacity-70'>Duplicates ignored</span>"
+                    "<span class='block text-[11px] font-semibold uppercase tracking-wide opacity-70'>Duplicate archive</span>"
                     f"<span class='mt-1 block text-2xl font-bold'>{d_count}</span>"
                     f"<span class='mt-1 block text-xs opacity-75'>{_exp_money(d_amt)}</span>"
                     "</button>"
@@ -23536,8 +23572,8 @@ body {{ background:#f7f6f3 !important; }}
                 dup_panel = (
                     f"<div id='exp-panel-{eid}-duplicates' class='exp-person-panel hidden mt-3 rounded-xl border border-gray-200 bg-gray-50 p-3'>"
                     "<div class='mb-2 flex items-center justify-between gap-2'>"
-                    f"<div><h3 class='text-sm font-bold text-gray-950'>{name} · Duplicates ignored</h3>"
-                    "<p class='text-xs text-gray-600'>These have been blocked from Xero. Open one if you want to compare or delete it.</p></div>"
+                    f"<div><h3 class='text-sm font-bold text-gray-950'>{name} · Duplicate archive</h3>"
+                    "<p class='text-xs text-gray-600'>These are already accepted duplicates. They are not payable, not in payout batches, and are shown here only as an audit trail.</p></div>"
                     "<button type='button' data-exp-close class='rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-sm font-bold text-gray-800 hover:bg-gray-50'>Close</button>"
                     "</div>"
                     f"{d_panel}</div>"
