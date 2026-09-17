@@ -16956,6 +16956,71 @@ body {{ background:#f7f6f3 !important; }}
             "use Accept as duplicate on the extra copy before submitting to Xero."
         )
 
+    def _expense_unresolved_duplicate_blocks(
+        eng: dict,
+        receipts: list[dict],
+    ) -> list[dict]:
+        """Duplicate risks that must be resolved before a payout is batched/paid."""
+        if not eng or not receipts:
+            return []
+        receipt_ids = {str(r.get("id") or "") for r in receipts}
+        seen: dict[tuple[str, float, str], dict] = {}
+        blocks: list[dict] = []
+        seen_pairs: set[tuple[str, str]] = set()
+
+        def _amount_key(r: dict) -> float:
+            try:
+                return round(float(r.get("amount_inc") or 0), 2)
+            except (TypeError, ValueError):
+                return 0.0
+
+        def _add_block(rec: dict, dup: dict):
+            rid = str(rec.get("id") or "")
+            did = str(dup.get("id") or "")
+            if not rid or not did:
+                return
+            pair = tuple(sorted((rid, did)))
+            if pair in seen_pairs:
+                return
+            seen_pairs.add(pair)
+            blocks.append({
+                "receipt": rec,
+                "duplicate": dup,
+                "message": _receipt_duplicate_block_message(rec, dup),
+            })
+
+        for rec in receipts:
+            status = (rec.get("status") or "").strip().lower()
+            if status in {"ignored", "failed"}:
+                continue
+            if "duplicate" in (rec.get("xero_error") or "").lower():
+                blocks.append({
+                    "receipt": rec,
+                    "duplicate": {},
+                    "message": rec.get("xero_error") or "Duplicate needs review.",
+                })
+                continue
+            amount = _amount_key(rec)
+            day = (rec.get("purchased_on") or "")[:10]
+            if day and amount > 0:
+                source = (rec.get("payment_source") or "company_card").strip()
+                key = (day, amount, source)
+                prev = seen.get(key)
+                if prev:
+                    _add_block(rec, prev)
+                else:
+                    seen[key] = rec
+            dup = _receipt_unresolved_exact_duplicate(rec, eng)
+            if dup:
+                # If the duplicate is outside this proposed/held payout, it
+                # still blocks payment. If it is inside the same receipt set,
+                # the in-batch check above records the same risk once.
+                if str(dup.get("id") or "") not in receipt_ids:
+                    _add_block(rec, dup)
+                elif str(dup.get("id") or "") in receipt_ids:
+                    _add_block(rec, dup)
+        return blocks
+
     def _maybe_settle_subcontractor(eng, *, allow_xero: bool = True):
         """Recognise the company's payment to a subcontractor in the Plaid feed
         by the app's payment reference (PWSUB<id>), then reconcile it against the
@@ -21684,6 +21749,10 @@ body {{ background:#f7f6f3 !important; }}
                             if request.args.get("ref") else "."
                         )
                     ),
+                    "payout_duplicates": (
+                        "Payment batch blocked. Resolve duplicate receipt warnings for this person first, "
+                        "then prepare or pay the batch."
+                    ),
                     "payout_paid_xero": "Subcontractor payout marked paid and sent to Xero.",
                     "payout_paid_waiting": (
                         "Subcontractor payout marked paid. Xero did not complete; check the "
@@ -21691,7 +21760,7 @@ body {{ background:#f7f6f3 !important; }}
                     ),
                 }
                 msg = _flash_labels.get(flash, "Done.")
-            err_flashes = {"not_found", "username_taken"}
+            err_flashes = {"not_found", "username_taken", "payout_duplicates"}
             if flash in err_flashes:
                 flash_html = (
                     "<div class='rounded-lg border border-red-200 bg-red-50 "
@@ -21812,6 +21881,12 @@ body {{ background:#f7f6f3 !important; }}
             unpaid_total = exp_store.amount_unpaid_to_engineer(
                 db, sub["id"], payment_source=pay_source
             )
+            unbatched_receipts = exp_store.list_unsettled_receipts_for_engineer(
+                db, sub["id"], payment_source=pay_source
+            )
+            duplicate_blocks = _expense_unresolved_duplicate_blocks(
+                sub, unbatched_receipts
+            )
             settlements = exp_store.list_settlements_for_engineer(db, sub["id"])
             open_settlements = [
                 s for s in settlements[:8]
@@ -21884,13 +21959,49 @@ body {{ background:#f7f6f3 !important; }}
                     "<div class='mt-3 rounded-lg border border-dashed border-gray-200 "
                     "bg-white px-3 py-2 text-xs text-gray-500'>No prepared payout batches.</div>"
                 )
-            prepare_btn = (
-                "<button type='submit' class='rounded-lg bg-gray-900 px-3 py-2 "
-                "text-sm font-semibold text-white'>Prepare payment batch</button>"
-                if unbatched > 0 else
-                "<button type='button' disabled class='rounded-lg bg-gray-200 px-3 py-2 "
-                "text-sm font-semibold text-gray-500'>Nothing to batch</button>"
-            )
+            if duplicate_blocks:
+                prepare_btn = (
+                    "<button type='button' "
+                    f"data-exp-panel='exp-panel-{int(sub['id'])}-pending' "
+                    "onclick=\"alert('Duplicate receipts need checking before this payment batch can be prepared. Open the pending review/duplicates for this person and accept or remove the extra copy first.');\" "
+                    "class='rounded-lg border border-red-300 bg-red-50 px-3 py-2 "
+                    "text-sm font-semibold text-red-800 hover:bg-red-100'>"
+                    "Review duplicates first</button>"
+                )
+            else:
+                prepare_btn = (
+                    "<button type='submit' class='rounded-lg bg-gray-900 px-3 py-2 "
+                    "text-sm font-semibold text-white'>Prepare payment batch</button>"
+                    if unbatched > 0 else
+                    "<button type='button' disabled class='rounded-lg bg-gray-200 px-3 py-2 "
+                    "text-sm font-semibold text-gray-500'>Nothing to batch</button>"
+                )
+            duplicate_warning_html = ""
+            if duplicate_blocks:
+                examples = []
+                for block in duplicate_blocks[:3]:
+                    rec = block.get("receipt") or {}
+                    examples.append(
+                        "<li>"
+                        f"{escape(rec.get('merchant') or rec.get('ocr_merchant') or 'Receipt')} "
+                        f"{escape(_exp_uk_date((rec.get('purchased_on') or '')[:10]))} "
+                        f"&middot; {_exp_money(rec.get('amount_inc') or 0)}"
+                        "</li>"
+                    )
+                more = len(duplicate_blocks) - len(examples)
+                duplicate_warning_html = (
+                    "<div class='mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-900'>"
+                    "<div class='font-bold'>Duplicate check required before payout</div>"
+                    "<p class='mt-1'>This person has receipt duplicates in the payable pile. "
+                    "Sort those first so the same receipt cannot be paid twice.</p>"
+                    "<ul class='mt-1 list-disc pl-5'>"
+                    + "".join(examples)
+                    + (
+                        f"<li>{more} more duplicate check(s)</li>"
+                        if more > 0 else ""
+                    )
+                    + "</ul></div>"
+                )
             payout_card_html = (
                 "<div class='rounded-xl border border-gray-200 bg-gray-50 p-4'>"
                 "<div class='flex items-start justify-between gap-3 flex-wrap'>"
@@ -21908,6 +22019,7 @@ body {{ background:#f7f6f3 !important; }}
                 f"<div class='text-lg font-bold text-gray-900'>{_exp_money(unpaid_total)}</div>"
                 f"<div class='text-xs text-gray-500'>{_exp_money(unbatched)} ready to batch</div>"
                 "</div></div>"
+                f"{duplicate_warning_html}"
                 "<form method='post' "
                 f"action='/receipts/expenses/{sub['id']}/prepare-payment' "
                 "data-expense-submit-once data-loading-text='Preparing batch...' "
@@ -23874,6 +23986,16 @@ body {{ background:#f7f6f3 !important; }}
                 amount_override = round(float(actual_paid_raw.replace(",", "")), 2)
             except ValueError:
                 amount_override = None
+        payable_receipts = exp_store.list_unsettled_receipts_for_engineer(
+            db, engineer_id, payment_source=pay_source
+        )
+        duplicate_blocks = _expense_unresolved_duplicate_blocks(eng, payable_receipts)
+        if duplicate_blocks:
+            _feed.push(
+                f"Payment batch for {eng.get('name')} blocked: resolve duplicate receipts first.",
+                "warning",
+            )
+            return redirect("/receipts/expenses?flash=payout_duplicates")
         settlement, receipts = exp_store.create_prepared_settlement_for_engineer(
             db,
             engineer_id=engineer_id,
@@ -23912,6 +24034,13 @@ body {{ background:#f7f6f3 !important; }}
                 for r in receipts
             ):
                 return redirect("/receipts/expenses?flash=not_found")
+        duplicate_blocks = _expense_unresolved_duplicate_blocks(eng, receipts)
+        if duplicate_blocks:
+            _feed.push(
+                f"Payout {settlement.get('reference')} blocked: resolve duplicate receipts before marking it paid.",
+                "warning",
+            )
+            return redirect("/receipts/expenses?flash=payout_duplicates")
         paid_on = (request.form.get("paid_on") or "").strip()
         if not paid_on:
             paid_on = dt.datetime.now(dt.timezone.utc).date().isoformat()
@@ -23952,6 +24081,13 @@ body {{ background:#f7f6f3 !important; }}
                 for r in receipts
             ):
                 return redirect("/receipts/expenses?flash=not_found")
+        duplicate_blocks = _expense_unresolved_duplicate_blocks(eng, receipts)
+        if duplicate_blocks:
+            _feed.push(
+                f"Payout {settlement.get('reference')} blocked: resolve duplicate receipts before sending it to Xero.",
+                "warning",
+            )
+            return redirect("/receipts/expenses?flash=payout_duplicates")
         bill_id = _create_xero_bill_for_settlement(
             eng, settlement, receipts, force=True
         )
