@@ -215,6 +215,15 @@ def _job_folder_name(event: dict[str, Any]) -> str:
 
 
 def ensure_event_drive_folder(config: AppConfig, event_key: str, category: str) -> tuple[str, dict[str, Any]]:
+    return ensure_event_drive_folder_for_upload(config, event_key, category, "")
+
+
+def ensure_event_drive_folder_for_upload(
+    config: AppConfig,
+    event_key: str,
+    category: str,
+    category_detail: str = "",
+) -> tuple[str, dict[str, Any]]:
     settings = get_job_photo_settings(config.admin_db_file)
     parent = str(settings.get("drive_parent_folder_id") or "").strip() or "root"
     creds = load_admin_credentials(config)
@@ -227,6 +236,9 @@ def ensure_event_drive_folder(config: AppConfig, event_key: str, category: str) 
     job_id = _find_or_create_folder(drive, _job_folder_name(event), customers_id)
     category_name = CATEGORY_LABELS.get(category, CATEGORY_LABELS[CATEGORY_CUSTOMER])
     category_id = _find_or_create_folder(drive, category_name, job_id)
+    detail = " ".join((category_detail or "").strip().lower().split())
+    if category == CATEGORY_BEFORE_AFTER and detail in {"before", "after"}:
+        category_id = _find_or_create_folder(drive, detail.title(), category_id)
     return category_id, event
 
 
@@ -238,9 +250,13 @@ def upload_job_photo(
     filename: str,
     mime_type: str,
     category: str,
+    category_detail: str = "",
 ) -> dict[str, Any]:
     category = category if category in CATEGORY_LABELS else CATEGORY_CUSTOMER
-    folder_id, event = ensure_event_drive_folder(config, event_key, category)
+    detail = " ".join((category_detail or "").strip().lower().split())
+    if category != CATEGORY_BEFORE_AFTER or detail not in {"before", "after"}:
+        detail = ""
+    folder_id, event = ensure_event_drive_folder_for_upload(config, event_key, category, detail)
     creds = load_admin_credentials(config)
     if not creds:
         raise ValueError("Google is not connected.")
@@ -258,6 +274,7 @@ def upload_job_photo(
     )
     row = {
         "id": created.get("id", ""),
+        "file_id": created.get("id", ""),
         "name": created.get("name", safe_filename),
         "mime_type": created.get("mimeType", mime_type or ""),
         "web_view_link": created.get("webViewLink", ""),
@@ -265,6 +282,7 @@ def upload_job_photo(
         "created_time": created.get("createdTime", ""),
         "uploaded_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "category": category,
+        "category_detail": detail,
         "category_label": CATEGORY_LABELS.get(category, CATEGORY_LABELS[CATEGORY_CUSTOMER]),
     }
     _save_job_photo(config.admin_db_file, event_key, row)

@@ -32425,6 +32425,25 @@ document.addEventListener('submit', function(e) {{
             if processed
             else f"<option value='{CATEGORY_CUSTOMER}'>{escape(CATEGORY_LABELS[CATEGORY_CUSTOMER])}</option>"
         )
+        before_after_switch = (
+            """
+            <fieldset id="before-after-switch" class="rounded-2xl border border-gray-200 bg-white p-3">
+              <legend class="px-1 text-sm font-bold text-gray-800">Stage</legend>
+              <div class="grid grid-cols-2 gap-2">
+                <label class="cursor-pointer rounded-xl border border-sky-200 bg-sky-50 px-3 py-3 text-center text-sm font-bold text-sky-900">
+                  <input type="radio" name="category_detail" value="before" class="sr-only" checked>
+                  <span>Before</span>
+                </label>
+                <label class="cursor-pointer rounded-xl border border-gray-200 bg-white px-3 py-3 text-center text-sm font-bold text-gray-700">
+                  <input type="radio" name="category_detail" value="after" class="sr-only">
+                  <span>After</span>
+                </label>
+              </div>
+            </fieldset>
+            """
+            if processed
+            else ""
+        )
         existing = (
             f"<a href='/jp/{escape(code)}' class='inline-flex items-center justify-center rounded-xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm font-bold text-sky-800'>View {len(photos)} saved photo{'s' if len(photos) != 1 else ''}</a>"
             if photos
@@ -32436,22 +32455,123 @@ document.addEventListener('submit', function(e) {{
           <h1 class="mt-1 text-2xl font-bold text-gray-950">{escape(title)}</h1>
           <p class="mt-1 text-sm text-gray-500">{escape(date_label)}</p>
           <p class="mt-4 rounded-2xl border border-sky-100 bg-sky-50 px-4 py-3 text-sm font-semibold text-sky-900">{escape(upload_hint)}</p>
-          <form method="post" enctype="multipart/form-data" class="mt-6 space-y-4">
+          <form id="job-photo-form" method="post" enctype="multipart/form-data" class="mt-6 space-y-4">
             <label class="block text-sm font-bold text-gray-800">Photo type
               <select name="category" class="mt-2 block w-full rounded-xl border border-gray-300 px-3 py-3 text-base">
                 {category_options}
               </select>
             </label>
-            <label class="block rounded-2xl border-2 border-dashed border-sky-200 bg-sky-50/60 p-5 text-center">
-              <span class="block text-sm font-bold text-sky-900">Choose photos or videos</span>
-              <span class="mt-1 block text-xs text-sky-700">{escape(file_hint)} Camera or photo library both work.</span>
-              <input required type="file" name="photos" multiple accept="image/*,video/*" class="mt-4 block w-full text-sm">
-            </label>
-            <button class="w-full rounded-2xl bg-sky-700 px-5 py-4 text-base font-bold text-white shadow-sm">Upload to Drive</button>
+            {before_after_switch}
+            <div class="grid gap-3 sm:grid-cols-2">
+              <label class="block rounded-2xl border-2 border-dashed border-sky-200 bg-sky-50/60 p-5 text-center">
+                <span class="block text-sm font-bold text-sky-900">Choose one or more files</span>
+                <span class="mt-1 block text-xs text-sky-700">{escape(file_hint)}</span>
+                <input id="job-photo-files" type="file" name="photos" multiple accept="image/*,video/*" class="mt-4 block w-full text-sm">
+              </label>
+              <button id="job-photo-camera-button" type="button" class="rounded-2xl border-2 border-sky-200 bg-white p-5 text-center text-sky-900 shadow-sm">
+                <span class="block text-sm font-bold">Open camera</span>
+                <span class="mt-1 block text-xs text-sky-700">Take a picture or video now.</span>
+              </button>
+            </div>
+            <input id="job-photo-camera" type="file" name="photos" accept="image/*,video/*" capture="environment" class="hidden">
+            <button id="job-photo-upload-button" class="w-full rounded-2xl bg-sky-700 px-5 py-4 text-base font-bold text-white shadow-sm">Upload selected</button>
           </form>
-          <div class="mt-4 flex flex-wrap gap-3">{existing}</div>
+          <div id="job-photo-progress" class="mt-4 hidden rounded-2xl border border-sky-100 bg-sky-50 p-4">
+            <div class="flex items-center justify-between gap-3 text-sm font-bold text-sky-900">
+              <span id="job-photo-progress-label">Uploading...</span>
+              <span id="job-photo-progress-percent">0%</span>
+            </div>
+            <div class="mt-3 h-3 overflow-hidden rounded-full bg-white">
+              <div id="job-photo-progress-bar" class="h-full w-0 rounded-full bg-sky-700 transition-all"></div>
+            </div>
+            <p class="mt-2 text-xs text-sky-700">You can keep choosing more photos while this finishes.</p>
+          </div>
+          <div id="job-photo-links" class="mt-4 flex flex-wrap gap-3">{existing}</div>
           <p class="mt-5 text-xs leading-relaxed text-gray-500">Files are saved to Google Drive in this job's customer folder. This app keeps only the Drive file ID and upload details.</p>
         </section>
+        <script>
+        (function() {{
+          var form = document.getElementById('job-photo-form');
+          var category = form && form.querySelector('select[name="category"]');
+          var stage = document.getElementById('before-after-switch');
+          var fileInput = document.getElementById('job-photo-files');
+          var cameraInput = document.getElementById('job-photo-camera');
+          var cameraButton = document.getElementById('job-photo-camera-button');
+          var progress = document.getElementById('job-photo-progress');
+          var bar = document.getElementById('job-photo-progress-bar');
+          var pct = document.getElementById('job-photo-progress-percent');
+          var label = document.getElementById('job-photo-progress-label');
+          var links = document.getElementById('job-photo-links');
+          function updateStage() {{
+            if (!stage || !category) return;
+            stage.style.display = category.value === '{CATEGORY_BEFORE_AFTER}' ? 'block' : 'none';
+          }}
+          function updateRadios() {{
+            if (!stage) return;
+            stage.querySelectorAll('label').forEach(function(lbl) {{
+              var input = lbl.querySelector('input');
+              if (input && input.checked) {{
+                lbl.className = 'cursor-pointer rounded-xl border border-sky-200 bg-sky-50 px-3 py-3 text-center text-sm font-bold text-sky-900';
+              }} else {{
+                lbl.className = 'cursor-pointer rounded-xl border border-gray-200 bg-white px-3 py-3 text-center text-sm font-bold text-gray-700';
+              }}
+            }});
+          }}
+          function selectedFiles(input) {{
+            return input && input.files && input.files.length ? input.files : null;
+          }}
+          function upload(files) {{
+            if (!files || !files.length) return;
+            var fd = new FormData();
+            fd.append('category', category ? category.value : '{CATEGORY_CUSTOMER}');
+            var checked = form.querySelector('input[name="category_detail"]:checked');
+            if (checked) fd.append('category_detail', checked.value);
+            Array.prototype.forEach.call(files, function(file) {{ fd.append('photos', file); }});
+            progress.classList.remove('hidden');
+            label.textContent = 'Uploading ' + files.length + ' file' + (files.length === 1 ? '' : 's') + '...';
+            bar.style.width = '0%';
+            pct.textContent = '0%';
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', window.location.pathname);
+            xhr.setRequestHeader('X-Requested-With', 'fetch');
+            xhr.upload.onprogress = function(e) {{
+              if (!e.lengthComputable) return;
+              var n = Math.max(1, Math.min(99, Math.round((e.loaded / e.total) * 100)));
+              bar.style.width = n + '%';
+              pct.textContent = n + '%';
+            }};
+            xhr.onload = function() {{
+              if (xhr.status >= 200 && xhr.status < 300) {{
+                bar.style.width = '100%';
+                pct.textContent = '100%';
+                label.textContent = 'Uploaded to Google Drive.';
+                fileInput.value = '';
+                cameraInput.value = '';
+                try {{
+                  var data = JSON.parse(xhr.responseText || '{{}}');
+                  if (links && data.gallery_url && !links.querySelector('a')) {{
+                    links.innerHTML = '<a href="' + data.gallery_url + '" class="inline-flex items-center justify-center rounded-xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm font-bold text-sky-800">View saved photos</a>';
+                  }}
+                }} catch (err) {{}}
+              }} else {{
+                label.textContent = 'Upload failed. Try again.';
+              }}
+            }};
+            xhr.onerror = function() {{ label.textContent = 'Upload failed. Check signal and try again.'; }};
+            xhr.send(fd);
+          }}
+          if (category) category.addEventListener('change', updateStage);
+          if (stage) stage.addEventListener('change', updateRadios);
+          if (cameraButton && cameraInput) cameraButton.addEventListener('click', function() {{ cameraInput.click(); }});
+          if (cameraInput) cameraInput.addEventListener('change', function() {{ upload(selectedFiles(cameraInput)); }});
+          if (form) form.addEventListener('submit', function(e) {{
+            e.preventDefault();
+            upload(selectedFiles(fileInput));
+          }});
+          updateStage();
+          updateRadios();
+        }})();
+        </script>
         """
         return _job_photo_public_page(body, title=upload_title)
 
@@ -32466,8 +32586,13 @@ document.addEventListener('submit', function(e) {{
             category = CATEGORY_CUSTOMER
         if category not in CATEGORY_LABELS:
             category = CATEGORY_BEFORE_AFTER if processed else CATEGORY_CUSTOMER
+        category_detail = (request.form.get("category_detail") or "").strip().lower()
+        if category != CATEGORY_BEFORE_AFTER or category_detail not in {"before", "after"}:
+            category_detail = ""
         files = [f for f in request.files.getlist("photos") if f and (f.filename or "").strip()]
         if not files:
+            if request.headers.get("X-Requested-With") == "fetch":
+                return jsonify({"ok": False, "error": "No files selected.", "uploaded": 0}), 400
             return redirect(f"/j/{urllib.parse.quote(code)}")
         uploaded = 0
         for file in files[:50]:
@@ -32481,6 +32606,7 @@ document.addEventListener('submit', function(e) {{
                 filename=file.filename or "job-photo",
                 mime_type=file.mimetype or "application/octet-stream",
                 category=category,
+                category_detail=category_detail,
             )
             uploaded += 1
         try:
@@ -32502,6 +32628,8 @@ document.addEventListener('submit', function(e) {{
                 update_event_description(config, event_id, new_desc, calendar_id=cal_id)
         except Exception as exc:
             print(f"[job-photos] Upload succeeded but calendar link refresh failed: {exc}", flush=True)
+        if request.headers.get("X-Requested-With") == "fetch":
+            return jsonify({"ok": True, "uploaded": uploaded, "gallery_url": f"/jp/{code}"})
         return redirect(f"/jp/{urllib.parse.quote(code)}?uploaded={uploaded}")
 
     @app.get("/jp/<code>")
@@ -32529,9 +32657,17 @@ document.addEventListener('submit', function(e) {{
                 continue
             tiles = []
             for item in items:
-                file_id = escape(str(item.get("file_id") or ""))
+                file_id = escape(str(item.get("file_id") or item.get("id") or ""))
                 name = escape(str(item.get("name") or "Photo"))
                 mime = str(item.get("mime_type") or "")
+                detail = str(item.get("category_detail") or "").strip().title()
+                detail_badge = (
+                    "<span class='mt-2 inline-flex rounded-full bg-sky-100 px-2 py-1 text-[11px] font-bold text-sky-800'>"
+                    + escape(detail)
+                    + "</span>"
+                    if category == CATEGORY_BEFORE_AFTER and detail in {"Before", "After"}
+                    else ""
+                )
                 src = f"/job-photo-file/{escape(code)}/{file_id}"
                 if mime.startswith("video/"):
                     media = f"<video controls preload='metadata' class='h-full w-full rounded-xl object-contain bg-black' src='{src}'></video>"
@@ -32541,7 +32677,8 @@ document.addEventListener('submit', function(e) {{
                     "<figure class='rounded-2xl border border-gray-200 bg-gray-50 p-2 shadow-sm'>"
                     "<div class='aspect-[4/5] overflow-hidden rounded-xl bg-white'>" + media + "</div>"
                     "<figcaption class='mt-2 truncate px-1 text-xs text-gray-500'>" + name + "</figcaption>"
-                    "</figure>"
+                    + detail_badge
+                    + "</figure>"
                 )
             sections.append(
                 "<section class='mt-6'><h2 class='text-sm font-bold uppercase tracking-wide text-gray-600'>"
@@ -32573,7 +32710,10 @@ document.addEventListener('submit', function(e) {{
         _link, event_key, _event = _job_photo_event_from_code(code)
         if not event_key:
             return ("Photo link not available", 404)
-        known_ids = {str(item.get("file_id") or "") for item in list_job_photos(config.admin_db_file, event_key)}
+        known_ids = {
+            str(item.get("file_id") or item.get("id") or "")
+            for item in list_job_photos(config.admin_db_file, event_key)
+        }
         if file_id not in known_ids:
             return ("File not found", 404)
         data, mime, name = get_drive_file_media(config, file_id)
