@@ -171,6 +171,32 @@ from . import vehicle_store
 from . import xero_statement_feed as xero_statement
 from . import plaid_match
 from . import gmail_client as _gmail_mod
+
+
+def _google_non_gmail_scopes(config) -> list[str]:
+    return [
+        scope
+        for scope in (config.google_admin_scopes or config.google_scopes or [])
+        if scope != _gmail_mod.GMAIL_READONLY_SCOPE
+    ]
+
+
+def _saved_google_token_scopes(config) -> set[str]:
+    try:
+        token_path = Path(config.google_admin_token_file)
+        if not token_path.exists():
+            return set()
+        data = json.loads(token_path.read_text()) or {}
+        return set(data.get("scopes") or [])
+    except Exception:
+        return set()
+
+
+def _google_core_authorised(config) -> bool:
+    saved = _saved_google_token_scopes(config)
+    required = set(_google_non_gmail_scopes(config))
+    return bool(required and required.issubset(saved))
+
 from .cashflows_reconciliation import (
     CashflowsClient,
     CashflowsReconciliationService,
@@ -6612,7 +6638,11 @@ def create_app() -> Flask:
             return redirect(url_for("index"))
         try:
             dynamic_google_redirect = _current_base_url() + "/oauth/callback"
-            auth_url, state = oauth_authorization_url(config, redirect_uri=dynamic_google_redirect)
+            auth_url, state = oauth_authorization_url(
+                config,
+                redirect_uri=dynamic_google_redirect,
+                scopes=_google_non_gmail_scopes(config),
+            )
         except Exception as exc:
             session["save_notice"] = f"error:Could not start Google OAuth: {exc}"
             return redirect(url_for("index"))
@@ -6643,6 +6673,7 @@ def create_app() -> Flask:
                 creds = oauth_exchange_code(
                     config, state=state, code=code,
                     redirect_uri=dynamic_google_redirect,
+                    scopes=_gmail_scopes(),
                 )
                 aid = str(gmail_pending.get("account_id") or "").strip() or secrets.token_urlsafe(8)
                 token_path = _gmail_token_dir() / f"{aid}.json"
@@ -6684,6 +6715,11 @@ def create_app() -> Flask:
             get_json_setting(config.admin_db_file, "oauth_pending_state", "")
         ).strip()
         state_ok = bool(state) and (state == expected_session or state == expected_store)
+        if code and state and not state_ok and not google_error and _google_core_authorised(config):
+            print("[OAuth Callback] Ignoring stale Google callback; core Google token is already authorised.")
+            session["logged_in"] = True
+            session["save_notice"] = "success:Google is already connected."
+            return redirect(url_for("index"))
         if not code or not state_ok:
             error_detail = google_error or ("missing code" if not code else "state mismatch")
             print(f"[OAuth Callback] Failing: code={'present' if code else 'MISSING'}, state_ok={state_ok}, google_error={google_error!r}")
@@ -6702,7 +6738,13 @@ def create_app() -> Flask:
             or _current_base_url() + "/oauth/callback"
         )
         try:
-            creds = oauth_exchange_code(config, state=state, code=code, redirect_uri=dynamic_google_redirect)
+            creds = oauth_exchange_code(
+                config,
+                state=state,
+                code=code,
+                redirect_uri=dynamic_google_redirect,
+                scopes=_google_non_gmail_scopes(config),
+            )
         except Exception as exc:
             print(f"[OAuth Callback] token exchange failed: {exc}")
             return _page(f"""
@@ -7506,15 +7548,9 @@ function toggleReceiptsEnabled(requested) {{
         sheets_ok, sheets_msg = _sheets_status_data(config, creds, target)
         xero_ok, xero_msg, xero_tenant = _xero_status_data(config)
         google_ok = creds is not None
-        google_saved_scopes = set()
-        try:
-            _google_token_path = Path(config.google_admin_token_file)
-            if _google_token_path.exists():
-                google_saved_scopes = set((json.loads(_google_token_path.read_text()) or {}).get("scopes") or [])
-        except Exception:
-            google_saved_scopes = set()
+        google_saved_scopes = _saved_google_token_scopes(config)
         google_missing_scopes = [
-            scope for scope in (config.google_admin_scopes or config.google_scopes or [])
+            scope for scope in _google_non_gmail_scopes(config)
             if scope not in google_saved_scopes
         ]
         google_fully_authorised = bool(google_ok and not google_missing_scopes)
@@ -29931,7 +29967,9 @@ body {{ background:#f7f6f3 !important; }}
         try:
             dynamic_google_redirect = _current_base_url() + "/oauth/callback"
             auth_url, state = oauth_authorization_url(
-                config, redirect_uri=dynamic_google_redirect
+                config,
+                redirect_uri=dynamic_google_redirect,
+                scopes=_gmail_scopes(),
             )
             aid = secrets.token_urlsafe(8)
             set_json_setting(

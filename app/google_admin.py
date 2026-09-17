@@ -51,11 +51,12 @@ def build_sheets_service_from_creds(creds: Credentials):
 def oauth_authorization_url(
     config: AppConfig,
     redirect_uri: str | None = None,
+    scopes: list[str] | None = None,
 ) -> tuple[str, str]:
     uri = redirect_uri or config.google_oauth_redirect_uri
     flow = Flow.from_client_secrets_file(
         config.google_credentials_file,
-        scopes=_scopes(config),
+        scopes=scopes or _scopes(config),
         redirect_uri=uri,
     )
     state = secrets.token_urlsafe(24)
@@ -72,11 +73,12 @@ def oauth_exchange_code(
     state: str,
     code: str,
     redirect_uri: str | None = None,
+    scopes: list[str] | None = None,
 ) -> Credentials:
     uri = redirect_uri or config.google_oauth_redirect_uri
     flow = Flow.from_client_secrets_file(
         config.google_credentials_file,
-        scopes=_scopes(config),
+        scopes=scopes or _scopes(config),
         state=state,
         redirect_uri=uri,
     )
