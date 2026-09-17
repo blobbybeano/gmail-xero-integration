@@ -261,6 +261,12 @@ def run() -> None:
     _PAST_EVENT_AUTO_XERO_HOURS = max(
         int(os.getenv("PAST_EVENT_AUTO_XERO_HOURS", "24") or "24"), 1
     )
+    _RECENT_CREATED_PREFILL_HOURS = max(
+        int(os.getenv("RECENT_CREATED_PREFILL_HOURS", "24") or "24"), 1
+    )
+    _RECENT_UPDATE_SWEEP_HOURS = max(
+        int(os.getenv("RECENT_UPDATE_SWEEP_HOURS", "24") or "24"), 1
+    )
     _DRAFT_CLEANUP_PER_HOURLY = max(
         int(os.getenv("DRAFT_CLEANUP_PER_HOURLY", "1") or "1"), 1
     )
@@ -1956,6 +1962,19 @@ def run() -> None:
                             calendar_id=calendar_id,
                         )
                     )
+                elif _is_scheduled_maintenance_cycle:
+                    # Hourly safety net: if Google misses/delays a webhook for a
+                    # future booking, the normal today/tomorrow scan will not see
+                    # it. A bounded updatedMin sweep catches recently-created
+                    # future work without broad-scanning every diary slot.
+                    cal_events.extend(
+                        list_updated_events(
+                            config=config,
+                            updated_min=now
+                            - dt.timedelta(hours=_RECENT_UPDATE_SWEEP_HOURS),
+                            calendar_id=calendar_id,
+                        )
+                    )
                 for _time_min, _time_max in _scan_windows:
                     cal_events.extend(
                         list_recent_events(
@@ -2226,10 +2245,20 @@ def run() -> None:
                     except ValueError:
                         updated_at = None
 
-                # Only touch events created after this run started.
-                # If created time is missing, fall back to updated time.
+                # Only touch events created after this run started. Also allow
+                # very recent blank events so a restart/deploy does not make a
+                # newly-booked future job permanently miss its notes template.
                 should_prefill = False
+                _recent_created_prefill_floor = now - dt.timedelta(
+                    hours=_RECENT_CREATED_PREFILL_HOURS
+                )
                 if created_at and created_at >= run_started_at:
+                    should_prefill = True
+                elif (
+                    created_at
+                    and created_at >= _recent_created_prefill_floor
+                    and not (event.get("description") or "").strip()
+                ):
                     should_prefill = True
                 elif not created_at and updated_at and updated_at >= run_started_at:
                     should_prefill = True
