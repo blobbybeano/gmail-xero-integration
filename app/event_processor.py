@@ -9,7 +9,8 @@ APP_LEDGER_START = "[app]"
 APP_LEDGER_END = "[/app]"
 RECEIPT_LINK_LABEL = "Submit transaction receipt:"
 JOB_PHOTO_UPLOAD_LABEL = "Photos upload:"
-JOB_PHOTO_ADD_LABEL = "Add job photos:"
+JOB_PHOTO_ADD_LABEL = "Technician photos:"
+JOB_PHOTO_LEGACY_ADD_LABEL = "Add job photos:"
 JOB_PHOTO_VIEW_LABEL = "View photos:"
 
 # Engineering note:
@@ -1959,6 +1960,7 @@ def upsert_job_photo_links(
     labels = (
         JOB_PHOTO_UPLOAD_LABEL.lower(),
         JOB_PHOTO_ADD_LABEL.lower(),
+        JOB_PHOTO_LEGACY_ADD_LABEL.lower(),
         JOB_PHOTO_VIEW_LABEL.lower(),
     )
     lines = [

@@ -32408,11 +32408,10 @@ document.addEventListener('submit', function(e) {{
         title, date_label = _job_photo_event_title(event)
         processed = job_photo_event_is_processed(event.get("description") or "")
         photos = list_job_photos(config.admin_db_file, event_key)
-        upload_title = "Add job photos" if processed else "Upload customer photos"
+        upload_title = "Upload technician photos" if processed else "Upload customer photos"
         category_options = (
             f"<option value='{CATEGORY_BEFORE_AFTER}'>{escape(CATEGORY_LABELS[CATEGORY_BEFORE_AFTER])}</option>"
             f"<option value='{CATEGORY_UPDATE}'>{escape(CATEGORY_LABELS[CATEGORY_UPDATE])}</option>"
-            f"<option value='{CATEGORY_CUSTOMER}'>{escape(CATEGORY_LABELS[CATEGORY_CUSTOMER])}</option>"
             if processed
             else f"<option value='{CATEGORY_CUSTOMER}'>{escape(CATEGORY_LABELS[CATEGORY_CUSTOMER])}</option>"
         )
