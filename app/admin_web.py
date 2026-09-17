@@ -24287,18 +24287,39 @@ body {{ background:#f7f6f3 !important; }}
     def expense_admin_receipt_accept_duplicate(rid: str):
         """Mark a pending receipt as a confirmed duplicate without deleting it."""
         db = config.admin_db_file
+        wants_json = (
+            request.headers.get("X-Requested-With") == "fetch"
+            or "application/json" in (request.headers.get("Accept") or "")
+        )
         rec = exp_store.get_receipt(db, rid)
         if not rec:
+            if wants_json:
+                return jsonify({"ok": False, "error": "Receipt was not found."}), 404
             return redirect("/receipts/expenses?flash=not_found")
         status = (rec.get("status") or "").strip().lower()
+        if status == "ignored" and "duplicate" in (rec.get("xero_error") or "").lower():
+            if wants_json:
+                return jsonify({
+                    "ok": True,
+                    "id": rid,
+                    "status": "ignored",
+                    "already_ignored": True,
+                })
+            return_to = request.form.get("return_to") or "/receipts/expenses"
+            return redirect(return_to + ("&" if "?" in return_to else "?") + "flash=updated")
         if (
             status not in {"pending_review", "approved"}
             or (rec.get("xero_id") or "").strip()
             or rec.get("settlement_id")
         ):
-            return _exp_error_page(
+            message = (
                 "This receipt has already been submitted or linked to a payment, "
-                "so it cannot be marked as a duplicate.",
+                "so it cannot be marked as a duplicate."
+            )
+            if wants_json:
+                return jsonify({"ok": False, "error": message}), 400
+            return _exp_error_page(
+                message,
                 400,
             )
         exp_store.update_receipt(
@@ -24306,10 +24327,6 @@ body {{ background:#f7f6f3 !important; }}
             rid,
             status="ignored",
             xero_error="Accepted as duplicate by admin; not submitted to Xero.",
-        )
-        wants_json = (
-            request.headers.get("X-Requested-With") == "fetch"
-            or "application/json" in (request.headers.get("Accept") or "")
         )
         if wants_json:
             return jsonify({"ok": True, "id": rid, "status": "ignored"})
