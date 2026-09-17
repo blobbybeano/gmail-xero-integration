@@ -32479,11 +32479,6 @@ document.addEventListener('submit', function(e) {{
         photos = list_job_photos(config.admin_db_file, event_key)
         upload_title = "Upload technician photos" if processed else "Upload customer photos"
         hub_title = "Job photos"
-        upload_hint = (
-            "Add before/after pictures, access photos, technical pictures, or short update videos for the completed job."
-            if processed
-            else "Add photos supplied by the customer before the draft is processed."
-        )
         file_hint = (
             "Choose before/after photos, technical photos, or videos."
             if processed
@@ -32495,6 +32490,8 @@ document.addEventListener('submit', function(e) {{
             if processed
             else f"<option value='{CATEGORY_CUSTOMER}'>{escape(CATEGORY_LABELS[CATEGORY_CUSTOMER])}</option>"
         )
+        view_card_tone = "border-emerald-200 bg-emerald-50 text-emerald-950" if photos else "border-gray-200 bg-white text-gray-900"
+        view_count_tone = "text-emerald-700" if photos else "text-gray-500"
         before_after_switch = (
             """
             <fieldset id="before-after-switch" class="rounded-2xl border border-gray-200 bg-white p-3">
@@ -32514,42 +32511,46 @@ document.addEventListener('submit', function(e) {{
             if processed
             else ""
         )
-        existing = (
-            f"<a href='/jp/{escape(code)}' class='inline-flex items-center justify-center rounded-xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm font-bold text-sky-800'>View {len(photos)} saved photo{'s' if len(photos) != 1 else ''}</a>"
-            if photos
-            else f"<a href='/jp/{escape(code)}' class='inline-flex items-center justify-center rounded-xl border border-gray-200 bg-white px-4 py-3 text-sm font-bold text-gray-600'>View photos</a>"
-        )
         body = f"""
         <section class="rounded-3xl border border-gray-200 bg-white p-5 shadow-sm">
           <p class="text-xs font-semibold uppercase tracking-wide text-sky-700">{escape(hub_title)}</p>
           <h1 class="mt-1 text-2xl font-bold text-gray-950">{escape(title)}</h1>
           <p class="mt-1 text-sm text-gray-500">{escape(date_label)}</p>
-          <div class="mt-5 grid gap-3 sm:grid-cols-2">
-            <a href="/jp/{escape(code)}" class="rounded-2xl border border-gray-200 bg-white px-4 py-4 text-sm font-bold text-gray-900 shadow-sm">View job photos<span class="mt-1 block text-xs font-semibold text-gray-500">{len(photos)} saved</span></a>
-            <a href="#job-photo-form" class="rounded-2xl border border-sky-200 bg-sky-50 px-4 py-4 text-sm font-bold text-sky-900 shadow-sm">{escape(upload_title)}<span class="mt-1 block text-xs font-semibold text-sky-700">Camera or file upload</span></a>
+          <div class="mt-5 grid gap-4">
+            <section class="rounded-2xl border {view_card_tone} p-4 shadow-sm">
+              <div class="flex items-center justify-between gap-3">
+                <div>
+                  <h2 class="text-base font-bold">View job photos</h2>
+                  <p id="job-photo-view-count" class="mt-1 text-xs font-semibold {view_count_tone}">{len(photos)} saved</p>
+                </div>
+                <a id="job-photo-gallery-link" href="/jp/{escape(code)}" class="rounded-xl bg-white/80 px-4 py-3 text-sm font-bold text-gray-900 shadow-sm ring-1 ring-black/5">Open</a>
+              </div>
+            </section>
+            <section class="rounded-2xl border border-sky-200 bg-sky-50 p-4 shadow-sm">
+              <h2 class="text-base font-bold text-sky-950">{escape(upload_title)}</h2>
+              <form id="job-photo-form" method="post" enctype="multipart/form-data" class="mt-4 space-y-4">
+                <label class="block text-sm font-bold text-gray-800">Photo type
+                  <select name="category" class="mt-2 block w-full rounded-xl border border-sky-200 bg-white px-3 py-3 text-base">
+                    {category_options}
+                  </select>
+                </label>
+                {before_after_switch}
+                <div class="grid gap-3 sm:grid-cols-2">
+                  <label class="block rounded-2xl border-2 border-dashed border-sky-300 bg-white p-5 text-center">
+                    <span class="block text-sm font-bold text-sky-900">Choose one or more files</span>
+                    <span class="mt-1 block text-xs text-sky-700">{escape(file_hint)}</span>
+                    <input id="job-photo-files" type="file" name="photos" multiple accept="image/*,video/*" class="mt-4 block w-full text-sm">
+                  </label>
+                  <button id="job-photo-camera-button" type="button" class="rounded-2xl border-2 border-sky-300 bg-white p-5 text-center text-sky-900 shadow-sm">
+                    <span class="block text-sm font-bold">Open camera</span>
+                    <span class="mt-1 block text-xs text-sky-700">Take a picture or video now.</span>
+                  </button>
+                </div>
+                <input id="job-photo-camera" type="file" name="photos" accept="image/*,video/*" capture="environment" class="hidden">
+                <button id="job-photo-upload-button" class="w-full rounded-2xl bg-sky-700 px-5 py-4 text-base font-bold text-white shadow-sm">Upload selected</button>
+              </form>
+            </section>
           </div>
-          <p class="mt-4 rounded-2xl border border-sky-100 bg-sky-50 px-4 py-3 text-sm font-semibold text-sky-900">{escape(upload_hint)}</p>
-          <form id="job-photo-form" method="post" enctype="multipart/form-data" class="mt-6 space-y-4">
-            <label class="block text-sm font-bold text-gray-800">Photo type
-              <select name="category" class="mt-2 block w-full rounded-xl border border-gray-300 px-3 py-3 text-base">
-                {category_options}
-              </select>
-            </label>
-            {before_after_switch}
-            <div class="grid gap-3 sm:grid-cols-2">
-              <label class="block rounded-2xl border-2 border-dashed border-sky-200 bg-sky-50/60 p-5 text-center">
-                <span class="block text-sm font-bold text-sky-900">Choose one or more files</span>
-                <span class="mt-1 block text-xs text-sky-700">{escape(file_hint)}</span>
-                <input id="job-photo-files" type="file" name="photos" multiple accept="image/*,video/*" class="mt-4 block w-full text-sm">
-              </label>
-              <button id="job-photo-camera-button" type="button" class="rounded-2xl border-2 border-sky-200 bg-white p-5 text-center text-sky-900 shadow-sm">
-                <span class="block text-sm font-bold">Open camera</span>
-                <span class="mt-1 block text-xs text-sky-700">Take a picture or video now.</span>
-              </button>
-            </div>
-            <input id="job-photo-camera" type="file" name="photos" accept="image/*,video/*" capture="environment" class="hidden">
-            <button id="job-photo-upload-button" class="w-full rounded-2xl bg-sky-700 px-5 py-4 text-base font-bold text-white shadow-sm">Upload selected</button>
-          </form>
           <div id="job-photo-progress" class="mt-4 hidden rounded-2xl border border-sky-100 bg-sky-50 p-4">
             <div class="flex items-center justify-between gap-3 text-sm font-bold text-sky-900">
               <span id="job-photo-progress-label">Uploading...</span>
@@ -32560,7 +32561,6 @@ document.addEventListener('submit', function(e) {{
             </div>
             <p class="mt-2 text-xs text-sky-700">You can keep choosing more photos while this finishes.</p>
           </div>
-          <div id="job-photo-links" class="mt-4 flex flex-wrap gap-3">{existing}</div>
           <p class="mt-5 text-xs leading-relaxed text-gray-500">Files are saved to Google Drive in this job's customer folder. This app keeps only the Drive file ID and upload details.</p>
         </section>
         <script>
@@ -32575,7 +32575,8 @@ document.addEventListener('submit', function(e) {{
           var bar = document.getElementById('job-photo-progress-bar');
           var pct = document.getElementById('job-photo-progress-percent');
           var label = document.getElementById('job-photo-progress-label');
-          var links = document.getElementById('job-photo-links');
+          var viewCard = document.getElementById('job-photo-view-count');
+          var galleryLink = document.getElementById('job-photo-gallery-link');
           function updateStage() {{
             if (!stage || !category) return;
             stage.style.display = category.value === '{CATEGORY_BEFORE_AFTER}' ? 'block' : 'none';
@@ -32623,8 +32624,13 @@ document.addEventListener('submit', function(e) {{
                 cameraInput.value = '';
                 try {{
                   var data = JSON.parse(xhr.responseText || '{{}}');
-                  if (links && data.gallery_url && !links.querySelector('a')) {{
-                    links.innerHTML = '<a href="' + data.gallery_url + '" class="inline-flex items-center justify-center rounded-xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm font-bold text-sky-800">View saved photos</a>';
+                  if (galleryLink && data.gallery_url) {{
+                    galleryLink.href = data.gallery_url;
+                  }}
+                  if (viewCard) {{
+                    var count = data.photo_count || data.uploaded || files.length;
+                    viewCard.textContent = count + ' saved';
+                    viewCard.className = 'mt-1 text-xs font-semibold text-emerald-700';
                   }}
                 }} catch (err) {{}}
               }} else {{
@@ -32743,7 +32749,9 @@ document.addEventListener('submit', function(e) {{
         except Exception as exc:
             print(f"[job-photos] Upload succeeded but calendar link refresh failed: {exc}", flush=True)
         if request.headers.get("X-Requested-With") == "fetch":
-            return jsonify({"ok": True, "uploaded": uploaded, "gallery_url": f"/jp/{code}"})
+            photo_count = len(list_job_photos(config.admin_db_file, event_key))
+            print(f"[job-photos] Uploaded {uploaded} file(s) for {event_key}; total={photo_count}", flush=True)
+            return jsonify({"ok": True, "uploaded": uploaded, "photo_count": photo_count, "gallery_url": f"/jp/{code}"})
         return redirect(f"/jp/{urllib.parse.quote(code)}?uploaded={uploaded}")
 
     @app.get("/jp/<code>")

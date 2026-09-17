@@ -1989,6 +1989,8 @@ def upsert_job_photo_links(
         lines.pop()
     if upload_url:
         lines.append(f"{JOB_PHOTO_LABEL} {upload_url}")
+    if has_photos and gallery_url:
+        lines.append(f"{JOB_PHOTO_VIEW_LABEL} {gallery_url}")
     updated = "\n".join(lines).rstrip() + "\n"
     return preserve_app_ledger_suffix(updated, description)
 

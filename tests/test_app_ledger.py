@@ -95,9 +95,9 @@ App status: Sent - 39e93301
         )
 
         self.assertIn("Photos: https://app/j/abc", updated)
+        self.assertIn("View photos: https://app/jp/abc", updated)
         self.assertNotIn("Photos upload:", updated)
         self.assertNotIn("Technician photos:", updated)
-        self.assertNotIn("View photos:", updated)
         self.assertTrue(updated.rstrip().endswith("[app]s=sent;r=ok;fp=3c0562b811;x=1;w=none;inv=39e93301[/app]"))
 
 
