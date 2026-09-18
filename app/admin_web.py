@@ -32813,15 +32813,10 @@ document.addEventListener('submit', function(e) {{
                 <fieldset class="rounded-2xl border border-sky-200 bg-white p-3">
                   <legend class="px-1 text-sm font-bold text-gray-800">Stage</legend>
                   <div class="grid grid-cols-2 gap-2">
-                    <label class="job-stage-label cursor-pointer rounded-xl border border-sky-200 bg-sky-50 px-3 py-3 text-center text-sm font-bold text-sky-900">
-                      <input type="radio" name="job_photo_stage" value="before" class="sr-only" checked>
-                      <span>Before</span>
-                    </label>
-                    <label class="job-stage-label cursor-pointer rounded-xl border border-gray-200 bg-white px-3 py-3 text-center text-sm font-bold text-gray-700">
-                      <input type="radio" name="job_photo_stage" value="after" class="sr-only">
-                      <span>After</span>
-                    </label>
+                    <button type="button" class="job-stage-button rounded-xl border border-sky-200 bg-sky-50 px-3 py-3 text-center text-sm font-bold text-sky-900" data-stage="before" aria-pressed="true">Before</button>
+                    <button type="button" class="job-stage-button rounded-xl border border-gray-200 bg-white px-3 py-3 text-center text-sm font-bold text-gray-700" data-stage="after" aria-pressed="false">After</button>
                   </div>
+                  <input type="hidden" id="job-photo-stage-value" value="before">
                 </fieldset>
                 <label class="block rounded-2xl border-2 border-dashed border-sky-300 bg-white p-5 text-center">
                   <span class="block text-sm font-bold text-sky-900">Choose one or more files</span>
@@ -32868,16 +32863,18 @@ document.addEventListener('submit', function(e) {{
           var viewCard = document.getElementById('job-photo-view-count');
           var galleryLink = document.getElementById('job-photo-gallery-link');
           function currentStage() {{
-            var checked = document.querySelector('input[name="job_photo_stage"]:checked');
-            return checked ? checked.value : 'before';
+            var value = document.getElementById('job-photo-stage-value');
+            return value && value.value === 'after' ? 'after' : 'before';
           }}
           function updateRadios() {{
-            document.querySelectorAll('.job-stage-label').forEach(function(lbl) {{
-              var input = lbl.querySelector('input');
-              if (input && input.checked) {{
-                lbl.className = 'cursor-pointer rounded-xl border border-sky-200 bg-sky-50 px-3 py-3 text-center text-sm font-bold text-sky-900';
+            var active = currentStage();
+            document.querySelectorAll('.job-stage-button').forEach(function(btn) {{
+              var isActive = btn.dataset.stage === active;
+              btn.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+              if (isActive) {{
+                btn.className = 'job-stage-button rounded-xl border border-sky-200 bg-sky-50 px-3 py-3 text-center text-sm font-bold text-sky-900 ring-2 ring-sky-300';
               }} else {{
-                lbl.className = 'cursor-pointer rounded-xl border border-gray-200 bg-white px-3 py-3 text-center text-sm font-bold text-gray-700';
+                btn.className = 'job-stage-button rounded-xl border border-gray-200 bg-white px-3 py-3 text-center text-sm font-bold text-gray-700';
               }}
             }});
           }}
@@ -32933,8 +32930,12 @@ document.addEventListener('submit', function(e) {{
             xhr.onerror = function() {{ label.textContent = 'Upload failed. Check signal and try again.'; }};
             xhr.send(fd);
           }}
-          document.querySelectorAll('input[name="job_photo_stage"]').forEach(function(input) {{
-            input.addEventListener('change', updateRadios);
+          document.querySelectorAll('.job-stage-button').forEach(function(btn) {{
+            btn.addEventListener('click', function() {{
+              var value = document.getElementById('job-photo-stage-value');
+              if (value) value.value = btn.dataset.stage === 'after' ? 'after' : 'before';
+              updateRadios();
+            }});
           }});
           document.querySelectorAll('.job-photo-files').forEach(function(input) {{
             input.addEventListener('change', function() {{
