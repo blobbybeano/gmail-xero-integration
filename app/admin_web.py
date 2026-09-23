@@ -20825,6 +20825,7 @@ body {{ background:#f7f6f3 !important; }}
             # The checked set is submitted only from the explicit batch button,
             # keeping review fast and preventing hidden Xero bursts.
             return _review_done_redirect()
+        _process_approved_direct_receipts_to_xero(engineer_id=int(eng["id"]), limit=1)
         return redirect(f"/expenses/{token}?flash=approved")
 
     @app.post("/expenses/<token>/receipt/<rid>/accept-duplicate")
