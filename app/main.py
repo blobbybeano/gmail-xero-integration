@@ -2558,7 +2558,9 @@ def run() -> None:
                 if current_summary.startswith("🟢"):
                     _desc_now = event.get("description") or ""
                     _mail_retry_requested = bool(
-                        has_send and ("invoice send failed" in _desc_now.lower())
+                        has_send
+                        and ("invoice send failed" in _desc_now.lower())
+                        and not is_invoice_sent(state, event_key)
                     )
                     _mail_retry_invoice_id = get_invoice_for_event(state, event_key) or ""
                     if _mail_retry_requested and _mail_retry_invoice_id and xero_client:
