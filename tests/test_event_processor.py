@@ -249,6 +249,26 @@ class InvoiceSalesParsingTests(unittest.TestCase):
         self.assertIn("Check customer e-mail", updated)
         self.assertIn("SEND NOW (Y/N) =", updated)
 
+    def test_email_send_failure_clears_send_now_yes(self):
+        description = (
+            "[invoice]\n"
+            "Gutter cleaning = £100+VAT\n"
+            "[/invoice]\n"
+            "PROCESS DRAFT (Y/N) =Y\n\n"
+            "[app-status]\n"
+            "Invoice total (inc VAT): £120.00\n"
+            "PAYMENT TYPE (CARD/INVOICE) = INVOICE\n"
+            "SEND NOW (Y/N) =Y\n"
+            "[/app-status]"
+        )
+
+        updated = upsert_send_failure(description, "test send failure")
+
+        self.assertIn("PROCESS DRAFT (Y/N) =Y", updated)
+        self.assertIn("SEND NOW (Y/N) =", updated)
+        self.assertNotIn("SEND NOW (Y/N) =Y", updated)
+        self.assertFalse(send_choice_is_yes(updated))
+
     def test_mirrored_sales_above_marker_are_ignored(self):
         description = (
             "[invoice]\n"

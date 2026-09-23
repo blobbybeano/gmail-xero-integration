@@ -511,6 +511,28 @@ def clear_process_draft_yes(description: str | None) -> str:
     )
 
 
+def clear_send_now_yes(description: str | None) -> str:
+    """Clear SEND NOW yes after a failed send attempt.
+
+    A failed send is a human-action state. Leaving SEND NOW = Y in place lets
+    the poller keep retrying the same broken action and can burn Xero limits.
+    """
+    import re
+
+    text = (description or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not text:
+        return text
+
+    def repl(match: re.Match) -> str:
+        return match.group("prefix").rstrip() + " "
+
+    return re.sub(
+        r"(?im)^(?P<prefix>\s*SEND\s+NOW\s*\(\s*Y\s*/\s*N\s*\)\s*=\s*)(?:Y|YES)\s*$",
+        repl,
+        text,
+    )
+
+
 def _looks_like_invoice_line(line: str) -> bool:
     import re
 
@@ -1847,6 +1869,7 @@ def upsert_send_failure(
 ) -> str:
     STATUS_START = "[app-status]"
     STATUS_END = "[/app-status]"
+    description = clear_send_now_yes(description)
     cleaned = _status_base_lines(description)
     payment_type_missing = bool(reason and "payment type" in reason.lower())
     alert = "!!! PAYMENT TYPE EMPTY !!!!" if payment_type_missing else None
