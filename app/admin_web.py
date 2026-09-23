@@ -14366,7 +14366,6 @@ body {{ background:#f7f6f3 !important; }}
         feed_to_date = _d(feed_to)
         mismatch_rows = []
         duplicate_rows = []
-        auto_ignored_duplicate_keys: set[str] = set()
 
         def _has_exact_card_feed_line(row: dict) -> bool:
             """True when the uploaded card feed already contains this payment.
@@ -14409,37 +14408,14 @@ body {{ background:#f7f6f3 !important; }}
                 if rec_has_clean_xero_link:
                     continue
                 if _has_exact_card_feed_line(row):
-                    if (
-                        status in {"pending_review", "approved"}
-                        and not (rec.get("xero_id") or "").strip()
-                        and not rec.get("settlement_id")
-                    ):
-                        rid = str(rec.get("id") or "")
-                        if rid:
-                            try:
-                                exp_store.update_receipt(
-                                    db,
-                                    rid,
-                                    status="ignored",
-                                    xero_error=(
-                                        "Auto-ignored duplicate: the uploaded "
-                                        "card feed already has this exact date "
-                                        "and amount covered by another receipt."
-                                    ),
-                                )
-                                auto_ignored_duplicate_keys.add(str(row.get("key") or ""))
-                            except Exception:
-                                duplicate_rows.append(row)
-                        continue
+                    # This view is diagnostic only. It must not silently mutate
+                    # receipts: an exact card-feed date/amount means "check this",
+                    # not "ignore it", because the receipt may still need to be
+                    # attached to Xero or submitted as a Spend Money item.
                     duplicate_rows.append(row)
                     continue
                 if status in {"approved", "submitted", "failed"}:
                     mismatch_rows.append(row)
-        if auto_ignored_duplicate_keys:
-            receipt_only_rows = [
-                row for row in receipt_only_rows
-                if str(row.get("key") or "") not in auto_ignored_duplicate_keys
-            ]
         mismatch_keys = {str(row.get("key") or "") for row in mismatch_rows}
         duplicate_keys = {str(row.get("key") or "") for row in duplicate_rows}
 
