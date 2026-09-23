@@ -2238,8 +2238,10 @@ def _get_xero_expense_accounts(
     """Return (expense_accounts, warning).
 
     Expense accounts are the Xero accounts engineers code receipts against
-    (fuel, advertising, plant & hire, etc.). Filters to expense-style account
-    types and caches the result for _XERO_CACHE_TTL seconds.
+    (fuel, advertising, plant & hire, etc.). This also includes real fixed
+    asset equipment accounts such as Plant and Machinery, because engineers
+    sometimes submit receipts for purchased equipment. Depreciation and other
+    contra-asset rows are still excluded.
 
     When Xero is paused (XERO_DISABLED), no live request is made; the last
     saved snapshot from the DB is returned so receipt category prediction can
@@ -2288,7 +2290,18 @@ def _get_xero_expense_accounts(
             for a in r.json().get("Accounts", []):
                 if a.get("Status") != "ACTIVE":
                     continue
-                if a.get("Type", "") in ("EXPENSE", "OVERHEADS", "DIRECTCOSTS"):
+                acct_type = str(a.get("Type") or "").strip().upper()
+                name_norm = _norm_account_choice(a.get("Name") or "")
+                is_fixed_equipment = (
+                    acct_type == "FIXED"
+                    and any(
+                        token in name_norm
+                        for token in ("plant", "machinery", "equipment", "tools")
+                    )
+                    and "depreciation" not in name_norm
+                    and "accumulated" not in name_norm
+                )
+                if acct_type in ("EXPENSE", "OVERHEADS", "DIRECTCOSTS") or is_fixed_equipment:
                     accts.append(a)
             accts.sort(key=lambda x: (x.get("Name") or "").lower())
             if db_path and accts:
