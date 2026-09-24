@@ -16338,7 +16338,7 @@ body {{ background:#f7f6f3 !important; }}
                         """
                         SELECT id, engineer_id, status, merchant, ocr_merchant,
                                purchased_on, amount_inc, xero_type, xero_id,
-                               created_at, stored_file
+                               xero_error, created_at, stored_file
                         FROM expense_receipts
                         WHERE id <> ?
                           AND purchased_on = ?
@@ -16358,10 +16358,16 @@ body {{ background:#f7f6f3 !important; }}
                         eng_name = ""
                     label = candidate.get("merchant") or candidate.get("ocr_merchant") or "Receipt"
                     status = candidate.get("status") or "saved"
-                    xero_note = (
-                        " · already linked to Xero"
-                        if (candidate.get("xero_id") or "").strip() else ""
-                    )
+                    candidate_xero_id = (candidate.get("xero_id") or "").strip()
+                    candidate_error = (candidate.get("xero_error") or "").strip()
+                    if candidate_xero_id:
+                        xero_note = " · already linked to Xero"
+                    elif "xero submit failed" in candidate_error.lower():
+                        xero_note = " · saved in app only - previous Xero submit failed"
+                    elif status in {"approved", "pending_review"}:
+                        xero_note = " · saved in app only - not yet in Xero"
+                    else:
+                        xero_note = " · saved in app only"
                     cand_id = str(candidate.get("id") or "")
                     can_view_candidate = (
                         not str(accept_url or "").startswith("/expenses/")
@@ -16397,7 +16403,12 @@ body {{ background:#f7f6f3 !important; }}
                     warnings.append(
                         f"<li><b>App duplicate:</b> {escape(label)}"
                         f" · {escape(eng_name or 'unknown user')} · "
-                        f"{escape(status)}{escape(xero_note)}{img_link}</li>"
+                        f"{escape(status)}{escape(xero_note)}"
+                        + (
+                            f" · {escape(candidate_error[:140])}"
+                            if candidate_error and not candidate_xero_id else ""
+                        )
+                        + f"{img_link}</li>"
                     )
             except Exception:
                 pass
