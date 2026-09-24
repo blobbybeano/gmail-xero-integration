@@ -523,12 +523,13 @@ def clear_send_now_yes(description: str | None) -> str:
     if not text:
         return text
 
-    def repl(match: re.Match) -> str:
-        return match.group("prefix").rstrip() + " "
-
     return re.sub(
-        r"(?im)^(?P<prefix>\s*SEND\s+NOW\s*\(\s*Y\s*/\s*N\s*\)\s*=\s*)(?:Y|YES)\s*$",
-        repl,
+        r"(?im)^"
+        r"(?P<lead>\s*(?:<b>)?\s*)"
+        r"(?P<prompt>SEND\s+NOW\s*\(\s*Y\s*/\s*N\s*\)\s*=\s*)"
+        r"(?:Y|YES)"
+        r"(?P<trail>\s*(?:</b>)?\s*)$",
+        lambda match: f"{match.group('lead')}{match.group('prompt').rstrip()} {match.group('trail')}",
         text,
     )
 
@@ -2272,6 +2273,7 @@ def preserve_latest_user_controls(
     latest = latest_description or ""
     if not proposed or not latest or proposed == latest:
         return proposed
+    proposed_is_send_failure = "invoice send failed" in proposed.lower()
 
     latest_controls: dict[str, str] = {}
     for line in _normalize_description(latest).splitlines():
@@ -2287,6 +2289,14 @@ def preserve_latest_user_controls(
     for line in proposed.splitlines():
         kind, canonical = _canonical_user_control_line(line)
         if kind and kind in latest_controls:
+            if (
+                proposed_is_send_failure
+                and kind == "send"
+                and canonical == SEND_PROMPT
+            ):
+                out.append(line)
+                seen.add(kind)
+                continue
             if kind in seen:
                 changed = True
                 continue

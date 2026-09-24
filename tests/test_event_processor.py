@@ -258,7 +258,7 @@ class InvoiceSalesParsingTests(unittest.TestCase):
             "[app-status]\n"
             "Invoice total (inc VAT): £120.00\n"
             "PAYMENT TYPE (CARD/INVOICE) = INVOICE\n"
-            "SEND NOW (Y/N) =Y\n"
+            "<b>SEND NOW (Y/N) =Y</b>\n"
             "[/app-status]"
         )
 
@@ -267,7 +267,30 @@ class InvoiceSalesParsingTests(unittest.TestCase):
         self.assertIn("PROCESS DRAFT (Y/N) =Y", updated)
         self.assertIn("SEND NOW (Y/N) =", updated)
         self.assertNotIn("SEND NOW (Y/N) =Y", updated)
+        self.assertNotIn("SEND NOW (Y/N) =Y</b>", updated)
         self.assertFalse(send_choice_is_yes(updated))
+
+    def test_send_failure_merge_does_not_restore_latest_send_yes(self):
+        proposed = (
+            "[app-status]\n"
+            "Invoice send failed ❌\n"
+            "Reason: Choose PAYMENT TYPE as CARD or INVOICE before SEND\n"
+            "SEND NOW (Y/N) =\n"
+            "[/app-status]"
+        )
+        latest = (
+            "[app-status]\n"
+            "Invoice send failed ❌\n"
+            "Reason: Choose PAYMENT TYPE as CARD or INVOICE before SEND\n"
+            "SEND NOW (Y/N) = Y\n"
+            "[/app-status]"
+        )
+
+        merged = preserve_latest_user_controls(proposed, latest)
+
+        self.assertIn("SEND NOW (Y/N) =", merged)
+        self.assertNotIn("SEND NOW (Y/N) = Y", merged)
+        self.assertFalse(send_choice_is_yes(merged))
 
     def test_mirrored_sales_above_marker_are_ignored(self):
         description = (
