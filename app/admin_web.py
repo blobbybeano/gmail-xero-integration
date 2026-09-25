@@ -11767,7 +11767,7 @@ function toggleReceiptsEnabled(requested) {{
               const type = btn.dataset.type || '';
               const fallbackText = type === 'discount'
                 ? 'Cashflows card underpayment adjustment'
-                : 'Cashflows materials balance';
+                : 'Materials';
               const entryText = (window.prompt('Entry text for this Xero adjustment:', fallbackText) || '').trim();
               if (!entryText) return;
               _setAdjustment(_saleKey(b.id, sales[si], si), {{
@@ -12993,7 +12993,7 @@ function toggleReceiptsEnabled(requested) {{
                         extra_invoice_payloads.append(
                             {
                                 "contact_name": "Materials",
-                                "description": (adjustment_description or f"Cashflows materials balance {sale_ref or selected.get('number') or batch_id}")[:4000],
+                                "description": (adjustment_description or "Materials")[:4000],
                                 "amount": extra_amount,
                                 "reference": f"{reference} extra {sale_ref}".strip()[:255],
                                 "invoice_date": str(sale.get("date") or payout_date),
