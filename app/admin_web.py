@@ -11089,7 +11089,7 @@ function toggleReceiptsEnabled(requested) {{
                 }}).sort(function(a, b) {{ return b.gross - a.gross; }})
               : [];
             const displayDate = splitActive
-              ? '<div class="font-semibold text-sky-900">' + splitRows.length + ' payments</div><div class="text-[10px] text-gray-400">' + splitPaymentRows.map(function(p, pIdx) {{ return (pIdx ? '+ ' : '') + esc(p.date) + (p.time ? ' ' + esc(p.time) : ''); }}).join('<br>') + '</div>'
+              ? '<div class="font-semibold text-sky-900">' + splitRows.length + ' payments</div><div class="text-[10px] text-gray-400">' + splitPaymentRows.map(function(p, pIdx) {{ return (pIdx ? '+ ' : '') + esc(p.date) + (p.time ? '<br><span class="ml-2">' + esc(p.time) + '</span>' : ''); }}).join('<br>') + '</div>'
               : esc(gb(s.date)) + sTime;
             const displayGrossHtml = splitActive
               ? '<div>' + money(displayGross) + '</div><div class="mt-0.5 text-[10px] font-normal text-sky-700">' + splitPaymentRows.map(function(p, pIdx) {{ return (pIdx ? '+ ' : '') + money(p.gross); }}).join('<br>') + '</div>'
