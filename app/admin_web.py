@@ -5991,7 +5991,6 @@ def create_app() -> Flask:
         """)
 
     @app.get("/lead-voice")
-    @require_login
     def lead_voice_popup():
         nonce = secrets.token_urlsafe(18)
         session["lead_voice_nonce"] = nonce
@@ -6174,7 +6173,6 @@ def create_app() -> Flask:
         return Response(html, mimetype="text/html")
 
     @app.get("/lead-voice/recent")
-    @require_login
     def lead_voice_recent():
         creds = load_admin_credentials(config)
         if not creds:
@@ -6189,7 +6187,6 @@ def create_app() -> Flask:
         return jsonify({"rows": rows})
 
     @app.post("/lead-voice/submit")
-    @require_login
     def lead_voice_submit():
         nonce = (request.form.get("nonce") or "").strip()
         expected = str(session.get("lead_voice_nonce") or "")
