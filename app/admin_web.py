@@ -10937,8 +10937,16 @@ function toggleReceiptsEnabled(requested) {{
             if (!id) return null;
             let gross = Number((sales[idx] || {{}}).gross || 0);
             const rows = [idx];
-            primaryInvoiceIdsByRow.forEach(function(otherId, otherIdx) {{
-              if (otherIdx !== idx && otherId === id) {{
+            function saleHasInvoiceOption(sale, invoiceId) {{
+              if (!sale || !invoiceId) return false;
+              if (sale.invoice && String(sale.invoice.id || '') === invoiceId) return true;
+              if (sale.quick_invoice && String(sale.quick_invoice.id || '') === invoiceId) return true;
+              return (sale.candidates || []).concat(sale.tied_candidates || []).some(function(candidate) {{
+                return candidate && String(candidate.id || '') === invoiceId;
+              }});
+            }}
+            sales.forEach(function(otherSale, otherIdx) {{
+              if (otherIdx !== idx && saleHasInvoiceOption(otherSale, id)) {{
                 gross += Number((sales[otherIdx] || {{}}).gross || 0);
                 rows.push(otherIdx);
               }}
