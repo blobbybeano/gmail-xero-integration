@@ -11077,9 +11077,23 @@ function toggleReceiptsEnabled(requested) {{
             const displayFee = splitActive
               ? splitRows.reduce(function(sum, rIdx) {{ return sum + Number((sales[rIdx] || {{}}).fee || 0); }}, 0)
               : Number(s.fee || 0);
+            const splitPaymentRows = splitActive
+              ? splitRows.map(function(rIdx) {{
+                  return {{
+                    idx: rIdx,
+                    gross: Number((sales[rIdx] || {{}}).gross || 0),
+                    fee: Number((sales[rIdx] || {{}}).fee || 0),
+                    date: gb((sales[rIdx] || {{}}).date),
+                    time: (sales[rIdx] || {{}}).time || '',
+                  }};
+                }}).sort(function(a, b) {{ return b.gross - a.gross; }})
+              : [];
             const displayDate = splitActive
-              ? '<div class="font-semibold text-sky-900">' + splitRows.length + ' payments</div><div class="text-[10px] text-gray-400">' + splitRows.map(function(rIdx) {{ return esc(gb((sales[rIdx] || {{}}).date)); }}).join(' + ') + '</div>'
+              ? '<div class="font-semibold text-sky-900">' + splitRows.length + ' payments</div><div class="text-[10px] text-gray-400">' + splitPaymentRows.map(function(p, pIdx) {{ return (pIdx ? '+ ' : '') + esc(p.date) + (p.time ? ' ' + esc(p.time) : ''); }}).join('<br>') + '</div>'
               : esc(gb(s.date)) + sTime;
+            const displayGrossHtml = splitActive
+              ? '<div>' + money(displayGross) + '</div><div class="mt-0.5 text-[10px] font-normal text-sky-700">' + splitPaymentRows.map(function(p, pIdx) {{ return (pIdx ? '+ ' : '') + money(p.gross); }}).join('<br>') + '</div>'
+              : money(displayGross);
 
             // Option list: matched -> [app pick, ...same-amount alts]; missing -> ranked candidates.
             const allOptions = isMissing
@@ -11423,7 +11437,7 @@ function toggleReceiptsEnabled(requested) {{
 
             return '<tr class="border-t ' + rowCls + '">'
               + '<td class="px-3 py-2 text-xs text-sky-900 bg-sky-50/45 whitespace-nowrap">' + displayDate + '</td>'
-              + '<td class="px-3 py-2 text-xs text-right font-semibold text-sky-950 bg-sky-50/45">' + money(displayGross) + '</td>'
+              + '<td class="px-3 py-2 text-xs text-right font-semibold text-sky-950 bg-sky-50/45">' + displayGrossHtml + '</td>'
               + '<td class="px-3 py-2 text-xs text-right text-sky-700 bg-sky-50/45">' + money(displayFee) + '</td>'
               + '<td class="px-3 py-2 text-xs font-medium text-gray-900">' + custName + '</td>'
               + '<td class="px-3 py-2 text-xs">' + invCell + '</td>'
@@ -11485,11 +11499,15 @@ function toggleReceiptsEnabled(requested) {{
           const advancedMenuHtml = '<details class="relative">'
             + '<summary class="cursor-pointer list-none rounded-full border border-gray-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-gray-500 hover:bg-gray-50">Advanced ▾</summary>'
             + '<div class="absolute right-0 z-30 mt-2 w-[22rem] max-w-[calc(100vw-2rem)] rounded-lg border border-gray-200 bg-white p-3 shadow-lg">'
-            + '<div class="text-[10px] uppercase tracking-widest text-gray-400 font-semibold mb-2">Combine payments</div>'
+            + '<button type="button" class="cf-advanced-show-combine flex w-full items-center justify-between rounded px-2 py-1.5 text-left text-[11px] font-semibold text-gray-700 hover:bg-gray-50">'
+            + '<span>Combine payments</span><span class="text-gray-400">›</span></button>'
+            + '<div class="cf-advanced-combine-panel hidden mt-2 border-t border-gray-100 pt-2">'
+            + '<div class="text-[10px] uppercase tracking-widest text-gray-400 font-semibold mb-2">Cashflows CSV payments</div>'
             + '<div class="space-y-1.5 max-h-64 overflow-auto">' + advancedRows + '</div>'
             + '<div class="mt-2 flex items-center gap-2">'
             + '<button type="button" class="cf-advanced-combine px-2 py-1 rounded bg-sky-600 text-white text-[11px] font-semibold hover:bg-sky-700">Combine selected payments</button>'
             + '<span class="cf-advanced-status text-[11px] text-gray-500"></span>'
+            + '</div>'
             + '</div>'
             + '</div>'
             + '</details>';
@@ -11575,6 +11593,13 @@ function toggleReceiptsEnabled(requested) {{
           wrap.querySelectorAll('.cf-row-toggle').forEach(btn => {{
             btn.addEventListener('click', () => {{
               const panel = wrap.querySelector('#cf-row-panel-' + b.id + '-' + btn.dataset.si);
+              if (panel) panel.classList.toggle('hidden');
+            }});
+          }});
+
+          wrap.querySelectorAll('.cf-advanced-show-combine').forEach(btn => {{
+            btn.addEventListener('click', () => {{
+              const panel = btn.closest('details') ? btn.closest('details').querySelector('.cf-advanced-combine-panel') : null;
               if (panel) panel.classList.toggle('hidden');
             }});
           }});
