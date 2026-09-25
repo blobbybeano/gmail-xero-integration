@@ -210,6 +210,85 @@ class CashflowsCsvSubmitTests(unittest.TestCase):
         fee = data["plans"][0]["payloads"]["bank_fee"]["BankTransactions"][0]
         self.assertEqual(fee["LineItems"][0]["UnitAmount"], 2.0)
 
+    def test_split_card_payments_can_clear_one_invoice_when_confirmed(self):
+        invoice = {
+            "id": "inv-1",
+            "number": "INV-1",
+            "contact_name": "Vincent Doyle",
+            "total": 150.0,
+            "amount_due": 150.0,
+            "is_open": True,
+        }
+        preview = {
+            "preview_id": "preview-1",
+            "batches": [
+                {
+                    "id": "batch-1",
+                    "status": "ready",
+                    "payout": {"csv_ref": "pay-1", "date": "2026-09-23"},
+                    "gross": 150.0,
+                    "net": 148.16,
+                    "sales": [
+                        {
+                            "sale_ref": "sale-1",
+                            "date": "2026-09-22",
+                            "gross": 125.0,
+                            "fee": 1.72,
+                            "invoice": invoice,
+                            "candidates": [],
+                            "tied_candidates": [],
+                        },
+                        {
+                            "sale_ref": "sale-2",
+                            "date": "2026-09-22",
+                            "gross": 25.0,
+                            "fee": 0.12,
+                            "invoice": None,
+                            "candidates": [invoice],
+                            "tied_candidates": [],
+                        },
+                    ],
+                }
+            ],
+        }
+        app = self._app_with_preview(preview)
+        with app.test_client() as client:
+            with client.session_transaction() as session:
+                session["logged_in"] = True
+            with patch("app.admin_web.build_xero_client", return_value=FakeXeroClient()):
+                resp = client.post(
+                    "/cashflows-sync/submit-csv-batches",
+                    json={
+                        "preview_id": "preview-1",
+                        "batches": [
+                            {
+                                "batch_id": "batch-1",
+                                "sales": [
+                                    {
+                                        "sale_index": 0,
+                                        "selected_invoice_id": "inv-1",
+                                        "split_group_key": "batch-1::split::inv-1",
+                                        "split_group_invoice_id": "inv-1",
+                                    },
+                                    {
+                                        "sale_index": 1,
+                                        "selected_invoice_id": "inv-1",
+                                        "split_group_key": "batch-1::split::inv-1",
+                                        "split_group_invoice_id": "inv-1",
+                                    },
+                                ],
+                            }
+                        ],
+                    },
+                )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        plan = data["plans"][0]
+        self.assertEqual(len(plan["chosen_invoices"]), 1)
+        batch = plan["payloads"]["batch_payment"]["BatchPayments"][0]
+        self.assertEqual(batch["Payments"], [{"Invoice": {"InvoiceID": "inv-1"}, "Amount": 150.0}])
+        self.assertEqual(plan["fee_or_charge_total"], 1.84)
+
     def test_underpayment_builds_credit_note_allocation_payload(self):
         preview = {
             "preview_id": "preview-1",

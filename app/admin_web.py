@@ -10702,6 +10702,15 @@ function toggleReceiptsEnabled(requested) {{
           if (adj) localStorage.setItem(_adjKey(saleKey), JSON.stringify(adj));
           else localStorage.removeItem(_adjKey(saleKey));
         }}
+        function _splitKey(saleKey) {{ return 'cf_split_' + _previewId + '_' + saleKey; }}
+        function _getSplit(saleKey) {{
+          try {{ return JSON.parse(localStorage.getItem(_splitKey(saleKey)) || 'null'); }}
+          catch (e) {{ return null; }}
+        }}
+        function _setSplit(saleKey, split) {{
+          if (split) localStorage.setItem(_splitKey(saleKey), JSON.stringify(split));
+          else localStorage.removeItem(_splitKey(saleKey));
+        }}
         function _invAmount(inv) {{
           if (!inv) return 0;
           const raw = inv.total ?? inv.amount_due ?? 0;
@@ -10734,12 +10743,15 @@ function toggleReceiptsEnabled(requested) {{
           const saleKey = _saleKey(batch.id, sale, idx);
           const selected = _selectedInvoiceForSale(batch, sale, idx);
           const adjustment = _getAdjustment(saleKey);
+          const split = _getSplit(saleKey);
           return {{
             sale_ref: sale.sale_ref || '',
             sale_index: idx,
             selected_invoice_id: selected ? (selected.id || '') : '',
             selected_invoice_number: selected ? (selected.number || '') : '',
             adjustment: adjustment || null,
+            split_group_key: split && split.key ? split.key : '',
+            split_group_invoice_id: split && split.invoice_id ? split.invoice_id : '',
           }};
         }}
         function updateCsvSubmitPanel() {{
@@ -10920,9 +10932,33 @@ function toggleReceiptsEnabled(requested) {{
           const primaryInvoiceIdsByRow = sales.map(function(s) {{
             return s.invoice && s.invoice.id ? String(s.invoice.id) : '';
           }});
+          function splitCandidateForRow(opt, idx) {{
+            const id = opt && opt.id ? String(opt.id) : '';
+            if (!id) return null;
+            let gross = Number((sales[idx] || {{}}).gross || 0);
+            const rows = [idx];
+            primaryInvoiceIdsByRow.forEach(function(otherId, otherIdx) {{
+              if (otherIdx !== idx && otherId === id) {{
+                gross += Number((sales[otherIdx] || {{}}).gross || 0);
+                rows.push(otherIdx);
+              }}
+            }});
+            if (rows.length < 2) return null;
+            const invTotal = _invAmount(opt);
+            if (Math.abs(gross - invTotal) >= 0.02) return null;
+            rows.sort(function(a, b) {{ return a - b; }});
+            return {{
+              key: b.id + '::split::' + id,
+              invoice_id: id,
+              rows: rows,
+              gross: Number(gross.toFixed(2)),
+              invoice_total: Number(invTotal.toFixed(2)),
+            }};
+          }}
           function optionAvailableForRow(opt, idx) {{
             const id = opt && opt.id ? String(opt.id) : '';
             if (!id) return true;
+            if (splitCandidateForRow(opt, idx)) return true;
             return !primaryInvoiceIdsByRow.some(function(otherId, otherIdx) {{
               return otherIdx !== idx && otherId === id;
             }});
@@ -10943,6 +10979,8 @@ function toggleReceiptsEnabled(requested) {{
             const id = inv && inv.id ? String(inv.id) : '';
             if (!id || selectedInvoiceCounts[id] <= 1) return;
             const saleKey = _saleKey(b.id, s, idx);
+            const split = _getSplit(saleKey);
+            if (split && split.invoice_id === id && split.rows && split.rows.length > 1) return;
             if (s.invoice && _getTiedSwap(b.id, idx)) {{
               _setTiedSwap(b.id, idx, null);
               rawRowSelections[idx] = _selectedInvoiceForSale(b, s, idx);
@@ -10958,15 +10996,20 @@ function toggleReceiptsEnabled(requested) {{
             const saleKey = _saleKey(b.id, s, idx);
             const selected = rawRowSelections[idx];
             const selectedId = selected && selected.id ? String(selected.id) : '';
-            const duplicateSelected = !!(selectedId && selectedInvoiceCounts[selectedId] > 1);
+            const split = _getSplit(saleKey);
+            const splitActive = !!(split && selectedId && split.invoice_id === selectedId && split.rows && split.rows.length > 1);
+            const splitGross = splitActive
+              ? (split.rows || []).reduce(function(sum, rIdx) {{ return sum + Number((sales[rIdx] || {{}}).gross || 0); }}, 0)
+              : Number(s.gross || 0);
+            const duplicateSelected = !!(selectedId && selectedInvoiceCounts[selectedId] > 1 && !splitActive);
             const invTotal = _invAmount(selected);
-            const expectedAdj = selected ? _expectedAdjustment(Number(s.gross || 0), invTotal) : null;
+            const expectedAdj = selected ? _expectedAdjustment(splitGross, invTotal) : null;
             const adjustment = _getAdjustment(saleKey);
             const adjustmentOk = _adjustmentMatches(expectedAdj, adjustment);
             const selectedStatus = String((selected && selected.status) || '').toUpperCase();
             const invoiceReady = selectedStatus !== 'DRAFT';
             const ready = !!selected && adjustmentOk && invoiceReady && !duplicateSelected;
-            return {{saleKey, selected, invTotal, expectedAdj, adjustment, adjustmentOk, invoiceReady, duplicateSelected, ready}};
+            return {{saleKey, selected, invTotal, expectedAdj, adjustment, adjustmentOk, invoiceReady, duplicateSelected, splitActive, split, splitGross, ready}};
           }});
           // A sale counts toward the total only if it has a selected invoice and
           // any under/over difference has an explicit adjustment plan.
@@ -10993,6 +11036,7 @@ function toggleReceiptsEnabled(requested) {{
             const adjustmentOk = rowState.adjustmentOk;
             const invoiceReady = rowState.invoiceReady;
             const duplicateSelected = rowState.duplicateSelected;
+            const splitActive = rowState.splitActive;
 
             // Option list: matched -> [app pick, ...same-amount alts]; missing -> ranked candidates.
             const allOptions = isMissing
@@ -11069,6 +11113,7 @@ function toggleReceiptsEnabled(requested) {{
             }}
 
             const favoured = allOptions[favIdx] || null;
+            const splitCandidate = favoured ? splitCandidateForRow(favoured, idx) : null;
             const favCal = favoured ? optCal[favIdx] : null;
             const favCalNameMatch = !!(favCal && favoured && _nameOverlap(favCal.customer || '', favoured.contact_name || ''));
             const favDateMismatch = !!(favCalNameMatch && favoured && Number(favoured.days_apart || 0) > 3);
@@ -11167,6 +11212,17 @@ function toggleReceiptsEnabled(requested) {{
                 : '<span class="text-indigo-700 font-mono">' + esc(favoured.number || '') + '</span> '
                     + '<span class="text-gray-400 font-mono">' + esc(favoured.reference || '') + '</span>' + calLine + suggestedConfirmBtn;
             if (noMatch) {{ invCell += '<div class="mt-1">' + qiBtn + '</div>'; }}
+            if (splitCandidate && !splitActive) {{
+              invCell += '<div class="mt-2 rounded border border-sky-200 bg-sky-50 p-2 text-[11px] text-sky-800">'
+                + '<div class="font-semibold">Split card payment: ' + splitCandidate.rows.map(function(rIdx) {{ return money((sales[rIdx] || {{}}).gross || 0); }}).join(' + ') + ' = ' + money(splitCandidate.invoice_total) + '</div>'
+                + '<button class="cf-split-combine mt-1 inline-flex px-2 py-1 rounded bg-sky-600 text-white text-[11px] font-semibold hover:bg-sky-700" data-si="' + idx + '" data-ci="' + favIdx + '" data-missing="' + (isMissing ? '1' : '0') + '" data-rows="' + esc(splitCandidate.rows.join(',')) + '" data-invoice-id="' + esc(splitCandidate.invoice_id) + '" data-key="' + esc(splitCandidate.key) + '">Combine split payments</button>'
+                + '</div>';
+            }} else if (splitActive) {{
+              invCell += '<div class="mt-2 rounded border border-emerald-200 bg-emerald-50 p-2 text-[11px] text-emerald-800">'
+                + '<div class="font-semibold">Split payment combined: ' + money(rowState.splitGross) + ' against one invoice.</div>'
+                + '<button class="cf-split-clear mt-1 underline text-gray-500 hover:text-red-600" data-si="' + idx + '">clear</button>'
+                + '</div>';
+            }}
             if (favoured && expectedAdj) {{
               const expLabel = _adjustmentLabel(expectedAdj);
               const activeLabel = adjustmentOk ? '&#10003; ' + _adjustmentLabel(adjustment) : '';
@@ -11283,7 +11339,7 @@ function toggleReceiptsEnabled(requested) {{
                 : '';
               const slot = (displayCal && displayCal.event_date && displayCal.event_start) ? (displayCal.event_date + 'T' + displayCal.event_start) : '';
               const optId = opt && opt.id ? String(opt.id) : '';
-              const optDuplicateElsewhere = !!(optId && selectedInvoiceCounts[optId] && !(isFav && !duplicateSelected));
+              const optDuplicateElsewhere = !!(optId && selectedInvoiceCounts[optId] && !splitCandidateForRow(opt, idx) && !(isFav && !duplicateSelected));
               const btn = isFav
                 ? '<span class="text-[11px] text-gray-400 italic shrink-0 self-center">'
                     + (noAmountMatch ? 'top suggestion' : 'currently shown')
@@ -11472,6 +11528,7 @@ function toggleReceiptsEnabled(requested) {{
               // Claim the calendar slot so it disappears from every other row.
               _setCalRowSlot(b.id, si, btn.dataset.calSlot || '');
               _setAdjustment(_saleKey(b.id, sales[si], si), null);
+              _setSplit(_saleKey(b.id, sales[si], si), null);
               _setTiedSwap(b.id, si, chosen);
               wrap.replaceWith(renderBatch(b));
             }});
@@ -11487,7 +11544,48 @@ function toggleReceiptsEnabled(requested) {{
               if (!cand) return;
               _setCalRowSlot(b.id, si, btn.dataset.calSlot || '');
               _setAdjustment(_saleKey(b.id, s, si), null);
+              _setSplit(_saleKey(b.id, s, si), null);
               _setMatch(_saleKey(b.id, s, si), cand);
+              wrap.replaceWith(renderBatch(b));
+            }});
+          }});
+
+          // Explicitly allow two Cashflows card rows to clear one Xero invoice
+          // when their combined gross equals that invoice total.
+          wrap.querySelectorAll('.cf-split-combine').forEach(btn => {{
+            btn.addEventListener('click', () => {{
+              const si = Number(btn.dataset.si);
+              const ci = Number(btn.dataset.ci);
+              const s = sales[si];
+              const splitRows = (btn.dataset.rows || '').split(',').map(function(x) {{ return Number(x); }}).filter(function(x) {{ return Number.isInteger(x); }});
+              const split = {{
+                key: btn.dataset.key || '',
+                invoice_id: btn.dataset.invoiceId || '',
+                rows: splitRows,
+              }};
+              const opts = btn.dataset.missing === '1'
+                ? (s.candidates || []).filter(function(opt){{ return optionAvailableForRow(opt, si); }})
+                : [s.invoice].concat((s.tied_candidates || []).filter(function(opt){{ return optionAvailableForRow(opt, si); }}));
+              const chosen = opts[ci];
+              if (!chosen || !split.invoice_id || splitRows.length < 2) return;
+              if (btn.dataset.missing === '1') _setMatch(_saleKey(b.id, s, si), chosen);
+              else if (!s.invoice || String(s.invoice.id || '') !== split.invoice_id) _setTiedSwap(b.id, si, chosen);
+              splitRows.forEach(function(rIdx) {{
+                if (!sales[rIdx]) return;
+                _setAdjustment(_saleKey(b.id, sales[rIdx], rIdx), null);
+                _setSplit(_saleKey(b.id, sales[rIdx], rIdx), split);
+              }});
+              wrap.replaceWith(renderBatch(b));
+            }});
+          }});
+          wrap.querySelectorAll('.cf-split-clear').forEach(btn => {{
+            btn.addEventListener('click', () => {{
+              const si = Number(btn.dataset.si);
+              const split = _getSplit(_saleKey(b.id, sales[si], si));
+              const rows = split && split.rows ? split.rows : [si];
+              rows.forEach(function(rIdx) {{
+                if (sales[rIdx]) _setSplit(_saleKey(b.id, sales[rIdx], rIdx), null);
+              }});
               wrap.replaceWith(renderBatch(b));
             }});
           }});
@@ -11498,6 +11596,7 @@ function toggleReceiptsEnabled(requested) {{
               const si = Number(btn.dataset.si);
               _setCalRowSlot(b.id, si, '');
               _setAdjustment(_saleKey(b.id, sales[si], si), null);
+              _setSplit(_saleKey(b.id, sales[si], si), null);
               if (btn.dataset.missing === '1') {{
                 _setMatch(_saleKey(b.id, sales[si], si), null);
               }} else {{
@@ -12486,6 +12585,22 @@ function toggleReceiptsEnabled(requested) {{
             if len(req_sales) < len(sales):
                 blocking_errors.append(f"Batch {batch_id} was incomplete. Re-open the preview and submit again.")
                 continue
+            split_groups: dict[str, dict] = {}
+            for split_idx, split_sale in enumerate(sales):
+                req_sale = req_sales.get(split_idx) or {}
+                split_key = str(req_sale.get("split_group_key") or "").strip()
+                split_invoice_id = str(req_sale.get("split_group_invoice_id") or "").strip()
+                if not split_key or not split_invoice_id:
+                    continue
+                group = split_groups.setdefault(
+                    split_key,
+                    {"invoice_id": split_invoice_id, "indices": [], "gross": 0.0},
+                )
+                if group["invoice_id"] != split_invoice_id:
+                    blocking_errors.append(f"Batch {batch_id} has an inconsistent split-payment selection.")
+                    continue
+                group["indices"].append(split_idx)
+                group["gross"] = round(_money_value(group["gross"]) + _money_value(split_sale.get("gross")), 2)
 
             reference = f"Cashflows {((batch.get('payout') or {}).get('csv_ref') or batch_id)}"
             payout_date = ((batch.get("payout") or {}).get("date") or dt.date.today().isoformat())
@@ -12530,6 +12645,36 @@ function toggleReceiptsEnabled(requested) {{
                 selected_due = _money_value(selected.get("amount_due"))
                 payable_amount = selected_due if selected_due > 0 else selected_total
                 adjustment = req_sale.get("adjustment") if isinstance(req_sale.get("adjustment"), dict) else None
+                if not selected_id:
+                    blocking_errors.append(
+                        f"Batch {batch_id} invoice {selected.get('number') or sale_ref or idx + 1} has no Xero InvoiceID."
+                    )
+                    continue
+                split_key = str(req_sale.get("split_group_key") or "").strip()
+                split_group = split_groups.get(split_key) if split_key else None
+                split_ok = False
+                split_first_idx = idx
+                if split_group and split_group.get("invoice_id") == selected_id and len(split_group.get("indices") or []) > 1:
+                    split_first_idx = min(split_group.get("indices") or [idx])
+                    split_ok = abs(_money_value(split_group.get("gross")) - payable_amount) <= 0.02
+                if split_group and not split_ok:
+                    blocking_errors.append(
+                        f"Batch {batch_id} split payments for invoice {selected.get('number') or selected_id} do not add up to the Xero invoice total."
+                    )
+                    continue
+                if selected_id in selected_invoice_ids_seen:
+                    if split_ok:
+                        continue
+                    else:
+                        blocking_errors.append(
+                            f"Batch {batch_id} selects invoice {selected.get('number') or selected_id} more than once. Pick a different invoice for one of those Cashflows rows before submitting."
+                        )
+                    continue
+                selected_invoice_ids_seen.add(selected_id)
+                if split_ok:
+                    sale_gross = _money_value(split_group.get("gross"))
+                    sale_ref = f"split card payments for {selected.get('number') or selected_id}"
+
                 chosen_invoices.append(
                     {
                         "id": selected_id,
@@ -12558,17 +12703,6 @@ function toggleReceiptsEnabled(requested) {{
                         )
                 else:
                     open_invoice_count += 1
-                if not selected_id:
-                    blocking_errors.append(
-                        f"Batch {batch_id} invoice {selected.get('number') or sale_ref or idx + 1} has no Xero InvoiceID."
-                    )
-                    continue
-                if selected_id in selected_invoice_ids_seen:
-                    blocking_errors.append(
-                        f"Batch {batch_id} selects invoice {selected.get('number') or selected_id} more than once. Pick a different invoice for one of those Cashflows rows before submitting."
-                    )
-                    continue
-                selected_invoice_ids_seen.add(selected_id)
 
                 diff = round(sale_gross - payable_amount, 2)
                 if is_open is False:
