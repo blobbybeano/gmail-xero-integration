@@ -11045,6 +11045,37 @@ function toggleReceiptsEnabled(requested) {{
             const ready = !!selected && adjustmentOk && invoiceReady && !duplicateSelected;
             return {{saleKey, selected, invTotal, expectedAdj, adjustment, adjustmentOk, invoiceReady, duplicateSelected, splitActive, split, splitGross, ready}};
           }});
+          function reassignInvoiceTakenBy(chosenId, targetIdx) {{
+            if (!chosenId) return;
+            sales.forEach(function(otherSale, otherIdx) {{
+              if (otherIdx === targetIdx || !otherSale) return;
+              const otherSelected = _selectedInvoiceForSale(b, otherSale, otherIdx);
+              if (!otherSelected || String(otherSelected.id || '') !== chosenId) return;
+              const seenAltIds = new Set();
+              const visibleOptions = otherSale.invoice
+                ? [otherSale.invoice].concat(otherSale.tied_candidates || [])
+                : (otherSale.candidates || []);
+              const alternatives = visibleOptions.filter(function(opt) {{
+                const id = opt && opt.id ? String(opt.id) : '';
+                if (!id || id === chosenId) return false;
+                if (seenAltIds.has(id)) return false;
+                seenAltIds.add(id);
+                return !rawRowSelections.some(function(inv, invIdx) {{
+                  return invIdx !== targetIdx && invIdx !== otherIdx && inv && String(inv.id || '') === id;
+                }});
+              }});
+              const next = alternatives[0] || null;
+              _setCalRowSlot(b.id, otherIdx, '');
+              _setAdjustment(_saleKey(b.id, otherSale, otherIdx), null);
+              _setSplit(_saleKey(b.id, otherSale, otherIdx), null);
+              if (otherSale.invoice) {{
+                if (next && String(next.id || '') !== String(otherSale.invoice.id || '')) _setTiedSwap(b.id, otherIdx, next);
+                else _setTiedSwap(b.id, otherIdx, null);
+              }} else {{
+                _setMatch(_saleKey(b.id, otherSale, otherIdx), next);
+              }}
+            }});
+          }}
           // A sale counts toward the total only if it has a selected invoice and
           // any under/over difference has an explicit adjustment plan.
           const matchedGrossEff = sales.reduce((sum, r, idx) =>
@@ -11097,8 +11128,8 @@ function toggleReceiptsEnabled(requested) {{
 
             // Option list: matched -> [app pick, ...same-amount alts]; missing -> ranked candidates.
             const allOptions = isMissing
-              ? (s.candidates || []).filter(function(opt){{ return optionAvailableForRow(opt, idx); }})
-              : [s.invoice].concat((s.tied_candidates || []).filter(function(opt){{ return optionAvailableForRow(opt, idx); }}));
+              ? (s.candidates || [])
+              : [s.invoice].concat(s.tied_candidates || []);
 
             // User overrides.
             const tswap = isMissing ? null : _getTiedSwap(b.id, idx);
@@ -11278,6 +11309,9 @@ function toggleReceiptsEnabled(requested) {{
             if (favoured && expectedAdj) {{
               const expLabel = _adjustmentLabel(expectedAdj);
               const activeLabel = adjustmentOk ? '&#10003; ' + _adjustmentLabel(adjustment) : '';
+              const activeText = adjustmentOk && adjustment && adjustment.description
+                ? '<div class="mt-0.5 text-[10px] text-emerald-700">Entry text: ' + esc(adjustment.description) + '</div>'
+                : '';
               const actionText = expectedAdj.type === 'discount'
                 ? 'Add discount plan'
                 : 'Add Materials invoice plan';
@@ -11288,7 +11322,7 @@ function toggleReceiptsEnabled(requested) {{
                 + '<div class="text-[11px] font-semibold">Adjustment needed: ' + expLabel + '</div>'
                 + '<div class="text-[10px] mt-0.5">' + helpText + '</div>'
                 + (adjustmentOk
-                    ? '<div class="mt-1 text-[11px] font-semibold">' + activeLabel + ' <button class="cf-adjust-clear ml-1 underline text-gray-500 hover:text-red-600" data-si="' + idx + '">clear</button></div>'
+                    ? '<div class="mt-1 text-[11px] font-semibold">' + activeLabel + ' <button class="cf-adjust-clear ml-1 underline text-gray-500 hover:text-red-600" data-si="' + idx + '">clear</button></div>' + activeText
                     : '<button class="cf-adjust-set mt-1 inline-flex px-2 py-1 rounded bg-amber-600 text-white text-[11px] font-semibold hover:bg-amber-700" data-si="' + idx + '" data-type="' + expectedAdj.type + '" data-amt="' + expectedAdj.amount.toFixed(2) + '">' + actionText + ' (' + money(expectedAdj.amount) + ')</button>')
                 + '</div>';
             }}
@@ -11398,9 +11432,7 @@ function toggleReceiptsEnabled(requested) {{
                 ? '<span class="text-[11px] text-gray-400 italic shrink-0 self-center">'
                     + (noAmountMatch ? 'top suggestion' : 'currently shown')
                   + '</span>'
-                : optDuplicateElsewhere
-                  ? '<span class="text-[11px] text-red-500 italic shrink-0 self-center">already used in this batch</span>'
-                : '<button class="' + (isMissing ? 'cf-cand-pick' : 'cf-tied-pick') + ' shrink-0 self-center px-2 py-1 rounded bg-indigo-600 text-white text-[11px] font-semibold hover:bg-indigo-700" data-si="' + idx + '" data-' + (isMissing?'ci':'oi') + '="' + origIdx + '" data-cal-slot="' + esc(slot) + '">Use this</button>';
+                : '<button class="' + (isMissing ? 'cf-cand-pick' : 'cf-tied-pick') + ' shrink-0 self-center px-2 py-1 rounded ' + (optDuplicateElsewhere ? 'bg-amber-600 hover:bg-amber-700' : 'bg-indigo-600 hover:bg-indigo-700') + ' text-white text-[11px] font-semibold" data-si="' + idx + '" data-' + (isMissing?'ci':'oi') + '="' + origIdx + '" data-cal-slot="' + esc(slot) + '">' + (optDuplicateElsewhere ? 'Use here' : 'Use this') + '</button>';
               return '<div class="flex items-start justify-between gap-2 py-1.5 px-2 rounded border-b border-gray-100 last:border-0 hover:bg-white ' + (isFav?'bg-teal-50/40':'') + '">'
                 + '<div class="min-w-0">'
                 +   '<div class="text-xs"><span class="font-medium text-gray-900">' + esc(opt.contact_name || opt.number || '\u2014') + '</span> '
@@ -11638,6 +11670,7 @@ function toggleReceiptsEnabled(requested) {{
               const allOpts = [s.invoice].concat(s.tied_candidates||[]);
               const chosen = allOpts[oi];
               if (!chosen) return;
+              reassignInvoiceTakenBy(String(chosen.id || ''), si);
               // Claim the calendar slot so it disappears from every other row.
               _setCalRowSlot(b.id, si, btn.dataset.calSlot || '');
               _setAdjustment(_saleKey(b.id, sales[si], si), null);
@@ -11655,6 +11688,7 @@ function toggleReceiptsEnabled(requested) {{
               const s = sales[si];
               const cand = (s.candidates || [])[ci];
               if (!cand) return;
+              reassignInvoiceTakenBy(String(cand.id || ''), si);
               _setCalRowSlot(b.id, si, btn.dataset.calSlot || '');
               _setAdjustment(_saleKey(b.id, s, si), null);
               _setSplit(_saleKey(b.id, s, si), null);
@@ -11725,9 +11759,16 @@ function toggleReceiptsEnabled(requested) {{
               const si = Number(btn.dataset.si);
               const amount = Number(btn.dataset.amt || 0);
               if (!amount || amount <= 0) return;
+              const type = btn.dataset.type || '';
+              const fallbackText = type === 'discount'
+                ? 'Cashflows card underpayment adjustment'
+                : 'Cashflows materials balance';
+              const entryText = (window.prompt('Entry text for this Xero adjustment:', fallbackText) || '').trim();
+              if (!entryText) return;
               _setAdjustment(_saleKey(b.id, sales[si], si), {{
-                type: btn.dataset.type || '',
+                type: type,
                 amount: amount,
+                description: entryText,
               }});
               wrap.replaceWith(renderBatch(b));
             }});
@@ -12771,6 +12812,9 @@ function toggleReceiptsEnabled(requested) {{
                 selected_due = _money_value(selected.get("amount_due"))
                 payable_amount = selected_due if selected_due > 0 else selected_total
                 adjustment = req_sale.get("adjustment") if isinstance(req_sale.get("adjustment"), dict) else None
+                adjustment_description = ""
+                if adjustment:
+                    adjustment_description = str(adjustment.get("description") or "").strip()
                 if not selected_id:
                     blocking_errors.append(
                         f"Batch {batch_id} invoice {selected.get('number') or sale_ref or idx + 1} has no Xero InvoiceID."
@@ -12845,7 +12889,7 @@ function toggleReceiptsEnabled(requested) {{
                             {
                                 "invoice": {"InvoiceID": selected_id, "InvoiceNumber": selected.get("number")},
                                 "amount": discount_amount,
-                                "reason": "Card payment is lower than an already-paid invoice; a matching-pack adjustment will be created.",
+                                "reason": adjustment_description or "Card payment is lower than an already-paid invoice; a matching-pack adjustment will be created.",
                             }
                         )
                     elif diff > 0.01:
@@ -12864,7 +12908,7 @@ function toggleReceiptsEnabled(requested) {{
                                 "amount": diff,
                                 "invoice_paid_amount": payable_amount,
                                 "card_sale_amount": sale_gross,
-                                "reason": "Card sale is higher than an already-paid Xero invoice; the app will add a positive Cashflows adjustment line to the match pack.",
+                                "reason": adjustment_description or "Card sale is higher than an already-paid Xero invoice; the app will add a positive Cashflows adjustment line to the match pack.",
                             }
                         )
                     continue
@@ -12880,7 +12924,7 @@ function toggleReceiptsEnabled(requested) {{
                         {
                             "invoice": {"InvoiceID": selected_id, "InvoiceNumber": selected.get("number")},
                             "amount": discount_amount,
-                            "reason": "Card payment is lower than invoice total.",
+                            "reason": adjustment_description or "Card payment is lower than invoice total.",
                         }
                     )
                     contact_id = str(selected.get("contact_id") or "").strip()
@@ -12899,7 +12943,7 @@ function toggleReceiptsEnabled(requested) {{
                                         "LineAmountTypes": "Inclusive",
                                         "LineItems": [
                                             {
-                                                "Description": f"Cashflows card underpayment adjustment for {selected.get('number') or sale_ref}"[:4000],
+                                                "Description": (adjustment_description or f"Cashflows card underpayment adjustment for {selected.get('number') or sale_ref}")[:4000],
                                                 "Quantity": 1,
                                                 "UnitAmount": discount_amount,
                                                 "AccountCode": getattr(xero_client, "sales_account_code", "200") if xero_client else "200",
@@ -12944,7 +12988,7 @@ function toggleReceiptsEnabled(requested) {{
                         extra_invoice_payloads.append(
                             {
                                 "contact_name": "Materials",
-                                "description": f"Cashflows materials balance {sale_ref or selected.get('number') or batch_id}",
+                                "description": (adjustment_description or f"Cashflows materials balance {sale_ref or selected.get('number') or batch_id}")[:4000],
                                 "amount": extra_amount,
                                 "reference": f"{reference} extra {sale_ref}".strip()[:255],
                                 "invoice_date": str(sale.get("date") or payout_date),
