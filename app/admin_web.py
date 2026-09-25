@@ -1625,6 +1625,268 @@ def _first_url(text: str) -> str:
     return m.group(0) if m else ""
 
 
+LEAD_VOICE_SPREADSHEET_ID = "1E3WhqMu_BdMn8kslCGxrwGgwocSc5HCnXojLBhox0Rw"
+LEAD_VOICE_SHEET_NAME = "Sheet1"
+LEAD_VOICE_COLUMNS = [
+    ("date", "Date"),
+    ("lead_name", "Lead Name"),
+    ("number", "Number"),
+    ("email", "e-mail"),
+    ("source", "Source"),
+    ("job_type", "Job Type"),
+    ("form_of_contact", "Form of Contact"),
+    ("conversion", "Conversion"),
+    ("void", "Void"),
+    ("area", "Area"),
+    ("contact", "Contact"),
+    ("notes", "Notes"),
+]
+LEAD_VOICE_DROPDOWN_KEYS = {
+    "source": "E",
+    "job_type": "F",
+    "form_of_contact": "G",
+    "conversion": "H",
+    "void": "I",
+    "area": "J",
+    "contact": "K",
+}
+
+
+def _lead_voice_openai_key(config: AppConfig) -> str:
+    try:
+        saved = get_openai_settings(config.admin_db_file).get("api_key") or ""
+    except Exception:
+        saved = ""
+    return str(saved or (os.getenv("OPENAI_API_KEY") or "")).strip()
+
+
+def _lead_voice_json_text(data: dict) -> str:
+    out = str(data.get("output_text") or "").strip()
+    if out:
+        return out
+    parts: list[str] = []
+    for item in data.get("output") or []:
+        if str(item.get("type") or "") != "message":
+            continue
+        for content in item.get("content") or []:
+            ctype = str(content.get("type") or "").lower()
+            if ctype in {"output_text", "text", "message_text"}:
+                text = str(content.get("text") or "").strip()
+                if text:
+                    parts.append(text)
+    return "\n".join(parts).strip()
+
+
+def _lead_voice_sanitise_cell(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text[0] in ("=", "+", "-", "@"):
+        return "'" + text
+    return text
+
+
+def _lead_voice_sanitise_phone(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if not text.startswith("'"):
+        text = "'" + text
+    return text
+
+
+def _lead_voice_sheet_meta(service) -> tuple[int, dict[str, list[str]]]:
+    meta = (
+        service.spreadsheets()
+        .get(
+            spreadsheetId=LEAD_VOICE_SPREADSHEET_ID,
+            ranges=[f"{LEAD_VOICE_SHEET_NAME}!E2:K2"],
+            includeGridData=True,
+            fields=(
+                "sheets(properties(sheetId,title),data(rowData(values("
+                "dataValidation(condition(type,values(userEnteredValue)))))))"
+            ),
+        )
+        .execute()
+    )
+    sheet_id = None
+    dropdowns = {key: [] for key in LEAD_VOICE_DROPDOWN_KEYS}
+    for sheet in meta.get("sheets") or []:
+        props = sheet.get("properties") or {}
+        if props.get("title") != LEAD_VOICE_SHEET_NAME:
+            continue
+        sheet_id = int(props.get("sheetId"))
+        values = (((sheet.get("data") or [{}])[0]).get("rowData") or [{}])[0].get("values") or []
+        keys = ["source", "job_type", "form_of_contact", "conversion", "void", "area", "contact"]
+        for idx, key in enumerate(keys):
+            cell = values[idx] if idx < len(values) else {}
+            cond = ((cell.get("dataValidation") or {}).get("condition") or {})
+            if str(cond.get("type") or "") == "ONE_OF_LIST":
+                dropdowns[key] = [
+                    str(v.get("userEnteredValue") or "").strip()
+                    for v in cond.get("values") or []
+                    if str(v.get("userEnteredValue") or "").strip()
+                ]
+            elif str(cond.get("type") or "") == "ONE_OF_RANGE":
+                raw_range = str(((cond.get("values") or [{}])[0]).get("userEnteredValue") or "").strip()
+                if raw_range.startswith("="):
+                    raw_range = raw_range[1:]
+                if raw_range:
+                    try:
+                        resp = service.spreadsheets().values().get(
+                            spreadsheetId=LEAD_VOICE_SPREADSHEET_ID,
+                            range=raw_range,
+                        ).execute()
+                        opts: list[str] = []
+                        for row in resp.get("values") or []:
+                            for item in row:
+                                text = str(item or "").strip()
+                                if text:
+                                    opts.append(text)
+                        dropdowns[key] = list(dict.fromkeys(opts))
+                    except Exception:
+                        dropdowns[key] = []
+    if sheet_id is None:
+        raise RuntimeError("Lead sheet tab was not found.")
+    return sheet_id, dropdowns
+
+
+def _lead_voice_pick_default(options: list[str], needles: tuple[str, ...]) -> str:
+    lowered = [(opt, opt.lower()) for opt in options]
+    for needle in needles:
+        n = needle.lower()
+        for opt, low in lowered:
+            if low == n or n in low:
+                return opt
+    return ""
+
+
+def _lead_voice_transcribe(config: AppConfig, audio_bytes: bytes, filename: str, mime_type: str) -> str:
+    api_key = _lead_voice_openai_key(config)
+    if not api_key:
+        raise RuntimeError("OpenAI is not configured.")
+    resp = requests.post(
+        "https://api.openai.com/v1/audio/transcriptions",
+        headers={"Authorization": f"Bearer {api_key}"},
+        data={"model": os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")},
+        files={"file": (filename or "lead.webm", audio_bytes, mime_type or "audio/webm")},
+        timeout=60,
+    )
+    if not resp.ok:
+        raise RuntimeError("OpenAI transcription failed.")
+    try:
+        text = str((resp.json() or {}).get("text") or "").strip()
+    except Exception as exc:
+        raise RuntimeError("OpenAI transcription response was invalid.") from exc
+    if not text:
+        raise RuntimeError("No speech was detected.")
+    return text
+
+
+def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[str, list[str]]) -> dict:
+    api_key = _lead_voice_openai_key(config)
+    if not api_key:
+        raise RuntimeError("OpenAI is not configured.")
+    model = (get_openai_settings(config.admin_db_file).get("model") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "lead_name": {"type": "string"},
+            "number": {"type": "string"},
+            "email": {"type": "string"},
+            "source": {"type": "string"},
+            "job_type": {"type": "string"},
+            "form_of_contact": {"type": "string"},
+            "conversion": {"type": "string"},
+            "void": {"type": "string"},
+            "area": {"type": "string"},
+            "contact": {"type": "string"},
+            "notes": {"type": "string"},
+        },
+        "required": ["lead_name", "number", "email", "source", "job_type", "form_of_contact", "conversion", "void", "area", "contact", "notes"],
+    }
+    prompt = (
+        "Extract one new sales lead from the transcript. Return only JSON matching the schema. "
+        "Never invent customer information. Leave missing unknown customer fields blank. "
+        "For dropdown fields, choose only one exact permitted option or blank. "
+        "Giving a quote does not mean conversion unless the customer booked/accepted. "
+        "Use notes only for concise operational details not already in other fields. "
+        "Preserve UK phone numbers and leading zeroes.\n\n"
+        f"Permitted dropdown values:\n{json.dumps(dropdowns, ensure_ascii=False)}\n\n"
+        f"Transcript:\n{transcript}"
+    )
+    resp = requests.post(
+        "https://api.openai.com/v1/responses",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": model,
+            "input": [
+                {"role": "system", "content": [{"type": "input_text", "text": "You convert spoken lead notes into strict CRM spreadsheet JSON."}]},
+                {"role": "user", "content": [{"type": "input_text", "text": prompt}]},
+            ],
+            "text": {"format": {"type": "json_schema", "name": "lead_voice_entry", "schema": schema, "strict": True}},
+            "max_output_tokens": 600,
+        },
+        timeout=45,
+    )
+    if not resp.ok:
+        raise RuntimeError("OpenAI lead extraction failed.")
+    try:
+        data = json.loads(_lead_voice_json_text(resp.json()))
+    except Exception as exc:
+        raise RuntimeError("OpenAI returned invalid lead data.") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("OpenAI returned invalid lead data.")
+    cleaned = {key: str(data.get(key) or "").strip() for key, _label in LEAD_VOICE_COLUMNS if key != "date"}
+    for key in LEAD_VOICE_DROPDOWN_KEYS:
+        value = cleaned.get(key, "")
+        allowed = dropdowns.get(key) or []
+        if value and value not in allowed:
+            raise RuntimeError(f"AI chose an invalid {key.replace('_', ' ')} option.")
+    if not cleaned.get("conversion"):
+        cleaned["conversion"] = _lead_voice_pick_default(dropdowns.get("conversion") or [], ("?", "unknown", "not sure"))
+    if not cleaned.get("void"):
+        cleaned["void"] = _lead_voice_pick_default(dropdowns.get("void") or [], ("fine", "no", "valid", "not void"))
+    return cleaned
+
+
+def _lead_voice_insert_row(service, sheet_id: int, lead: dict) -> None:
+    try:
+        from zoneinfo import ZoneInfo
+        today = dt.datetime.now(ZoneInfo("Europe/London"))
+    except Exception:
+        today = dt.datetime.now()
+    row = [
+        today.strftime("%d/%m/%Y"),
+        _lead_voice_sanitise_cell(lead.get("lead_name")),
+        _lead_voice_sanitise_phone(lead.get("number")),
+        _lead_voice_sanitise_cell(lead.get("email")),
+        _lead_voice_sanitise_cell(lead.get("source")),
+        _lead_voice_sanitise_cell(lead.get("job_type")),
+        _lead_voice_sanitise_cell(lead.get("form_of_contact")),
+        _lead_voice_sanitise_cell(lead.get("conversion")),
+        _lead_voice_sanitise_cell(lead.get("void")),
+        _lead_voice_sanitise_cell(lead.get("area")),
+        _lead_voice_sanitise_cell(lead.get("contact")),
+        _lead_voice_sanitise_cell(lead.get("notes")),
+    ]
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=LEAD_VOICE_SPREADSHEET_ID,
+        body={"requests": [
+            {"insertDimension": {"range": {"sheetId": sheet_id, "dimension": "ROWS", "startIndex": 1, "endIndex": 2}, "inheritFromBefore": False}},
+            {"copyPaste": {"source": {"sheetId": sheet_id, "startRowIndex": 2, "endRowIndex": 3, "startColumnIndex": 0, "endColumnIndex": 12}, "destination": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": 2, "startColumnIndex": 0, "endColumnIndex": 12}, "pasteType": "PASTE_FORMAT", "pasteOrientation": "NORMAL"}},
+            {"copyPaste": {"source": {"sheetId": sheet_id, "startRowIndex": 2, "endRowIndex": 3, "startColumnIndex": 0, "endColumnIndex": 12}, "destination": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": 2, "startColumnIndex": 0, "endColumnIndex": 12}, "pasteType": "PASTE_DATA_VALIDATION", "pasteOrientation": "NORMAL"}},
+        ]},
+    ).execute()
+    service.spreadsheets().values().update(
+        spreadsheetId=LEAD_VOICE_SPREADSHEET_ID,
+        range=f"{LEAD_VOICE_SHEET_NAME}!A2:L2",
+        valueInputOption="USER_ENTERED",
+        body={"values": [row]},
+    ).execute()
+
+
 def _validate_google_credentials_json(raw: bytes) -> tuple[bool, str]:
     try:
         payload = json.loads(raw.decode("utf-8"))
@@ -5607,6 +5869,149 @@ def create_app() -> Flask:
           </div>
         </div>
         """)
+
+    @app.get("/lead-voice")
+    @require_login
+    def lead_voice_popup():
+        nonce = secrets.token_urlsafe(18)
+        session["lead_voice_nonce"] = nonce
+        html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Speak Lead</title>
+  <style>
+    :root {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #111827; }}
+    body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f8fafc; }}
+    .wrap {{ width: min(100vw, 350px); height: min(100vh, 350px); box-sizing: border-box; padding: 22px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; text-align: center; }}
+    button {{ width: 148px; height: 148px; border-radius: 999px; border: 0; background: #4f46e5; color: white; font-size: 54px; box-shadow: 0 16px 36px rgba(79,70,229,.28); cursor: pointer; transition: transform .12s ease, background .12s ease; }}
+    button:active {{ transform: scale(.97); }}
+    button[disabled] {{ opacity: .65; cursor: wait; }}
+    .recording button {{ background: #dc2626; animation: pulse 1.1s infinite; }}
+    @keyframes pulse {{ 0%,100% {{ box-shadow: 0 0 0 0 rgba(220,38,38,.35); }} 50% {{ box-shadow: 0 0 0 18px rgba(220,38,38,0); }} }}
+    .title {{ font-size: 21px; font-weight: 800; }}
+    .msg {{ min-height: 34px; font-size: 14px; color: #6b7280; line-height: 1.3; }}
+    .err {{ color: #b91c1c; }}
+    .ok {{ color: #047857; font-weight: 700; }}
+    .retry {{ width: auto; height: auto; border-radius: 10px; padding: 9px 14px; font-size: 13px; box-shadow: none; background: #111827; }}
+  </style>
+</head>
+<body>
+  <div class="wrap" id="wrap">
+    <button id="mic" type="button" aria-label="Start recording">🎤</button>
+    <div class="title" id="title">Speak Lead</div>
+    <div class="msg" id="msg">Press the microphone and speak naturally.</div>
+  </div>
+  <script>
+    const nonce = {json.dumps(nonce)};
+    const wrap = document.getElementById('wrap');
+    const mic = document.getElementById('mic');
+    const title = document.getElementById('title');
+    const msg = document.getElementById('msg');
+    let recorder = null, stream = null, chunks = [], processing = false;
+    function setState(t, m, cls='') {{
+      title.textContent = t; msg.textContent = m || ''; msg.className = 'msg ' + cls;
+    }}
+    function reset() {{
+      processing = false; recorder = null; chunks = []; wrap.classList.remove('recording'); mic.disabled = false; mic.textContent = '🎤'; setState('Speak Lead', 'Press the microphone and speak naturally.');
+    }}
+    async function start() {{
+      try {{
+        stream = await navigator.mediaDevices.getUserMedia({{audio: true}});
+        chunks = [];
+        const opts = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? {{mimeType:'audio/webm;codecs=opus'}} : {{}};
+        recorder = new MediaRecorder(stream, opts);
+        recorder.ondataavailable = e => {{ if (e.data && e.data.size) chunks.push(e.data); }};
+        recorder.onstop = submit;
+        recorder.start();
+        wrap.classList.add('recording'); mic.textContent = '■'; setState('Recording…', 'Press again to stop.');
+      }} catch (e) {{
+        setState('Microphone blocked', 'Allow microphone access and try again.', 'err');
+      }}
+    }}
+    function stop() {{
+      if (!recorder || recorder.state !== 'recording') return;
+      mic.disabled = true; processing = true; wrap.classList.remove('recording'); setState('Processing…', 'Adding lead to the sheet.');
+      recorder.stop();
+      if (stream) stream.getTracks().forEach(t => t.stop());
+    }}
+    async function submit() {{
+      try {{
+        const blob = new Blob(chunks, {{type: (chunks[0] && chunks[0].type) || 'audio/webm'}});
+        if (blob.size < 800) throw new Error('Nothing was recorded. Try again.');
+        const fd = new FormData();
+        fd.append('nonce', nonce);
+        fd.append('audio', blob, 'lead.webm');
+        const resp = await fetch('/lead-voice/submit', {{method:'POST', body: fd}});
+        const data = await resp.json().catch(() => ({{}}));
+        if (!resp.ok || data.error) throw new Error(data.error || 'Upload failed.');
+        setState('Lead added ✓', 'Closing…', 'ok');
+        setTimeout(() => {{ try {{ window.close(); }} catch(e) {{}} setState('Lead added ✓', 'You can close this window.', 'ok'); }}, 900);
+      }} catch (e) {{
+        mic.disabled = false; processing = false; mic.textContent = '↻';
+        setState('Try again', e.message || 'Something went wrong.', 'err');
+      }}
+    }}
+    mic.addEventListener('click', () => {{
+      if (processing) return;
+      if (recorder && recorder.state === 'recording') stop();
+      else if (mic.textContent === '↻') reset();
+      else start();
+    }});
+    if (!navigator.mediaDevices || !window.MediaRecorder) {{
+      mic.disabled = true; setState('Not supported', 'This browser cannot record audio here.', 'err');
+    }}
+  </script>
+</body>
+</html>"""
+        return Response(html, mimetype="text/html")
+
+    @app.post("/lead-voice/submit")
+    @require_login
+    def lead_voice_submit():
+        nonce = (request.form.get("nonce") or "").strip()
+        expected = str(session.get("lead_voice_nonce") or "")
+        if not nonce or nonce != expected:
+            return jsonify({"error": "This voice session expired. Reopen Speak Lead."}), 400
+        done = session.get("lead_voice_done") or {}
+        if isinstance(done, dict) and done.get(nonce):
+            return jsonify({"ok": True, "duplicate": True})
+        upload = request.files.get("audio")
+        if not upload:
+            return jsonify({"error": "No audio was received."}), 400
+        audio = upload.read()
+        if len(audio) < 800:
+            return jsonify({"error": "Nothing was recorded. Try again."}), 400
+        if len(audio) > 25 * 1024 * 1024:
+            return jsonify({"error": "Recording was too long. Try a shorter lead note."}), 400
+        creds = load_admin_credentials(config)
+        if not creds:
+            return jsonify({"error": "Google Sheets is not connected. Reconnect Google in Settings."}), 500
+        try:
+            service = build_sheets_service_from_creds(creds)
+            sheet_id, dropdowns = _lead_voice_sheet_meta(service)
+            transcript = _lead_voice_transcribe(
+                config,
+                audio,
+                upload.filename or "lead.webm",
+                upload.mimetype or "audio/webm",
+            )
+            lead = _lead_voice_extract(config=config, transcript=transcript, dropdowns=dropdowns)
+            _lead_voice_insert_row(service, sheet_id, lead)
+        except HttpError:
+            return jsonify({"error": "Google Sheets write failed."}), 500
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 500
+        except Exception:
+            return jsonify({"error": "Lead could not be added. Try again."}), 500
+        done = done if isinstance(done, dict) else {}
+        done[nonce] = int(time.time())
+        # Keep the browser session cookie small.
+        done = dict(list(done.items())[-10:])
+        session["lead_voice_done"] = done
+        session["lead_voice_nonce"] = ""
+        return jsonify({"ok": True})
 
     @app.get("/login")
     def login():
