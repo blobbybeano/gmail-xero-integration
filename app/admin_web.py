@@ -10932,36 +10932,57 @@ function toggleReceiptsEnabled(requested) {{
           const primaryInvoiceIdsByRow = sales.map(function(s) {{
             return s.invoice && s.invoice.id ? String(s.invoice.id) : '';
           }});
+          function saleInvoiceOptions(sale) {{
+            const seen = new Set();
+            const out = [];
+            [sale && sale.invoice, sale && sale.quick_invoice].concat((sale && sale.candidates) || [], (sale && sale.tied_candidates) || []).forEach(function(opt) {{
+              const id = opt && opt.id ? String(opt.id) : '';
+              if (!id || seen.has(id)) return;
+              seen.add(id);
+              out.push(opt);
+            }});
+            return out;
+          }}
+          function splitCandidateForRows(rows) {{
+            const cleanRows = (rows || []).filter(function(rIdx) {{ return Number.isInteger(rIdx) && sales[rIdx]; }});
+            if (cleanRows.length < 2) return null;
+            const gross = cleanRows.reduce(function(sum, rIdx) {{ return sum + Number((sales[rIdx] || {{}}).gross || 0); }}, 0);
+            const firstOptions = saleInvoiceOptions(sales[cleanRows[0]]);
+            let chosen = null;
+            firstOptions.some(function(opt) {{
+              const id = opt && opt.id ? String(opt.id) : '';
+              if (!id) return false;
+              const onEveryRow = cleanRows.every(function(rIdx) {{
+                return saleInvoiceOptions(sales[rIdx]).some(function(other) {{ return other && String(other.id || '') === id; }});
+              }});
+              if (!onEveryRow) return false;
+              const invTotal = _invAmount(opt);
+              if (Math.abs(gross - invTotal) >= 0.02) return false;
+              chosen = opt;
+              return true;
+            }});
+            if (!chosen) return null;
+            const id = String(chosen.id || '');
+            const invTotal = _invAmount(chosen);
+            cleanRows.sort(function(a, b) {{ return a - b; }});
+            return {{
+              key: b.id + '::split::' + id + '::' + cleanRows.join('-'),
+              invoice_id: id,
+              rows: cleanRows,
+              gross: Number(gross.toFixed(2)),
+              invoice_total: Number(invTotal.toFixed(2)),
+              invoice: chosen,
+            }};
+          }}
           function splitCandidateForRow(opt, idx) {{
             const id = opt && opt.id ? String(opt.id) : '';
             if (!id) return null;
-            let gross = Number((sales[idx] || {{}}).gross || 0);
             const rows = [idx];
-            function saleHasInvoiceOption(sale, invoiceId) {{
-              if (!sale || !invoiceId) return false;
-              if (sale.invoice && String(sale.invoice.id || '') === invoiceId) return true;
-              if (sale.quick_invoice && String(sale.quick_invoice.id || '') === invoiceId) return true;
-              return (sale.candidates || []).concat(sale.tied_candidates || []).some(function(candidate) {{
-                return candidate && String(candidate.id || '') === invoiceId;
-              }});
-            }}
             sales.forEach(function(otherSale, otherIdx) {{
-              if (otherIdx !== idx && saleHasInvoiceOption(otherSale, id)) {{
-                gross += Number((sales[otherIdx] || {{}}).gross || 0);
-                rows.push(otherIdx);
-              }}
+              if (otherIdx !== idx && saleInvoiceOptions(otherSale).some(function(candidate) {{ return candidate && String(candidate.id || '') === id; }})) rows.push(otherIdx);
             }});
             if (rows.length < 2) return null;
-            const invTotal = _invAmount(opt);
-            if (Math.abs(gross - invTotal) >= 0.02) return null;
-            rows.sort(function(a, b) {{ return a - b; }});
-            return {{
-              key: b.id + '::split::' + id,
-              invoice_id: id,
-              rows: rows,
-              gross: Number(gross.toFixed(2)),
-              invoice_total: Number(invTotal.toFixed(2)),
-            }};
+            return splitCandidateForRows(rows);
           }}
           function optionAvailableForRow(opt, idx) {{
             const id = opt && opt.id ? String(opt.id) : '';
@@ -11045,6 +11066,15 @@ function toggleReceiptsEnabled(requested) {{
             const invoiceReady = rowState.invoiceReady;
             const duplicateSelected = rowState.duplicateSelected;
             const splitActive = rowState.splitActive;
+            const splitRows = splitActive ? ((rowState.split && rowState.split.rows) || []).slice().sort(function(a, b) {{ return a - b; }}) : [];
+            if (splitActive && splitRows.length && idx !== splitRows[0]) return '';
+            const displayGross = splitActive ? rowState.splitGross : Number(s.gross || 0);
+            const displayFee = splitActive
+              ? splitRows.reduce(function(sum, rIdx) {{ return sum + Number((sales[rIdx] || {{}}).fee || 0); }}, 0)
+              : Number(s.fee || 0);
+            const displayDate = splitActive
+              ? '<div class="font-semibold text-sky-900">' + splitRows.length + ' payments</div><div class="text-[10px] text-gray-400">' + splitRows.map(function(rIdx) {{ return esc(gb((sales[rIdx] || {{}}).date)); }}).join(' + ') + '</div>'
+              : esc(gb(s.date)) + sTime;
 
             // Option list: matched -> [app pick, ...same-amount alts]; missing -> ranked candidates.
             const allOptions = isMissing
@@ -11135,8 +11165,8 @@ function toggleReceiptsEnabled(requested) {{
             // as "no matching invoice" and show the raw CSV sale facts, while
             // still keeping the candidates below for manual cross-referencing.
             const favAmountMatch = !!(favoured && favoured.amount_match);
-            const noAmountMatch = isMissing && !userChosen && !!favoured && !favAmountMatch;
-            const needsSuggestionConfirm = isMissing && !userChosen && !!favoured && favAmountMatch;
+            const noAmountMatch = !splitActive && isMissing && !userChosen && !!favoured && !favAmountMatch;
+            const needsSuggestionConfirm = !splitActive && isMissing && !userChosen && !!favoured && favAmountMatch;
             const likelyCal = (s.calendar_suggestions || []).find(function(c) {{
               const eventGross = Number(c.event_gross);
               const saleGross = Number(s.gross || 0);
@@ -11220,12 +11250,7 @@ function toggleReceiptsEnabled(requested) {{
                 : '<span class="text-indigo-700 font-mono">' + esc(favoured.number || '') + '</span> '
                     + '<span class="text-gray-400 font-mono">' + esc(favoured.reference || '') + '</span>' + calLine + suggestedConfirmBtn;
             if (noMatch) {{ invCell += '<div class="mt-1">' + qiBtn + '</div>'; }}
-            if (splitCandidate && !splitActive) {{
-              invCell += '<div class="mt-2 rounded border border-sky-200 bg-sky-50 p-2 text-[11px] text-sky-800">'
-                + '<div class="font-semibold">Split card payment: ' + splitCandidate.rows.map(function(rIdx) {{ return money((sales[rIdx] || {{}}).gross || 0); }}).join(' + ') + ' = ' + money(splitCandidate.invoice_total) + '</div>'
-                + '<button class="cf-split-combine mt-1 inline-flex px-2 py-1 rounded bg-sky-600 text-white text-[11px] font-semibold hover:bg-sky-700" data-si="' + idx + '" data-ci="' + favIdx + '" data-missing="' + (isMissing ? '1' : '0') + '" data-rows="' + esc(splitCandidate.rows.join(',')) + '" data-invoice-id="' + esc(splitCandidate.invoice_id) + '" data-key="' + esc(splitCandidate.key) + '">Combine split payments</button>'
-                + '</div>';
-            }} else if (splitActive) {{
+            if (splitActive) {{
               invCell += '<div class="mt-2 rounded border border-emerald-200 bg-emerald-50 p-2 text-[11px] text-emerald-800">'
                 + '<div class="font-semibold">Split payment combined: ' + money(rowState.splitGross) + ' against one invoice.</div>'
                 + '<button class="cf-split-clear mt-1 underline text-gray-500 hover:text-red-600" data-si="' + idx + '">clear</button>'
@@ -11276,6 +11301,8 @@ function toggleReceiptsEnabled(requested) {{
                 + ' <button class="cf-row-reset ml-1 text-[10px] text-gray-400 hover:text-red-500 underline" data-si="' + idx + '" data-missing="' + (isMissing?'1':'0') + '">reset</button>';
             }} else if (noAmountMatch) {{
               statusBadge = '<span class="text-amber-700 font-semibold">\u26a0 no matching invoice</span>';
+            }} else if (splitActive) {{
+              statusBadge = '<span class="text-emerald-700 font-semibold">✓ combined payments</span>';
             }} else if (isMissing) {{
               statusBadge = '<span class="text-amber-700 font-semibold">\u23f3 suggested \u2014 confirm this row</span>';
             }} else if (expectedAdj && !adjustmentOk) {{
@@ -11390,9 +11417,9 @@ function toggleReceiptsEnabled(requested) {{
               : 'border-gray-100 hover:bg-gray-50';
 
             return '<tr class="border-t ' + rowCls + '">'
-              + '<td class="px-3 py-2 text-xs text-sky-900 bg-sky-50/45 whitespace-nowrap">' + esc(gb(s.date)) + sTime + '</td>'
-              + '<td class="px-3 py-2 text-xs text-right font-semibold text-sky-950 bg-sky-50/45">' + money(s.gross) + '</td>'
-              + '<td class="px-3 py-2 text-xs text-right text-sky-700 bg-sky-50/45">' + money(s.fee) + '</td>'
+              + '<td class="px-3 py-2 text-xs text-sky-900 bg-sky-50/45 whitespace-nowrap">' + displayDate + '</td>'
+              + '<td class="px-3 py-2 text-xs text-right font-semibold text-sky-950 bg-sky-50/45">' + money(displayGross) + '</td>'
+              + '<td class="px-3 py-2 text-xs text-right text-sky-700 bg-sky-50/45">' + money(displayFee) + '</td>'
               + '<td class="px-3 py-2 text-xs font-medium text-gray-900">' + custName + '</td>'
               + '<td class="px-3 py-2 text-xs">' + invCell + '</td>'
               + '<td class="px-3 py-2 text-xs">' + statusBadge + toggle + '</td>'
@@ -11439,6 +11466,32 @@ function toggleReceiptsEnabled(requested) {{
             : (checked
                 ? '<span class="text-emerald-700 font-semibold">✓ Confirmed — ready to reconcile in Xero</span>'
                 : '<span class="text-gray-600">Mark as confirmed — all invoices look correct</span>');
+          const advancedRows = sales.map(function(s, idx) {{
+            const opts = saleInvoiceOptions(s);
+            const selected = rowStates[idx] && rowStates[idx].selected;
+            const selectedLabel = selected ? (selected.contact_name || selected.number || 'invoice') : (opts[0] ? (opts[0].contact_name || opts[0].number || 'suggestion') : 'no invoice option');
+            return '<label class="flex items-center justify-between gap-3 rounded border border-gray-100 bg-white px-2 py-1.5">'
+              + '<span class="flex items-center gap-2 min-w-0">'
+              + '<input type="checkbox" class="cf-combine-payment h-3.5 w-3.5 accent-sky-600" data-si="' + idx + '">'
+              + '<span class="min-w-0"><span class="font-semibold text-gray-800">' + esc(gb(s.date)) + '</span>'
+              + '<span class="text-gray-500"> · ' + esc(s.time || '') + '</span>'
+              + '<span class="block truncate text-gray-500">' + esc(selectedLabel) + '</span></span>'
+              + '</span>'
+              + '<span class="font-semibold text-sky-900">' + money(s.gross || 0) + '</span>'
+              + '</label>';
+          }}).join('');
+          const advancedHtml = '<details class="mb-2 rounded-lg border border-gray-200 bg-gray-50">'
+            + '<summary class="cursor-pointer list-none px-3 py-2 text-[11px] font-semibold text-gray-600 flex items-center justify-between">'
+            + '<span>Advanced</span><span class="text-gray-400">combine payments</span></summary>'
+            + '<div class="border-t border-gray-200 p-3">'
+            + '<div class="text-[11px] text-gray-500 mb-2">Combine card payments only when they belong to the same invoice.</div>'
+            + '<div class="grid gap-1.5 sm:grid-cols-2 lg:grid-cols-3">' + advancedRows + '</div>'
+            + '<div class="mt-2 flex items-center gap-2">'
+            + '<button type="button" class="cf-advanced-combine px-2 py-1 rounded bg-sky-600 text-white text-[11px] font-semibold hover:bg-sky-700">Combine selected payments</button>'
+            + '<span class="cf-advanced-status text-[11px] text-gray-500"></span>'
+            + '</div>'
+            + '</div>'
+            + '</details>';
 
           const borderCls = b.status === 'ready' ? 'border-emerald-200'
                           : b.status === 'needs_review' ? 'border-orange-200'
@@ -11470,6 +11523,7 @@ function toggleReceiptsEnabled(requested) {{
             <div class="px-4 py-3">
               <div class="text-[10px] uppercase tracking-widest text-gray-400 font-semibold mb-0.5">Invoices to select in Xero (${{b.sale_count}} in this batch)</div>
               <div class="text-[11px] text-gray-400 mb-2">${{batchHasPaidInvoices ? 'These invoices are already paid in Xero. Submitting moves the invoice payment into Cashflow reconciliation and creates one net Cashflows bank transaction for the payout.' : 'These were matched by this app. Xero is not changed by preview or ticking; only the separate submit button prepares the selected batches for Xero.'}}</div>
+              ${{advancedHtml}}
               <div class="overflow-x-auto rounded-lg border border-gray-100">
                 <table class="w-full text-xs">
                   <thead>
@@ -11521,6 +11575,31 @@ function toggleReceiptsEnabled(requested) {{
             btn.addEventListener('click', () => {{
               const panel = wrap.querySelector('#cf-row-panel-' + b.id + '-' + btn.dataset.si);
               if (panel) panel.classList.toggle('hidden');
+            }});
+          }});
+
+          wrap.querySelectorAll('.cf-advanced-combine').forEach(btn => {{
+            btn.addEventListener('click', () => {{
+              const status = wrap.querySelector('.cf-advanced-status');
+              const selectedRows = Array.from(wrap.querySelectorAll('.cf-combine-payment:checked'))
+                .map(function(cb) {{ return Number(cb.dataset.si); }})
+                .filter(function(x) {{ return Number.isInteger(x); }});
+              const split = splitCandidateForRows(selectedRows);
+              if (!split) {{
+                if (status) status.textContent = 'Selected payments do not add up to one shared invoice.';
+                return;
+              }}
+              selectedRows.forEach(function(rIdx) {{
+                const sale = sales[rIdx];
+                if (!sale) return;
+                const chosen = saleInvoiceOptions(sale).find(function(opt) {{ return opt && String(opt.id || '') === split.invoice_id; }});
+                if (!chosen) return;
+                if (!sale.invoice) _setMatch(_saleKey(b.id, sale, rIdx), chosen);
+                else if (String(sale.invoice.id || '') !== split.invoice_id) _setTiedSwap(b.id, rIdx, chosen);
+                _setAdjustment(_saleKey(b.id, sale, rIdx), null);
+                _setSplit(_saleKey(b.id, sale, rIdx), split);
+              }});
+              wrap.replaceWith(renderBatch(b));
             }});
           }});
 
