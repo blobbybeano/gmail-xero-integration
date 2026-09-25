@@ -10917,6 +10917,16 @@ function toggleReceiptsEnabled(requested) {{
 
           // ── Invoice rows (right side of Xero reconciliation — "Find & select") ──
           const sales = b.sales || [];
+          const primaryInvoiceIdsByRow = sales.map(function(s) {{
+            return s.invoice && s.invoice.id ? String(s.invoice.id) : '';
+          }});
+          function optionAvailableForRow(opt, idx) {{
+            const id = opt && opt.id ? String(opt.id) : '';
+            if (!id) return true;
+            return !primaryInvoiceIdsByRow.some(function(otherId, otherIdx) {{
+              return otherIdx !== idx && otherId === id;
+            }});
+          }}
           let rawRowSelections = sales.map((s, idx) => _selectedInvoiceForSale(b, s, idx));
           let selectedInvoiceCounts = {{}};
           function rebuildSelectedInvoiceCounts() {{
@@ -10986,8 +10996,8 @@ function toggleReceiptsEnabled(requested) {{
 
             // Option list: matched -> [app pick, ...same-amount alts]; missing -> ranked candidates.
             const allOptions = isMissing
-              ? (s.candidates || [])
-              : [s.invoice].concat(s.tied_candidates || []);
+              ? (s.candidates || []).filter(function(opt){{ return optionAvailableForRow(opt, idx); }})
+              : [s.invoice].concat((s.tied_candidates || []).filter(function(opt){{ return optionAvailableForRow(opt, idx); }}));
 
             // User overrides.
             const tswap = isMissing ? null : _getTiedSwap(b.id, idx);
