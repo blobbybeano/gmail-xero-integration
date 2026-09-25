@@ -10947,15 +10947,20 @@ function toggleReceiptsEnabled(requested) {{
             const cleanRows = (rows || []).filter(function(rIdx) {{ return Number.isInteger(rIdx) && sales[rIdx]; }});
             if (cleanRows.length < 2) return null;
             const gross = cleanRows.reduce(function(sum, rIdx) {{ return sum + Number((sales[rIdx] || {{}}).gross || 0); }}, 0);
-            const firstOptions = saleInvoiceOptions(sales[cleanRows[0]]);
+            const seen = new Set();
+            const allOptions = [];
+            cleanRows.forEach(function(rIdx) {{
+              saleInvoiceOptions(sales[rIdx]).forEach(function(opt) {{
+                const id = opt && opt.id ? String(opt.id) : '';
+                if (!id || seen.has(id)) return;
+                seen.add(id);
+                allOptions.push(opt);
+              }});
+            }});
             let chosen = null;
-            firstOptions.some(function(opt) {{
+            allOptions.some(function(opt) {{
               const id = opt && opt.id ? String(opt.id) : '';
               if (!id) return false;
-              const onEveryRow = cleanRows.every(function(rIdx) {{
-                return saleInvoiceOptions(sales[rIdx]).some(function(other) {{ return other && String(other.id || '') === id; }});
-              }});
-              if (!onEveryRow) return false;
               const invTotal = _invAmount(opt);
               if (Math.abs(gross - invTotal) >= 0.02) return false;
               chosen = opt;
@@ -11467,25 +11472,21 @@ function toggleReceiptsEnabled(requested) {{
                 ? '<span class="text-emerald-700 font-semibold">✓ Confirmed — ready to reconcile in Xero</span>'
                 : '<span class="text-gray-600">Mark as confirmed — all invoices look correct</span>');
           const advancedRows = sales.map(function(s, idx) {{
-            const opts = saleInvoiceOptions(s);
-            const selected = rowStates[idx] && rowStates[idx].selected;
-            const selectedLabel = selected ? (selected.contact_name || selected.number || 'invoice') : (opts[0] ? (opts[0].contact_name || opts[0].number || 'suggestion') : 'no invoice option');
             return '<label class="flex items-center justify-between gap-3 rounded border border-gray-100 bg-white px-2 py-1.5">'
               + '<span class="flex items-center gap-2 min-w-0">'
               + '<input type="checkbox" class="cf-combine-payment h-3.5 w-3.5 accent-sky-600" data-si="' + idx + '">'
               + '<span class="min-w-0"><span class="font-semibold text-gray-800">' + esc(gb(s.date)) + '</span>'
               + '<span class="text-gray-500"> · ' + esc(s.time || '') + '</span>'
-              + '<span class="block truncate text-gray-500">' + esc(selectedLabel) + '</span></span>'
+              + '<span class="block truncate text-gray-500">CSV card payment · fee ' + money(s.fee || 0) + '</span></span>'
               + '</span>'
               + '<span class="font-semibold text-sky-900">' + money(s.gross || 0) + '</span>'
               + '</label>';
           }}).join('');
-          const advancedHtml = '<details class="mb-2 rounded-lg border border-gray-200 bg-gray-50">'
-            + '<summary class="cursor-pointer list-none px-3 py-2 text-[11px] font-semibold text-gray-600 flex items-center justify-between">'
-            + '<span>Advanced</span><span class="text-gray-400">combine payments</span></summary>'
-            + '<div class="border-t border-gray-200 p-3">'
-            + '<div class="text-[11px] text-gray-500 mb-2">Combine card payments only when they belong to the same invoice.</div>'
-            + '<div class="grid gap-1.5 sm:grid-cols-2 lg:grid-cols-3">' + advancedRows + '</div>'
+          const advancedMenuHtml = '<details class="relative">'
+            + '<summary class="cursor-pointer list-none rounded-full border border-gray-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-gray-500 hover:bg-gray-50">Advanced ▾</summary>'
+            + '<div class="absolute right-0 z-30 mt-2 w-[22rem] max-w-[calc(100vw-2rem)] rounded-lg border border-gray-200 bg-white p-3 shadow-lg">'
+            + '<div class="text-[10px] uppercase tracking-widest text-gray-400 font-semibold mb-2">Combine payments</div>'
+            + '<div class="space-y-1.5 max-h-64 overflow-auto">' + advancedRows + '</div>'
             + '<div class="mt-2 flex items-center gap-2">'
             + '<button type="button" class="cf-advanced-combine px-2 py-1 rounded bg-sky-600 text-white text-[11px] font-semibold hover:bg-sky-700">Combine selected payments</button>'
             + '<span class="cf-advanced-status text-[11px] text-gray-500"></span>'
@@ -11514,6 +11515,7 @@ function toggleReceiptsEnabled(requested) {{
                 </div>
               </div>
               <div class="flex items-center gap-2">
+                ${{advancedMenuHtml}}
                 <button type="button" class="batch-refresh-btn h-7 w-7 rounded-full border border-gray-200 bg-white hover:bg-gray-50 text-gray-500 text-sm leading-none disabled:opacity-50" data-batch-id="${{b.id}}" title="Refresh this batch after updating the calendar or Xero">↻</button>
                 <span class="px-2 py-1 rounded-full border text-xs font-semibold ${{displayMeta.cls}}">${{displayMeta.label}}</span>
               </div>
@@ -11523,7 +11525,6 @@ function toggleReceiptsEnabled(requested) {{
             <div class="px-4 py-3">
               <div class="text-[10px] uppercase tracking-widest text-gray-400 font-semibold mb-0.5">Invoices to select in Xero (${{b.sale_count}} in this batch)</div>
               <div class="text-[11px] text-gray-400 mb-2">${{batchHasPaidInvoices ? 'These invoices are already paid in Xero. Submitting moves the invoice payment into Cashflow reconciliation and creates one net Cashflows bank transaction for the payout.' : 'These were matched by this app. Xero is not changed by preview or ticking; only the separate submit button prepares the selected batches for Xero.'}}</div>
-              ${{advancedHtml}}
               <div class="overflow-x-auto rounded-lg border border-gray-100">
                 <table class="w-full text-xs">
                   <thead>
@@ -12715,6 +12716,19 @@ function toggleReceiptsEnabled(requested) {{
                     str(req_sale.get("selected_invoice_id") or ""),
                     str(req_sale.get("selected_invoice_number") or ""),
                 )
+                if not selected:
+                    split_key_for_lookup = str(req_sale.get("split_group_key") or "").strip()
+                    split_group_for_lookup = split_groups.get(split_key_for_lookup) if split_key_for_lookup else None
+                    for group_idx in (split_group_for_lookup or {}).get("indices", []):
+                        if group_idx == idx or group_idx < 0 or group_idx >= len(sales):
+                            continue
+                        selected = _find_candidate(
+                            sales[group_idx],
+                            str(req_sale.get("selected_invoice_id") or ""),
+                            str(req_sale.get("selected_invoice_number") or ""),
+                        )
+                        if selected:
+                            break
                 sale_ref = str(sale.get("sale_ref") or "")
                 sale_gross = _money_value(sale.get("gross"))
                 if not selected:
