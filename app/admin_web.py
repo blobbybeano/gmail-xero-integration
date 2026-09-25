@@ -1761,6 +1761,24 @@ def _lead_voice_pick_default(options: list[str], needles: tuple[str, ...]) -> st
     return ""
 
 
+def _lead_voice_london_today() -> dt.datetime:
+    try:
+        from zoneinfo import ZoneInfo
+        return dt.datetime.now(ZoneInfo("Europe/London"))
+    except Exception:
+        return dt.datetime.now()
+
+
+def _lead_voice_date_text(value: object) -> str:
+    raw = str(value or "").strip()
+    if raw:
+        try:
+            return dt.date.fromisoformat(raw[:10]).strftime("%d/%m/%Y")
+        except Exception:
+            pass
+    return _lead_voice_london_today().strftime("%d/%m/%Y")
+
+
 def _lead_voice_transcribe(config: AppConfig, audio_bytes: bytes, filename: str, mime_type: str) -> str:
     api_key = _lead_voice_openai_key(config)
     if not api_key:
@@ -1792,6 +1810,7 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
         "type": "object",
         "additionalProperties": False,
         "properties": {
+            "lead_date": {"type": "string"},
             "lead_name": {"type": "string"},
             "number": {"type": "string"},
             "email": {"type": "string"},
@@ -1804,11 +1823,14 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
             "contact": {"type": "string"},
             "notes": {"type": "string"},
         },
-        "required": ["lead_name", "number", "email", "source", "job_type", "form_of_contact", "conversion", "void", "area", "contact", "notes"],
+        "required": ["lead_date", "lead_name", "number", "email", "source", "job_type", "form_of_contact", "conversion", "void", "area", "contact", "notes"],
     }
+    today_iso = _lead_voice_london_today().date().isoformat()
     prompt = (
         "Extract one new sales lead from the transcript. Return only JSON matching the schema. "
         "Never invent customer information. Leave missing unknown customer fields blank. "
+        f"For lead_date, return {today_iso} unless the speaker clearly says a different date. "
+        "If a different date is clearly spoken, return it as YYYY-MM-DD. "
         "For dropdown fields, choose only one exact permitted option or blank. "
         "Giving a quote does not mean conversion unless the customer booked/accepted. "
         "Use notes only for concise operational details not already in other fields. "
@@ -1839,6 +1861,7 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
     if not isinstance(data, dict):
         raise RuntimeError("OpenAI returned invalid lead data.")
     cleaned = {key: str(data.get(key) or "").strip() for key, _label in LEAD_VOICE_COLUMNS if key != "date"}
+    cleaned["lead_date"] = str(data.get("lead_date") or today_iso).strip() or today_iso
     for key in LEAD_VOICE_DROPDOWN_KEYS:
         value = cleaned.get(key, "")
         allowed = dropdowns.get(key) or []
@@ -1852,13 +1875,8 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
 
 
 def _lead_voice_insert_row(service, sheet_id: int, lead: dict) -> None:
-    try:
-        from zoneinfo import ZoneInfo
-        today = dt.datetime.now(ZoneInfo("Europe/London"))
-    except Exception:
-        today = dt.datetime.now()
     row = [
-        today.strftime("%d/%m/%Y"),
+        _lead_voice_date_text(lead.get("lead_date")),
         _lead_voice_sanitise_cell(lead.get("lead_name")),
         _lead_voice_sanitise_phone(lead.get("number")),
         _lead_voice_sanitise_cell(lead.get("email")),
