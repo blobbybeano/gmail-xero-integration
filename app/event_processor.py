@@ -866,9 +866,14 @@ def set_title_status_emoji(
     if not emoji:
         return base
     prefix = emoji + ("." * dots if dots else "")
+    parts = [prefix]
+    if _title_has_photo_emoji(summary):
+        parts.append("📷")
+    if _title_has_mail_emoji(summary):
+        parts.append("✉️")
     if base:
-        return f"{prefix} {base}"
-    return prefix
+        parts.append(base)
+    return " ".join(parts).strip()
 
 
 def set_title_mail_emoji(summary: str | None, email_send_failed: bool) -> str:
@@ -879,16 +884,64 @@ def set_title_mail_emoji(summary: str | None, email_send_failed: bool) -> str:
     base = _strip_title_prefix_markers(summary)
     status_emoji = _extract_title_status_emoji(summary)
     dots = _extract_title_progress_dots(summary)
+    has_photo = _title_has_photo_emoji(summary)
     mail_emoji = "✉️" if email_send_failed else ""
 
     parts: list[str] = []
     if status_emoji:
         parts.append(status_emoji + ("." * dots if dots else ""))
+    if has_photo:
+        parts.append("📷")
     if mail_emoji:
         parts.append(mail_emoji)
     if base:
         parts.append(base)
     return " ".join(parts).strip()
+
+
+def set_title_photo_emoji(summary: str | None, has_job_photos: bool) -> str:
+    """
+    Add/remove the job-photo marker next to the status dot in the title.
+    This is for technician-side photos only; customer-provided photos do not count.
+    Example: "🟡 📷 My Event"
+    """
+    base = _strip_title_prefix_markers(summary)
+    status_emoji = _extract_title_status_emoji(summary)
+    dots = _extract_title_progress_dots(summary)
+    has_mail = _title_has_mail_emoji(summary)
+
+    parts: list[str] = []
+    if status_emoji:
+        parts.append(status_emoji + ("." * dots if dots else ""))
+    if has_job_photos:
+        parts.append("📷")
+    if has_mail:
+        parts.append("✉️")
+    if base:
+        parts.append(base)
+    return " ".join(parts).strip()
+
+
+def _title_has_mail_emoji(summary: str | None) -> bool:
+    text = (summary or "").strip()
+    for em in ("🔵", "🟠", "🟡", "🟢", "🔴"):
+        if text.startswith(em):
+            text = text[len(em):].lstrip(" -")
+            break
+    text = text.lstrip(". ").lstrip(" -")
+    if text.startswith("📷"):
+        text = text[len("📷"):].lstrip(" -")
+    return text.startswith("✉️") or text.startswith("✉")
+
+
+def _title_has_photo_emoji(summary: str | None) -> bool:
+    text = (summary or "").strip()
+    for em in ("🔵", "🟠", "🟡", "🟢", "🔴"):
+        if text.startswith(em):
+            text = text[len(em):].lstrip(" -")
+            break
+    text = text.lstrip(". ").lstrip(" -")
+    return text.startswith("📷")
 
 
 def _extract_title_status_emoji(summary: str | None) -> str:
@@ -923,9 +976,13 @@ def _strip_title_prefix_markers(summary: str | None) -> str:
             text = text[len(em):].lstrip(" -")
             break
     text = text.lstrip(". ").lstrip(" -")
-    for em in ("✉️", "✉"):
-        if text.startswith(em):
-            text = text[len(em):].lstrip(" -")
+    while True:
+        original = text
+        for em in ("📷", "✉️", "✉"):
+            if text.startswith(em):
+                text = text[len(em):].lstrip(" -")
+                break
+        if text == original:
             break
     return text.strip()
 

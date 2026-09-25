@@ -164,6 +164,18 @@ def list_job_photos(db_path: str, event_key: str) -> list[dict[str, Any]]:
     return files if isinstance(files, list) else []
 
 
+def has_technician_title_photo_marker(photos: list[dict[str, Any]]) -> bool:
+    """Only after photos and technical uploads get a camera marker in Calendar titles."""
+    for photo in photos or []:
+        category = str(photo.get("category") or "")
+        detail = str(photo.get("category_detail") or "").lower()
+        if category == CATEGORY_UPDATE:
+            return True
+        if category == CATEGORY_BEFORE_AFTER and detail == "after":
+            return True
+    return False
+
+
 def _save_job_photo(db_path: str, event_key: str, row: dict[str, Any]) -> None:
     rows = get_json_setting(db_path, _FILES_KEY, {}) or {}
     files = rows.get(event_key) or []

@@ -12,6 +12,7 @@ from app.event_processor import (
     clear_process_draft_yes,
     send_choice_is_no,
     send_choice_is_yes,
+    set_title_photo_emoji,
     sync_invoice_block_from_xero,
     upsert_invoice_summary,
     upsert_invoice_profile_missing_hint,
@@ -24,6 +25,22 @@ SALES_MARKER = "\u2b07Sales\u2b07"
 
 
 class InvoiceSalesParsingTests(unittest.TestCase):
+    def test_title_photo_marker_sits_after_status_dot(self):
+        self.assertEqual(
+            set_title_photo_emoji("🟠 ✉️ SE6 GC Sylvie", True),
+            "🟠 📷 ✉️ SE6 GC Sylvie",
+        )
+        self.assertEqual(
+            set_title_photo_emoji("🟠.. G.C Carol Canaan", True),
+            "🟠.. 📷 G.C Carol Canaan",
+        )
+
+    def test_title_photo_marker_can_be_removed_without_losing_mail(self):
+        self.assertEqual(
+            set_title_photo_emoji("🟡 📷 ✉️ SE6 GC Sylvie", False),
+            "🟡 ✉️ SE6 GC Sylvie",
+        )
+
     def test_sales_section_enters_invoice_totals_once(self):
         description = (
             "[invoice]\n"
