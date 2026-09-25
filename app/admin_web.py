@@ -1764,6 +1764,46 @@ def _lead_voice_pick_default(options: list[str], needles: tuple[str, ...]) -> st
     return ""
 
 
+def _lead_voice_option_key(value: object) -> str:
+    return re.sub(r"[\s_]+", "", str(value or "").strip().lower())
+
+
+def _lead_voice_find_option(options: list[str], wanted: str) -> str:
+    wanted_key = _lead_voice_option_key(wanted)
+    for option in options:
+        if _lead_voice_option_key(option) == wanted_key:
+            return option
+    return ""
+
+
+def _lead_voice_apply_abbreviation_rules(lead: dict, transcript: str, dropdowns: dict[str, list[str]]) -> dict:
+    text = str(transcript or "").lower()
+    form_options = dropdowns.get("form_of_contact") or []
+    has_call = any(word in text for word in ("call", "called", "phoned", "rang"))
+    no_answer = any(
+        phrase in text
+        for phrase in (
+            "no answer",
+            "no-answer",
+            "no reply",
+            "didn't answer",
+            "did not answer",
+            "wouldn't answer",
+            "n.a",
+            "n/a",
+        )
+    )
+    has_whatsapp = any(word in text for word in ("whatsapp", "whatsapped", "watsapp"))
+    if has_call and no_answer and has_whatsapp:
+        option = (
+            _lead_voice_find_option(form_options, "Call N.A/Whatsapp")
+            or _lead_voice_find_option(form_options, "Call N.A /Whatsapp")
+        )
+        if option:
+            lead["form_of_contact"] = option
+    return lead
+
+
 def _lead_voice_london_today() -> dt.datetime:
     try:
         from zoneinfo import ZoneInfo
@@ -1804,7 +1844,7 @@ def _lead_voice_transcribe(config: AppConfig, audio_bytes: bytes, filename: str,
     return text
 
 
-def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[str, list[str]]) -> dict:
+def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[str, list[str]], for_edit: bool = False) -> dict:
     api_key = _lead_voice_openai_key(config)
     if not api_key:
         raise RuntimeError("OpenAI is not configured.")
@@ -1829,12 +1869,25 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
         "required": ["lead_date", "lead_name", "number", "email", "source", "job_type", "form_of_contact", "conversion", "void", "area", "contact", "notes"],
     }
     today_iso = _lead_voice_london_today().date().isoformat()
+    date_instruction = (
+        "For lead_date, leave it blank unless the speaker clearly says a replacement date. "
+        if for_edit
+        else f"For lead_date, return {today_iso} unless the speaker clearly says a different date. "
+    )
+    task_instruction = (
+        "Extract only the fields to update on an existing sales lead from the transcript. "
+        "Leave fields blank when the speaker has not clearly asked to change or add them. "
+        if for_edit
+        else "Extract one new sales lead from the transcript. "
+    )
     prompt = (
-        "Extract one new sales lead from the transcript. Return only JSON matching the schema. "
+        f"{task_instruction}Return only JSON matching the schema. "
         "Never invent customer information. Leave missing unknown customer fields blank. "
-        f"For lead_date, return {today_iso} unless the speaker clearly says a different date. "
-        "If a different date is clearly spoken, return it as YYYY-MM-DD. "
+        f"{date_instruction}"
+        "If a date is clearly spoken, return it as YYYY-MM-DD. "
         "For dropdown fields, choose only one exact permitted option or blank. "
+        "Abbreviations: N.A means no answer. If the speaker says they called, got no answer, "
+        "then WhatsApped, choose the exact permitted Form of Contact option matching Call N.A/Whatsapp. "
         "Giving a quote does not mean conversion unless the customer booked/accepted. "
         "Use notes only for concise operational details not already in other fields. "
         "Preserve UK phone numbers and leading zeroes.\n\n"
@@ -1864,15 +1917,16 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
     if not isinstance(data, dict):
         raise RuntimeError("OpenAI returned invalid lead data.")
     cleaned = {key: str(data.get(key) or "").strip() for key, _label in LEAD_VOICE_COLUMNS if key != "date"}
-    cleaned["lead_date"] = str(data.get("lead_date") or today_iso).strip() or today_iso
+    cleaned["lead_date"] = str(data.get("lead_date") or ("" if for_edit else today_iso)).strip() or ("" if for_edit else today_iso)
+    cleaned = _lead_voice_apply_abbreviation_rules(cleaned, transcript, dropdowns)
     for key in LEAD_VOICE_DROPDOWN_KEYS:
         value = cleaned.get(key, "")
         allowed = dropdowns.get(key) or []
         if value and value not in allowed:
             raise RuntimeError(f"AI chose an invalid {key.replace('_', ' ')} option.")
-    if not cleaned.get("conversion"):
+    if not for_edit and not cleaned.get("conversion"):
         cleaned["conversion"] = _lead_voice_pick_default(dropdowns.get("conversion") or [], ("?", "unknown", "not sure"))
-    if not cleaned.get("void"):
+    if not for_edit and not cleaned.get("void"):
         cleaned["void"] = _lead_voice_pick_default(dropdowns.get("void") or [], ("fine", "no", "valid", "not void"))
     return cleaned
 
@@ -1903,6 +1957,51 @@ def _lead_voice_insert_row(service, sheet_id: int, lead: dict) -> None:
     service.spreadsheets().values().update(
         spreadsheetId=LEAD_VOICE_SPREADSHEET_ID,
         range=f"{LEAD_VOICE_SHEET_NAME}!A2:L2",
+        valueInputOption="USER_ENTERED",
+        body={"values": [row]},
+    ).execute()
+
+
+def _lead_voice_recent_rows(service, limit: int = 50) -> list[dict]:
+    resp = service.spreadsheets().values().get(
+        spreadsheetId=LEAD_VOICE_SPREADSHEET_ID,
+        range=f"{LEAD_VOICE_SHEET_NAME}!A2:L{limit + 1}",
+    ).execute()
+    rows: list[dict] = []
+    for idx, row in enumerate(resp.get("values") or [], start=2):
+        padded = list(row) + [""] * (len(LEAD_VOICE_COLUMNS) - len(row))
+        padded = padded[:len(LEAD_VOICE_COLUMNS)]
+        date_text = str(padded[0] or "").strip()
+        name = str(padded[1] or "").strip()
+        phone = str(padded[2] or "").strip().lstrip("'")
+        source = str(padded[4] or "").strip()
+        label_bits = [bit for bit in (date_text, name, phone, source) if bit]
+        rows.append({"row_number": idx, "label": " · ".join(label_bits) or f"Row {idx}", "values": padded})
+    return rows
+
+
+def _lead_voice_update_row(service, row_number: int, lead: dict) -> None:
+    if row_number < 2:
+        raise RuntimeError("Choose a valid recent lead to edit.")
+    resp = service.spreadsheets().values().get(
+        spreadsheetId=LEAD_VOICE_SPREADSHEET_ID,
+        range=f"{LEAD_VOICE_SHEET_NAME}!A{row_number}:L{row_number}",
+    ).execute()
+    existing = ((resp.get("values") or [[]])[0])
+    row = (list(existing) + [""] * len(LEAD_VOICE_COLUMNS))[:len(LEAD_VOICE_COLUMNS)]
+    column_index = {key: idx for idx, (key, _label) in enumerate(LEAD_VOICE_COLUMNS)}
+    if lead.get("lead_date"):
+        row[column_index["date"]] = _lead_voice_date_text(lead.get("lead_date"))
+    for key, _label in LEAD_VOICE_COLUMNS:
+        if key == "date":
+            continue
+        value = str(lead.get(key) or "").strip()
+        if not value:
+            continue
+        row[column_index[key]] = _lead_voice_sanitise_phone(value) if key == "number" else _lead_voice_sanitise_cell(value)
+    service.spreadsheets().values().update(
+        spreadsheetId=LEAD_VOICE_SPREADSHEET_ID,
+        range=f"{LEAD_VOICE_SHEET_NAME}!A{row_number}:L{row_number}",
         valueInputOption="USER_ENTERED",
         body={"values": [row]},
     ).execute()
@@ -5903,26 +6002,54 @@ def create_app() -> Flask:
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Speak Lead</title>
   <style>
-    :root {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #111827; }}
-    body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f8fafc; }}
-    .wrap {{ width: min(100vw, 350px); height: min(100vh, 350px); box-sizing: border-box; padding: 22px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; text-align: center; }}
-    button {{ width: 148px; height: 148px; border-radius: 999px; border: 0; background: #4f46e5; color: white; font-size: 54px; box-shadow: 0 16px 36px rgba(79,70,229,.28); cursor: pointer; transition: transform .12s ease, background .12s ease; }}
-    button:active {{ transform: scale(.97); }}
-    button[disabled] {{ opacity: .65; cursor: wait; }}
-    .recording button {{ background: #dc2626; animation: pulse 1.1s infinite; }}
-    @keyframes pulse {{ 0%,100% {{ box-shadow: 0 0 0 0 rgba(220,38,38,.35); }} 50% {{ box-shadow: 0 0 0 18px rgba(220,38,38,0); }} }}
-    .title {{ font-size: 21px; font-weight: 800; }}
-    .msg {{ min-height: 34px; font-size: 14px; color: #6b7280; line-height: 1.3; }}
+    :root {{ font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif; color: #111827; }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: radial-gradient(circle at top, #ffffff 0, #f2f4f8 52%, #e8edf5 100%); }}
+    .wrap {{ width: min(100vw, 390px); min-height: min(100vh, 430px); padding: 22px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 15px; text-align: center; }}
+    .panel {{ width: 100%; padding: 20px; border-radius: 30px; background: rgba(255,255,255,.82); border: 1px solid rgba(255,255,255,.9); box-shadow: 0 24px 70px rgba(15,23,42,.14), inset 0 1px 0 rgba(255,255,255,.95); backdrop-filter: blur(20px); display: flex; flex-direction: column; align-items: center; gap: 14px; }}
+    .modebar {{ display: grid; grid-template-columns: 1fr 1fr; gap: 6px; width: 100%; padding: 4px; border-radius: 999px; background: #eef1f6; }}
+    .mode {{ border: 0; border-radius: 999px; padding: 9px 10px; background: transparent; color: #64748b; font-size: 13px; font-weight: 800; cursor: pointer; }}
+    .mode.active {{ background: white; color: #111827; box-shadow: 0 3px 12px rgba(15,23,42,.09); }}
+    .picker {{ width: 100%; display: none; gap: 7px; }}
+    .picker.show {{ display: grid; }}
+    select {{ width: 100%; min-height: 42px; border: 1px solid #d8dee9; border-radius: 14px; padding: 9px 12px; background: white; color: #111827; font-size: 14px; }}
+    .mic {{ width: 138px; height: 138px; border-radius: 999px; border: 0; background: linear-gradient(145deg, #0f172a, #3b82f6); color: white; font-size: 48px; box-shadow: 0 22px 46px rgba(37,99,235,.28), inset 0 1px 0 rgba(255,255,255,.25); cursor: pointer; transition: transform .14s ease, box-shadow .14s ease, background .14s ease; }}
+    .mic:active {{ transform: scale(.97); }}
+    .mic[disabled] {{ opacity: .62; cursor: wait; }}
+    .recording .mic {{ background: linear-gradient(145deg, #991b1b, #ef4444); animation: pulse 1.1s infinite; }}
+    @keyframes pulse {{ 0%,100% {{ box-shadow: 0 0 0 0 rgba(239,68,68,.35), inset 0 1px 0 rgba(255,255,255,.25); }} 50% {{ box-shadow: 0 0 0 18px rgba(239,68,68,0), inset 0 1px 0 rgba(255,255,255,.25); }} }}
+    .title {{ font-size: 22px; font-weight: 850; letter-spacing: 0; }}
+    .msg {{ min-height: 38px; font-size: 14px; color: #6b7280; line-height: 1.35; }}
     .err {{ color: #b91c1c; }}
-    .ok {{ color: #047857; font-weight: 700; }}
-    .retry {{ width: auto; height: auto; border-radius: 10px; padding: 9px 14px; font-size: 13px; box-shadow: none; background: #111827; }}
+    .ok {{ color: #047857; font-weight: 750; }}
+    .actions {{ display: none; width: 100%; grid-template-columns: 1fr 1fr; gap: 8px; }}
+    .actions.show {{ display: grid; }}
+    .action {{ min-height: 42px; border: 0; border-radius: 14px; background: #111827; color: white; font-weight: 800; cursor: pointer; }}
+    .action.secondary {{ background: #eef2ff; color: #3730a3; }}
+    .action.full {{ grid-column: 1 / -1; background: #f8fafc; color: #475569; }}
   </style>
 </head>
 <body>
   <div class="wrap" id="wrap">
-    <button id="mic" type="button" aria-label="Start recording">🎤</button>
-    <div class="title" id="title">Speak Lead</div>
-    <div class="msg" id="msg">Press the microphone and speak naturally.</div>
+    <div class="panel">
+      <div class="modebar">
+        <button class="mode active" id="newMode" type="button">Add lead</button>
+        <button class="mode" id="editMode" type="button">Edit recent</button>
+      </div>
+      <div class="picker" id="picker">
+        <select id="recent">
+          <option value="">Loading recent leads…</option>
+        </select>
+      </div>
+      <button class="mic" id="mic" type="button" aria-label="Start recording">🎙</button>
+      <div class="title" id="title">Speak Lead</div>
+      <div class="msg" id="msg">Press the microphone and speak naturally.</div>
+      <div class="actions" id="actions">
+        <button class="action secondary" id="addAnother" type="button">Add another</button>
+        <button class="action secondary" id="editRecent" type="button">Edit recent</button>
+        <button class="action full" id="closeWin" type="button">Close</button>
+      </div>
+    </div>
   </div>
   <script>
     const nonce = {json.dumps(nonce)};
@@ -5930,14 +6057,63 @@ def create_app() -> Flask:
     const mic = document.getElementById('mic');
     const title = document.getElementById('title');
     const msg = document.getElementById('msg');
+    const picker = document.getElementById('picker');
+    const recent = document.getElementById('recent');
+    const newMode = document.getElementById('newMode');
+    const editMode = document.getElementById('editMode');
+    const actions = document.getElementById('actions');
+    const addAnother = document.getElementById('addAnother');
+    const editRecent = document.getElementById('editRecent');
+    const closeWin = document.getElementById('closeWin');
     let recorder = null, stream = null, chunks = [], processing = false;
+    let mode = new URLSearchParams(location.search).get('mode') === 'edit' ? 'edit' : 'add';
+    let recentLoaded = false;
     function setState(t, m, cls='') {{
       title.textContent = t; msg.textContent = m || ''; msg.className = 'msg ' + cls;
     }}
+    function showActions() {{ actions.classList.add('show'); }}
+    function hideActions() {{ actions.classList.remove('show'); }}
+    function setMode(next) {{
+      mode = next === 'edit' ? 'edit' : 'add';
+      newMode.classList.toggle('active', mode === 'add');
+      editMode.classList.toggle('active', mode === 'edit');
+      picker.classList.toggle('show', mode === 'edit');
+      hideActions();
+      if (mode === 'edit') {{
+        loadRecent();
+        setState('Edit Lead', 'Choose a recent row, then record only the changes.');
+      }} else {{
+        setState('Speak Lead', 'Press the microphone and speak naturally.');
+      }}
+    }}
+    async function loadRecent() {{
+      if (recentLoaded) return;
+      recentLoaded = true;
+      try {{
+        const resp = await fetch('/lead-voice/recent');
+        const data = await resp.json().catch(() => ({{}}));
+        if (!resp.ok || data.error) throw new Error(data.error || 'Could not load recent leads.');
+        recent.innerHTML = '<option value="">Choose a recent lead…</option>';
+        (data.rows || []).forEach(row => {{
+          const opt = document.createElement('option');
+          opt.value = row.row_number;
+          opt.textContent = row.label;
+          recent.appendChild(opt);
+        }});
+      }} catch (e) {{
+        recent.innerHTML = '<option value="">Recent leads failed to load</option>';
+        setState('Recent leads unavailable', e.message || 'Try again.', 'err');
+      }}
+    }}
     function reset() {{
-      processing = false; recorder = null; chunks = []; wrap.classList.remove('recording'); mic.disabled = false; mic.textContent = '🎤'; setState('Speak Lead', 'Press the microphone and speak naturally.');
+      processing = false; recorder = null; chunks = []; wrap.classList.remove('recording'); mic.disabled = false; mic.textContent = '🎙'; hideActions();
+      setState(mode === 'edit' ? 'Edit Lead' : 'Speak Lead', mode === 'edit' ? 'Choose a recent row, then record only the changes.' : 'Press the microphone and speak naturally.');
     }}
     async function start() {{
+      if (mode === 'edit' && !recent.value) {{
+        setState('Choose a lead first', 'Pick one of the latest 50 rows before recording an edit.', 'err');
+        return;
+      }}
       try {{
         stream = await navigator.mediaDevices.getUserMedia({{audio: true}});
         chunks = [];
@@ -5953,7 +6129,7 @@ def create_app() -> Flask:
     }}
     function stop() {{
       if (!recorder || recorder.state !== 'recording') return;
-      mic.disabled = true; processing = true; wrap.classList.remove('recording'); setState('Processing…', 'Adding lead to the sheet.');
+      mic.disabled = true; processing = true; wrap.classList.remove('recording'); setState('Processing…', mode === 'edit' ? 'Updating the selected lead.' : 'Adding lead to the sheet.');
       recorder.stop();
       if (stream) stream.getTracks().forEach(t => t.stop());
     }}
@@ -5964,11 +6140,14 @@ def create_app() -> Flask:
         const fd = new FormData();
         fd.append('nonce', nonce);
         fd.append('audio', blob, 'lead.webm');
+        fd.append('mode', mode);
+        if (mode === 'edit') fd.append('row_number', recent.value || '');
         const resp = await fetch('/lead-voice/submit', {{method:'POST', body: fd}});
         const data = await resp.json().catch(() => ({{}}));
         if (!resp.ok || data.error) throw new Error(data.error || 'Upload failed.');
-        setState('Lead added ✓', 'Closing…', 'ok');
-        setTimeout(() => {{ try {{ window.close(); }} catch(e) {{}} setState('Lead added ✓', 'You can close this window.', 'ok'); }}, 900);
+        mic.disabled = true;
+        setState(mode === 'edit' ? 'Lead updated ✓' : 'Lead added ✓', 'Choose what to do next.', 'ok');
+        showActions();
       }} catch (e) {{
         mic.disabled = false; processing = false; mic.textContent = '↻';
         setState('Try again', e.message || 'Something went wrong.', 'err');
@@ -5980,13 +6159,34 @@ def create_app() -> Flask:
       else if (mic.textContent === '↻') reset();
       else start();
     }});
+    newMode.addEventListener('click', () => setMode('add'));
+    editMode.addEventListener('click', () => setMode('edit'));
+    addAnother.addEventListener('click', () => location.href = '/lead-voice');
+    editRecent.addEventListener('click', () => location.href = '/lead-voice?mode=edit');
+    closeWin.addEventListener('click', () => {{ try {{ window.close(); }} catch(e) {{}} }});
     if (!navigator.mediaDevices || !window.MediaRecorder) {{
       mic.disabled = true; setState('Not supported', 'This browser cannot record audio here.', 'err');
     }}
+    setMode(mode);
   </script>
 </body>
 </html>"""
         return Response(html, mimetype="text/html")
+
+    @app.get("/lead-voice/recent")
+    @require_login
+    def lead_voice_recent():
+        creds = load_admin_credentials(config)
+        if not creds:
+            return jsonify({"error": "Google Sheets is not connected. Reconnect Google in Settings."}), 500
+        try:
+            service = build_sheets_service_from_creds(creds)
+            rows = _lead_voice_recent_rows(service, limit=50)
+        except HttpError:
+            return jsonify({"error": "Google Sheets read failed."}), 500
+        except Exception:
+            return jsonify({"error": "Recent leads could not be loaded."}), 500
+        return jsonify({"rows": rows})
 
     @app.post("/lead-voice/submit")
     @require_login
@@ -6006,6 +6206,15 @@ def create_app() -> Flask:
             return jsonify({"error": "Nothing was recorded. Try again."}), 400
         if len(audio) > 25 * 1024 * 1024:
             return jsonify({"error": "Recording was too long. Try a shorter lead note."}), 400
+        mode = (request.form.get("mode") or "add").strip().lower()
+        row_number = 0
+        if mode == "edit":
+            try:
+                row_number = int(str(request.form.get("row_number") or "0"))
+            except Exception:
+                row_number = 0
+            if row_number < 2:
+                return jsonify({"error": "Choose a recent lead before recording an edit."}), 400
         creds = load_admin_credentials(config)
         if not creds:
             return jsonify({"error": "Google Sheets is not connected. Reconnect Google in Settings."}), 500
@@ -6018,8 +6227,11 @@ def create_app() -> Flask:
                 upload.filename or "lead.webm",
                 upload.mimetype or "audio/webm",
             )
-            lead = _lead_voice_extract(config=config, transcript=transcript, dropdowns=dropdowns)
-            _lead_voice_insert_row(service, sheet_id, lead)
+            lead = _lead_voice_extract(config=config, transcript=transcript, dropdowns=dropdowns, for_edit=(mode == "edit"))
+            if mode == "edit":
+                _lead_voice_update_row(service, row_number, lead)
+            else:
+                _lead_voice_insert_row(service, sheet_id, lead)
         except HttpError:
             return jsonify({"error": "Google Sheets write failed."}), 500
         except RuntimeError as exc:
@@ -6032,7 +6244,7 @@ def create_app() -> Flask:
         done = dict(list(done.items())[-10:])
         session["lead_voice_done"] = done
         session["lead_voice_nonce"] = ""
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "mode": "edit" if mode == "edit" else "add"})
 
     @app.get("/login")
     def login():
