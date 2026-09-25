@@ -1653,11 +1653,14 @@ LEAD_VOICE_DROPDOWN_KEYS = {
 
 
 def _lead_voice_openai_key(config: AppConfig) -> str:
+    env_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    if env_key:
+        return env_key
     try:
         saved = get_openai_settings(config.admin_db_file).get("api_key") or ""
     except Exception:
         saved = ""
-    return str(saved or (os.getenv("OPENAI_API_KEY") or "")).strip()
+    return str(saved).strip()
 
 
 def _lead_voice_json_text(data: dict) -> str:
