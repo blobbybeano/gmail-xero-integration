@@ -10811,6 +10811,7 @@ function toggleReceiptsEnabled(requested) {{
         function renderCsvSubmitSummary(data) {{
           const plans = data.plans || [];
           const blockers = data.production_blockers || [];
+          const skipped = data.skipped_batches || [];
           const mode = data.mode === 'production' ? 'Production write' : 'Test mode';
           const modeCls = data.mode === 'production'
             ? 'bg-sky-50 border-sky-200 text-sky-800'
@@ -10848,6 +10849,9 @@ function toggleReceiptsEnabled(requested) {{
           const blockerHtml = blockers.length
             ? '<div class="rounded-lg border border-amber-200 bg-amber-50 text-amber-800 p-3 mt-3"><div class="font-semibold mb-1">Production blockers</div><ul class="list-disc pl-5 space-y-1">' + blockers.map(b => '<li>' + esc(b) + '</li>').join('') + '</ul></div>'
             : '';
+          const skippedHtml = skipped.length
+            ? '<div class="rounded-lg border border-amber-200 bg-amber-50 text-amber-800 p-3 mt-3"><div class="font-semibold mb-1">Skipped unsafe batch' + (skipped.length===1?'':'es') + '</div><ul class="list-disc pl-5 space-y-1">' + skipped.map(b => '<li>' + esc(b) + '</li>').join('') + '</ul><div class="mt-2 text-[11px] text-amber-700">Safe batches can still be submitted. The skipped batch needs checking in Xero first.</div></div>'
+            : '';
           csvSubmitOutput.innerHTML = `
             <div class="inline-flex px-2 py-1 rounded-full border text-[11px] font-semibold ${{modeCls}}">${{esc(mode)}}</div>
             <div class="mt-2 text-sm font-semibold text-gray-900">${{esc(data.message || 'Submission prepared.')}}</div>
@@ -10866,6 +10870,7 @@ function toggleReceiptsEnabled(requested) {{
               </table>
             </div>
             ${{blockerHtml}}
+            ${{skippedHtml}}
             <details class="mt-3 rounded-lg border border-gray-200 bg-white">
               <summary class="cursor-pointer px-3 py-2 text-[11px] font-semibold text-gray-600">Technical Xero payload preview</summary>
               <pre class="px-3 pb-3 whitespace-pre-wrap text-[11px] text-gray-600">${{esc(JSON.stringify(data, null, 2))}}</pre>
@@ -13030,7 +13035,7 @@ function toggleReceiptsEnabled(requested) {{
                     if status != "AUTHORISED":
                         return f"{invoice_label}: payment is {status}, not AUTHORISED"
                     if payment.get("is_reconciled"):
-                        return f"{invoice_label}: existing payment is already reconciled in Xero"
+                        return f"{invoice_label}: existing Xero payment is already reconciled to a bank statement line, so the app cannot safely move it into this Cashflows match pack"
                     if abs(amount - expected) > 0.01:
                         return (
                             f"{invoice_label}: existing payment is £{amount:.2f}, "
@@ -13227,20 +13232,23 @@ function toggleReceiptsEnabled(requested) {{
                 }
             )
 
-        if blocking_errors:
+        skipped_batches = blocking_errors[:]
+        if blocking_errors and not plans:
             msg = " ".join(blocking_errors[:4])
             print(f"[cashflows-csv-submit] blocked before Xero writes: {msg}", flush=True)
-            return _flask.jsonify({"error": msg}), 400
+            return _flask.jsonify({"error": "No safe Cashflows batches to submit. " + msg}), 400
 
         if not production_enabled:
             message = (
                 f"Test mode: prepared {len(plans)} selected batch(es). No Xero writes were sent."
             )
+            if skipped_batches:
+                message += f" Skipped {len(skipped_batches)} unsafe selected batch(es)."
             if production_blockers:
                 message += " Some rows are blocked from production until reviewed."
             print(
                 "[cashflows-csv-submit] TEST MODE payloads:\n"
-                + json.dumps({"plans": plans, "production_blockers": production_blockers}, indent=2, sort_keys=True),
+                + json.dumps({"plans": plans, "production_blockers": production_blockers, "skipped_batches": skipped_batches}, indent=2, sort_keys=True),
                 flush=True,
             )
             return _flask.jsonify(
@@ -13250,6 +13258,7 @@ function toggleReceiptsEnabled(requested) {{
                     "message": message,
                     "production_enabled": False,
                     "production_blockers": production_blockers,
+                    "skipped_batches": skipped_batches,
                     "plans": plans,
                 }
             )
@@ -13426,6 +13435,7 @@ function toggleReceiptsEnabled(requested) {{
             "plans": plans,
             "responses": [],
             "error": "",
+            "skipped_batches": skipped_batches,
             "resume_after_ts": 0.0,
             "started_at": now_iso,
             "updated_at": now_iso,
@@ -13502,9 +13512,11 @@ function toggleReceiptsEnabled(requested) {{
                     _persist_job(state)
                 state["status"] = "done"
                 state["current_batch_ref"] = ""
+                skipped_count = len(state.get("skipped_batches") or [])
                 state["message"] = (
                     f"Submitted {state['completed']} batch(es) to Xero. Open Xero "
                     "bank reconciliation and press OK on the matching Cashflows bank line."
+                    + (f" Skipped {skipped_count} unsafe selected batch(es) for review." if skipped_count else "")
                 )
                 _persist_job(state)
                 _feed.push(
@@ -13565,6 +13577,7 @@ function toggleReceiptsEnabled(requested) {{
                         "total": existing.get("total"),
                         "message": "A Cashflows submission is already running — showing its progress.",
                         "production_enabled": True,
+                        "skipped_batches": existing.get("skipped_batches") or [],
                     }
                 )
             _cf_submit_job.clear()
@@ -13589,8 +13602,10 @@ function toggleReceiptsEnabled(requested) {{
                 "message": (
                     f"Reconciling {total} batch(es) in the background. You can safely "
                     "leave this page — progress is saved and it keeps running."
+                    + (f" Skipped {len(skipped_batches)} unsafe selected batch(es)." if skipped_batches else "")
                 ),
                 "production_enabled": True,
+                "skipped_batches": skipped_batches,
             }
         )
 
@@ -13640,6 +13655,7 @@ function toggleReceiptsEnabled(requested) {{
                 "percent": int(round((completed / total) * 100)) if total else 0,
                 "current_batch_ref": job.get("current_batch_ref") or "",
                 "completed_batch_ids": job.get("completed_batch_ids") or [],
+                "skipped_batches": job.get("skipped_batches") or [],
                 "error": job.get("error") or "",
                 "resume_in": max(0, int(resume_after - time.time())) if resume_after else 0,
                 "preview_id": job.get("preview_id") or "",

@@ -967,6 +967,124 @@ class CashflowsCsvSubmitTests(unittest.TestCase):
         self.assertEqual(len(fake.get_payments_calls), 1)
         self.assertEqual(fake.get_invoice_calls, [])
 
+    def test_unsafe_already_paid_batch_does_not_block_safe_batches(self):
+        preview = {
+            "preview_id": "preview-1",
+            "date_from": "2026-06-01",
+            "date_to": "2026-06-30",
+            "batches": [
+                {
+                    "id": "safe-batch",
+                    "status": "ready",
+                    "payout": {"csv_ref": "safe-pay", "date": "2026-06-30"},
+                    "gross": 100.0,
+                    "net": 98.0,
+                    "sales": [
+                        {
+                            "sale_ref": "safe-sale",
+                            "date": "2026-06-30",
+                            "gross": 100.0,
+                            "fee": 2.0,
+                            "invoice": {
+                                "id": "inv-safe",
+                                "number": "INV-SAFE",
+                                "contact_name": "Safe Customer",
+                                "total": 100.0,
+                                "amount_due": 100.0,
+                                "is_open": True,
+                            },
+                            "candidates": [],
+                            "tied_candidates": [],
+                        }
+                    ],
+                },
+                {
+                    "id": "blocked-batch",
+                    "status": "ready",
+                    "payout": {"csv_ref": "blocked-pay", "date": "2026-06-30"},
+                    "gross": 114.0,
+                    "net": 113.36,
+                    "sales": [
+                        {
+                            "sale_ref": "blocked-sale",
+                            "date": "2026-06-30",
+                            "gross": 114.0,
+                            "fee": 0.64,
+                            "invoice": {
+                                "id": "inv-blocked",
+                                "number": "INV-BLOCKED",
+                                "contact_name": "Blocked Customer",
+                                "total": 114.0,
+                                "amount_due": 0.0,
+                                "is_open": False,
+                            },
+                            "candidates": [],
+                            "tied_candidates": [],
+                        }
+                    ],
+                },
+            ],
+        }
+        app = self._app_with_preview(preview, dry_run=False, production=True)
+        fake = FakeXeroClient()
+        fake.dry_run = False
+        fake.bulk_payments = [
+            {
+                "PaymentID": "pay-reconciled",
+                "Status": "AUTHORISED",
+                "IsReconciled": True,
+                "Amount": 114.0,
+                "Account": {"Code": "090", "Name": "Pow Wash"},
+                "Invoice": {"InvoiceID": "inv-blocked"},
+            }
+        ]
+        with app.test_client() as client:
+            with client.session_transaction() as session:
+                session["logged_in"] = True
+            with patch("app.admin_web.build_xero_client", return_value=fake), patch(
+                "app.admin_web._CF_SUBMIT_PACE_SECONDS", 0
+            ):
+                resp = client.post(
+                    "/cashflows-sync/submit-csv-batches",
+                    json={
+                        "preview_id": "preview-1",
+                        "batches": [
+                            {
+                                "batch_id": "safe-batch",
+                                "sales": [
+                                    {
+                                        "sale_index": 0,
+                                        "selected_invoice_id": "inv-safe",
+                                        "selected_invoice_number": "INV-SAFE",
+                                    }
+                                ],
+                            },
+                            {
+                                "batch_id": "blocked-batch",
+                                "sales": [
+                                    {
+                                        "sale_index": 0,
+                                        "selected_invoice_id": "inv-blocked",
+                                        "selected_invoice_number": "INV-BLOCKED",
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                )
+                self.assertEqual(resp.status_code, 200)
+                data = resp.get_json()
+                self.assertEqual(data["total"], 1)
+                self.assertEqual(len(data["skipped_batches"]), 1)
+                self.assertIn("INV-BLOCKED", data["skipped_batches"][0])
+                progress = self._wait_for_submit_job(client)
+        self.assertEqual(progress["status"], "done")
+        self.assertEqual(progress["completed"], 1)
+        self.assertEqual(len(progress["skipped_batches"]), 1)
+        self.assertEqual(len(fake.batch_payments), 1)
+        payment = fake.batch_payments[0]["BatchPayments"][0]["Payments"][0]
+        self.assertEqual(payment["Invoice"], {"InvoiceID": "inv-safe"})
+
     def test_invented_invoice_id_is_rejected(self):
         preview = {
             "preview_id": "preview-1",
