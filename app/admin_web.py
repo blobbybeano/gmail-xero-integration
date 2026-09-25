@@ -11326,11 +11326,11 @@ function toggleReceiptsEnabled(requested) {{
               : 'border-gray-100 hover:bg-gray-50';
 
             return '<tr class="border-t ' + rowCls + '">'
-              + '<td class="px-3 py-2 text-xs text-gray-500 whitespace-nowrap">' + esc(gb(s.date)) + sTime + '</td>'
+              + '<td class="px-3 py-2 text-xs text-sky-900 bg-sky-50/45 whitespace-nowrap">' + esc(gb(s.date)) + sTime + '</td>'
+              + '<td class="px-3 py-2 text-xs text-right font-semibold text-sky-950 bg-sky-50/45">' + money(s.gross) + '</td>'
+              + '<td class="px-3 py-2 text-xs text-right text-sky-700 bg-sky-50/45">' + money(s.fee) + '</td>'
               + '<td class="px-3 py-2 text-xs font-medium text-gray-900">' + custName + '</td>'
               + '<td class="px-3 py-2 text-xs">' + invCell + '</td>'
-              + '<td class="px-3 py-2 text-xs text-right font-semibold text-gray-900">' + money(s.gross) + '</td>'
-              + '<td class="px-3 py-2 text-xs text-right text-gray-400">' + money(s.fee) + '</td>'
               + '<td class="px-3 py-2 text-xs">' + statusBadge + toggle + '</td>'
               + '</tr>' + panelRow;
           }}).join('');
@@ -11344,14 +11344,14 @@ function toggleReceiptsEnabled(requested) {{
           sales.forEach(function(s, i){{ if (!rowStates[i].ready) {{ missingGross += Number(s.gross||0); missingFees += Number(s.fee||0); }} }});
           const missingRow = (missingCount > 0 && missingGross > 0.005)
             ? '<tr class="border-t border-dashed border-amber-300 bg-amber-50 text-xs text-amber-800">'
-                + '<td class="px-3 py-2.5" colspan="3">'
+                + '<td class="px-3 py-2.5">'
                 +   '<span class="font-semibold">&#128161; Action needed to balance</span>'
                 +   ' <span class="text-[11px] text-amber-600">\u2014 '
                 +   missingCount + ' CSV payment' + (missingCount===1?'':'s') + ' need a confirmed invoice or adjustment plan</span>'
                 + '</td>'
                 + '<td class="px-3 py-2.5 text-right font-bold text-amber-900">' + money(missingGross) + '</td>'
                 + '<td class="px-3 py-2.5 text-right text-amber-700">' + money(missingFees) + '</td>'
-                + '<td class="px-3 py-2.5 text-[11px] text-amber-700">Confirm the orange suggested row(s), or choose another option if the suggestion is wrong.</td>'
+                + '<td class="px-3 py-2.5 text-[11px] text-amber-700" colspan="3">Confirm the orange suggested row(s), or choose another option if the suggestion is wrong.</td>'
                 + '</tr>'
             : '';
           const totalCheck = balanced
@@ -11360,10 +11360,10 @@ function toggleReceiptsEnabled(requested) {{
               ? `⚠ Small discrepancy of £${{netVariance.toFixed(2)}} — check for absorbed declined payments`
               : `⚠ ${{money(Math.abs(Number(b.net||0) - netOfFees))}} still unreconciled — ${{missingCount}} row${{missingCount===1?'':'s'}} need action`;
           const totalRow = `<tr class="border-t-2 border-gray-200 ${{totalRowCls}} font-semibold text-xs">
-            <td class="px-3 py-2" colspan="3">Total invoices matched</td>
+            <td class="px-3 py-2">Total invoices matched</td>
             <td class="px-3 py-2 text-right">${{money(matchedGrossEff)}}</td>
-            <td class="px-3 py-2"></td>
-            <td class="px-3 py-2 text-xs">${{totalCheck}}</td>
+            <td class="px-3 py-2 text-right">${{money(matchedFees)}}</td>
+            <td class="px-3 py-2 text-xs" colspan="3">${{totalCheck}}</td>
           </tr>`;
 
           const checked = _isChecked(b.id);
@@ -11410,11 +11410,11 @@ function toggleReceiptsEnabled(requested) {{
                 <table class="w-full text-xs">
                   <thead>
                     <tr class="bg-gray-50 text-[11px] uppercase tracking-wide text-gray-400 text-left">
-                      <th class="px-3 py-2">Date / Time</th>
-                      <th class="px-3 py-2">Sale / customer</th>
+                      <th class="px-3 py-2 bg-sky-50 text-sky-700">Date / Time</th>
+                      <th class="px-3 py-2 text-right bg-sky-50 text-sky-700">Gross</th>
+                      <th class="px-3 py-2 text-right bg-sky-50 text-sky-700">CF fee</th>
+                      <th class="px-3 py-2">Customer</th>
                       <th class="px-3 py-2">Invoice / Ref</th>
-                      <th class="px-3 py-2 text-right">Gross</th>
-                      <th class="px-3 py-2 text-right">CF fee</th>
                       <th class="px-3 py-2">Status</th>
                     </tr>
                   </thead>
