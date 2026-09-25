@@ -10917,17 +10917,46 @@ function toggleReceiptsEnabled(requested) {{
 
           // ── Invoice rows (right side of Xero reconciliation — "Find & select") ──
           const sales = b.sales || [];
+          let rawRowSelections = sales.map((s, idx) => _selectedInvoiceForSale(b, s, idx));
+          let selectedInvoiceCounts = {{}};
+          function rebuildSelectedInvoiceCounts() {{
+            selectedInvoiceCounts = {{}};
+            rawRowSelections.forEach(function(inv) {{
+              const id = inv && inv.id ? String(inv.id) : '';
+              if (id) selectedInvoiceCounts[id] = (selectedInvoiceCounts[id] || 0) + 1;
+            }});
+          }}
+          rebuildSelectedInvoiceCounts();
+          let clearedDuplicateOverride = false;
+          sales.forEach(function(s, idx) {{
+            const inv = rawRowSelections[idx];
+            const id = inv && inv.id ? String(inv.id) : '';
+            if (!id || selectedInvoiceCounts[id] <= 1) return;
+            const saleKey = _saleKey(b.id, s, idx);
+            if (s.invoice && _getTiedSwap(b.id, idx)) {{
+              _setTiedSwap(b.id, idx, null);
+              rawRowSelections[idx] = _selectedInvoiceForSale(b, s, idx);
+              clearedDuplicateOverride = true;
+            }} else if (!s.invoice && _getMatch(saleKey)) {{
+              _setMatch(saleKey, null);
+              rawRowSelections[idx] = _selectedInvoiceForSale(b, s, idx);
+              clearedDuplicateOverride = true;
+            }}
+          }});
+          if (clearedDuplicateOverride) rebuildSelectedInvoiceCounts();
           const rowStates = sales.map((s, idx) => {{
             const saleKey = _saleKey(b.id, s, idx);
-            const selected = _selectedInvoiceForSale(b, s, idx);
+            const selected = rawRowSelections[idx];
+            const selectedId = selected && selected.id ? String(selected.id) : '';
+            const duplicateSelected = !!(selectedId && selectedInvoiceCounts[selectedId] > 1);
             const invTotal = _invAmount(selected);
             const expectedAdj = selected ? _expectedAdjustment(Number(s.gross || 0), invTotal) : null;
             const adjustment = _getAdjustment(saleKey);
             const adjustmentOk = _adjustmentMatches(expectedAdj, adjustment);
             const selectedStatus = String((selected && selected.status) || '').toUpperCase();
             const invoiceReady = selectedStatus !== 'DRAFT';
-            const ready = !!selected && adjustmentOk && invoiceReady;
-            return {{saleKey, selected, invTotal, expectedAdj, adjustment, adjustmentOk, invoiceReady, ready}};
+            const ready = !!selected && adjustmentOk && invoiceReady && !duplicateSelected;
+            return {{saleKey, selected, invTotal, expectedAdj, adjustment, adjustmentOk, invoiceReady, duplicateSelected, ready}};
           }});
           // A sale counts toward the total only if it has a selected invoice and
           // any under/over difference has an explicit adjustment plan.
@@ -10953,6 +10982,7 @@ function toggleReceiptsEnabled(requested) {{
             const adjustment = rowState.adjustment;
             const adjustmentOk = rowState.adjustmentOk;
             const invoiceReady = rowState.invoiceReady;
+            const duplicateSelected = rowState.duplicateSelected;
 
             // Option list: matched -> [app pick, ...same-amount alts]; missing -> ranked candidates.
             const allOptions = isMissing
@@ -11150,11 +11180,19 @@ function toggleReceiptsEnabled(requested) {{
                 + '<div class="mt-0.5">It is the best match, but it cannot be included in a Cashflows submission while still DRAFT.</div>'
                 + '</div>';
             }}
+            if (duplicateSelected) {{
+              invCell += '<div class="mt-2 rounded border border-red-200 bg-red-50 p-2 text-[11px] text-red-800">'
+                + '<div class="font-semibold">Same invoice selected more than once in this Cashflows payout.</div>'
+                + '<div class="mt-0.5">Choose another option for one of the duplicate rows, or refresh the batch after correcting Xero/calendar.</div>'
+                + '</div>';
+            }}
 
             // Status badge.
             let statusBadge;
             if (noMatch) {{
               statusBadge = '<span class="text-amber-600 font-semibold">\u23f3 no matches found</span>';
+            }} else if (duplicateSelected) {{
+              statusBadge = '<span class="text-red-700 font-semibold">⚠ duplicate invoice selected</span>';
             }} else if (favoured && String(favoured.status || '').toUpperCase() === 'DRAFT') {{
               statusBadge = '<span class="text-amber-700 font-semibold">\u26a0 invoice needs finalising</span>';
             }} else if (userChosen) {{
@@ -11234,10 +11272,14 @@ function toggleReceiptsEnabled(requested) {{
                     + '</div>'
                 : '';
               const slot = (displayCal && displayCal.event_date && displayCal.event_start) ? (displayCal.event_date + 'T' + displayCal.event_start) : '';
+              const optId = opt && opt.id ? String(opt.id) : '';
+              const optDuplicateElsewhere = !!(optId && selectedInvoiceCounts[optId] && !(isFav && !duplicateSelected));
               const btn = isFav
                 ? '<span class="text-[11px] text-gray-400 italic shrink-0 self-center">'
                     + (noAmountMatch ? 'top suggestion' : 'currently shown')
                   + '</span>'
+                : optDuplicateElsewhere
+                  ? '<span class="text-[11px] text-red-500 italic shrink-0 self-center">already used in this batch</span>'
                 : '<button class="' + (isMissing ? 'cf-cand-pick' : 'cf-tied-pick') + ' shrink-0 self-center px-2 py-1 rounded bg-indigo-600 text-white text-[11px] font-semibold hover:bg-indigo-700" data-si="' + idx + '" data-' + (isMissing?'ci':'oi') + '="' + origIdx + '" data-cal-slot="' + esc(slot) + '">Use this</button>';
               return '<div class="flex items-start justify-between gap-2 py-1.5 px-2 rounded border-b border-gray-100 last:border-0 hover:bg-white ' + (isFav?'bg-teal-50/40':'') + '">'
                 + '<div class="min-w-0">'
@@ -12452,6 +12494,7 @@ function toggleReceiptsEnabled(requested) {{
             paid_invoice_discount_total = 0.0
             paid_invoice_extra_total = 0.0
             paid_overpayment_adjustments: list[dict] = []
+            selected_invoice_ids_seen: set[str] = set()
 
             for idx, sale in enumerate(sales):
                 req_sale = req_sales.get(idx) or {}
@@ -12510,6 +12553,12 @@ function toggleReceiptsEnabled(requested) {{
                         f"Batch {batch_id} invoice {selected.get('number') or sale_ref or idx + 1} has no Xero InvoiceID."
                     )
                     continue
+                if selected_id in selected_invoice_ids_seen:
+                    blocking_errors.append(
+                        f"Batch {batch_id} selects invoice {selected.get('number') or selected_id} more than once. Pick a different invoice for one of those Cashflows rows before submitting."
+                    )
+                    continue
+                selected_invoice_ids_seen.add(selected_id)
 
                 diff = round(sale_gross - payable_amount, 2)
                 if is_open is False:
