@@ -6039,8 +6039,7 @@ def create_app() -> Flask:
     .mic {{ width: 100%; height: 52px; border-radius: 16px; border: 0; background: linear-gradient(145deg, #047857, #10b981); color: white; font-size: 18px; font-weight: 900; box-shadow: 0 12px 22px rgba(16,185,129,.2), inset 0 1px 0 rgba(255,255,255,.24); cursor: pointer; transition: transform .14s ease, box-shadow .14s ease, background .14s ease; display: inline-flex; align-items: center; justify-content: center; gap: 10px; }}
     .mic:active {{ transform: scale(.97); }}
     .mic[disabled] {{ opacity: .62; cursor: wait; }}
-    .recording .mic {{ background: linear-gradient(145deg, #991b1b, #ef4444); animation: pulse 1.1s infinite; }}
-    @keyframes pulse {{ 0%,100% {{ box-shadow: 0 0 0 0 rgba(239,68,68,.35), inset 0 1px 0 rgba(255,255,255,.25); }} 50% {{ box-shadow: 0 0 0 18px rgba(239,68,68,0), inset 0 1px 0 rgba(255,255,255,.25); }} }}
+    .recording .mic {{ background: linear-gradient(145deg, #047857, #10b981); }}
     .rec-dot {{ display: none; width: 11px; height: 11px; border-radius: 999px; background: #22c55e; box-shadow: 0 0 0 0 rgba(34,197,94,.48); }}
     .recording .rec-dot {{ display: inline-block; animation: greenPulse 1s infinite; }}
     @keyframes greenPulse {{ 0%,100% {{ transform: scale(.9); box-shadow: 0 0 0 0 rgba(34,197,94,.45); }} 50% {{ transform: scale(1.12); box-shadow: 0 0 0 8px rgba(34,197,94,0); }} }}
