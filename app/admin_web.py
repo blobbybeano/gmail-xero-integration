@@ -1808,6 +1808,62 @@ def _lead_voice_apply_abbreviation_rules(lead: dict, transcript: str, dropdowns:
     return lead
 
 
+LEAD_VOICE_FIELD_ALIASES = {
+    "lead_name": ("lead name", "customer name", "name"),
+    "number": ("phone number", "mobile number", "telephone number", "number", "phone", "mobile"),
+    "email": ("email address", "e-mail address", "emails", "e-mails", "email", "e-mail", "mail"),
+    "source": ("source",),
+    "job_type": ("job type", "job"),
+    "form_of_contact": ("form of contact", "contact method", "contact type"),
+    "conversion": ("conversion", "converted"),
+    "void": ("void",),
+    "area": ("area",),
+    "contact": ("staff contact", "contact person", "assigned contact", "assigned to"),
+    "notes": ("notes", "note"),
+}
+
+
+def _lead_voice_clean_spoken_field_value(value: str, *, field: str) -> str:
+    text = str(value or "").strip(" .,:;-")
+    text = re.sub(r"^(?:is|as|to|should be|needs to be|change(?:d)? to|set(?: it)? to|make(?: it)?|put(?: it)? as)\s+", "", text, flags=re.I).strip()
+    if field == "email":
+        text = text.lower()
+        text = re.sub(r"\s+at\s+", "@", text)
+        text = re.sub(r"\s+dot\s+", ".", text)
+        text = text.replace(" at ", "@").replace(" dot ", ".")
+        text = text.replace("'", "")
+        text = re.sub(r"\s+", "", text)
+    return text
+
+
+def _lead_voice_extract_spoken_field_instruction(transcript: str, field: str) -> str:
+    text = str(transcript or "").strip()
+    if not text:
+        return ""
+    aliases = LEAD_VOICE_FIELD_ALIASES.get(field) or ()
+    for alias in aliases:
+        pattern = rf"(?:^|\b){re.escape(alias)}(?:'s|\s+is|\s+as|\s+to|\s+should be|\s+needs to be|\s+change(?:d)? to|\s+set(?: it)? to|\s+make(?: it)?|\s+put(?: it)? as)?\s+(.+)$"
+        match = re.search(pattern, text, flags=re.I)
+        if match:
+            return _lead_voice_clean_spoken_field_value(match.group(1), field=field)
+    return ""
+
+
+def _lead_voice_apply_edit_instruction_rules(lead: dict, transcript: str, *, for_edit: bool) -> dict:
+    if not for_edit:
+        return lead
+    instructed_fields: set[str] = set()
+    for field in LEAD_VOICE_FIELD_ALIASES:
+        value = _lead_voice_extract_spoken_field_instruction(transcript, field)
+        if value:
+            lead[field] = value
+            instructed_fields.add(field)
+    if instructed_fields and "notes" not in instructed_fields:
+        # A correction like "email is ..." is an instruction, not a note.
+        lead["notes"] = ""
+    return lead
+
+
 def _lead_voice_london_today() -> dt.datetime:
     try:
         from zoneinfo import ZoneInfo
@@ -1890,6 +1946,9 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
         f"{date_instruction}"
         "If a date is clearly spoken, return it as YYYY-MM-DD. "
         "For dropdown fields, choose only one exact permitted option or blank. "
+        "During edits, phrases like 'email is ...', 'number is ...', 'source is ...', "
+        "or 'change job type to ...' are field update instructions. Put the spoken value in that named field only. "
+        "Do not copy field update instructions into notes. "
         "Abbreviations: N.A means no answer. If the speaker says they called, got no answer, "
         "then WhatsApped, choose the exact permitted Form of Contact option matching Call N.A/Whatsapp. "
         "Giving a quote does not mean conversion unless the customer booked/accepted. "
@@ -1923,6 +1982,7 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
     cleaned = {key: str(data.get(key) or "").strip() for key, _label in LEAD_VOICE_COLUMNS if key != "date"}
     cleaned["lead_date"] = str(data.get("lead_date") or ("" if for_edit else today_iso)).strip() or ("" if for_edit else today_iso)
     cleaned = _lead_voice_apply_abbreviation_rules(cleaned, transcript, dropdowns)
+    cleaned = _lead_voice_apply_edit_instruction_rules(cleaned, transcript, for_edit=for_edit)
     for key in LEAD_VOICE_DROPDOWN_KEYS:
         value = cleaned.get(key, "")
         allowed = dropdowns.get(key) or []
