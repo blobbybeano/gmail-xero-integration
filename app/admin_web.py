@@ -6024,24 +6024,27 @@ def create_app() -> Flask:
   <style>
     :root {{ font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif; color: #111827; }}
     * {{ box-sizing: border-box; }}
-    body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: radial-gradient(circle at top, #ffffff 0, #f2f4f8 52%, #e8edf5 100%); }}
-    .wrap {{ width: min(96vw, 760px); min-height: min(100vh, 560px); padding: 16px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 15px; text-align: center; }}
-    .panel {{ width: 100%; padding: 18px; border-radius: 28px; background: rgba(255,255,255,.86); border: 1px solid rgba(255,255,255,.9); box-shadow: 0 24px 70px rgba(15,23,42,.14), inset 0 1px 0 rgba(255,255,255,.95); backdrop-filter: blur(20px); display: flex; flex-direction: column; align-items: center; gap: 13px; }}
+    body {{ margin: 0; min-height: 100vh; display: grid; place-items: start center; background: radial-gradient(circle at top, #ffffff 0, #f2f4f8 52%, #e8edf5 100%); }}
+    .wrap {{ width: min(98vw, 760px); min-height: 0; padding: 4px; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; gap: 0; text-align: center; }}
+    .panel {{ width: 100%; padding: 12px; border-radius: 22px; background: rgba(255,255,255,.88); border: 1px solid rgba(255,255,255,.9); box-shadow: 0 16px 44px rgba(15,23,42,.12), inset 0 1px 0 rgba(255,255,255,.95); backdrop-filter: blur(20px); display: flex; flex-direction: column; align-items: center; gap: 9px; }}
     .modebar {{ display: grid; grid-template-columns: 1fr 1fr; gap: 6px; width: 100%; padding: 4px; border-radius: 999px; background: #eef1f6; }}
-    .mode {{ border: 0; border-radius: 999px; padding: 9px 10px; background: transparent; color: #64748b; font-size: 13px; font-weight: 800; cursor: pointer; }}
+    .mode {{ border: 0; border-radius: 999px; padding: 7px 10px; background: transparent; color: #64748b; font-size: 13px; font-weight: 800; cursor: pointer; }}
     .mode.active {{ background: white; color: #111827; box-shadow: 0 3px 12px rgba(15,23,42,.09); }}
     .picker {{ width: 100%; display: none; gap: 7px; }}
     .picker.show {{ display: grid; }}
-    select {{ width: 100%; min-height: 42px; border: 1px solid #d8dee9; border-radius: 14px; padding: 9px 12px; background: white; color: #111827; font-size: 14px; }}
-    .fields {{ width: 100%; display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; padding: 2px 1px 4px; }}
-    .field-chip {{ border: 1px solid #e2e8f0; border-radius: 999px; background: #f8fafc; color: #64748b; font-size: 11px; font-weight: 800; padding: 6px 9px; white-space: nowrap; }}
-    .mic {{ width: 100%; height: 58px; border-radius: 18px; border: 0; background: linear-gradient(145deg, #047857, #10b981); color: white; font-size: 18px; font-weight: 900; box-shadow: 0 14px 28px rgba(16,185,129,.22), inset 0 1px 0 rgba(255,255,255,.24); cursor: pointer; transition: transform .14s ease, box-shadow .14s ease, background .14s ease; }}
+    select {{ width: 100%; min-height: 38px; border: 1px solid #d8dee9; border-radius: 12px; padding: 7px 10px; background: white; color: #111827; font-size: 14px; }}
+    .fields {{ width: 100%; display: flex; flex-wrap: wrap; justify-content: center; gap: 4px; padding: 0; }}
+    .field-chip {{ border: 1px solid #e2e8f0; border-radius: 999px; background: #f8fafc; color: #64748b; font-size: 10.5px; font-weight: 800; padding: 4px 7px; white-space: nowrap; }}
+    .mic {{ width: 100%; height: 52px; border-radius: 16px; border: 0; background: linear-gradient(145deg, #047857, #10b981); color: white; font-size: 18px; font-weight: 900; box-shadow: 0 12px 22px rgba(16,185,129,.2), inset 0 1px 0 rgba(255,255,255,.24); cursor: pointer; transition: transform .14s ease, box-shadow .14s ease, background .14s ease; display: inline-flex; align-items: center; justify-content: center; gap: 10px; }}
     .mic:active {{ transform: scale(.97); }}
     .mic[disabled] {{ opacity: .62; cursor: wait; }}
     .recording .mic {{ background: linear-gradient(145deg, #991b1b, #ef4444); animation: pulse 1.1s infinite; }}
     @keyframes pulse {{ 0%,100% {{ box-shadow: 0 0 0 0 rgba(239,68,68,.35), inset 0 1px 0 rgba(255,255,255,.25); }} 50% {{ box-shadow: 0 0 0 18px rgba(239,68,68,0), inset 0 1px 0 rgba(255,255,255,.25); }} }}
+    .rec-dot {{ display: none; width: 11px; height: 11px; border-radius: 999px; background: #22c55e; box-shadow: 0 0 0 0 rgba(34,197,94,.48); }}
+    .recording .rec-dot {{ display: inline-block; animation: greenPulse 1s infinite; }}
+    @keyframes greenPulse {{ 0%,100% {{ transform: scale(.9); box-shadow: 0 0 0 0 rgba(34,197,94,.45); }} 50% {{ transform: scale(1.12); box-shadow: 0 0 0 8px rgba(34,197,94,0); }} }}
     .title {{ display: none; }}
-    .msg {{ min-height: 24px; font-size: 13px; color: #6b7280; line-height: 1.35; }}
+    .msg {{ min-height: 18px; font-size: 12px; color: #6b7280; line-height: 1.25; }}
     .err {{ color: #b91c1c; }}
     .ok {{ color: #047857; font-weight: 750; }}
     .actions {{ display: none; width: 100%; grid-template-columns: 1fr 1fr; gap: 8px; }}
@@ -6049,17 +6052,17 @@ def create_app() -> Flask:
     .action {{ min-height: 42px; border: 0; border-radius: 14px; background: #111827; color: white; font-weight: 800; cursor: pointer; }}
     .action.secondary {{ background: #eef2ff; color: #3730a3; }}
     .action.full {{ grid-column: 1 / -1; background: #f8fafc; color: #475569; }}
-    .review {{ display: none; width: 100%; text-align: left; border: 1px solid #d1fae5; border-radius: 20px; background: #f7fefb; padding: 12px; }}
+    .review {{ display: none; width: 100%; text-align: left; border: 1px solid #d1fae5; border-radius: 18px; background: #f7fefb; padding: 10px; }}
     .review.show {{ display: block; }}
     .review-head {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }}
     .review-title {{ font-size: 13px; font-weight: 850; color: #111827; }}
     .tick {{ width: 38px; height: 34px; border: 0; border-radius: 12px; background: #10b981; color: white; font-size: 18px; font-weight: 900; cursor: pointer; }}
-    .saved-row {{ display: grid; grid-template-columns: 1fr; gap: 6px; max-height: 154px; overflow: auto; }}
-    .saved-field {{ display: grid; grid-template-columns: 92px 1fr; gap: 8px; align-items: start; font-size: 13px; line-height: 1.25; }}
+    .saved-row {{ display: grid; grid-template-columns: 1fr; gap: 5px; max-height: 148px; overflow: auto; }}
+    .saved-field {{ display: grid; grid-template-columns: 92px 1fr; gap: 8px; align-items: start; font-size: 12.5px; line-height: 1.2; }}
     .saved-label {{ color: #64748b; font-weight: 800; }}
     .saved-value {{ color: #111827; font-weight: 750; overflow-wrap: anywhere; }}
-    .review-tools {{ margin-top: 10px; display: grid; grid-template-columns: 1fr; gap: 8px; }}
-    .amend {{ min-height: 40px; border: 1px solid #86efac; border-radius: 14px; background: #ecfdf5; color: #047857; font-weight: 850; cursor: pointer; }}
+    .review-tools {{ margin-top: 8px; display: grid; grid-template-columns: 1fr; gap: 8px; }}
+    .amend {{ min-height: 38px; border: 1px solid #86efac; border-radius: 14px; background: #ecfdf5; color: #047857; font-weight: 850; cursor: pointer; }}
   </style>
 </head>
 <body>
@@ -6088,7 +6091,7 @@ def create_app() -> Flask:
         <span class="field-chip">Area</span>
         <span class="field-chip">Notes</span>
       </div>
-      <button class="mic" id="mic" type="button" aria-label="Start talking">Start talking</button>
+      <button class="mic" id="mic" type="button" aria-label="Start talking"><span class="rec-dot" aria-hidden="true"></span><span id="micText">Start talking</span></button>
       <div class="title" id="title">Start</div>
       <div class="msg" id="msg">Tap to start. Tap again to stop.</div>
       <div class="review" id="review">
@@ -6108,10 +6111,11 @@ def create_app() -> Flask:
     </div>
   </div>
   <script>
-    try {{ window.resizeTo(800, 640); }} catch (e) {{}}
+    try {{ window.resizeTo(800, 500); }} catch (e) {{}}
     let nonce = {json.dumps(nonce)};
     const wrap = document.getElementById('wrap');
     const mic = document.getElementById('mic');
+    const micText = document.getElementById('micText');
     const title = document.getElementById('title');
     const msg = document.getElementById('msg');
     const picker = document.getElementById('picker');
@@ -6131,6 +6135,7 @@ def create_app() -> Flask:
     function setState(t, m, cls='') {{
       title.textContent = t; msg.textContent = m || ''; msg.className = 'msg ' + cls;
     }}
+    function setMicText(text) {{ micText.textContent = text; }}
     function showActions() {{ actions.classList.add('show'); }}
     function hideActions() {{ actions.classList.remove('show'); }}
     function hideReview() {{ review.classList.remove('show'); savedRow.innerHTML = ''; }}
@@ -6155,7 +6160,7 @@ def create_app() -> Flask:
       mode = next === 'edit' ? 'edit' : 'add';
       processing = false;
       mic.disabled = false;
-      mic.textContent = 'Start talking';
+      setMicText('Start talking');
       delete mic.dataset.action;
       newMode.classList.toggle('active', mode === 'add');
       editMode.classList.toggle('active', mode === 'edit');
@@ -6189,7 +6194,7 @@ def create_app() -> Flask:
       }}
     }}
     function reset() {{
-      processing = false; recorder = null; chunks = []; wrap.classList.remove('recording'); mic.disabled = false; mic.textContent = 'Start talking'; hideActions(); hideReview();
+      processing = false; recorder = null; chunks = []; wrap.classList.remove('recording'); mic.disabled = false; setMicText('Start talking'); hideActions(); hideReview();
       delete mic.dataset.action;
       setState('Start', mode === 'edit' ? 'Choose a recent row, then record only the changes.' : 'Tap to start. Tap again to stop.');
     }}
@@ -6222,14 +6227,14 @@ def create_app() -> Flask:
         recorder.onstop = submit;
         recorder.start();
         delete mic.dataset.action;
-        wrap.classList.add('recording'); mic.textContent = 'Stop and save'; setState('Stop', 'Tap again when you are finished.');
+        wrap.classList.add('recording'); setMicText('Stop and save'); setState('Stop', 'Tap again when you are finished.');
       }} catch (e) {{
         setState('Microphone blocked', 'Allow microphone access and try again.', 'err');
       }}
     }}
     function stop() {{
       if (!recorder || recorder.state !== 'recording') return;
-      mic.disabled = true; processing = true; wrap.classList.remove('recording'); mic.textContent = 'Saving...'; setState('Saving', mode === 'edit' ? 'Updating the selected lead.' : 'Adding lead to the sheet.');
+      mic.disabled = true; processing = true; wrap.classList.remove('recording'); setMicText('Saving...'); setState('Saving', mode === 'edit' ? 'Updating the selected lead.' : 'Adding lead to the sheet.');
       recorder.stop();
       if (stream) stream.getTracks().forEach(t => t.stop());
     }}
@@ -6250,11 +6255,11 @@ def create_app() -> Flask:
         showSavedRow(data.saved_row || []);
         processing = false;
         mic.disabled = false;
-        mic.textContent = 'Start talking again';
+        setMicText('Start talking again');
         mic.dataset.action = 'again';
         setState('Check the line', 'Tick it if correct, or talk again to amend it.', 'ok');
       }} catch (e) {{
-        mic.disabled = false; processing = false; mic.textContent = 'Try again'; mic.dataset.action = 'retry';
+        mic.disabled = false; processing = false; setMicText('Try again'); mic.dataset.action = 'retry';
         setState('Try again', e.message || 'Something went wrong.', 'err');
       }}
     }}
@@ -6269,7 +6274,7 @@ def create_app() -> Flask:
     editMode.addEventListener('click', () => setMode('edit'));
     addAnother.addEventListener('click', () => location.href = '/lead-voice');
     amendSaved.addEventListener('click', () => {{ hideActions(); hideReview(); start(); }});
-    okSaved.addEventListener('click', () => {{ hideReview(); mic.textContent = 'Approved'; mic.disabled = true; delete mic.dataset.action; setState('Approved ✓', 'Start a new entry or exit.', 'ok'); showActions(); }});
+    okSaved.addEventListener('click', () => {{ hideReview(); setMicText('Approved'); mic.disabled = true; delete mic.dataset.action; setState('Approved ✓', 'Start a new entry or exit.', 'ok'); showActions(); }});
     closeWin.addEventListener('click', () => {{ try {{ window.close(); }} catch(e) {{}} }});
     if (!navigator.mediaDevices || !window.MediaRecorder) {{
       mic.disabled = true; setState('Not supported', 'This browser cannot record audio here.', 'err');
