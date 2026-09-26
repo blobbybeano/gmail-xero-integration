@@ -1931,7 +1931,7 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
     return cleaned
 
 
-def _lead_voice_insert_row(service, sheet_id: int, lead: dict) -> None:
+def _lead_voice_insert_row(service, sheet_id: int, lead: dict) -> int:
     row = [
         _lead_voice_date_text(lead.get("lead_date")),
         _lead_voice_sanitise_cell(lead.get("lead_name")),
@@ -1960,6 +1960,7 @@ def _lead_voice_insert_row(service, sheet_id: int, lead: dict) -> None:
         valueInputOption="USER_ENTERED",
         body={"values": [row]},
     ).execute()
+    return 2
 
 
 def _lead_voice_recent_rows(service, limit: int = 50) -> list[dict]:
@@ -5999,7 +6000,7 @@ def create_app() -> Flask:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Speak Lead</title>
+  <title>Start / Stop</title>
   <style>
     :root {{ font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif; color: #111827; }}
     * {{ box-sizing: border-box; }}
@@ -6041,8 +6042,8 @@ def create_app() -> Flask:
         </select>
       </div>
       <button class="mic" id="mic" type="button" aria-label="Start recording">🎙</button>
-      <div class="title" id="title">Speak Lead</div>
-      <div class="msg" id="msg">Press the microphone and speak naturally.</div>
+      <div class="title" id="title">Start</div>
+      <div class="msg" id="msg">Tap to start. Tap again to stop.</div>
       <div class="actions" id="actions">
         <button class="action secondary" id="addAnother" type="button">Add another</button>
         <button class="action secondary" id="editRecent" type="button">Edit recent</button>
@@ -6051,7 +6052,7 @@ def create_app() -> Flask:
     </div>
   </div>
   <script>
-    const nonce = {json.dumps(nonce)};
+    let nonce = {json.dumps(nonce)};
     const wrap = document.getElementById('wrap');
     const mic = document.getElementById('mic');
     const title = document.getElementById('title');
@@ -6080,9 +6081,9 @@ def create_app() -> Flask:
       hideActions();
       if (mode === 'edit') {{
         loadRecent();
-        setState('Edit Lead', 'Choose a recent row, then record only the changes.');
+        setState('Start', 'Choose a recent row, then record only the changes.');
       }} else {{
-        setState('Speak Lead', 'Press the microphone and speak naturally.');
+        setState('Start', 'Tap to start. Tap again to stop.');
       }}
     }}
     async function loadRecent() {{
@@ -6106,7 +6107,22 @@ def create_app() -> Flask:
     }}
     function reset() {{
       processing = false; recorder = null; chunks = []; wrap.classList.remove('recording'); mic.disabled = false; mic.textContent = '🎙'; hideActions();
-      setState(mode === 'edit' ? 'Edit Lead' : 'Speak Lead', mode === 'edit' ? 'Choose a recent row, then record only the changes.' : 'Press the microphone and speak naturally.');
+      delete mic.dataset.action;
+      setState('Start', mode === 'edit' ? 'Choose a recent row, then record only the changes.' : 'Tap to start. Tap again to stop.');
+    }}
+    function continueEditing(rowNumber, label) {{
+      if (!rowNumber) return;
+      mode = 'edit';
+      newMode.classList.remove('active');
+      editMode.classList.add('active');
+      picker.classList.add('show');
+      if (![...recent.options].some(opt => opt.value === String(rowNumber))) {{
+        const opt = document.createElement('option');
+        opt.value = rowNumber;
+        opt.textContent = label || 'Just added lead';
+        recent.insertBefore(opt, recent.firstChild);
+      }}
+      recent.value = String(rowNumber);
     }}
     async function start() {{
       if (mode === 'edit' && !recent.value) {{
@@ -6121,14 +6137,15 @@ def create_app() -> Flask:
         recorder.ondataavailable = e => {{ if (e.data && e.data.size) chunks.push(e.data); }};
         recorder.onstop = submit;
         recorder.start();
-        wrap.classList.add('recording'); mic.textContent = '■'; setState('Recording…', 'Press again to stop.');
+        delete mic.dataset.action;
+        wrap.classList.add('recording'); mic.textContent = '■'; setState('Stop', 'Tap again when you are finished.');
       }} catch (e) {{
         setState('Microphone blocked', 'Allow microphone access and try again.', 'err');
       }}
     }}
     function stop() {{
       if (!recorder || recorder.state !== 'recording') return;
-      mic.disabled = true; processing = true; wrap.classList.remove('recording'); setState('Processing…', mode === 'edit' ? 'Updating the selected lead.' : 'Adding lead to the sheet.');
+      mic.disabled = true; processing = true; wrap.classList.remove('recording'); mic.textContent = '…'; setState('Saving', mode === 'edit' ? 'Updating the selected lead.' : 'Adding lead to the sheet.');
       recorder.stop();
       if (stream) stream.getTracks().forEach(t => t.stop());
     }}
@@ -6144,18 +6161,24 @@ def create_app() -> Flask:
         const resp = await fetch('/lead-voice/submit', {{method:'POST', body: fd}});
         const data = await resp.json().catch(() => ({{}}));
         if (!resp.ok || data.error) throw new Error(data.error || 'Upload failed.');
-        mic.disabled = true;
-        setState(mode === 'edit' ? 'Lead updated ✓' : 'Lead added ✓', 'Choose what to do next.', 'ok');
+        if (data.new_nonce) nonce = data.new_nonce;
+        continueEditing(data.row_number, data.label);
+        processing = false;
+        mic.disabled = false;
+        mic.textContent = '↻';
+        mic.dataset.action = 'again';
+        setState('Saved ✓', 'Tap again to add more to this entry, or choose another option.', 'ok');
         showActions();
       }} catch (e) {{
-        mic.disabled = false; processing = false; mic.textContent = '↻';
+        mic.disabled = false; processing = false; mic.textContent = '↻'; mic.dataset.action = 'retry';
         setState('Try again', e.message || 'Something went wrong.', 'err');
       }}
     }}
     mic.addEventListener('click', () => {{
       if (processing) return;
       if (recorder && recorder.state === 'recording') stop();
-      else if (mic.textContent === '↻') reset();
+      else if (mic.dataset.action === 'retry') reset();
+      else if (mic.dataset.action === 'again') {{ hideActions(); start(); }}
       else start();
     }});
     newMode.addEventListener('click', () => setMode('add'));
@@ -6228,7 +6251,7 @@ def create_app() -> Flask:
             if mode == "edit":
                 _lead_voice_update_row(service, row_number, lead)
             else:
-                _lead_voice_insert_row(service, sheet_id, lead)
+                row_number = _lead_voice_insert_row(service, sheet_id, lead)
         except HttpError:
             return jsonify({"error": "Google Sheets write failed."}), 500
         except RuntimeError as exc:
@@ -6240,8 +6263,21 @@ def create_app() -> Flask:
         # Keep the browser session cookie small.
         done = dict(list(done.items())[-10:])
         session["lead_voice_done"] = done
-        session["lead_voice_nonce"] = ""
-        return jsonify({"ok": True, "mode": "edit" if mode == "edit" else "add"})
+        new_nonce = secrets.token_urlsafe(18)
+        session["lead_voice_nonce"] = new_nonce
+        label_bits = [
+            _lead_voice_date_text(lead.get("lead_date")),
+            str(lead.get("lead_name") or "").strip(),
+            str(lead.get("number") or "").strip(),
+        ]
+        label = " · ".join(bit for bit in label_bits if bit) or "Just added lead"
+        return jsonify({
+            "ok": True,
+            "mode": "edit" if mode == "edit" else "add",
+            "row_number": row_number,
+            "label": label,
+            "new_nonce": new_nonce,
+        })
 
     @app.get("/login")
     def login():
