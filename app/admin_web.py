@@ -6056,13 +6056,16 @@ def create_app() -> Flask:
     .review.show {{ display: block; }}
     .review-head {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }}
     .review-title {{ font-size: 13px; font-weight: 850; color: #111827; }}
-    .tick {{ width: 38px; height: 34px; border: 0; border-radius: 12px; background: #10b981; color: white; font-size: 18px; font-weight: 900; cursor: pointer; }}
-    .saved-row {{ display: grid; grid-template-columns: 1fr; gap: 5px; max-height: 148px; overflow: auto; }}
-    .saved-field {{ display: grid; grid-template-columns: 92px 1fr; gap: 8px; align-items: start; font-size: 12.5px; line-height: 1.2; }}
+    .tick {{ width: 38px; height: 34px; border: 0; border-radius: 12px; background: linear-gradient(145deg, #d97706, #f59e0b); color: white; font-size: 18px; font-weight: 900; cursor: pointer; box-shadow: 0 8px 18px rgba(217,119,6,.22); }}
+    .saved-row {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 18px; row-gap: 5px; max-height: none; overflow: visible; }}
+    .saved-field {{ display: grid; grid-template-columns: 86px minmax(0, 1fr); gap: 7px; align-items: start; font-size: 12.5px; line-height: 1.2; min-width: 0; }}
     .saved-label {{ color: #64748b; font-weight: 800; }}
     .saved-value {{ color: #111827; font-weight: 750; overflow-wrap: anywhere; }}
     .review-tools {{ margin-top: 8px; display: grid; grid-template-columns: 1fr; gap: 8px; }}
     .amend {{ min-height: 38px; border: 1px solid #86efac; border-radius: 14px; background: #ecfdf5; color: #047857; font-weight: 850; cursor: pointer; }}
+    @media (max-width: 560px) {{
+      .saved-row {{ grid-template-columns: 1fr; }}
+    }}
   </style>
 </head>
 <body>
