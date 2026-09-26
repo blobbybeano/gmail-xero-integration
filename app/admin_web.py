@@ -1698,8 +1698,114 @@ def _lead_voice_sanitise_phone(value: object) -> str:
     return text
 
 
+def _lead_voice_compact_spoken_email_domain(value: str) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"\b(?:dot|full stop|point)\b", ".", text)
+    text = re.sub(r"\b(?:co uk|couk)\b", "co.uk", text)
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"[^a-z0-9.-].*$", "", text)
+    text = re.sub(r"\.+", ".", text).strip(".")
+    common_domains = (
+        "gmail.com",
+        "googlemail.com",
+        "hotmail.co.uk",
+        "hotmail.com",
+        "outlook.com",
+        "yahoo.com",
+        "icloud.com",
+    )
+    compact = text.replace(".", "")
+    for domain in common_domains:
+        if text.startswith(domain) or compact.startswith(domain.replace(".", "")):
+            return domain
+    shortcuts = {
+        "gmail": "gmail.com",
+        "googlemail": "googlemail.com",
+        "hotmail": "hotmail.com",
+        "outlook": "outlook.com",
+        "yahoo": "yahoo.com",
+        "icloud": "icloud.com",
+    }
+    for shortcut, domain in shortcuts.items():
+        if text == shortcut or text.startswith(shortcut + ".") or compact.startswith(shortcut):
+            return domain
+    return text
+
+
+def _lead_voice_compact_spoken_email_local(value: str) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"\b(?:email|e-mail|address|that'?s|thats|this|her|his|their|the)\b", " ", text)
+    text = re.sub(r"\b(?:is|as|to|should be|needs to be|change(?:d)? to|set(?: it)? to|make(?: it)?|put(?: it)? as)\b", " ", text)
+    text = re.sub(r"\b(?:spell(?:ed|ing)?|spelt|again|same word|same)\b", " ", text)
+    text = re.sub(r"\b(?:dot|full stop|point)\b", ".", text)
+    text = re.sub(r"\b(?:dash|hyphen|minus)\b", "-", text)
+    text = re.sub(r"\bunderscore\b", "_", text)
+    text = re.sub(r"\bplus\b", "+", text)
+    chunks = [chunk for chunk in re.split(r"[,;\n]+", text) if chunk.strip()]
+    pieces: list[str] = []
+    for chunk in chunks or [text]:
+        raw = chunk.strip()
+        if not raw:
+            continue
+        if re.fullmatch(r"(?:[a-z0-9]\s*[- ]\s*)+[a-z0-9]", raw):
+            piece = re.sub(r"[-\s]+", "", raw)
+        else:
+            piece = re.sub(r"[^a-z0-9._+-]+", "", raw)
+        if not piece:
+            continue
+        previous = pieces[-1] if pieces else ""
+        if previous == piece or previous.endswith(piece):
+            continue
+        pieces.append(piece)
+    return "".join(pieces)
+
+
+def _lead_voice_normalise_spoken_email(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    text = raw.lower().replace("'", "")
+    text = re.sub(r"\s+at\s+", "@", text)
+    text = re.sub(r"\bat\b", "@", text)
+    text = re.sub(r"\s*@\s*", "@", text)
+    text = re.sub(r"\b(?:dot|full stop|point)\b", ".", text)
+    if "@" in text:
+        local_raw, domain_raw = text.rsplit("@", 1)
+        local = _lead_voice_compact_spoken_email_local(local_raw)
+        domain = _lead_voice_compact_spoken_email_domain(domain_raw)
+        if local and domain:
+            return f"{local}@{domain}"
+    text = re.sub(r"\b(?:dot|full stop|point)\b", ".", text)
+    text = re.sub(r"\b(?:dash|hyphen|minus)\b", "-", text)
+    text = re.sub(r"\bunderscore\b", "_", text)
+    text = re.sub(r"\bplus\b", "+", text)
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"[^a-z0-9@._+-]", "", text)
+    return text
+
+
 def _lead_voice_sanitise_email(value: object) -> str:
-    return _lead_voice_sanitise_cell(str(value or "").strip().lower())
+    return _lead_voice_sanitise_cell(_lead_voice_normalise_spoken_email(value))
+
+
+def _lead_voice_trim_at_next_field_instruction(value: str, *, current_field: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    stops: list[str] = []
+    for field, aliases in LEAD_VOICE_FIELD_ALIASES.items():
+        if field == current_field:
+            continue
+        stops.extend(aliases)
+    stops.extend(("that's her email", "thats her email", "that's his email", "thats his email", "source's", "sources"))
+    escaped = sorted((re.escape(stop) for stop in stops if stop), key=len, reverse=True)
+    if not escaped:
+        return text
+    pattern = rf"(?:^|[\s,.;])(?:{'|'.join(escaped)})(?:'s|\s+is|\s+as|\s+to|\s+was|\s+should be|\s+needs to be|\s+change(?:d)? to|\s+set(?: it)? to|\s+make(?: it)?|\s+put(?: it)? as)?\b"
+    match = re.search(pattern, text, flags=re.I)
+    if match:
+        return text[: match.start()].strip(" .,:;-")
+    return text
 
 
 def _lead_voice_sheet_meta(service) -> tuple[int, dict[str, list[str]]]:
@@ -1842,14 +1948,10 @@ LEAD_VOICE_FIELD_ALIASES = {
 
 def _lead_voice_clean_spoken_field_value(value: str, *, field: str) -> str:
     text = str(value or "").strip(" .,:;-")
+    text = _lead_voice_trim_at_next_field_instruction(text, current_field=field)
     text = re.sub(r"^(?:is|as|to|should be|needs to be|change(?:d)? to|set(?: it)? to|make(?: it)?|put(?: it)? as)\s+", "", text, flags=re.I).strip()
     if field == "email":
-        text = text.lower()
-        text = re.sub(r"\s+at\s+", "@", text)
-        text = re.sub(r"\s+dot\s+", ".", text)
-        text = text.replace(" at ", "@").replace(" dot ", ".")
-        text = text.replace("'", "")
-        text = re.sub(r"\s+", "", text)
+        text = _lead_voice_normalise_spoken_email(text)
     return text
 
 
@@ -1967,6 +2069,9 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
         "During edits, phrases like 'email is ...', 'number is ...', 'source is ...', "
         "or 'change job type to ...' are field update instructions. Put the spoken value in that named field only. "
         "Do not copy field update instructions into notes. "
+        "For emails, understand spoken spelling confirmations: if someone says a word then spells the same word, "
+        "keep one copy only, and convert 'at', 'dot', 'dash', 'underscore', and 'plus' into email characters. "
+        "Stop the email value when the speaker moves on to another field such as source, form of contact, or contact. "
         "Abbreviations: N.A means no answer. If the speaker says they called, got no answer, "
         "then WhatsApped, choose the exact permitted Form of Contact option matching Call N.A/Whatsapp. "
         "Giving a quote does not mean conversion unless the customer booked/accepted. "
