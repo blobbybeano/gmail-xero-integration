@@ -6238,6 +6238,8 @@ def create_app() -> Flask:
     let recorder = null, stream = null, chunks = [], processing = false;
     let mode = new URLSearchParams(location.search).get('mode') === 'edit' ? 'edit' : 'add';
     let recentLoaded = false;
+    const columnLabels = ["Date", "Lead Name", "Number", "e-mail", "Source", "Job Type", "Form of Contact", "Conversion", "Void", "Area", "Contact", "Notes"];
+    const recentRows = new Map();
     function setState(t, m, cls='') {{
       title.textContent = t; msg.textContent = m || ''; msg.className = 'msg ' + cls;
     }}
@@ -6262,6 +6264,18 @@ def create_app() -> Flask:
       }});
       review.classList.toggle('show', !!(fields || []).length);
       resizeShell();
+    }}
+    function rowValuesToFields(values) {{
+      return (values || []).map((value, idx) => ({{label: columnLabels[idx] || ('Column ' + (idx + 1)), value: String(value || '').replace(/^'/, '').trim()}})).filter(field => field.value);
+    }}
+    function showSelectedRecentRow() {{
+      const row = recentRows.get(String(recent.value));
+      if (row && row.values) {{
+        showSavedRow(rowValuesToFields(row.values));
+        setState('Current row', 'Talk again to add or amend anything shown below.', 'ok');
+      }} else {{
+        hideReview();
+      }}
     }}
     function setMode(next) {{
       mode = next === 'edit' ? 'edit' : 'add';
@@ -6290,6 +6304,7 @@ def create_app() -> Flask:
         if (!resp.ok || data.error) throw new Error(data.error || 'Could not load recent leads.');
         recent.innerHTML = '<option value="">Choose a recent lead…</option>';
         (data.rows || []).forEach(row => {{
+          recentRows.set(String(row.row_number), row);
           const opt = document.createElement('option');
           opt.value = row.row_number;
           opt.textContent = row.label;
@@ -6379,6 +6394,7 @@ def create_app() -> Flask:
     }});
     newMode.addEventListener('click', () => setMode('add'));
     editMode.addEventListener('click', () => setMode('edit'));
+    recent.addEventListener('change', () => showSelectedRecentRow());
     addAnother.addEventListener('click', () => location.href = '/lead-voice');
     amendSaved.addEventListener('click', () => {{ hideActions(); hideReview(); start(); }});
     okSaved.addEventListener('click', () => {{ hideReview(); setMicText('Approved'); mic.disabled = true; delete mic.dataset.action; setState('Approved ✓', 'Start a new entry or exit.', 'ok'); showActions(); }});
