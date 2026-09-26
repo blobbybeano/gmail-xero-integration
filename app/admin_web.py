@@ -6024,9 +6024,10 @@ def create_app() -> Flask:
   <style>
     :root {{ font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif; color: #111827; }}
     * {{ box-sizing: border-box; }}
-    body {{ margin: 0; min-height: 100vh; display: grid; place-items: start center; background: radial-gradient(circle at top, #ffffff 0, #f2f4f8 52%, #e8edf5 100%); }}
-    .wrap {{ width: min(98vw, 760px); min-height: 0; padding: 4px; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; gap: 0; text-align: center; }}
-    .panel {{ width: 100%; padding: 12px; border-radius: 22px; background: rgba(255,255,255,.88); border: 1px solid rgba(255,255,255,.9); box-shadow: 0 16px 44px rgba(15,23,42,.12), inset 0 1px 0 rgba(255,255,255,.95); backdrop-filter: blur(20px); display: flex; flex-direction: column; align-items: center; gap: 9px; }}
+    html {{ margin: 0; padding: 0; min-height: 0; background: #f8fafc; }}
+    body {{ margin: 0; min-height: 0; height: auto; overflow: hidden; background: #f8fafc; }}
+    .wrap {{ width: min(98vw, 760px); min-height: 0; padding: 0; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; gap: 0; text-align: center; }}
+    .panel {{ width: 100%; padding: 10px; border-radius: 18px; background: rgba(255,255,255,.92); border: 1px solid rgba(255,255,255,.9); box-shadow: 0 10px 30px rgba(15,23,42,.1), inset 0 1px 0 rgba(255,255,255,.95); backdrop-filter: blur(18px); display: flex; flex-direction: column; align-items: center; gap: 8px; }}
     .modebar {{ display: grid; grid-template-columns: 1fr 1fr; gap: 6px; width: 100%; padding: 4px; border-radius: 999px; background: #eef1f6; }}
     .mode {{ border: 0; border-radius: 999px; padding: 7px 10px; background: transparent; color: #64748b; font-size: 13px; font-weight: 800; cursor: pointer; }}
     .mode.active {{ background: white; color: #111827; box-shadow: 0 3px 12px rgba(15,23,42,.09); }}
@@ -6111,7 +6112,17 @@ def create_app() -> Flask:
     </div>
   </div>
   <script>
-    try {{ window.resizeTo(800, 500); }} catch (e) {{}}
+    function resizeShell() {{
+      setTimeout(() => {{
+        try {{
+          const panel = document.querySelector('.panel');
+          const width = Math.min(820, Math.max(640, Math.ceil((panel && panel.scrollWidth) || document.body.scrollWidth || 760) + 56));
+          const height = Math.min(520, Math.max(250, Math.ceil((panel && panel.scrollHeight) || document.body.scrollHeight || 260) + 88));
+          window.resizeTo(width, height);
+        }} catch (e) {{}}
+      }}, 50);
+    }}
+    resizeShell();
     let nonce = {json.dumps(nonce)};
     const wrap = document.getElementById('wrap');
     const mic = document.getElementById('mic');
@@ -6136,9 +6147,9 @@ def create_app() -> Flask:
       title.textContent = t; msg.textContent = m || ''; msg.className = 'msg ' + cls;
     }}
     function setMicText(text) {{ micText.textContent = text; }}
-    function showActions() {{ actions.classList.add('show'); }}
-    function hideActions() {{ actions.classList.remove('show'); }}
-    function hideReview() {{ review.classList.remove('show'); savedRow.innerHTML = ''; }}
+    function showActions() {{ actions.classList.add('show'); resizeShell(); }}
+    function hideActions() {{ actions.classList.remove('show'); resizeShell(); }}
+    function hideReview() {{ review.classList.remove('show'); savedRow.innerHTML = ''; resizeShell(); }}
     function showSavedRow(fields) {{
       savedRow.innerHTML = '';
       (fields || []).forEach(field => {{
@@ -6155,6 +6166,7 @@ def create_app() -> Flask:
         savedRow.appendChild(row);
       }});
       review.classList.toggle('show', !!(fields || []).length);
+      resizeShell();
     }}
     function setMode(next) {{
       mode = next === 'edit' ? 'edit' : 'add';
