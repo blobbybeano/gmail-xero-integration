@@ -6025,7 +6025,7 @@ def create_app() -> Flask:
     :root {{ font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif; color: #111827; }}
     * {{ box-sizing: border-box; }}
     body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: radial-gradient(circle at top, #ffffff 0, #f2f4f8 52%, #e8edf5 100%); }}
-    .wrap {{ width: min(100vw, 440px); min-height: min(100vh, 540px); padding: 16px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 15px; text-align: center; }}
+    .wrap {{ width: min(96vw, 760px); min-height: min(100vh, 560px); padding: 16px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 15px; text-align: center; }}
     .panel {{ width: 100%; padding: 18px; border-radius: 28px; background: rgba(255,255,255,.86); border: 1px solid rgba(255,255,255,.9); box-shadow: 0 24px 70px rgba(15,23,42,.14), inset 0 1px 0 rgba(255,255,255,.95); backdrop-filter: blur(20px); display: flex; flex-direction: column; align-items: center; gap: 13px; }}
     .modebar {{ display: grid; grid-template-columns: 1fr 1fr; gap: 6px; width: 100%; padding: 4px; border-radius: 999px; background: #eef1f6; }}
     .mode {{ border: 0; border-radius: 999px; padding: 9px 10px; background: transparent; color: #64748b; font-size: 13px; font-weight: 800; cursor: pointer; }}
@@ -6033,16 +6033,15 @@ def create_app() -> Flask:
     .picker {{ width: 100%; display: none; gap: 7px; }}
     .picker.show {{ display: grid; }}
     select {{ width: 100%; min-height: 42px; border: 1px solid #d8dee9; border-radius: 14px; padding: 9px 12px; background: white; color: #111827; font-size: 14px; }}
-    .fields {{ width: 100%; display: flex; gap: 6px; overflow-x: auto; padding: 2px 1px 4px; scrollbar-width: none; }}
-    .fields::-webkit-scrollbar {{ display: none; }}
-    .field-chip {{ flex: 0 0 auto; border: 1px solid #e2e8f0; border-radius: 999px; background: #f8fafc; color: #64748b; font-size: 11px; font-weight: 800; padding: 6px 9px; }}
-    .mic {{ width: 100%; height: 58px; border-radius: 18px; border: 0; background: linear-gradient(145deg, #111827, #2563eb); color: white; font-size: 18px; font-weight: 900; box-shadow: 0 14px 28px rgba(37,99,235,.22), inset 0 1px 0 rgba(255,255,255,.24); cursor: pointer; transition: transform .14s ease, box-shadow .14s ease, background .14s ease; }}
+    .fields {{ width: 100%; display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; padding: 2px 1px 4px; }}
+    .field-chip {{ border: 1px solid #e2e8f0; border-radius: 999px; background: #f8fafc; color: #64748b; font-size: 11px; font-weight: 800; padding: 6px 9px; white-space: nowrap; }}
+    .mic {{ width: 100%; height: 58px; border-radius: 18px; border: 0; background: linear-gradient(145deg, #047857, #10b981); color: white; font-size: 18px; font-weight: 900; box-shadow: 0 14px 28px rgba(16,185,129,.22), inset 0 1px 0 rgba(255,255,255,.24); cursor: pointer; transition: transform .14s ease, box-shadow .14s ease, background .14s ease; }}
     .mic:active {{ transform: scale(.97); }}
     .mic[disabled] {{ opacity: .62; cursor: wait; }}
     .recording .mic {{ background: linear-gradient(145deg, #991b1b, #ef4444); animation: pulse 1.1s infinite; }}
     @keyframes pulse {{ 0%,100% {{ box-shadow: 0 0 0 0 rgba(239,68,68,.35), inset 0 1px 0 rgba(255,255,255,.25); }} 50% {{ box-shadow: 0 0 0 18px rgba(239,68,68,0), inset 0 1px 0 rgba(255,255,255,.25); }} }}
-    .title {{ font-size: 19px; font-weight: 850; letter-spacing: 0; }}
-    .msg {{ min-height: 34px; font-size: 13px; color: #6b7280; line-height: 1.35; }}
+    .title {{ display: none; }}
+    .msg {{ min-height: 24px; font-size: 13px; color: #6b7280; line-height: 1.35; }}
     .err {{ color: #b91c1c; }}
     .ok {{ color: #047857; font-weight: 750; }}
     .actions {{ display: none; width: 100%; grid-template-columns: 1fr 1fr; gap: 8px; }}
@@ -6060,7 +6059,7 @@ def create_app() -> Flask:
     .saved-label {{ color: #64748b; font-weight: 800; }}
     .saved-value {{ color: #111827; font-weight: 750; overflow-wrap: anywhere; }}
     .review-tools {{ margin-top: 10px; display: grid; grid-template-columns: 1fr; gap: 8px; }}
-    .amend {{ min-height: 40px; border: 1px solid #c7d2fe; border-radius: 14px; background: #eef2ff; color: #3730a3; font-weight: 850; cursor: pointer; }}
+    .amend {{ min-height: 40px; border: 1px solid #86efac; border-radius: 14px; background: #ecfdf5; color: #047857; font-weight: 850; cursor: pointer; }}
   </style>
 </head>
 <body>
@@ -6077,12 +6076,15 @@ def create_app() -> Flask:
       </div>
       <div class="fields" aria-label="Sheet columns">
         <span class="field-chip">Date</span>
-        <span class="field-chip">Lead</span>
+        <span class="field-chip">Lead Name</span>
         <span class="field-chip">Number</span>
+        <span class="field-chip">e-mail</span>
         <span class="field-chip">Source</span>
-        <span class="field-chip">Job</span>
+        <span class="field-chip">Job Type</span>
+        <span class="field-chip">Form of Contact</span>
         <span class="field-chip">Contact</span>
         <span class="field-chip">Conversion</span>
+        <span class="field-chip">Void</span>
         <span class="field-chip">Area</span>
         <span class="field-chip">Notes</span>
       </div>
@@ -6106,6 +6108,7 @@ def create_app() -> Flask:
     </div>
   </div>
   <script>
+    try {{ window.resizeTo(800, 640); }} catch (e) {{}}
     let nonce = {json.dumps(nonce)};
     const wrap = document.getElementById('wrap');
     const mic = document.getElementById('mic');
