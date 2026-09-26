@@ -1780,6 +1780,23 @@ def _lead_voice_find_option(options: list[str], wanted: str) -> str:
     return ""
 
 
+def _lead_voice_snap_dropdown_value(value: str, allowed: list[str]) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if raw in allowed:
+        return raw
+    exact = _lead_voice_find_option(allowed, raw)
+    if exact:
+        return exact
+    raw_key = _lead_voice_option_key(raw)
+    for option in allowed:
+        opt_key = _lead_voice_option_key(option)
+        if raw_key and (raw_key in opt_key or opt_key in raw_key):
+            return option
+    return ""
+
+
 def _lead_voice_apply_abbreviation_rules(lead: dict, transcript: str, dropdowns: dict[str, list[str]]) -> dict:
     text = str(transcript or "").lower()
     form_options = dropdowns.get("form_of_contact") or []
@@ -1945,7 +1962,8 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
         "Never invent customer information. Leave missing unknown customer fields blank. "
         f"{date_instruction}"
         "If a date is clearly spoken, return it as YYYY-MM-DD. "
-        "For dropdown fields, choose only one exact permitted option or blank. "
+        "Dropdown field values come from the live Google Sheet validation lists below. "
+        "For dropdown fields, choose only one exact permitted option from those lists or blank; never invent a category. "
         "During edits, phrases like 'email is ...', 'number is ...', 'source is ...', "
         "or 'change job type to ...' are field update instructions. Put the spoken value in that named field only. "
         "Do not copy field update instructions into notes. "
@@ -1986,8 +2004,14 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
     for key in LEAD_VOICE_DROPDOWN_KEYS:
         value = cleaned.get(key, "")
         allowed = dropdowns.get(key) or []
-        if value and value not in allowed:
-            raise RuntimeError(f"AI chose an invalid {key.replace('_', ' ')} option.")
+        if value and allowed:
+            snapped = _lead_voice_snap_dropdown_value(value, allowed)
+            if snapped:
+                cleaned[key] = snapped
+            elif for_edit:
+                cleaned[key] = ""
+            else:
+                raise RuntimeError(f"AI chose an invalid {key.replace('_', ' ')} option.")
     if not for_edit and not cleaned.get("conversion"):
         cleaned["conversion"] = _lead_voice_pick_default(dropdowns.get("conversion") or [], ("?", "unknown", "not sure"))
     if not for_edit and not cleaned.get("void"):
