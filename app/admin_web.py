@@ -1981,6 +1981,26 @@ def _lead_voice_recent_rows(service, limit: int = 50) -> list[dict]:
     return rows
 
 
+def _lead_voice_read_row(service, row_number: int) -> list[str]:
+    if row_number < 2:
+        return []
+    resp = service.spreadsheets().values().get(
+        spreadsheetId=LEAD_VOICE_SPREADSHEET_ID,
+        range=f"{LEAD_VOICE_SHEET_NAME}!A{row_number}:L{row_number}",
+    ).execute()
+    row = ((resp.get("values") or [[]])[0])
+    return (list(row) + [""] * len(LEAD_VOICE_COLUMNS))[:len(LEAD_VOICE_COLUMNS)]
+
+
+def _lead_voice_row_payload(row: list[str]) -> list[dict]:
+    fields: list[dict] = []
+    for idx, (_key, label) in enumerate(LEAD_VOICE_COLUMNS):
+        value = str(row[idx] if idx < len(row) else "").strip().lstrip("'")
+        if value:
+            fields.append({"label": label, "value": value})
+    return fields
+
+
 def _lead_voice_update_row(service, row_number: int, lead: dict) -> None:
     if row_number < 2:
         raise RuntimeError("Choose a valid recent lead to edit.")
@@ -6005,7 +6025,7 @@ def create_app() -> Flask:
     :root {{ font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif; color: #111827; }}
     * {{ box-sizing: border-box; }}
     body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: radial-gradient(circle at top, #ffffff 0, #f2f4f8 52%, #e8edf5 100%); }}
-    .wrap {{ width: min(100vw, 390px); min-height: min(100vh, 430px); padding: 22px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 15px; text-align: center; }}
+    .wrap {{ width: min(100vw, 410px); min-height: min(100vh, 500px); padding: 18px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 15px; text-align: center; }}
     .panel {{ width: 100%; padding: 20px; border-radius: 30px; background: rgba(255,255,255,.82); border: 1px solid rgba(255,255,255,.9); box-shadow: 0 24px 70px rgba(15,23,42,.14), inset 0 1px 0 rgba(255,255,255,.95); backdrop-filter: blur(20px); display: flex; flex-direction: column; align-items: center; gap: 14px; }}
     .modebar {{ display: grid; grid-template-columns: 1fr 1fr; gap: 6px; width: 100%; padding: 4px; border-radius: 999px; background: #eef1f6; }}
     .mode {{ border: 0; border-radius: 999px; padding: 9px 10px; background: transparent; color: #64748b; font-size: 13px; font-weight: 800; cursor: pointer; }}
@@ -6027,6 +6047,15 @@ def create_app() -> Flask:
     .action {{ min-height: 42px; border: 0; border-radius: 14px; background: #111827; color: white; font-weight: 800; cursor: pointer; }}
     .action.secondary {{ background: #eef2ff; color: #3730a3; }}
     .action.full {{ grid-column: 1 / -1; background: #f8fafc; color: #475569; }}
+    .review {{ display: none; width: 100%; text-align: left; border: 1px solid #e5e7eb; border-radius: 20px; background: #f8fafc; padding: 12px; }}
+    .review.show {{ display: block; }}
+    .review-head {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }}
+    .review-title {{ font-size: 13px; font-weight: 850; color: #111827; }}
+    .tick {{ width: 38px; height: 34px; border: 0; border-radius: 12px; background: #10b981; color: white; font-size: 18px; font-weight: 900; cursor: pointer; }}
+    .saved-row {{ display: grid; grid-template-columns: 1fr; gap: 6px; max-height: 154px; overflow: auto; }}
+    .saved-field {{ display: grid; grid-template-columns: 92px 1fr; gap: 8px; align-items: start; font-size: 13px; line-height: 1.25; }}
+    .saved-label {{ color: #64748b; font-weight: 800; }}
+    .saved-value {{ color: #111827; font-weight: 750; overflow-wrap: anywhere; }}
   </style>
 </head>
 <body>
@@ -6044,6 +6073,13 @@ def create_app() -> Flask:
       <button class="mic" id="mic" type="button" aria-label="Start recording">🎙</button>
       <div class="title" id="title">Start</div>
       <div class="msg" id="msg">Tap to start. Tap again to stop.</div>
+      <div class="review" id="review">
+        <div class="review-head">
+          <div class="review-title">Saved row</div>
+          <button class="tick" id="okSaved" type="button" aria-label="Looks ok">✓</button>
+        </div>
+        <div class="saved-row" id="savedRow"></div>
+      </div>
       <div class="actions" id="actions">
         <button class="action secondary" id="addAnother" type="button">Add another</button>
         <button class="action secondary" id="editRecent" type="button">Edit recent</button>
@@ -6062,6 +6098,9 @@ def create_app() -> Flask:
     const newMode = document.getElementById('newMode');
     const editMode = document.getElementById('editMode');
     const actions = document.getElementById('actions');
+    const review = document.getElementById('review');
+    const savedRow = document.getElementById('savedRow');
+    const okSaved = document.getElementById('okSaved');
     const addAnother = document.getElementById('addAnother');
     const editRecent = document.getElementById('editRecent');
     const closeWin = document.getElementById('closeWin');
@@ -6073,12 +6112,31 @@ def create_app() -> Flask:
     }}
     function showActions() {{ actions.classList.add('show'); }}
     function hideActions() {{ actions.classList.remove('show'); }}
+    function hideReview() {{ review.classList.remove('show'); savedRow.innerHTML = ''; }}
+    function showSavedRow(fields) {{
+      savedRow.innerHTML = '';
+      (fields || []).forEach(field => {{
+        const row = document.createElement('div');
+        row.className = 'saved-field';
+        const label = document.createElement('div');
+        label.className = 'saved-label';
+        label.textContent = field.label || '';
+        const value = document.createElement('div');
+        value.className = 'saved-value';
+        value.textContent = field.value || '';
+        row.appendChild(label);
+        row.appendChild(value);
+        savedRow.appendChild(row);
+      }});
+      review.classList.toggle('show', !!(fields || []).length);
+    }}
     function setMode(next) {{
       mode = next === 'edit' ? 'edit' : 'add';
       newMode.classList.toggle('active', mode === 'add');
       editMode.classList.toggle('active', mode === 'edit');
       picker.classList.toggle('show', mode === 'edit');
       hideActions();
+      hideReview();
       if (mode === 'edit') {{
         loadRecent();
         setState('Start', 'Choose a recent row, then record only the changes.');
@@ -6106,7 +6164,7 @@ def create_app() -> Flask:
       }}
     }}
     function reset() {{
-      processing = false; recorder = null; chunks = []; wrap.classList.remove('recording'); mic.disabled = false; mic.textContent = '🎙'; hideActions();
+      processing = false; recorder = null; chunks = []; wrap.classList.remove('recording'); mic.disabled = false; mic.textContent = '🎙'; hideActions(); hideReview();
       delete mic.dataset.action;
       setState('Start', mode === 'edit' ? 'Choose a recent row, then record only the changes.' : 'Tap to start. Tap again to stop.');
     }}
@@ -6131,6 +6189,7 @@ def create_app() -> Flask:
       }}
       try {{
         stream = await navigator.mediaDevices.getUserMedia({{audio: true}});
+        hideReview();
         chunks = [];
         const opts = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? {{mimeType:'audio/webm;codecs=opus'}} : {{}};
         recorder = new MediaRecorder(stream, opts);
@@ -6163,6 +6222,7 @@ def create_app() -> Flask:
         if (!resp.ok || data.error) throw new Error(data.error || 'Upload failed.');
         if (data.new_nonce) nonce = data.new_nonce;
         continueEditing(data.row_number, data.label);
+        showSavedRow(data.saved_row || []);
         processing = false;
         mic.disabled = false;
         mic.textContent = '↻';
@@ -6185,6 +6245,7 @@ def create_app() -> Flask:
     editMode.addEventListener('click', () => setMode('edit'));
     addAnother.addEventListener('click', () => location.href = '/lead-voice');
     editRecent.addEventListener('click', () => location.href = '/lead-voice?mode=edit');
+    okSaved.addEventListener('click', () => hideReview());
     closeWin.addEventListener('click', () => {{ try {{ window.close(); }} catch(e) {{}} }});
     if (!navigator.mediaDevices || !window.MediaRecorder) {{
       mic.disabled = true; setState('Not supported', 'This browser cannot record audio here.', 'err');
@@ -6271,12 +6332,14 @@ def create_app() -> Flask:
             str(lead.get("number") or "").strip(),
         ]
         label = " · ".join(bit for bit in label_bits if bit) or "Just added lead"
+        saved_row = _lead_voice_row_payload(_lead_voice_read_row(service, row_number))
         return jsonify({
             "ok": True,
             "mode": "edit" if mode == "edit" else "add",
             "row_number": row_number,
             "label": label,
             "new_nonce": new_nonce,
+            "saved_row": saved_row,
         })
 
     @app.get("/login")
