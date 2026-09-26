@@ -1698,6 +1698,10 @@ def _lead_voice_sanitise_phone(value: object) -> str:
     return text
 
 
+def _lead_voice_sanitise_email(value: object) -> str:
+    return _lead_voice_sanitise_cell(str(value or "").strip().lower())
+
+
 def _lead_voice_sheet_meta(service) -> tuple[int, dict[str, list[str]]]:
     meta = (
         service.spreadsheets()
@@ -1936,7 +1940,7 @@ def _lead_voice_insert_row(service, sheet_id: int, lead: dict) -> int:
         _lead_voice_date_text(lead.get("lead_date")),
         _lead_voice_sanitise_cell(lead.get("lead_name")),
         _lead_voice_sanitise_phone(lead.get("number")),
-        _lead_voice_sanitise_cell(lead.get("email")),
+        _lead_voice_sanitise_email(lead.get("email")),
         _lead_voice_sanitise_cell(lead.get("source")),
         _lead_voice_sanitise_cell(lead.get("job_type")),
         _lead_voice_sanitise_cell(lead.get("form_of_contact")),
@@ -2019,7 +2023,12 @@ def _lead_voice_update_row(service, row_number: int, lead: dict) -> None:
         value = str(lead.get(key) or "").strip()
         if not value:
             continue
-        row[column_index[key]] = _lead_voice_sanitise_phone(value) if key == "number" else _lead_voice_sanitise_cell(value)
+        if key == "number":
+            row[column_index[key]] = _lead_voice_sanitise_phone(value)
+        elif key == "email":
+            row[column_index[key]] = _lead_voice_sanitise_email(value)
+        else:
+            row[column_index[key]] = _lead_voice_sanitise_cell(value)
     service.spreadsheets().values().update(
         spreadsheetId=LEAD_VOICE_SPREADSHEET_ID,
         range=f"{LEAD_VOICE_SHEET_NAME}!A{row_number}:L{row_number}",
