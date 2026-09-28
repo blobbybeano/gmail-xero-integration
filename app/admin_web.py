@@ -6641,7 +6641,7 @@ def create_app() -> Flask:
     recent.addEventListener('change', () => showSelectedRecentRow());
     addAnother.addEventListener('click', () => location.href = '/lead-voice');
     amendSaved.addEventListener('click', () => {{ hideActions(); hideReview(); start(); }});
-    okSaved.addEventListener('click', () => {{ hideReview(); setMicText('Approved'); mic.disabled = true; delete mic.dataset.action; setState('Approved ✓', 'Start a new entry or exit.', 'ok'); showActions(); }});
+    okSaved.addEventListener('click', () => setMode('add'));
     closeWin.addEventListener('click', () => {{ try {{ window.close(); }} catch(e) {{}} }});
     if (!navigator.mediaDevices || !window.MediaRecorder) {{
       mic.disabled = true; setState('Not supported', 'This browser cannot record audio here.', 'err');
