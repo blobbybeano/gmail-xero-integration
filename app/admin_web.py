@@ -1691,6 +1691,8 @@ def _lead_voice_sanitise_cell(value: object) -> str:
 
 def _lead_voice_sanitise_phone(value: object) -> str:
     text = str(value or "").strip()
+    text = re.sub(r"\b(?:plus)\s*(?=\d)", "+", text, flags=re.I)
+    text = re.sub(r"\s+", "", text)
     if not text:
         return ""
     if not text.startswith("'"):
@@ -2047,6 +2049,10 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
         },
         "required": ["lead_date", "lead_name", "number", "email", "source", "job_type", "form_of_contact", "conversion", "void", "area", "contact", "notes"],
     }
+    for key in LEAD_VOICE_DROPDOWN_KEYS:
+        allowed = [str(option or "").strip() for option in (dropdowns.get(key) or []) if str(option or "").strip()]
+        if allowed:
+            schema["properties"][key] = {"type": "string", "enum": ["", *allowed]}
     today_iso = _lead_voice_london_today().date().isoformat()
     date_instruction = (
         "For lead_date, leave it blank unless the speaker clearly says a replacement date. "
@@ -2066,6 +2072,7 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
         "If a date is clearly spoken, return it as YYYY-MM-DD. "
         "Dropdown field values come from the live Google Sheet validation lists below. "
         "For dropdown fields, choose only one exact permitted option from those lists or blank; never invent a category. "
+        "If none of the permitted dropdown options clearly applies, return blank for that field. "
         "During edits, phrases like 'email is ...', 'number is ...', 'source is ...', "
         "or 'change job type to ...' are field update instructions. Put the spoken value in that named field only. "
         "Do not copy field update instructions into notes. "
@@ -2076,7 +2083,7 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
         "then WhatsApped, choose the exact permitted Form of Contact option matching Call N.A/Whatsapp. "
         "Giving a quote does not mean conversion unless the customer booked/accepted. "
         "Use notes only for concise operational details not already in other fields. "
-        "Preserve UK phone numbers and leading zeroes.\n\n"
+        "Preserve UK phone numbers, +44 prefixes, and leading zeroes.\n\n"
         f"Permitted dropdown values:\n{json.dumps(dropdowns, ensure_ascii=False)}\n\n"
         f"Transcript:\n{transcript}"
     )
@@ -2113,10 +2120,8 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
             snapped = _lead_voice_snap_dropdown_value(value, allowed)
             if snapped:
                 cleaned[key] = snapped
-            elif for_edit:
-                cleaned[key] = ""
             else:
-                raise RuntimeError(f"AI chose an invalid {key.replace('_', ' ')} option.")
+                cleaned[key] = ""
     if not for_edit and not cleaned.get("conversion"):
         cleaned["conversion"] = _lead_voice_pick_default(dropdowns.get("conversion") or [], ("?", "unknown", "not sure"))
     if not for_edit and not cleaned.get("void"):
