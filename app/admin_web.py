@@ -6576,10 +6576,13 @@ def create_app() -> Flask:
             else:
                 row_number = _lead_voice_insert_row(service, sheet_id, lead)
         except HttpError:
+            app.logger.exception("Lead voice Google Sheets write failed")
             return jsonify({"error": "Google Sheets write failed."}), 500
         except RuntimeError as exc:
+            app.logger.warning("Lead voice submit failed: %s", exc)
             return jsonify({"error": str(exc)}), 500
         except Exception:
+            app.logger.exception("Lead voice submit failed unexpectedly")
             return jsonify({"error": "Lead could not be added. Try again."}), 500
         done = done if isinstance(done, dict) else {}
         done[nonce] = int(time.time())
