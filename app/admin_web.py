@@ -1992,6 +1992,19 @@ def _lead_voice_extract_spoken_field_instruction(transcript: str, field: str) ->
     return ""
 
 
+def _lead_voice_email_from_transcript(transcript: str) -> str:
+    text = str(transcript or "").strip()
+    if not text:
+        return ""
+    match = re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", text, flags=re.I)
+    if match:
+        return _lead_voice_normalise_spoken_email(match.group(0))
+    instructed = _lead_voice_extract_spoken_field_instruction(text, "email")
+    if "@" in instructed:
+        return _lead_voice_normalise_spoken_email(instructed)
+    return ""
+
+
 def _lead_voice_apply_edit_instruction_rules(lead: dict, transcript: str, *, for_edit: bool) -> dict:
     if not for_edit:
         return lead
@@ -2200,6 +2213,9 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
     cleaned["lead_date"] = str(data.get("lead_date") or ("" if for_edit else today_iso)).strip() or ("" if for_edit else today_iso)
     cleaned = _lead_voice_apply_abbreviation_rules(cleaned, transcript, dropdowns)
     cleaned = _lead_voice_apply_edit_instruction_rules(cleaned, transcript, for_edit=for_edit)
+    transcript_email = _lead_voice_email_from_transcript(transcript)
+    if transcript_email:
+        cleaned["email"] = transcript_email
     return _lead_voice_apply_dropdown_guards(cleaned, dropdowns, for_edit=for_edit)
 
 
