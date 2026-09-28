@@ -1651,6 +1651,7 @@ LEAD_VOICE_DROPDOWN_KEYS = {
     "contact": "K",
 }
 LEAD_VOICE_PROCESS_LOG_KEY = "lead_voice_process_log"
+LEAD_VOICE_PENDING_PREFIX = "lead_voice_pending_"
 
 
 def _lead_voice_openai_key(config: AppConfig) -> str:
@@ -1709,12 +1710,17 @@ def _lead_voice_append_process_log(db_path: str, entry: dict) -> None:
             item["transcript"] = _lead_voice_log_value(item.get("transcript"), 2500)
         if "ai_raw" in item and isinstance(item.get("ai_raw"), dict):
             item["ai_raw"] = _lead_voice_log_lead(item.get("ai_raw"))
-        if "final_lead" in item and isinstance(item.get("final_lead"), dict):
-            item["final_lead"] = _lead_voice_log_lead(item.get("final_lead"))
+        for lead_key in ("final_lead", "confirmed_lead"):
+            if lead_key in item and isinstance(item.get(lead_key), dict):
+                item[lead_key] = _lead_voice_log_lead(item.get(lead_key))
         log.append(item)
         set_json_setting(db_path, LEAD_VOICE_PROCESS_LOG_KEY, log[-50:])
     except Exception:
         pass
+
+
+def _lead_voice_pending_key(token: str) -> str:
+    return LEAD_VOICE_PENDING_PREFIX + str(token or "").strip()
 
 
 def _lead_voice_sanitise_cell(value: object) -> str:
@@ -2130,6 +2136,11 @@ def _lead_voice_date_text(value: object) -> str:
             return dt.date.fromisoformat(raw[:10]).strftime("%d/%m/%Y")
         except Exception:
             pass
+        for fmt in ("%d/%m/%Y", "%d-%m-%Y"):
+            try:
+                return dt.datetime.strptime(raw[:10], fmt).strftime("%d/%m/%Y")
+            except Exception:
+                pass
     return _lead_voice_london_today().strftime("%d/%m/%Y")
 
 
@@ -2264,20 +2275,7 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
 
 
 def _lead_voice_insert_row(service, sheet_id: int, lead: dict) -> int:
-    row = [
-        _lead_voice_date_text(lead.get("lead_date")),
-        _lead_voice_sanitise_cell(lead.get("lead_name")),
-        _lead_voice_sanitise_phone(lead.get("number")),
-        _lead_voice_sanitise_email(lead.get("email")),
-        _lead_voice_sanitise_cell(lead.get("source")),
-        _lead_voice_sanitise_cell(lead.get("job_type")),
-        _lead_voice_sanitise_cell(lead.get("form_of_contact")),
-        _lead_voice_sanitise_cell(lead.get("conversion")),
-        _lead_voice_sanitise_cell(lead.get("void")),
-        _lead_voice_sanitise_cell(lead.get("area")),
-        _lead_voice_sanitise_cell(lead.get("contact")),
-        _lead_voice_sanitise_cell(lead.get("notes")),
-    ]
+    row = _lead_voice_row_from_lead(lead)
     service.spreadsheets().batchUpdate(
         spreadsheetId=LEAD_VOICE_SPREADSHEET_ID,
         body={"requests": [
@@ -2293,6 +2291,33 @@ def _lead_voice_insert_row(service, sheet_id: int, lead: dict) -> int:
         body={"values": [row]},
     ).execute()
     return 2
+
+
+def _lead_voice_row_from_lead(lead: dict) -> list[str]:
+    return [
+        _lead_voice_date_text(lead.get("lead_date")),
+        _lead_voice_sanitise_cell(lead.get("lead_name")),
+        _lead_voice_sanitise_phone(lead.get("number")),
+        _lead_voice_sanitise_email(lead.get("email")),
+        _lead_voice_sanitise_cell(lead.get("source")),
+        _lead_voice_sanitise_cell(lead.get("job_type")),
+        _lead_voice_sanitise_cell(lead.get("form_of_contact")),
+        _lead_voice_sanitise_cell(lead.get("conversion")),
+        _lead_voice_sanitise_cell(lead.get("void")),
+        _lead_voice_sanitise_cell(lead.get("area")),
+        _lead_voice_sanitise_cell(lead.get("contact")),
+        _lead_voice_sanitise_cell(lead.get("notes")),
+    ]
+
+
+def _lead_voice_lead_from_form_values(values: dict, dropdowns: dict[str, list[str]], *, for_edit: bool) -> dict:
+    lead = {key: "" for key, _label in LEAD_VOICE_COLUMNS if key != "date"}
+    lead["lead_date"] = str(values.get("lead_date") or values.get("date") or "").strip()
+    for key, _label in LEAD_VOICE_COLUMNS:
+        if key == "date":
+            continue
+        lead[key] = str(values.get(key) or "").strip()
+    return _lead_voice_apply_dropdown_guards(lead, dropdowns, for_edit=for_edit)
 
 
 def _lead_voice_recent_rows(service, limit: int = 50) -> list[dict]:
@@ -2324,12 +2349,13 @@ def _lead_voice_read_row(service, row_number: int) -> list[str]:
     return (list(row) + [""] * len(LEAD_VOICE_COLUMNS))[:len(LEAD_VOICE_COLUMNS)]
 
 
-def _lead_voice_row_payload(row: list[str]) -> list[dict]:
+def _lead_voice_row_payload(row: list[str], *, include_empty: bool = False) -> list[dict]:
     fields: list[dict] = []
-    for idx, (_key, label) in enumerate(LEAD_VOICE_COLUMNS):
+    for idx, (key, label) in enumerate(LEAD_VOICE_COLUMNS):
         value = str(row[idx] if idx < len(row) else "").strip().lstrip("'")
-        if value:
-            fields.append({"label": label, "value": value})
+        raw_key = "lead_date" if key == "date" else key
+        if value or include_empty:
+            fields.append({"key": raw_key, "label": label, "value": value})
     return fields
 
 
@@ -6398,6 +6424,8 @@ def create_app() -> Flask:
     .saved-field {{ display: grid; grid-template-columns: 86px minmax(0, 1fr); gap: 7px; align-items: start; font-size: 12.5px; line-height: 1.2; min-width: 0; }}
     .saved-label {{ color: #64748b; font-weight: 800; }}
     .saved-value {{ color: #111827; font-weight: 750; overflow-wrap: anywhere; }}
+    .saved-input {{ width: 100%; min-height: 30px; border: 1px solid #dbe4ee; border-radius: 9px; background: white; padding: 5px 7px; color: #111827; font: inherit; font-weight: 750; }}
+    .saved-input:focus {{ outline: 2px solid rgba(16,185,129,.22); border-color: #10b981; }}
     .review-tools {{ margin-top: 8px; display: grid; grid-template-columns: 1fr; gap: 8px; }}
     .amend {{ min-height: 38px; border: 1px solid #86efac; border-radius: 14px; background: #ecfdf5; color: #047857; font-weight: 850; cursor: pointer; }}
     @media (max-width: 560px) {{
@@ -6436,7 +6464,7 @@ def create_app() -> Flask:
       <div class="msg" id="msg">Tap to start. Tap again to stop.</div>
       <div class="review" id="review">
         <div class="review-head">
-          <div class="review-title">Saved row</div>
+          <div class="review-title">Preview row</div>
           <button class="tick" id="okSaved" type="button" aria-label="Looks ok">✓</button>
         </div>
         <div class="saved-row" id="savedRow"></div>
@@ -6479,7 +6507,7 @@ def create_app() -> Flask:
     const amendSaved = document.getElementById('amendSaved');
     const addAnother = document.getElementById('addAnother');
     const closeWin = document.getElementById('closeWin');
-    let recorder = null, stream = null, chunks = [], processing = false;
+    let recorder = null, stream = null, chunks = [], processing = false, pendingToken = '';
     let mode = new URLSearchParams(location.search).get('mode') === 'edit' ? 'edit' : 'add';
     let recentLoaded = false;
     const columnLabels = ["Date", "Lead Name", "Number", "e-mail", "Source", "Job Type", "Form of Contact", "Conversion", "Void", "Area", "Contact", "Notes"];
@@ -6491,7 +6519,8 @@ def create_app() -> Flask:
     function showActions() {{ actions.classList.add('show'); resizeShell(); }}
     function hideActions() {{ actions.classList.remove('show'); resizeShell(); }}
     function hideReview() {{ review.classList.remove('show'); savedRow.innerHTML = ''; resizeShell(); }}
-    function showSavedRow(fields) {{
+    function showSavedRow(fields, editable=false) {{
+      okSaved.disabled = false;
       savedRow.innerHTML = '';
       (fields || []).forEach(field => {{
         const row = document.createElement('div');
@@ -6499,9 +6528,18 @@ def create_app() -> Flask:
         const label = document.createElement('div');
         label.className = 'saved-label';
         label.textContent = field.label || '';
-        const value = document.createElement('div');
-        value.className = 'saved-value';
-        value.textContent = field.value || '';
+        let value;
+        if (editable) {{
+          value = document.createElement('input');
+          value.className = 'saved-input';
+          value.name = field.key || '';
+          value.value = field.value || '';
+          value.autocomplete = 'off';
+        }} else {{
+          value = document.createElement('div');
+          value.className = 'saved-value';
+          value.textContent = field.value || '';
+        }}
         row.appendChild(label);
         row.appendChild(value);
         savedRow.appendChild(row);
@@ -6523,6 +6561,7 @@ def create_app() -> Flask:
     }}
     function setMode(next) {{
       mode = next === 'edit' ? 'edit' : 'add';
+      pendingToken = '';
       processing = false;
       mic.disabled = false;
       setMicText('Start talking');
@@ -6617,16 +6656,50 @@ def create_app() -> Flask:
         const data = await resp.json().catch(() => ({{}}));
         if (!resp.ok || data.error) throw new Error(data.error || 'Upload failed.');
         if (data.new_nonce) nonce = data.new_nonce;
-        continueEditing(data.row_number, data.label);
-        showSavedRow(data.saved_row || []);
+        pendingToken = data.preview_token || '';
+        if (mode === 'edit' && data.row_number) continueEditing(data.row_number, data.label);
+        showSavedRow(data.preview_row || [], true);
         processing = false;
         mic.disabled = false;
         setMicText('Start talking again');
         mic.dataset.action = 'again';
-        setState('Check the line', 'Tick it if correct, or talk again to amend it.', 'ok');
+        setState('Check the line', 'Edit anything needed, then press the gold tick to submit.', 'ok');
       }} catch (e) {{
         mic.disabled = false; processing = false; setMicText('Try again'); mic.dataset.action = 'retry';
         setState('Try again', e.message || 'Something went wrong.', 'err');
+      }}
+    }}
+    function previewValues() {{
+      const values = {{}};
+      savedRow.querySelectorAll('input.saved-input').forEach(input => {{ values[input.name] = input.value || ''; }});
+      return values;
+    }}
+    async function confirmPreview() {{
+      if (!pendingToken) {{
+        setState('Nothing to submit', 'Record a lead first.', 'err');
+        return;
+      }}
+      try {{
+        processing = true;
+        okSaved.disabled = true;
+        mic.disabled = true;
+        setState('Submitting', 'Writing the checked line to the sheet.');
+        const resp = await fetch('/lead-voice/confirm', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json', 'Accept': 'application/json'}},
+          body: JSON.stringify({{preview_token: pendingToken, values: previewValues()}})
+        }});
+        const data = await resp.json().catch(() => ({{}}));
+        if (!resp.ok || data.error) throw new Error(data.error || 'Submit failed.');
+        if (data.new_nonce) nonce = data.new_nonce;
+        pendingToken = '';
+        showSavedRow(data.saved_row || [], false);
+        setMode('add');
+      }} catch (e) {{
+        processing = false;
+        okSaved.disabled = false;
+        mic.disabled = false;
+        setState('Submit failed', e.message || 'Try again.', 'err');
       }}
     }}
     mic.addEventListener('click', () => {{
@@ -6641,7 +6714,7 @@ def create_app() -> Flask:
     recent.addEventListener('change', () => showSelectedRecentRow());
     addAnother.addEventListener('click', () => location.href = '/lead-voice');
     amendSaved.addEventListener('click', () => {{ hideActions(); hideReview(); start(); }});
-    okSaved.addEventListener('click', () => setMode('add'));
+    okSaved.addEventListener('click', () => confirmPreview());
     closeWin.addEventListener('click', () => {{ try {{ window.close(); }} catch(e) {{}} }});
     if (!navigator.mediaDevices || !window.MediaRecorder) {{
       mic.disabled = true; setState('Not supported', 'This browser cannot record audio here.', 'err');
@@ -6719,11 +6792,15 @@ def create_app() -> Flask:
                 trace["fallback_reason"] = str(exc)
                 lead = _lead_voice_extract_basic_from_transcript(transcript, dropdowns, for_edit=(mode == "edit"))
                 trace["final_lead"] = lead
-            if mode == "edit":
-                _lead_voice_update_row(service, row_number, lead)
-            else:
-                row_number = _lead_voice_insert_row(service, sheet_id, lead)
-            trace["saved_row_number"] = row_number
+            preview_token = secrets.token_urlsafe(18)
+            pending = {
+                "mode": "edit" if mode == "edit" else "add",
+                "row_number": row_number,
+                "lead": lead,
+                "trace": trace,
+                "created_at": int(time.time()),
+            }
+            set_json_setting(config.admin_db_file, _lead_voice_pending_key(preview_token), pending)
         except HttpError:
             app.logger.exception("Lead voice Google Sheets write failed")
             trace["error"] = "Google Sheets write failed"
@@ -6742,11 +6819,6 @@ def create_app() -> Flask:
             if transcript:
                 _lead_voice_append_process_log(config.admin_db_file, trace)
             return jsonify({"error": "Lead could not be added. Try again."}), 500
-        done = done if isinstance(done, dict) else {}
-        done[nonce] = int(time.time())
-        # Keep the browser session cookie small.
-        done = dict(list(done.items())[-10:])
-        session["lead_voice_done"] = done
         new_nonce = secrets.token_urlsafe(18)
         session["lead_voice_nonce"] = new_nonce
         label_bits = [
@@ -6755,14 +6827,72 @@ def create_app() -> Flask:
             str(lead.get("number") or "").strip(),
         ]
         label = " · ".join(bit for bit in label_bits if bit) or "Just added lead"
-        saved_row = _lead_voice_row_payload(_lead_voice_read_row(service, row_number))
-        trace["saved_row"] = {str(item.get("label") or ""): str(item.get("value") or "") for item in saved_row}
-        _lead_voice_append_process_log(config.admin_db_file, trace)
         return jsonify({
             "ok": True,
+            "preview": True,
             "mode": "edit" if mode == "edit" else "add",
             "row_number": row_number,
             "label": label,
+            "preview_token": preview_token,
+            "new_nonce": new_nonce,
+            "preview_row": _lead_voice_row_payload(_lead_voice_row_from_lead(lead), include_empty=True),
+        })
+
+    @app.post("/lead-voice/confirm")
+    def lead_voice_confirm():
+        data = request.get_json(silent=True) or {}
+        token = str(data.get("preview_token") or "").strip()
+        if not token:
+            return jsonify({"error": "Preview expired. Record it again."}), 400
+        pending = get_json_setting(config.admin_db_file, _lead_voice_pending_key(token), None)
+        if not isinstance(pending, dict):
+            return jsonify({"error": "Preview expired. Record it again."}), 400
+        if not isinstance(pending.get("lead"), dict):
+            return jsonify({"error": "Preview expired. Record it again."}), 400
+        mode = "edit" if str(pending.get("mode") or "") == "edit" else "add"
+        row_number = int(pending.get("row_number") or 0)
+        values = data.get("values") if isinstance(data.get("values"), dict) else {}
+        trace = pending.get("trace") if isinstance(pending.get("trace"), dict) else {}
+        creds = load_admin_credentials(config)
+        if not creds:
+            return jsonify({"error": "Google Sheets is not connected. Reconnect Google in Settings."}), 500
+        try:
+            service = build_sheets_service_from_creds(creds)
+            sheet_id, dropdowns = _lead_voice_sheet_meta(service)
+            lead = _lead_voice_lead_from_form_values(values or pending.get("lead") or {}, dropdowns, for_edit=(mode == "edit"))
+            trace["confirmed_lead"] = lead
+            if mode == "edit":
+                if row_number < 2:
+                    return jsonify({"error": "Preview row is no longer valid. Record it again."}), 400
+                _lead_voice_update_row(service, row_number, lead)
+            else:
+                row_number = _lead_voice_insert_row(service, sheet_id, lead)
+            trace["saved_row_number"] = row_number
+            saved_row = _lead_voice_row_payload(_lead_voice_read_row(service, row_number))
+            trace["saved_row"] = {str(item.get("label") or ""): str(item.get("value") or "") for item in saved_row}
+            _lead_voice_append_process_log(config.admin_db_file, trace)
+            set_json_setting(config.admin_db_file, _lead_voice_pending_key(token), {})
+        except HttpError:
+            app.logger.exception("Lead voice confirm Google Sheets write failed")
+            trace["error"] = "Google Sheets write failed"
+            _lead_voice_append_process_log(config.admin_db_file, trace)
+            return jsonify({"error": "Google Sheets write failed."}), 500
+        except RuntimeError as exc:
+            app.logger.warning("Lead voice confirm failed: %s", exc)
+            trace["error"] = str(exc)
+            _lead_voice_append_process_log(config.admin_db_file, trace)
+            return jsonify({"error": str(exc)}), 500
+        except Exception:
+            app.logger.exception("Lead voice confirm failed unexpectedly")
+            trace["error"] = "Lead could not be submitted. Try again."
+            _lead_voice_append_process_log(config.admin_db_file, trace)
+            return jsonify({"error": "Lead could not be submitted. Try again."}), 500
+        new_nonce = secrets.token_urlsafe(18)
+        session["lead_voice_nonce"] = new_nonce
+        return jsonify({
+            "ok": True,
+            "mode": mode,
+            "row_number": row_number,
             "new_nonce": new_nonce,
             "saved_row": saved_row,
         })
