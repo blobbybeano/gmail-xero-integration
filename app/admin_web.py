@@ -1852,7 +1852,7 @@ def _lead_voice_word_from_spelled_letters(value: str) -> str:
 def _lead_voice_clean_name_piece(value: str) -> str:
     text = str(value or "").strip(" .,:;-")
     text = re.sub(
-        r"^(?:i'?m|im|i am|customer name|lead name|name)\b[:,]?\s*",
+        r"^(?:i'?m|im|i am|customer name|lead name|name|customer|surname|last name)\b[:,]?\s*",
         "",
         text,
         flags=re.I,
@@ -1870,6 +1870,10 @@ def _lead_voice_clean_name_piece(value: str) -> str:
     if not words or len(words) > 4:
         return ""
     return " ".join(word[:1].upper() + word[1:] for word in words)
+
+
+def _lead_voice_name_key(value: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
 
 
 def _lead_voice_extract_name_from_transcript(transcript: str, *, allow_leading_fallback: bool = False) -> str:
@@ -1893,7 +1897,7 @@ def _lead_voice_extract_name_from_transcript(transcript: str, *, allow_leading_f
         return ""
 
     pieces: list[str] = []
-    for chunk in re.split(r"[.;]\s*", name_part):
+    for chunk in re.split(r"[.;,]\s*", name_part):
         chunk = chunk.strip()
         if not chunk:
             continue
@@ -1901,7 +1905,36 @@ def _lead_voice_extract_name_from_transcript(transcript: str, *, allow_leading_f
         if spelled_match:
             spelled = _lead_voice_word_from_spelled_letters(spelled_match.group(1))
             if spelled:
-                pieces.append(spelled)
+                before_spelling = chunk[: spelled_match.start()]
+                cleaned_before = _lead_voice_clean_name_piece(before_spelling)
+                if cleaned_before:
+                    before_pieces = cleaned_before.split()
+                    if pieces:
+                        pieces.append(spelled)
+                    elif len(before_pieces) >= 2:
+                        before_pieces[-1] = spelled
+                        pieces.extend(before_pieces)
+                    else:
+                        pieces.append(spelled)
+                else:
+                    if pieces:
+                        last_similarity = difflib.SequenceMatcher(
+                            None,
+                            _lead_voice_name_key(pieces[-1]),
+                            _lead_voice_name_key(spelled),
+                        ).ratio()
+                        if last_similarity >= 0.65:
+                            pieces[-1] = spelled
+                        elif len(pieces) >= 2:
+                            previous_two = "".join(pieces[-2:])
+                            if difflib.SequenceMatcher(None, _lead_voice_name_key(previous_two), _lead_voice_name_key(spelled)).ratio() >= 0.55:
+                                pieces[-2:] = [spelled]
+                            else:
+                                pieces[-1] = spelled
+                        else:
+                            pieces[-1] = spelled
+                    else:
+                        pieces.append(spelled)
                 continue
         cleaned = _lead_voice_clean_name_piece(chunk)
         if cleaned:
@@ -2100,6 +2133,10 @@ def _lead_voice_clean_spoken_field_value(value: str, *, field: str) -> str:
     text = str(value or "").strip(" .,:;-")
     text = _lead_voice_trim_at_next_field_instruction(text, current_field=field)
     text = re.sub(r"^(?:is|as|to|should be|needs to be|change(?:d)? to|set(?: it)? to|make(?: it)?|put(?: it)? as)\s+", "", text, flags=re.I).strip()
+    if field == "lead_name":
+        parsed_name = _lead_voice_extract_name_from_transcript(text, allow_leading_fallback=True)
+        if parsed_name:
+            text = parsed_name
     if field == "email":
         text = _lead_voice_normalise_spoken_email(text)
     return text
@@ -2183,13 +2220,13 @@ def _lead_voice_extract_basic_from_transcript(transcript: str, dropdowns: dict[s
         value = _lead_voice_extract_spoken_field_instruction(text, field)
         if value:
             lead[field] = value
-    transcript_name = _lead_voice_extract_name_from_transcript(text, allow_leading_fallback=not bool(lead.get("lead_name")))
-    if transcript_name:
-        lead["lead_name"] = transcript_name
     if not lead.get("email"):
         email_match = re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", text, flags=re.I)
         if email_match:
             lead["email"] = _lead_voice_normalise_spoken_email(email_match.group(0))
+    transcript_name = _lead_voice_extract_name_from_transcript(text, allow_leading_fallback=not bool(lead.get("lead_name")))
+    if transcript_name:
+        lead["lead_name"] = transcript_name
     if not lead.get("number"):
         candidates = re.findall(r"(?:\+|plus\s*)?\d[\d\s().-]{6,}\d", text, flags=re.I)
         if candidates:
@@ -2349,6 +2386,11 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
     cleaned["lead_date"] = str(data.get("lead_date") or ("" if for_edit else today_iso)).strip() or ("" if for_edit else today_iso)
     cleaned = _lead_voice_apply_abbreviation_rules(cleaned, transcript, dropdowns)
     cleaned = _lead_voice_apply_edit_instruction_rules(cleaned, transcript, for_edit=for_edit)
+    transcript_email = _lead_voice_email_from_transcript(transcript)
+    if transcript_email:
+        cleaned["email"] = transcript_email
+        if trace is not None:
+            trace["transcript_email_override"] = transcript_email
     transcript_name = _lead_voice_extract_name_from_transcript(
         transcript,
         allow_leading_fallback=not bool(cleaned.get("lead_name")),
@@ -2357,11 +2399,6 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
         cleaned["lead_name"] = transcript_name
         if trace is not None:
             trace["transcript_name_override"] = transcript_name
-    transcript_email = _lead_voice_email_from_transcript(transcript)
-    if transcript_email:
-        cleaned["email"] = transcript_email
-        if trace is not None:
-            trace["transcript_email_override"] = transcript_email
     cleaned = _lead_voice_apply_dropdown_guards(cleaned, dropdowns, for_edit=for_edit)
     if trace is not None:
         trace["final_lead"] = cleaned

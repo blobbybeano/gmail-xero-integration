@@ -31,3 +31,20 @@ def test_lead_voice_uses_spelled_name_parts():
     )
     assert _lead_voice_extract_name_from_transcript(transcript) == "Sina Zangana"
 
+
+def test_lead_voice_spelled_surname_keeps_first_name():
+    transcript = (
+        "27th of September, name Matthew Merritt, spelt M-E-R-R-E-T-T, "
+        "number 07766661323, email MatthewMerritt@hotmail.co.uk"
+    )
+    assert _lead_voice_extract_name_from_transcript(transcript) == "Matthew Merrett"
+
+
+def test_lead_voice_spelled_name_wins_over_email_spelling():
+    transcript = (
+        "27th of September, name Matthew Merritt, spelt M-E-R-R-E-T-T, "
+        "number 07766661323, email MatthewMerritt@hotmail.co.uk"
+    )
+    lead = _lead_voice_extract_basic_from_transcript(transcript, {}, for_edit=False)
+    assert lead["lead_name"] == "Matthew Merrett"
+    assert lead["email"] == "matthewmerritt@hotmail.co.uk"
