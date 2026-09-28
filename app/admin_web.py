@@ -1650,6 +1650,7 @@ LEAD_VOICE_DROPDOWN_KEYS = {
     "area": "J",
     "contact": "K",
 }
+LEAD_VOICE_PROCESS_LOG_KEY = "lead_voice_process_log"
 
 
 def _lead_voice_openai_key(config: AppConfig) -> str:
@@ -1678,6 +1679,42 @@ def _lead_voice_json_text(data: dict) -> str:
                 if text:
                     parts.append(text)
     return "\n".join(parts).strip()
+
+
+def _lead_voice_log_value(value: object, limit: int = 1800) -> str:
+    text = str(value or "").strip()
+    if len(text) > limit:
+        return text[:limit] + "...[truncated]"
+    return text
+
+
+def _lead_voice_log_lead(lead: dict | None) -> dict:
+    safe = {}
+    source = lead or {}
+    for key, _label in LEAD_VOICE_COLUMNS:
+        raw_key = "lead_date" if key == "date" else key
+        value = source.get(raw_key, "")
+        safe[raw_key] = _lead_voice_log_value(value, 500)
+    return safe
+
+
+def _lead_voice_append_process_log(db_path: str, entry: dict) -> None:
+    try:
+        log = get_json_setting(db_path, LEAD_VOICE_PROCESS_LOG_KEY, [])
+        if not isinstance(log, list):
+            log = []
+        item = dict(entry or {})
+        item["created_at"] = _lead_voice_london_today().isoformat(timespec="seconds")
+        if "transcript" in item:
+            item["transcript"] = _lead_voice_log_value(item.get("transcript"), 2500)
+        if "ai_raw" in item and isinstance(item.get("ai_raw"), dict):
+            item["ai_raw"] = _lead_voice_log_lead(item.get("ai_raw"))
+        if "final_lead" in item and isinstance(item.get("final_lead"), dict):
+            item["final_lead"] = _lead_voice_log_lead(item.get("final_lead"))
+        log.append(item)
+        set_json_setting(db_path, LEAD_VOICE_PROCESS_LOG_KEY, log[-50:])
+    except Exception:
+        pass
 
 
 def _lead_voice_sanitise_cell(value: object) -> str:
@@ -2118,7 +2155,7 @@ def _lead_voice_transcribe(config: AppConfig, audio_bytes: bytes, filename: str,
     return text
 
 
-def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[str, list[str]], for_edit: bool = False) -> dict:
+def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[str, list[str]], for_edit: bool = False, trace: dict | None = None) -> dict:
     api_key = _lead_voice_openai_key(config)
     if not api_key:
         raise RuntimeError("OpenAI is not configured.")
@@ -2209,6 +2246,8 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
         raise RuntimeError("OpenAI returned invalid lead data.") from exc
     if not isinstance(data, dict):
         raise RuntimeError("OpenAI returned invalid lead data.")
+    if trace is not None:
+        trace["ai_raw"] = data
     cleaned = {key: str(data.get(key) or "").strip() for key, _label in LEAD_VOICE_COLUMNS if key != "date"}
     cleaned["lead_date"] = str(data.get("lead_date") or ("" if for_edit else today_iso)).strip() or ("" if for_edit else today_iso)
     cleaned = _lead_voice_apply_abbreviation_rules(cleaned, transcript, dropdowns)
@@ -2216,7 +2255,12 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
     transcript_email = _lead_voice_email_from_transcript(transcript)
     if transcript_email:
         cleaned["email"] = transcript_email
-    return _lead_voice_apply_dropdown_guards(cleaned, dropdowns, for_edit=for_edit)
+        if trace is not None:
+            trace["transcript_email_override"] = transcript_email
+    cleaned = _lead_voice_apply_dropdown_guards(cleaned, dropdowns, for_edit=for_edit)
+    if trace is not None:
+        trace["final_lead"] = cleaned
+    return cleaned
 
 
 def _lead_voice_insert_row(service, sheet_id: int, lead: dict) -> int:
@@ -6651,6 +6695,12 @@ def create_app() -> Flask:
         creds = load_admin_credentials(config)
         if not creds:
             return jsonify({"error": "Google Sheets is not connected. Reconnect Google in Settings."}), 500
+        transcript = ""
+        trace: dict = {
+            "mode": "edit" if mode == "edit" else "add",
+            "requested_row_number": row_number or "",
+            "source": "ai",
+        }
         try:
             service = build_sheets_service_from_creds(creds)
             sheet_id, dropdowns = _lead_voice_sheet_meta(service)
@@ -6660,23 +6710,37 @@ def create_app() -> Flask:
                 upload.filename or "lead.webm",
                 upload.mimetype or "audio/webm",
             )
+            trace["transcript"] = transcript
             try:
-                lead = _lead_voice_extract(config=config, transcript=transcript, dropdowns=dropdowns, for_edit=(mode == "edit"))
+                lead = _lead_voice_extract(config=config, transcript=transcript, dropdowns=dropdowns, for_edit=(mode == "edit"), trace=trace)
             except RuntimeError as exc:
                 app.logger.warning("Lead voice AI extraction failed, saving partial transcript parse: %s", exc)
+                trace["source"] = "fallback"
+                trace["fallback_reason"] = str(exc)
                 lead = _lead_voice_extract_basic_from_transcript(transcript, dropdowns, for_edit=(mode == "edit"))
+                trace["final_lead"] = lead
             if mode == "edit":
                 _lead_voice_update_row(service, row_number, lead)
             else:
                 row_number = _lead_voice_insert_row(service, sheet_id, lead)
+            trace["saved_row_number"] = row_number
         except HttpError:
             app.logger.exception("Lead voice Google Sheets write failed")
+            trace["error"] = "Google Sheets write failed"
+            if transcript:
+                _lead_voice_append_process_log(config.admin_db_file, trace)
             return jsonify({"error": "Google Sheets write failed."}), 500
         except RuntimeError as exc:
             app.logger.warning("Lead voice submit failed: %s", exc)
+            trace["error"] = str(exc)
+            if transcript:
+                _lead_voice_append_process_log(config.admin_db_file, trace)
             return jsonify({"error": str(exc)}), 500
         except Exception:
             app.logger.exception("Lead voice submit failed unexpectedly")
+            trace["error"] = "Lead could not be added. Try again."
+            if transcript:
+                _lead_voice_append_process_log(config.admin_db_file, trace)
             return jsonify({"error": "Lead could not be added. Try again."}), 500
         done = done if isinstance(done, dict) else {}
         done[nonce] = int(time.time())
@@ -6692,6 +6756,8 @@ def create_app() -> Flask:
         ]
         label = " · ".join(bit for bit in label_bits if bit) or "Just added lead"
         saved_row = _lead_voice_row_payload(_lead_voice_read_row(service, row_number))
+        trace["saved_row"] = {str(item.get("label") or ""): str(item.get("value") or "") for item in saved_row}
+        _lead_voice_append_process_log(config.admin_db_file, trace)
         return jsonify({
             "ok": True,
             "mode": "edit" if mode == "edit" else "add",
