@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import base64
+import difflib
 import hashlib
 import json
 import os
@@ -1756,7 +1757,10 @@ def _lead_voice_compact_spoken_email_domain(value: str) -> str:
         "hotmail.co.uk",
         "hotmail.com",
         "outlook.com",
+        "outlook.co.uk",
+        "yahoo.co.uk",
         "yahoo.com",
+        "btinternet.com",
         "icloud.com",
     )
     compact = text.replace(".", "")
@@ -1792,13 +1796,17 @@ def _lead_voice_compact_spoken_email_local(value: str) -> str:
         raw = chunk.strip()
         if not raw:
             continue
-        if re.fullmatch(r"(?:[a-z0-9]\s*[- ]\s*)+[a-z0-9]", raw):
+        spelled_piece = bool(re.fullmatch(r"(?:[a-z0-9]\s*[- ]\s*)+[a-z0-9]", raw))
+        if spelled_piece:
             piece = re.sub(r"[-\s]+", "", raw)
         else:
             piece = re.sub(r"[^a-z0-9._+-]+", "", raw)
         if not piece:
             continue
         previous = pieces[-1] if pieces else ""
+        if spelled_piece and previous and difflib.SequenceMatcher(None, previous, piece).ratio() >= 0.72:
+            pieces[-1] = piece
+            continue
         if previous == piece or previous.endswith(piece):
             continue
         pieces.append(piece)
@@ -1831,6 +1839,81 @@ def _lead_voice_normalise_spoken_email(value: object) -> str:
 
 def _lead_voice_sanitise_email(value: object) -> str:
     return _lead_voice_sanitise_cell(_lead_voice_normalise_spoken_email(value))
+
+
+def _lead_voice_word_from_spelled_letters(value: str) -> str:
+    text = str(value or "")
+    letters = re.findall(r"\b[A-Z]\b", text, flags=re.I)
+    if len(letters) < 2:
+        return ""
+    return "".join(letters).title()
+
+
+def _lead_voice_clean_name_piece(value: str) -> str:
+    text = str(value or "").strip(" .,:;-")
+    text = re.sub(
+        r"^(?:i'?m|im|i am|customer name|lead name|name)\b[:,]?\s*",
+        "",
+        text,
+        flags=re.I,
+    ).strip(" .,:;-")
+    text = re.sub(r"\b(?:that'?s|thats|is)?\s*(?:spelled|spelt|spell(?:ing)?)\b.*$", "", text, flags=re.I).strip(" .,:;-")
+    text = re.sub(r"\b(?:number|phone|mobile|email|e-mail|source|job type|form of contact|conversion|void|area|contact|notes)\b.*$", "", text, flags=re.I).strip(" .,:;-")
+    words = re.findall(r"[A-Za-z][A-Za-z'’-]*", text)
+    if not words:
+        return ""
+    blocked = {
+        "number", "phone", "mobile", "email", "source", "job", "type", "form",
+        "contact", "conversion", "void", "area", "notes",
+    }
+    words = [w for w in words if w.lower() not in blocked]
+    if not words or len(words) > 4:
+        return ""
+    return " ".join(word[:1].upper() + word[1:] for word in words)
+
+
+def _lead_voice_extract_name_from_transcript(transcript: str, *, allow_leading_fallback: bool = False) -> str:
+    text = str(transcript or "").strip()
+    if not text:
+        return ""
+    stop_match = re.search(
+        r"\b(?:number|phone|mobile|email|e-mail|source|job type|form of contact|conversion|void|area|contact|notes)\b",
+        text,
+        flags=re.I,
+    )
+    first_part = text[: stop_match.start()] if stop_match else text
+    explicit = re.search(r"\b(?:customer name|lead name|name)\b[:,]?\s+(.+)$", first_part, flags=re.I)
+    if explicit:
+        name_part = explicit.group(1)
+    elif allow_leading_fallback:
+        name_part = first_part
+    else:
+        name_part = ""
+    if not name_part:
+        return ""
+
+    pieces: list[str] = []
+    for chunk in re.split(r"[.;]\s*", name_part):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        spelled_match = re.search(r"\b(?:spelled|spelt|spell(?:ing)?)\b\s+((?:[A-Z]\s*[- ]\s*)+[A-Z])\b", chunk, flags=re.I)
+        if spelled_match:
+            spelled = _lead_voice_word_from_spelled_letters(spelled_match.group(1))
+            if spelled:
+                pieces.append(spelled)
+                continue
+        cleaned = _lead_voice_clean_name_piece(chunk)
+        if cleaned:
+            pieces.extend(cleaned.split())
+
+    deduped: list[str] = []
+    for piece in pieces:
+        if piece and piece.lower() not in {p.lower() for p in deduped}:
+            deduped.append(piece)
+    if not deduped or len(deduped) > 4:
+        return ""
+    return " ".join(deduped)
 
 
 def _lead_voice_trim_at_next_field_instruction(value: str, *, current_field: str) -> str:
@@ -2100,6 +2183,9 @@ def _lead_voice_extract_basic_from_transcript(transcript: str, dropdowns: dict[s
         value = _lead_voice_extract_spoken_field_instruction(text, field)
         if value:
             lead[field] = value
+    transcript_name = _lead_voice_extract_name_from_transcript(text, allow_leading_fallback=not bool(lead.get("lead_name")))
+    if transcript_name:
+        lead["lead_name"] = transcript_name
     if not lead.get("email"):
         email_match = re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", text, flags=re.I)
         if email_match:
@@ -2263,6 +2349,14 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
     cleaned["lead_date"] = str(data.get("lead_date") or ("" if for_edit else today_iso)).strip() or ("" if for_edit else today_iso)
     cleaned = _lead_voice_apply_abbreviation_rules(cleaned, transcript, dropdowns)
     cleaned = _lead_voice_apply_edit_instruction_rules(cleaned, transcript, for_edit=for_edit)
+    transcript_name = _lead_voice_extract_name_from_transcript(
+        transcript,
+        allow_leading_fallback=not bool(cleaned.get("lead_name")),
+    )
+    if transcript_name:
+        cleaned["lead_name"] = transcript_name
+        if trace is not None:
+            trace["transcript_name_override"] = transcript_name
     transcript_email = _lead_voice_email_from_transcript(transcript)
     if transcript_email:
         cleaned["email"] = transcript_email
