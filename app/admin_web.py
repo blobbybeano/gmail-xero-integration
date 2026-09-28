@@ -1907,6 +1907,28 @@ def _lead_voice_snap_dropdown_value(value: str, allowed: list[str]) -> str:
 
 def _lead_voice_apply_abbreviation_rules(lead: dict, transcript: str, dropdowns: dict[str, list[str]]) -> dict:
     text = str(transcript or "").lower()
+    job_options = dropdowns.get("job_type") or []
+    gutter_clean = re.search(r"\b(?:gutter\s*(?:clean|cleaning)|gutters?\s*(?:clean|cleaning)|g\.?\s*c\.?)\b", text)
+    pressure_wash = re.search(r"\b(?:pressure\s*wash(?:ing)?|power\s*wash(?:ing)?|jet\s*wash(?:ing)?|p\.?\s*w\.?)\b", text)
+    if gutter_clean:
+        option = (
+            _lead_voice_find_option(job_options, "G.C.")
+            or _lead_voice_find_option(job_options, "GC")
+            or _lead_voice_find_option(job_options, "Gutter Cleaning")
+            or _lead_voice_find_option(job_options, "Gutter Clean")
+        )
+        if option:
+            lead["job_type"] = option
+    elif pressure_wash:
+        option = (
+            _lead_voice_find_option(job_options, "P.W.")
+            or _lead_voice_find_option(job_options, "PW")
+            or _lead_voice_find_option(job_options, "Pressure Washing")
+            or _lead_voice_find_option(job_options, "Pressure Wash")
+        )
+        if option:
+            lead["job_type"] = option
+
     form_options = dropdowns.get("form_of_contact") or []
     has_call = any(word in text for word in ("call", "called", "phoned", "rang"))
     no_answer = any(
@@ -2139,6 +2161,8 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
         "Stop the email value when the speaker moves on to another field such as source, form of contact, or contact. "
         "Abbreviations: N.A means no answer. If the speaker says they called, got no answer, "
         "then WhatsApped, choose the exact permitted Form of Contact option matching Call N.A/Whatsapp. "
+        "Job abbreviations: gutter clean or gutter cleaning means the exact permitted Job Type matching G.C.; "
+        "pressure wash, power wash, or jet wash means the exact permitted Job Type matching P.W. "
         "Giving a quote does not mean conversion unless the customer booked/accepted. "
         "Use notes only for concise operational details not already in other fields. "
         "Preserve UK phone numbers, +44 prefixes, and leading zeroes.\n\n"
