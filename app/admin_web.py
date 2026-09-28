@@ -1985,6 +1985,64 @@ def _lead_voice_apply_edit_instruction_rules(lead: dict, transcript: str, *, for
     return lead
 
 
+def _lead_voice_apply_dropdown_guards(lead: dict, dropdowns: dict[str, list[str]], *, for_edit: bool) -> dict:
+    for key in LEAD_VOICE_DROPDOWN_KEYS:
+        value = str(lead.get(key) or "").strip()
+        allowed = dropdowns.get(key) or []
+        if value and allowed:
+            snapped = _lead_voice_snap_dropdown_value(value, allowed)
+            lead[key] = snapped or ""
+    if not for_edit and not lead.get("conversion"):
+        lead["conversion"] = _lead_voice_pick_default(dropdowns.get("conversion") or [], ("?", "unknown", "not sure"))
+    if not for_edit and not lead.get("void"):
+        lead["void"] = _lead_voice_pick_default(dropdowns.get("void") or [], ("fine", "no", "valid", "not void"))
+    return lead
+
+
+def _lead_voice_option_from_transcript(transcript: str, options: list[str]) -> str:
+    text_key = _lead_voice_option_key(transcript)
+    matches: list[tuple[int, str]] = []
+    for option in options:
+        opt_key = _lead_voice_option_key(option)
+        if opt_key and opt_key in text_key:
+            matches.append((len(opt_key), option))
+    if not matches:
+        return ""
+    matches.sort(reverse=True)
+    return matches[0][1]
+
+
+def _lead_voice_extract_basic_from_transcript(transcript: str, dropdowns: dict[str, list[str]], *, for_edit: bool) -> dict:
+    lead = {key: "" for key, _label in LEAD_VOICE_COLUMNS if key != "date"}
+    lead["lead_date"] = "" if for_edit else _lead_voice_london_today().date().isoformat()
+    text = str(transcript or "").strip()
+    if not text:
+        return _lead_voice_apply_dropdown_guards(lead, dropdowns, for_edit=for_edit)
+    for field in LEAD_VOICE_FIELD_ALIASES:
+        value = _lead_voice_extract_spoken_field_instruction(text, field)
+        if value:
+            lead[field] = value
+    if not lead.get("email"):
+        email_match = re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", text, flags=re.I)
+        if email_match:
+            lead["email"] = _lead_voice_normalise_spoken_email(email_match.group(0))
+    if not lead.get("number"):
+        candidates = re.findall(r"(?:\+|plus\s*)?\d[\d\s().-]{6,}\d", text, flags=re.I)
+        if candidates:
+            candidates.sort(key=lambda item: len(re.sub(r"\D", "", item)), reverse=True)
+            lead["number"] = candidates[0]
+    for key in LEAD_VOICE_DROPDOWN_KEYS:
+        if key in {"conversion", "void"}:
+            continue
+        if lead.get(key):
+            continue
+        option = _lead_voice_option_from_transcript(text, dropdowns.get(key) or [])
+        if option:
+            lead[key] = option
+    lead = _lead_voice_apply_abbreviation_rules(lead, text, dropdowns)
+    return _lead_voice_apply_dropdown_guards(lead, dropdowns, for_edit=for_edit)
+
+
 def _lead_voice_london_today() -> dt.datetime:
     try:
         from zoneinfo import ZoneInfo
@@ -2087,20 +2145,25 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
         f"Permitted dropdown values:\n{json.dumps(dropdowns, ensure_ascii=False)}\n\n"
         f"Transcript:\n{transcript}"
     )
-    resp = requests.post(
-        "https://api.openai.com/v1/responses",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={
-            "model": model,
-            "input": [
-                {"role": "system", "content": [{"type": "input_text", "text": "You convert spoken lead notes into strict CRM spreadsheet JSON."}]},
-                {"role": "user", "content": [{"type": "input_text", "text": prompt}]},
-            ],
-            "text": {"format": {"type": "json_schema", "name": "lead_voice_entry", "schema": schema, "strict": True}},
-            "max_output_tokens": 600,
-        },
-        timeout=45,
-    )
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "input": [
+                    {"role": "system", "content": [{"type": "input_text", "text": "You convert spoken lead notes into strict CRM spreadsheet JSON."}]},
+                    {"role": "user", "content": [{"type": "input_text", "text": prompt}]},
+                ],
+                "text": {"format": {"type": "json_schema", "name": "lead_voice_entry", "schema": schema, "strict": True}},
+                "max_output_tokens": 600,
+            },
+            timeout=45,
+        )
+    except requests.Timeout as exc:
+        raise RuntimeError("OpenAI lead extraction timed out.") from exc
+    except requests.RequestException as exc:
+        raise RuntimeError("OpenAI lead extraction failed.") from exc
     if not resp.ok:
         raise RuntimeError("OpenAI lead extraction failed.")
     try:
@@ -2113,20 +2176,7 @@ def _lead_voice_extract(*, config: AppConfig, transcript: str, dropdowns: dict[s
     cleaned["lead_date"] = str(data.get("lead_date") or ("" if for_edit else today_iso)).strip() or ("" if for_edit else today_iso)
     cleaned = _lead_voice_apply_abbreviation_rules(cleaned, transcript, dropdowns)
     cleaned = _lead_voice_apply_edit_instruction_rules(cleaned, transcript, for_edit=for_edit)
-    for key in LEAD_VOICE_DROPDOWN_KEYS:
-        value = cleaned.get(key, "")
-        allowed = dropdowns.get(key) or []
-        if value and allowed:
-            snapped = _lead_voice_snap_dropdown_value(value, allowed)
-            if snapped:
-                cleaned[key] = snapped
-            else:
-                cleaned[key] = ""
-    if not for_edit and not cleaned.get("conversion"):
-        cleaned["conversion"] = _lead_voice_pick_default(dropdowns.get("conversion") or [], ("?", "unknown", "not sure"))
-    if not for_edit and not cleaned.get("void"):
-        cleaned["void"] = _lead_voice_pick_default(dropdowns.get("void") or [], ("fine", "no", "valid", "not void"))
-    return cleaned
+    return _lead_voice_apply_dropdown_guards(cleaned, dropdowns, for_edit=for_edit)
 
 
 def _lead_voice_insert_row(service, sheet_id: int, lead: dict) -> int:
@@ -6570,7 +6620,11 @@ def create_app() -> Flask:
                 upload.filename or "lead.webm",
                 upload.mimetype or "audio/webm",
             )
-            lead = _lead_voice_extract(config=config, transcript=transcript, dropdowns=dropdowns, for_edit=(mode == "edit"))
+            try:
+                lead = _lead_voice_extract(config=config, transcript=transcript, dropdowns=dropdowns, for_edit=(mode == "edit"))
+            except RuntimeError as exc:
+                app.logger.warning("Lead voice AI extraction failed, saving partial transcript parse: %s", exc)
+                lead = _lead_voice_extract_basic_from_transcript(transcript, dropdowns, for_edit=(mode == "edit"))
             if mode == "edit":
                 _lead_voice_update_row(service, row_number, lead)
             else:
