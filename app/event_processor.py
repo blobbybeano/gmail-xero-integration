@@ -1046,7 +1046,7 @@ def _extract_contact_field(text: str, labels: tuple[str, ...]) -> str:
     label_pattern = "|".join(re.escape(label) for label in labels)
     stop_pattern = "|".join(re.escape(label) for label in all_labels)
     match = re.search(
-        rf"(?is)(?:^|\s)(?:{label_pattern})\s*:\s*(.*?)(?=\s+(?:{stop_pattern})\s*:|$)",
+        rf"(?is)(?:^|\s)(?:{label_pattern})\s*:\s*(.*?)(?=(?:\s+)?(?:{stop_pattern})\s*:|$)",
         text,
     )
     return (match.group(1).strip() if match else "")
@@ -1122,6 +1122,24 @@ def parse_invoice_contact_overrides(description: str | None) -> Dict:
     if contact_match:
         text = contact_match.group(1)
 
+    result["invoice_profile"] = _strip_error_hint(
+        _extract_contact_field(text, ("Invoice profile", "Invoce profile"))
+    ).strip()
+    result["invoice_name"] = _strip_error_hint(_extract_contact_field(text, ("Invoice name",))).strip()
+    result["invoice_address_line_1"] = _strip_error_hint(
+        _extract_contact_field(text, ("Invoice address line 1",))
+    )
+    result["invoice_address_line_2"] = _strip_error_hint(
+        _extract_contact_field(text, ("Invoice address line 2",))
+    )
+    result["invoice_city"] = _strip_error_hint(_extract_contact_field(text, ("Invoice city",)))
+    result["invoice_postcode"] = _strip_error_hint(
+        _extract_contact_field(text, ("Invoice postcode",))
+    )
+    result["invoice_country"] = _strip_error_hint(
+        _extract_contact_field(text, ("Invoice country",))
+    )
+
     for raw_line in text.splitlines():
         line = raw_line.strip()
         lower = line.lower()
@@ -1129,19 +1147,19 @@ def parse_invoice_contact_overrides(description: str | None) -> Dict:
             continue
         value = line.split(":", 1)[1].strip()
         if lower.startswith("invoice profile:") or lower.startswith("invoce profile:"):
-            result["invoice_profile"] = _strip_error_hint(value).strip()
+            result["invoice_profile"] = _strip_error_hint(value).strip() or result["invoice_profile"]
         elif lower.startswith("invoice name:"):
-            result["invoice_name"] = _strip_error_hint(value).strip()
+            result["invoice_name"] = _strip_error_hint(value).strip() or result["invoice_name"]
         elif lower.startswith("invoice address line 1:"):
-            result["invoice_address_line_1"] = _strip_error_hint(value)
+            result["invoice_address_line_1"] = _strip_error_hint(value) or result["invoice_address_line_1"]
         elif lower.startswith("invoice address line 2:"):
-            result["invoice_address_line_2"] = _strip_error_hint(value)
+            result["invoice_address_line_2"] = _strip_error_hint(value) or result["invoice_address_line_2"]
         elif lower.startswith("invoice city:"):
-            result["invoice_city"] = _strip_error_hint(value)
+            result["invoice_city"] = _strip_error_hint(value) or result["invoice_city"]
         elif lower.startswith("invoice postcode:"):
-            result["invoice_postcode"] = _strip_error_hint(value)
+            result["invoice_postcode"] = _strip_error_hint(value) or result["invoice_postcode"]
         elif lower.startswith("invoice country:"):
-            result["invoice_country"] = _strip_error_hint(value)
+            result["invoice_country"] = _strip_error_hint(value) or result["invoice_country"]
 
     return result
 

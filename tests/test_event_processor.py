@@ -159,6 +159,21 @@ class InvoiceSalesParsingTests(unittest.TestCase):
         self.assertEqual(customer["email"], "emma.prosser1997@gmail.com")
         self.assertEqual(customer["phone"], "447713112131")
 
+    def test_invoice_profile_parses_when_contact_block_is_collapsed(self):
+        description = (
+            "[contact] Customer name: Customer email address: "
+            "Customer contact number: 07399738688 "
+            "Invoice profile: Abbey Court Care Home [/contact]"
+        )
+
+        customer = parse_customer_fields(description)
+        overrides = parse_invoice_contact_overrides(description)
+
+        self.assertEqual(customer["name"], "")
+        self.assertEqual(customer["email"], "")
+        self.assertEqual(customer["phone"], "07399738688")
+        self.assertEqual(overrides["invoice_profile"], "Abbey Court Care Home")
+
     def test_explicit_payment_value_is_preserved(self):
         description = (
             "[app-status]\n"
